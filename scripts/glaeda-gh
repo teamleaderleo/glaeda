@@ -19158,16 +19158,21 @@ class LandQueue:
             self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
-        # Every worker's judgment holds its PR waited, so the pool is demand on the read loop too: no more workers
-        # than the reads it keeps fresh (read_room, LAND_WATCH_SHARE). cmux-cp-1, 2026-11-22: 175 workers, 262 waited
-        # PRs, 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old.
-        room = self.read_room()
-        if room is not None:
-            ceiling = max(1.0, min(ceiling, float(room)))
+        # The read loop is not the workers' bound: what a pool puts on it is the waited PRs, and those are capped at
+        # the daemon's read room where they come from -- the tick's watch window (LAND_WATCH_SHARE) and the snapshot
+        # waits ahead of the workers (snapshot_room) -- while a judging row is not due and holds no waited watch.
+        # cmux-cp-1, 2026-11-22: 175 workers held 262 waited PRs because each worker kept a snapshot wait's place
+        # (LAND_SNAPSHOT_AHEAD), and a snapshot wait is waited past the window. Capping the workers at the room too
+        # pinned the pool at LAND_WATCH_FLOOR: cmux-cp-1, 2026-11-25 06:35-12:35Z, the pool stepped
+        # down to 16 "more workers than the read loop keeps fresh" 13 times, 22 of ~23 workers busy on average with
+        # 75% of the CPU and 107 GB free, "every worker busy" holding 4,863 row-passes, and a due row waited a median
+        # 5.5 min (p90 37 min) for each judgment; 842 merges in 24 h, request-to-merge p50 51 min, p90 11 h. The pool
+        # now grows to its memory ceiling while due rows wait for a worker, halves on a quota refusal, and stops at
+        # the CPU headroom line (headroom_why) -- the bounds a judgment's real cost hits.
         if self.quota_refused > last:
             size, why = max(1.0, size / 2), "a quota refusal"
-        elif size > ceiling and room is not None and int(ceiling) == int(room):
-            size, why = ceiling, "more workers than the read loop keeps fresh"
+        elif size > ceiling:
+            size, why = ceiling, "more workers than the memory ceiling"
         elif len(self.jobs) >= int(size) and self.pass_gated:
             size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
         else:
@@ -20508,6 +20513,14 @@ class LandQueue:
                    if self.now - float(((self.entries.get(k) or {}).get("snapshotWait") or {}).get("since") or 0)
                    < LAND_SNAPSHOT_WAIT)
 
+    def snapshot_room(self, free: bool) -> bool:
+        """Whether one more snapshot wait fits the daemon's read room (read_room): each puts its PR's read first and
+        is waited past the tick's watch window (keep_watching), so they, not the workers, are the pool's demand on the
+        read loop. A row with no place is judged live once it has been due LAND_SNAPSHOT_WAIT (room_starved), as a
+        wait that ran out is. No room known (a lane VM, a test): the workers' places alone, as before."""
+        room = self.read_room()
+        return room is None or self.snapshot_places(free) < max(1, int(room))
+
     def room_starved(self, e: dict, sha: str) -> bool:
         """True when E, due at least LAND_SNAPSHOT_WAIT with a worker free, found no room ahead of the workers to
         start its own snapshot wait: it is judged live now, as a wait that ran out would have been by then. The room
@@ -21014,7 +21027,8 @@ class LandQueue:
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = self.busy() < workers
-        room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD)
+        room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD) \
+            and self.snapshot_room(free)
         if not free and not room and not e.get("snapshotWait"):
             # whether its snapshot is ready (read only, nothing nudged): a ready row goes first for a worker that
             # frees before the next pass, ahead of rows that could only start a snapshot wait (refill)

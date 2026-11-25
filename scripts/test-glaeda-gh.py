@@ -37086,28 +37086,46 @@ class LandTest(Base):
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
 
-    def test_the_pool_grows_no_wider_than_the_read_loop_keeps_fresh(self):
-        """cmux-cp-1, 2026-11-22 20:54Z, with the watch window capped: the pool at 175 workers, each judgment's PR
-        waited, held 262 waited PRs against 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old. The pool
-        grows no wider than the daemon's read room and steps down to it when the room shrinks; a quota refusal still halves."""
+    def test_the_pool_grows_past_the_read_room_and_the_snapshot_waits_stay_inside_it(self):
+        """cmux-cp-1, 2026-11-22 20:54Z: 175 workers held 262 waited PRs, each worker keeping a snapshot wait's place.
+        Capping the workers at the read room fixed that and pinned the pool at LAND_WATCH_FLOOR: cmux-cp-1, 2026-11-25
+        06:35-12:35Z, 16 workers, 22 of ~23 busy on average with 75% of the CPU free, a due row waiting a median 5.5
+        min for each judgment. The pool grows to its memory ceiling while rows wait for a worker; the snapshot waits,
+        what puts reads first, stay inside the room; a quota refusal still halves."""
         q, room = self.q, [6]
         q.read_room = lambda: room[0]
         with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
             q.now, q.pass_gated = 1000.0, 7
-            for _ in range(10):
+            for _ in range(20):
                 while len(q.jobs) < q.workers():
                     q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
                 q.now += gg.LAND_POOL_ADAPT_S
                 q.adapt_pool()
-            self.assertEqual(q.workers(), 6)
-            room[0] = 3  # GitHub slowed: the pool steps down to the room
+            self.assertEqual(q.workers(), 80)  # past the room of 6: the memory ceiling
+            room[0] = 3  # GitHub slowed: the workers stay
             q.now += gg.LAND_POOL_ADAPT_S
             q.adapt_pool()
-            self.assertEqual(q.workers(), 3)
-            room[0] = None  # no room known: the memory ceiling alone
+            self.assertEqual(q.workers(), 80)
+            q.jobs.clear()
+            # the snapshot waits are what the room bounds: 3 places, whatever the workers
+            q.snapshot_waiting = set()
+            for n in range(3):
+                q.snapshot_waiting.add(f"pr:o/r#{n + 500}")
+                q.entries[f"pr:o/r#{n + 500}"] = {"snapshotWait": {"since": q.now}}
+            self.assertFalse(q.snapshot_room(True))
+            room[0] = 4
+            self.assertTrue(q.snapshot_room(True))
+            room[0] = None  # no room known: the workers' places alone
+            self.assertTrue(q.snapshot_room(True))
+            for n in range(3):
+                q.entries.pop(f"pr:o/r#{n + 500}")
+            q.snapshot_waiting = set()
+            q.pass_gated = 3
+            q.now += 1
+            q.park_quota({"key": "pr:o/r#1", "state": "judging", "history": []}, "API rate limit exceeded")
             q.now += gg.LAND_POOL_ADAPT_S
             q.adapt_pool()
-            self.assertEqual(q.workers(), 4)
+            self.assertEqual(q.workers(), 40)  # a quota refusal halves it, as before
         q.jobs.clear()
         # a daemon up for less than the window counts its reads over its uptime
         d = gg.Daemon.__new__(gg.Daemon)
