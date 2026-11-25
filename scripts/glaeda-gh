@@ -6249,6 +6249,7 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.heads_between_seen: frozenset = frozenset()  # keys the tick's watch read listed
         self.heads_between_since = float("inf")  # wall time of this tick's watch read: later asks are read between
         self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
         self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
@@ -9003,12 +9004,14 @@ class Daemon:
                 touched = path.stat().st_mtime
             except OSError:
                 continue
-            if touched < since:
+            if touched < since - WATCH_MTIME_SLACK:
                 continue
             doc = read_json(path)
             key = doc.get("key") if isinstance(doc, dict) else None
             if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
                 continue
+            if touched < since and key in self.heads_between_seen:
+                continue  # in the slack, but the watch read already had it
             e = watch_entry(key, doc, read_cache(key), touched)
             if self.head_unanswered(e):
                 asked.append(e)
@@ -9413,14 +9416,16 @@ class Daemon:
                 self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
-        # Wall time, as a watch file's mtime is when it was asked; less WATCH_MTIME_SLACK, since Linux stamps mtimes
-        # from its coarse clock, up to a jiffy behind time.time(): a head asked just after this read was skipped
-        # until the next tick (fs-agent-lane-27, 2026-11-25). A head the watch read already saw is filtered by
-        # head_unanswered and due_heads, so the slack never reads one twice.
-        self.heads_between_since = time.time() - WATCH_MTIME_SLACK
+        # Wall time, as a watch file's mtime is when it was asked. Linux stamps mtimes from its coarse clock, up to a
+        # jiffy behind time.time(), so a head asked just after this read could carry an earlier mtime and was skipped
+        # until the next tick (2026-11-25): read_heads_between also takes a file up to WATCH_MTIME_SLACK older, unless
+        # the watch read below already listed its key (that one is the due phase's: read, or deferred on purpose).
+        self.heads_between_since = time.time()
+        self.heads_between_seen = frozenset()
         self.heads_between_read = 0
         with self.phase("watches"):
             entries = self.watches()
+        self.heads_between_seen = frozenset(e.get("key") for e in entries)
         self.adopt_pace_hold()
         try:
             with self.phase("controller"):

@@ -9101,8 +9101,7 @@ class TickBudgetTest(Base):
             def read(chunk):
                 if kind == "pr" and not queries:
                     gg.register(head, consumer="owner-merge")
-                    wall = self.daemon.heads_between_since + getattr(gg, "WATCH_MTIME_SLACK", 0)  # the read's time
-                    lag = wall - 0.003
+                    lag = self.daemon.heads_between_since - 0.003  # the watch read's wall time, less a jiffy
                     os.utime(gg.watch_dir() / gg.file_name(head), (lag, lag))
                 queries.append((kind, [e["key"] for e in chunk]))
             return read
