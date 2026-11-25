@@ -18937,6 +18937,13 @@ class LandQueue:
                 return
         running = land_checks_running(data, head)
         kind = w.get("kind")
+        if running and kind not in ("head_change", "repin") and land_override_pinned(e, head) \
+                and e.get("overridePinJudged") != f"{e.get('requestId') or ''}|{head}":
+            # LAND_OVERRIDE_PIN_KINDS' comment: a pinned override row is judged now, not after its checks finish;
+            # take() merges it at the pin if the judgment is a wait on those checks
+            e["overridePinJudged"] = f"{e.get('requestId') or ''}|{head}"
+            self.judge(e, head, fp, why="override_pin")
+            return
         if running and kind not in ("head_change", "repin") and self.stuck_carry_due(e, head, data):
             # an override given after this head's checks_stuck verdict: judged now, not after another wait on the same
             # pending check (land_override_carries); take() merges it if the judgment is still only that wait
@@ -20877,6 +20884,24 @@ class LandQueue:
                 e.pop("overrideWait", None)
             self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
+        if kind in LAND_OVERRIDE_PIN_KINDS and land_override_pinned(e, head):
+            # LAND_OVERRIDE_PIN_KINDS' comment: the pinned merge carrying the override, once per head
+            if (e.get("overridePinMerge") or {}).get("head") == head:
+                with self.lock:
+                    self.stop(e, "pinned_override_refused",
+                              f"the pinned merge carrying the override was already tried at {head[:12]} and refused "
+                              f"(the merge step's refusal is in this entry's history); land_judge now says "
+                              f"{answer.get('code') or kind}: {land_reason(answer.get('reason'))}",
+                              f"read the refusal, then gh pr merge {number} -R {repo} --squash "
+                              f"--match-head-commit {head} with LAND_JUDGE_OVERRIDE set")
+                return
+            with self.lock:
+                e["overridePinMerge"] = {"head": head, "at": self.now}
+                self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
+                             carried="pinned", **land_override_history(e))
+                self.save(e)
+            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
             nxt = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else act.get("text")
@@ -22553,6 +22578,29 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
     if act.get("kind") == "command":
         return True
     return act.get("kind") == "stop" and str(act.get("stop") or "") not in set(LAND_STOP_CLASSES.values())
+
+
+# A row queued with a pin and an override (`land --sha SHA --override-reason R --override-receipt T`) is the
+# requester's say-so to merge that exact head now (Leo, 2026-11-25 01:03Z: "stop waiting on ci to get these
+# [expletive] things in. if checks fail, fix the checks or ignore and just merge"). The queue still waited on its checks:
+# a running check kept it in wait_running, never judged, and a judgment that came back checks_running or a red check's
+# rerun_failed was taken as a wait, so the override reached no merge step. 2026-11-25: cmux#52546 parked until
+# 04:30Z; cmux#53958 recorded its override at 03:30:35Z and was judged checks_running 24 s later; a direct pinned
+# merge with the same override went in at once both times. Now such a row at its pin is judged at once even while
+# checks run, and a wait on its checks (wait_pr, wait_run) or a rerun of its red ones is the pinned merge carrying the
+# override, once per head. A merge refused there stops the row by name (pinned_override_refused), never another wait.
+# A hold, BLOCK, conflict or other LAND_STOP_CLASSES stop still stops; an unpinned override still waits on a running
+# check (land_override_carries), and a head off the pin is judged as before.
+LAND_OVERRIDE_PIN_KINDS = LAND_WAIT_KINDS | {"rerun_failed"}
+
+
+def land_override_pinned(e: dict, head: str) -> bool:
+    """True when E carries an override and a pin that HEAD is (the comment above). Not at a head this land already
+    sent a base update for (updateSent, land_judge's own included): that head is being replaced, the pin follows the
+    merge (follow_own_update), and the new head is the one merged."""
+    pin = str(e.get("pinSha") or "").lower()
+    return bool(land_override_env(e)) and bool(pin) and bool(SHA40.fullmatch(head or "")) \
+        and not land_head_moved(pin, head) and str((e.get("updateSent") or {}).get("head") or "").lower() != head
 
 
 # An override given after the queue already judged a check stuck covers that check at once. The queue stops an entry

@@ -29895,6 +29895,39 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
         self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
 
+    def test_land_override_pinned_row_merges_at_its_pin_past_running_or_red_checks(self):
+        # cmux#52546 parked until 04:30Z and cmux#53958 (override recorded 03:30:35Z, judged checks_running 24 s later),
+        # 2026-11-25: queued pinned with an override, they waited on their checks and never merged; a direct pinned
+        # merge with the same override went in at once. A pinned override row merges at its pin, checks running or red.
+        cases = (("running", [("ci", "IN_PROGRESS", None)], "checks_running", {"kind": "wait_pr", "sha": LA}),
+                 ("red", [("ci", "COMPLETED", "FAILURE")], "own_red", {"kind": "rerun_failed", "runs": [7]}))
+        for name, checks, code, act in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=checks)
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+                self.w.answers.append(refusal(code, LA, act))
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_whose_merge_is_refused_stops_by_name_not_a_wait(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "land-judge: refused [hold]: a hold at the head"
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800})  # noqa: E731
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual(e["state"], "stopped")
+        self.assertIn(e["stop"]["code"], ("pinned_override_refused", "hold"))
+
     def test_land_override_wakes_capped_retry_only_for_a_changed_receipt(self):
         self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
@@ -29911,20 +29944,15 @@ class LandTest(Base):
         self.assert_merged_at(LA)
 
     def test_land_override_new_receipt_rejudges_unchanged_red_pr_after_checks_running(self):
+        # A pinned override row judged checks_running no longer waits for a new receipt to be judged again: the wait is
+        # the pinned merge carrying the override it has (LAND_OVERRIDE_PIN_KINDS; cmux#52546, cmux#53958).
         self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
         self.w.answers.append(refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 3600}))
-        e = self.tick()
-        self.assertEqual((e["wait"]["kind"], len(self.w.explains())), ("pr", 1))
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
-        self.tick()
-        self.assertEqual((len(self.w.explains()), self.merge_envs()), (1, []))
-        updated = {**self.OVERRIDE, "receipt": "base run 11 job 1001"}
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=updated)
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
         self.tick()
         self.assert_merged_at(LA)
-        self.assertEqual(self.merge_envs()[0]["LAND_JUDGE_OVERRIDE_RECEIPT"], updated["receipt"])
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertEqual(self.merge_envs()[0]["LAND_JUDGE_OVERRIDE_RECEIPT"], self.OVERRIDE["receipt"])
 
     def test_land_override_capped_retry_requires_finished_checks_and_a_real_receipt(self):
         def eligible(data, pin=LA, receipt=self.OVERRIDE["receipt"], seen=None):
@@ -35383,9 +35411,11 @@ class LandTest(Base):
         self.assertEqual(self.w.refreshed, [self.KEY])
 
     def test_land_recovers_stale_checks_after_pin_seen(self):
+        # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
+        # so the stale-read recovery this covers is a plain pinned row's.
         # The first cache read already saw the pin and running jobs. No webhook or other waited-pass read
         # arrives. The recovery sweep reads that same head after the copy ages, before the one-hour wait.
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.pr(LA, checks=[("Skills", "IN_PROGRESS", None)])
         e = self.tick()
         self.assertEqual((e["pinSeen"], e["wait"]["why"]), (True, "checks running"))
@@ -35395,7 +35425,7 @@ class LandTest(Base):
 
         def finish(key):
             self.w.refreshed.append(key)
-            self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+            self.pr(LA, checks=[("Skills", "COMPLETED", "SUCCESS")])
 
         self.q.refresh = finish
         self.t += gg.LAND_OWN_REFRESH_AFTER - 1
@@ -35405,14 +35435,16 @@ class LandTest(Base):
         self.assertLess(self.t, original_wake)
         self.q.tick(self.t, dirty=set())
         self.assertEqual(self.w.refreshed, [self.KEY])
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
+        self.w.answers.append(ok_answer(LA))
         self.q.tick(self.t + 1, dirty=set())
         self.assert_merged_at(LA)
         self.assertEqual((len(self.w.explains()), self.w.refreshed), (1, [self.KEY]))
 
     def test_land_check_event_on_a_stale_running_pin_shares_the_host_read_budget(self):
+        # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
+        # so the stale-read recovery this covers is a plain pinned row's.
         self.pr(LA, checks=[("Skills", "IN_PROGRESS", None)])
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.tick()
         self.t += gg.LAND_OWN_REFRESH_AFTER + 1
         self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP  # a head event between sweeps
@@ -35429,8 +35461,8 @@ class LandTest(Base):
         self.q.tick(self.t + 1, dirty={self.KEY})
         self.q.tick(self.t + 2, dirty={self.KEY})
         self.assertEqual((self.w.refreshed, self.w.explains(), self.merge_envs()), ([self.KEY], [], []))
-        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
+        self.pr(LA, checks=[("Skills", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
         self.q.tick(self.t + 3, dirty={self.KEY})  # fresh terminal evidence still judges at a full read budget
         self.assert_merged_at(LA)
 
