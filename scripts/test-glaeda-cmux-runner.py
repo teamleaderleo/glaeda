@@ -9979,6 +9979,44 @@ class HostLoadCapTest(unittest.TestCase):
         only_unknown = dict(summary, jobs=[queued("some job the hook does not know", 60)])
         self.assertIsNone(hook.head_fit_units(only_unknown, side, now, need), "no known job keeps today's rule")
 
+    def test_head_fit_reads_every_workflow_not_only_cmux_next(self) -> None:
+        # 2026-11-25 18:04-22:04Z (controller timing feed): "Set up runner" held 13.8% of Mac job minutes, 53.6% on
+        # cmux13s; the jobs taken back to back with no room were mostly ones HEAD_FIT skipped (pr pipeline / ios 530
+        # min, pr pipeline / mac 304, ios-billing 235, ci.yml swift test 121).
+        for name, workflow, key in (("pr pipeline / ios", "pr-router.yml", ("pr-router.yml", "ios")),
+                                    ("pr pipeline / mac", "pr-router.yml", ("pr-router.yml", "mac")),
+                                    ("macos / swift-package-tests", "ci.yml", ("ci.yml", "swift-package-tests")),
+                                    ("remote-daemon / remote-daemon-macos-tests", "ci.yml",
+                                     ("ci.yml", "remote-daemon-macos-tests")),
+                                    ("ios-simulator-build", "test-ios.yml", ("test-ios.yml", "ios-simulator-build"))):
+            self.assertEqual(hook.head_job_key(name, workflow), key, name)
+        self.assertIsNone(hook.head_job_key("pr pipeline / ios ffi (build fleet)", "pr-router.yml"))
+        self.assertIsNone(hook.head_job_key("pr pipeline / ios", "some-other.yml"), "the workflow must name it")
+        self.assertEqual(hook.head_job_key("cmux-next daemon tests", "cmux-next.yml"), ("cmux-next.yml", "daemon-test"))
+        self.assertEqual(hook.feed_workflow(".github/workflows/pr-router.yml"), "pr-router.yml")
+        self.assertEqual(hook.feed_workflow(None), "")
+        doc = {"receiver_last_delivery": None, "jobs": [
+            {"id": 1, "name": "pr pipeline / ios", "workflow_path": ".github/workflows/pr-router.yml",
+             "status": "queued", "labels": ["glaeda-mini"], "created_at": None}]}
+        self.assertEqual(hook.load_cap_summary(doc, 0.0)["jobs"][0]["workflow"], "pr-router.yml")
+        side = frozenset(["glaeda-mini", "glaeda-side-std-xcode-26.6"])
+        now = time.time()
+
+        def queued(name, workflow, ago):
+            return {"labels": sorted(side), "status": "queued", "created": now - ago, "host": None,
+                    "urgent": False, "name": name, "workflow": workflow}
+        units = {("pr-router.yml", "ios"): 4, ("cmux-next.yml", "cmux-scheme-compile"): 3,
+                 ("nightly.yml", "publish-nightly"): 65536}
+
+        def need(workflow, job):
+            return units[(workflow, job)]
+        summary = {"at": now, "delivery": now, "jobs": [
+            queued("cmux app scheme compile (Debug)", "cmux-next.yml", 600), queued("pr pipeline / ios", "pr-router.yml", 60)]}
+        self.assertEqual(hook.head_fit_units(summary, side, now, need), (4, "pr pipeline / ios"))
+        whole = dict(summary, jobs=[*summary["jobs"], queued("publish-nightly", "nightly.yml", 30)])
+        self.assertEqual(hook.head_fit_units(whole, side, now, need, ceiling=7), (4, "pr pipeline / ios"),
+                         "a whole-mini need is not one a plain listener waits for")
+
 
     SIDE_LIGHT = "glaeda-side-light-xcode-26.6"
 
