@@ -5817,6 +5817,41 @@ class ClientTest(Base):
             self.assertEqual(gg.cmd_status("pr", "o/r#8", False, True, first_wait=0), gg.EXIT_DOWN)
         self.assertEqual([r["key"] for r in reads], ["pr:o/r#8"])
 
+    def test_status_on_an_upstream_fed_host_reads_a_cold_key_directly_after_a_short_wait(self) -> None:
+        """An upstream-fed host with a direct route waits STATUS_UPSTREAM_WAIT, not a cycle, before its direct read;
+        a host without one keeps the cycle wait."""
+        waits: list[float] = []
+        clock = [0.0]
+
+        def monotonic() -> float:
+            return clock[0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        def fill(req: dict) -> None:
+            waits.append(clock[0])
+            self.put(req["key"], gg.parse_pr(pr_node(9, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        for upstream, expect in ((["lane-gh", "glaeda-read"], gg.STATUS_UPSTREAM_WAIT), (None, gg.CYCLE + 10.0)):
+            waits.clear()
+            clock[0] = 0.0
+            with mock.patch.object(gg, "daemon_running", return_value=True), \
+                    mock.patch.object(gg, "daemon_failing", return_value=None), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None), \
+                    mock.patch.object(gg, "blocked_now", return_value=None), \
+                    mock.patch.object(gg, "say_waiting", lambda line: None), \
+                    mock.patch.object(gg, "upstream_command", return_value=upstream), \
+                    mock.patch.object(gg, "direct_command", return_value=["lane-gh", "call", "get"] if upstream else None), \
+                    mock.patch.object(gg, "daemon_policy", return_value={"cycle": gg.CYCLE}), \
+                    mock.patch.object(gg.time, "monotonic", side_effect=monotonic), \
+                    mock.patch.object(gg.time, "sleep", side_effect=sleep), \
+                    mock.patch.object(gg, "direct_read", side_effect=fill), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gg.cmd_status("pr", f"o/r#{9 if upstream else 10}", False, True), 0)
+            self.assertEqual(len(waits), 1)
+            self.assertGreaterEqual(waits[0], expect)
+            self.assertLess(waits[0], expect + 2)
+
     def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
