@@ -29734,6 +29734,16 @@ class LandTest(Base):
     def judge_envs(self) -> list[dict]:
         return [env for c, env in zip(self.w.calls, self.w.envs) if c[1:3] == [self.w.mh, "explain"]]
 
+    def test_the_queue_judgment_carries_the_land_queue_env_for_the_land_tier_label(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        envs = self.judge_envs()
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertEqual(env[gg.LAND_QUEUE_ENV], "1")
+
     def test_a_nominated_land_judges_and_merges_with_its_nomination_and_a_plain_one_without(self):
         # ci-v2 step 12: the nomination rode only a mark on the host that filed the land, so a queue on another host
         # judged the merge as a plain glaeda-land. Now every judgment and merge try carries it (LAND_NOMINATED_ENV).

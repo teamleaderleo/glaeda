@@ -20361,6 +20361,7 @@ class LandQueue:
         with self.lock:
             self.count("snapshot" if extra else "live")
         extra.update(land_nominated_env(e))  # judged under the nominating path, as the merge is (LAND_NOMINATED_ENV)
+        extra[LAND_QUEUE_ENV] = "1"  # the queue's judgment adds ready-to-land (land_tier_pending); ad-hoc explains do not
         for n, run_argv in enumerate(tries):
             bound = LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE
             with self.lock:
@@ -22479,6 +22480,7 @@ def land_override_env(e: dict) -> dict[str, str]:
 # to the executor (land.json "executor"), to an overflow peer ("overflow") and in a lane VM's land_handoff. A request
 # whose "nominated" is not that shape keeps {"unreadable": WHY}, which land_judge refuses: never a plain land.
 LAND_NOMINATED_ENV = "LAND_JUDGE_NOMINATED"
+LAND_QUEUE_ENV = "LAND_JUDGE_LAND_QUEUE"  # leo-workspace land_judge: an explain under it adds the land-tier label
 LAND_NOMINATED_MAX = 4000  # the evidence as JSON, at most: two gate results of a 40-hex head and a one-line why each
 LAND_NOMINATED_PATH = re.compile(r"[a-z][a-z0-9-]{0,39}")
 
