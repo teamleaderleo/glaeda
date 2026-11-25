@@ -29709,7 +29709,7 @@ def controller_rollup_head(repo: str, number: int, sha: str, now: float,
         # made to wait out a connect on every store read
         state = ((read_json(BASE / "daemon.json") or {}).get("controller") or {}).get("state")
         if state != "ok":
-            return None, f"the daemon's controller is {state or 'off'}"
+            return None, ""  # (said nowhere: the route is not offered here, as on a host with no controller)
     ctl = Controller.from_env() if controller is None else controller
     if ctl is None:
         return None, "no controller here"
@@ -29900,7 +29900,7 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
                     why_not = f"{why_not}; {direct_why}"
             if second is None and pr is not None:
                 second, third_not = controller_rollup_head(repo, pr, sha, time.time())
-                why_not = f"{why_not}; {third_not}" if why_not and second is None else why_not or third_not
+                why_not = f"{why_not}; {third_not}" if why_not and third_not else why_not or third_not
             if second is not None:
                 heads[sha] = second
             else:

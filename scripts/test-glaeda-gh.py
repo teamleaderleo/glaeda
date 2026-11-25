@@ -11676,7 +11676,7 @@ class HeadChecksTest(Base):
         self.assertIn("not whole and green", doc["unread"][SHA_A])
         ctl = self.controller_fixture(self.controller_rollup(SHA_A), state="down")
         code, doc = self.run_checks("o/r", [SHA_A], "land-judge", 120, 0, True, pr=7)
-        self.assertIn("the daemon's controller is down", doc["unread"][SHA_A])
+        self.assertNotIn("controller", doc["unread"][SHA_A])  # not offered here: the unread reason is as before
         ctl.get.assert_not_called()
 
     def test_the_land_queue_judges_a_green_rollup_without_waiting_for_its_github_snapshot(self) -> None:
