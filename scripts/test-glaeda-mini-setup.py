@@ -306,6 +306,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(repair["StandardOutPath"], "/dev/null")
         self.assertEqual(repair["StartInterval"], 60)
         self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
+        self.assertEqual(repair["EnvironmentVariables"]["BOOT_SPREAD_S"], "300", "boot's first pass waits 0-300 s")
         self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
         self.assertIsNone(warm.get("ProcessType"), "its build runs only while the mini is idle and should be fast")
         self.assertEqual((bin_dir / "glaeda-idle-warm").read_bytes(), (ROOT / "scripts/glaeda-idle-warm").read_bytes())
@@ -324,6 +325,7 @@ class MiniSetupTest(unittest.TestCase):
         guard = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.local-guard.plist").read_bytes())
         self.assertEqual(guard["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-local-guard"), "--apply"])
         self.assertEqual(guard["StartInterval"], 30)
+        self.assertEqual(guard["EnvironmentVariables"], {"BOOT_SPREAD_S": "120"}, "boot's first pass waits 0-120 s")
         self.assertIsNone(guard.get("ProcessType"), "it must get CPU while the runs it stops hold the machine")
         self.assertTrue(os.access(bin_dir / "glaeda-local-guard", os.X_OK))
         gh = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist").read_bytes())
@@ -445,7 +447,7 @@ class MiniSetupTest(unittest.TestCase):
         gen = update / "generations" / tag
         scripts = gen / "glaeda/scripts"
         scripts.mkdir(parents=True)
-        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh"):
+        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh", "cmux-disk"):
             shutil.copy2(ms.SCRIPT_DIR / name, scripts / name)
         old = b"#!/bin/sh\necho previous release\n"
         for name in ("glaeda-gh", "glaeda-disk", "disk-pressure.sh"):
@@ -1069,7 +1071,7 @@ class MiniSetupTest(unittest.TestCase):
                           "glaeda-update.service", "glaeda-update.timer"])
         self.assertNotIn("--idle", (units / "glaeda-disk-pressure.service").read_text())
         self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()),
-                         ["cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
+                         ["cmux-disk", "cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
         config = json.loads((self.home / ".config/glaeda/update.json").read_text())
         self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())

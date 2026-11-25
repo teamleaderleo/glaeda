@@ -4652,6 +4652,12 @@ class HookTest(unittest.TestCase):
                          ("simulator-step", False))
         self.assertEqual(hook.job_class("walk", "manaflow-ai/cmux", workflow="ios-review-gate.yml"),
                          ("simulator-step", False))
+        # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
+        # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
+        for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step")):
+            with self.subTest(pr_router=job):
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
+                self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
         for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
@@ -19573,6 +19579,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
         self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
         self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        # NO_RUST_GATE: the protected PATH has no Rust, so the hook's toolchain gate is off for the agent and listen.sh
+        self.assertEqual(agent["EnvironmentVariables"]["GLAEDA_RUNNER_TOOLCHAIN_GATE"], "0")
+        self.assertIn("export GLAEDA_RUNNER_TOOLCHAIN_GATE=0\n", listen)
         watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
         self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
         dot_path = (runner / ".path").read_text().strip().split(":")
