@@ -9368,6 +9368,51 @@ class TickBudgetTest(Base):
         self.assertEqual(queries[1], ("head", [head]), queries)
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
+    def test_heads_asked_between_batches_wait_once_the_heads_share_is_spent_and_a_waited_pr_is_due(self) -> None:
+        """The land host, 2026-11-25: land-judge asked ~380 unanswered heads in 2 min, the look between every read batch
+        (post_between, batched) read one more head batch each time with no time bound, half the tick's stacks sat there,
+        and waited PRs went 77 min unread. Past the heads' share (REST_HEAD_BUDGET) with a waited PR due, once the tick
+        read a head, a look reads none: the heads asked meanwhile are deferred to the next tick and every PR is read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "pr": 1, "head": 1}
+        for n in (1, 2, 3):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        first = f"head:o/r@{'c' * 40}"
+        gg.register(first, consumer="land-judge")  # asked before the tick: the due phase reads it
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        later = [f"head:o/r@{c * 40}" for c in "def"]
+        queries: list[tuple[str, list[str]]] = []
+
+        def fetch(kind):
+            def read(chunk):
+                if kind == "pr" and not any(k == "pr" for k, _ in queries):
+                    for key in later:  # asked while the tick reads its first PR
+                        gg.register(key, consumer="land-judge")
+                queries.append((kind, [e["key"] for e in chunk]))
+            return read
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        heads = [keys for kind, keys in queries if kind == "head"]
+        self.assertEqual(heads, [[first]], queries)
+        self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
+        for key in later:
+            self.assertNotIn(key, [k for _, keys in queries for k in keys], queries)
+
+    def test_past_the_heads_share_a_rest_look_stops_between_its_heads(self) -> None:
+        """The same bound over REST: a look that crosses the heads' share mid-look defers its other heads."""
+        self.daemon.head_until = 0.0  # spent (time.monotonic() is past it)
+        self.daemon.heads_between_read = 1
+        self.assertTrue(self.daemon.past_heads_share())
+        self.daemon.head_until = None  # no waited PR or run due: the looks keep only their own caps
+        self.assertFalse(self.daemon.past_heads_share())
+        self.daemon.head_until, self.daemon.heads_between_read = 0.0, 0
+        self.daemon.tick_asked = {}
+        self.assertFalse(self.daemon.past_heads_share(), "the tick's first head read is never held back")
+
     def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
         """A lane VM, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
         mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
@@ -26129,6 +26174,7 @@ class LandWorld:
         self.envs: list[dict] = []
         self.gh_rc: dict[str, int] = {}
         self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
+        self.gh_out: dict[str, str] = {}  # an answered step's stdout, by kind (default none)
         self.merged_on_merge = True
         self.view_state: str | None = None  # what a `pr view --json state,...` answers (None: OPEN, or MERGED after a merge)
         self.view_err: str | None = None  # a state read that fails, with these words
@@ -26247,7 +26293,8 @@ class LandWorld:
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
-            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
+            return subprocess.CompletedProcess(argv, rc, self.gh_out.get(kind, "") if rc == 0 else "",
+                                               "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
@@ -30189,6 +30236,52 @@ class LandTest(Base):
         self.assertIn("3 commit(s) behind main", e["stop"]["reason"])
         self.assertIn(f"gh pr update-branch 1 -R o/r --match-head-commit {LA}", e["stop"]["next"])
 
+    def queued_update_origin(self, main_path: str, attrs: str = "goals/*.md merge=union\n") -> tuple[str, str]:
+        """A real origin (union_origin, MAIN_PATH as there), the PR pinned at its head with base main, and the
+        update-branch answered the way the gh-quota shim answers a write it holds on the login's pace: exit 0 and
+        {"queued": true, ...}. GitHub's compare and the branch ref both still read the head, 3 behind."""
+        head, base = self.union_origin(attrs=attrs, main_path=main_path)
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        self.w.api["repos/o/r/compare/main..."] = json.dumps({"s": "diverged", "b": 3})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = head
+        self.w.gh_out["update"] = json.dumps({"queued": True, "queue_id": "q1", "html_url": "",
+                                              "status_command": "glaeda-gh post status q1"})
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        return head, base
+
+    def test_an_update_that_made_no_new_head_is_merged_here_and_the_land_goes_on(self):
+        # manaflow-ai/cmux#56724 and #56454, 2026-11-25 (LAND_UPDATE_LOCAL's comment): the shim queued the update-branch
+        # and answered exit 0; the head never moved within the wait and both stopped update_branch_no_new_head. The
+        # queue now makes the base merge itself, pushes it, and goes on at the new head.
+        head, base = self.queued_update_origin("goals/y.md")
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertIn("made no new head", self.origin_git("log", "-1", "--format=%B", merged))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("base_merge_try", "union_merged")],
+                         ["base_merge_try", "union_merged"])
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers[:] = [ok_answer(merged)]
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_an_update_with_no_new_head_and_a_true_conflict_stops_conflict_with_its_hunks(self):
+        head, _ = self.queued_update_origin("", attrs="docs/*.md merge=union\n")  # same file, no union: a conflict
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"), e.get("stop"))
+        self.assertIn("goals/x.md", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+
     def test_an_update_whose_new_head_the_reads_miss_waits_for_it_instead_of_stopping(self):
         # hq#26227, lw#11062, hq#26324, 2026-11-25: GitHub made the update's merge within seconds; the cache still read
         # the old head past LAND_HEAD_TIMEOUT and the land stopped "the update changed nothing". The branch ref says
@@ -30210,6 +30303,68 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_head_unread"))
         self.assertIn(f"made {LB[:12]}", e["stop"]["reason"])
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
+    def update_tip_pr(self, parents: list[str], base_side: str = '{"s": "behind", "b": 0}') -> None:
+        """LA pinned, base main, the update-branch answered and GitHub's lane/x ref at LB, whose parents are PARENTS;
+        BASE_SIDE is the compare main...LC (LC: the base commit the update merged in). The PR reads stay at LA."""
+        self.pr(LA)
+        data = self.w.cache[self.KEY]["data"]
+        data["baseRefName"], data["headRefName"] = "main", "lane/x"
+        self.w.api[f"repos/o/r/compare/main...{LC}"] = base_side  # first: the fake answers the first prefix that fits
+        self.w.api["repos/o/r/compare/main..."] = json.dumps({"s": "diverged", "b": 3})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+
+    def test_an_update_tip_that_is_the_pin_merged_with_base_waits_and_the_pin_carries_to_it(self):
+        # manaflow-ai/cmux#53399, #55811, #53921, #53968, 2026-11-25 17:12Z-19:59Z: the queue's update-branch made a
+        # merge commit (first parent the pin, second on the base), GitHub's PR kept the old head, and the land stopped
+        # update_head_unread asking for `land --sha TIP` by hand; each hand re-pin stopped head_moved 300 s later. The
+        # tip is read now: its own clean base merge waits for the PR, with no stop and no hand step, and lands there.
+        self.update_tip_pr([LA, LC])
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT * 4, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stop")), ("waiting", "head_change", None))
+        clean = [h for h in e["history"] if h["event"] == "update_tip_clean"]
+        self.assertEqual([(h["head"], h["tip"]) for h in clean], [(LA[:12], LB[:12])])  # once, not every look
+        self.assertEqual((e["pinSha"], self.w.gh_calls("pr", "merge")), (LA, []))
+        # GitHub's PR shows the update's commit: pin_follow carries the pin by its first parent and it merges there.
+        self.pr(LB, parent=LA)
+        self.w.answers[:] = [ok_answer(LB)]
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assert_merged_at(LB)
+
+    def test_an_update_tip_that_is_not_only_the_pin_merged_with_base_still_stops(self):
+        # The safety property: only the update's own clean base merge is carried. A commit pushed on the pin (one
+        # parent), a merge whose first parent is not the pin, or one whose second parent is not on the base all stop
+        # as before, naming the tip for a person to read; the pin stays and nothing merges.
+        for parents, base_side in (([LA], '{"s": "behind", "b": 0}'),
+                                   ([LC, LA], '{"s": "behind", "b": 0}'),
+                                   ([LA, LC], '{"s": "diverged", "b": 1}'),
+                                   ([LA, LC, LB], '{"s": "behind", "b": 0}')):
+            with self.subTest(parents=[p[:1] for p in parents], base=base_side):
+                self.w.api.clear()
+                self.update_tip_pr(parents, base_side)
+                e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                                  seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+                self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "update_head_unread", LA))
+                self.assertNotIn("update_tip_clean", [h["event"] for h in e["history"]])
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_clean_update_tip_the_pr_never_shows_stops_naming_what_syncs_it(self):
+        # GitHub's PR for cmux#53921 still said 52aafe8c 2 h after its ref went to the update's ccc62452: a re-pin
+        # cannot help there. Past LAND_PR_SYNC_MAX the stop says so, and names what makes GitHub sync the PR.
+        self.update_tip_pr([LA, LC])
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_SYNC_MAX * 2, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_unsynced", LA))
+        self.assertGreaterEqual(self.t - start, gg.LAND_PR_SYNC_MAX)
+        self.assertLess(self.t - start, gg.LAND_PR_SYNC_MAX + 2 * gg.LAND_HEAD_TIMEOUT)
+        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
         # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
