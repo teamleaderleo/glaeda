@@ -14859,6 +14859,12 @@ LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the 
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
 LAND_PIN_PARENT_WAIT = 300.0
+# How long a row whose own update-branch made a checked clean base merge (update_tip_clean: the branch ref's commit has
+# the pin as its first parent and a commit on the base as its second) waits for GitHub's PR to show that commit before
+# it stops pr_head_unsynced. It never stops for a hand re-pin: once the PR shows the commit, pin_follow carries the pin
+# (2026-11-25 17:12Z-19:59Z, manaflow-ai/cmux#53399, #55811, #53921, #53968: 3 update_head_unread stops asked for a
+# re-pin, and each re-pin stopped head_moved 300 s later, the PR still at the old head).
+LAND_PR_SYNC_MAX = 1800.0
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -22524,15 +22530,58 @@ class LandQueue:
                 head = said  # the PR's branch is now the rebased head; the base change follows from it
         self.push_step(e, "retarget", head, land_retarget_args(repo, number, base, self.broker_client()), base=base)
 
+    def branch_base(self, e: dict, head: str) -> tuple[str, str, str, bool]:
+        """(the PR's branch, its base, "", False) for a step that needs both names: this host's cache, and when it has
+        never read the PR at all one read of its own (refresh_job), bounded to once per head; else ("", "", why not,
+        whether that decided nothing about HEAD). An unread PR is no answer about its branch: one land queue, 2026-11-25,
+        stopped leo-workspace#10571 update_branch_conflict in the same second its first full read landed,
+        and #10649 and #10864 3.5 and 14 min before theirs, each stop terminal with a next step naming no file (46 of
+        127 stopped rows were conflict stops, 41 of them naming no file at all). A read that carries no ref names is
+        the same nothing: union_refs asks for the two names alone (another queue's #10997, #10659, #11038, #11192)."""
+        key = e["key"]
+        data = (self.cache_of(key) or {}).get("data") or {}
+        branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+        if not branch or not base:
+            said = ""
+            with self.lock:
+                again = str((e.get("branchRead") or {}).get("head") or "") == str(head or "")
+                if not again:
+                    e["branchRead"] = {"head": str(head or ""), "at": self.now}
+                    self.save(e)
+                hold = self.refresh_hold
+            if again:
+                said = "the one read this step makes per head named no branch"
+            elif self.refresh is None:
+                said = "no read of its own to make here"
+            elif self.refresh_held():
+                said = "this host's land reads are held: " + land_trim(str((hold or {}).get("why") or
+                                                                           (hold or {}).get("kind") or "a hold"), 120)
+            else:
+                try:
+                    self.refresh_job(key)
+                except OSError as error:
+                    said = describe(error)
+                data = (self.cache_of(key) or {}).get("data") or {}
+                branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+                if not branch or not base:  # a full read that carried no ref names: ask for the two names alone
+                    branch, base = self.union_refs(e, branch, base)
+                said = said or str((e.get("refresh") or {}).get("error") or "it named no branch")
+            if not branch or not base:
+                return "", "", f"{key_name(key)}'s branch and base could not be read from this host: {said}", True
+        for which, name in (("branch", branch), ("base", base)):
+            if not BRANCH_SAFE.fullmatch(name) or ".." in name:
+                return "", "", f"the PR's {which} {name!r} is not a plain branch name", False
+        return branch, base, "", False
+
     def stacked_rebase(self, e: dict, head: str, base: str) -> tuple[str, str]:
         """(state, what): "none" (no rebase needed: why), "rebased" (pushed: the new head), "conflict" or "empty"
         (nothing pushed: why), "failed" (decided nothing: why). LAND_STACKED_REBASE_MAX's comment."""
         repo = e["repo"]
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        branch, old = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
-        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(old) and BRANCH_SAFE.fullmatch(base)) \
-                or ".." in branch + old + base:
-            return "failed", f"the PR's branch {branch!r}, base {old!r} or new base {base!r} is not a plain branch name"
+        branch, old, why, _nothing = self.branch_base(e, head)
+        if why:  # "failed" is this step's decided-nothing channel: its caller refuses the step, never a bare retarget
+            return "failed", why
+        if not BRANCH_SAFE.fullmatch(base) or ".." in base:
+            return "failed", f"the new base {base!r} is not a plain branch name"
         if old == base:
             return "none", f"its base already is {base}"
         if repo.split("/", 1)[0].lower() not in LAND_MERGE_OWNERS:
@@ -22771,19 +22820,11 @@ class LandQueue:
         if repo.partition("/")[0].lower() not in LAND_MERGE_OWNERS:
             return "", "", "", (f"{repo} is not a repository of {', '.join(sorted(LAND_MERGE_OWNERS))}: this queue "
                                 "pushes a base merge only to their own branches")
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
-        if not (branch and base):
-            # cmux-cp-1, 2026-11-25: leo-workspace#10997, #10659, #11038 and #11192 stopped conflicts_base with the base
-            # merge skipped as "the PR's branch '' or base '' is not read": their cached rows held no ref names (a
-            # read that does not carry them). Read them once here; a read that fails decided nothing (retry).
-            branch, base = self.union_refs(e, branch, base)
-            if not (branch and base):
-                e["unionMerge"]["retry"] = True
-                return "", "", "", (f"the PR's branch {branch!r} or base {base!r} could not be read (neither the cache "
-                                    "nor a pr view held them)")
-        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
-            return "", "", "", f"the PR's branch {branch!r} or base {base!r} is not a plain branch name"
+        branch, base, why, nothing = self.branch_base(e, head)
+        if why:
+            if nothing:  # decided nothing about the head: a re-land at it tries again (unionMerge dropped)
+                e.setdefault("unionMerge", {})["retry"] = True
+            return "", "", "", why
         if not SHA40.fullmatch(head or ""):
             return "", "", "", "no 40-hex head to merge onto"
         gitdir = os.fspath(land_dir() / "union" / (repo.replace("/", "__") + ".git"))
@@ -23038,6 +23079,32 @@ class LandQueue:
         tip = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
         return (tip if SHA40.fullmatch(tip) else ""), branch
 
+    def update_tip_clean(self, e: dict, head: str, tip: str, base: str) -> bool:
+        """Whether TIP, the PR branch's ref after this queue's update-branch at HEAD, is that update's own clean base
+        merge and nothing else: exactly two parents, the first HEAD (E's pin, when E has one), the second a commit on
+        BASE (compare BASE...it: behind or identical). Two REST reads; False when either fails or says otherwise, so a
+        commit anyone else put on the branch (a push on top, a merge of another branch) is never carried."""
+        pin, gh, repo = str(e.get("pinSha") or ""), self.gh(), e["repo"]
+        if gh is None or not SHA40.fullmatch(tip) or not base or (pin and land_head_moved(pin, head)):
+            return False
+        got = self.call([gh, "api", f"repos/{repo}/commits/{tip}", "--jq", "[.parents[].sha]"], LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            parents = None
+        if not isinstance(parents, list) or len(parents) != 2 or not all(isinstance(p, str) for p in parents):
+            return False
+        first, second = (p.lower() for p in parents)
+        if first != head.lower() or not SHA40.fullmatch(second):
+            return False
+        path = f"repos/{repo}/compare/{urllib.parse.quote(base, safe='')}...{second}"
+        got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        return isinstance(doc, dict) and doc.get("s") in ("behind", "identical")
+
     def update_noop(self, e: dict, head: str, sent: dict, waited: float) -> bool:
         """land_judge named the update-branch again at HEAD, where GitHub already answered one (the comment after
         LAND_UPDATE_ONCE). True when this decided E (a short wait, a re-judgment, a stop); False when the compare could
@@ -23070,6 +23137,8 @@ class LandQueue:
         # nothing". One REST read of the branch ref tells the two apart (update_live_tip).
         tip, branch = self.update_live_tip(e, data) if behind else ("", "")
         if tip and tip != head:
+            # Read on the second look only (the first waits, and most reads catch up by then).
+            clean = (e.get("updateUnread") or {}).get("head") == head and self.update_tip_clean(e, head, tip, base)
             with self.lock:
                 if (e.get("updateUnread") or {}).get("head") != head:
                     e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
@@ -23077,6 +23146,28 @@ class LandQueue:
                                  why=f"GitHub's {branch} is at {tip[:12]}: the update made it, the reads lag")
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                    return True
+                u = e["updateUnread"]
+                since = float(u.get("at") or self.now)
+                if clean and self.now - since < LAND_PR_SYNC_MAX:
+                    # The update's own clean base merge: no re-pin by hand. The row waits for GitHub's PR to show it,
+                    # and pin_follow carries the pin there (its first parent is the pin) as for any own update.
+                    if u.get("clean") != tip:
+                        u["clean"] = tip
+                        self.history(e, "update_tip_clean", head=head[:12], tip=tip[:12],
+                                     why=f"{tip[:12]} is {head[:12]} merged with {base}: the pin follows it once "
+                                         "GitHub's PR shows it")
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now},
+                              min(LAND_HEAD_TIMEOUT, LAND_PR_SYNC_MAX - (self.now - since)))
+                    return True
+                if clean:
+                    self.stop(e, "pr_head_unsynced",
+                              f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with {base}, "
+                              f"GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
+                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch",
+                              f"gh pr close {number} -R {repo} && gh pr reopen {number} -R {repo} (GitHub syncs the "
+                              f"PR's head on reopen), then glaeda-gh land {name} --sha {tip}")
                     return True
                 self.stop(e, "update_head_unread",
                           f"the update-branch sent at {head[:12]} {waited:.0f} s ago made {tip[:12]} (GitHub's {branch} "

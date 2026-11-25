@@ -30227,6 +30227,68 @@ class LandTest(Base):
         self.assertIn(f"made {LB[:12]}", e["stop"]["reason"])
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
 
+    def update_tip_pr(self, parents: list[str], base_side: str = '{"s": "behind", "b": 0}') -> None:
+        """LA pinned, base main, the update-branch answered and GitHub's lane/x ref at LB, whose parents are PARENTS;
+        BASE_SIDE is the compare main...LC (LC: the base commit the update merged in). The PR reads stay at LA."""
+        self.pr(LA)
+        data = self.w.cache[self.KEY]["data"]
+        data["baseRefName"], data["headRefName"] = "main", "lane/x"
+        self.w.api[f"repos/o/r/compare/main...{LC}"] = base_side  # first: the fake answers the first prefix that fits
+        self.w.api["repos/o/r/compare/main..."] = json.dumps({"s": "diverged", "b": 3})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+
+    def test_an_update_tip_that_is_the_pin_merged_with_base_waits_and_the_pin_carries_to_it(self):
+        # manaflow-ai/cmux#53399, #55811, #53921, #53968, 2026-11-25 17:12Z-19:59Z: the queue's update-branch made a
+        # merge commit (first parent the pin, second on the base), GitHub's PR kept the old head, and the land stopped
+        # update_head_unread asking for `land --sha TIP` by hand; each hand re-pin stopped head_moved 300 s later. The
+        # tip is read now: its own clean base merge waits for the PR, with no stop and no hand step, and lands there.
+        self.update_tip_pr([LA, LC])
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT * 4, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stop")), ("waiting", "head_change", None))
+        clean = [h for h in e["history"] if h["event"] == "update_tip_clean"]
+        self.assertEqual([(h["head"], h["tip"]) for h in clean], [(LA[:12], LB[:12])])  # once, not every look
+        self.assertEqual((e["pinSha"], self.w.gh_calls("pr", "merge")), (LA, []))
+        # GitHub's PR shows the update's commit: pin_follow carries the pin by its first parent and it merges there.
+        self.pr(LB, parent=LA)
+        self.w.answers[:] = [ok_answer(LB)]
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assert_merged_at(LB)
+
+    def test_an_update_tip_that_is_not_only_the_pin_merged_with_base_still_stops(self):
+        # The safety property: only the update's own clean base merge is carried. A commit pushed on the pin (one
+        # parent), a merge whose first parent is not the pin, or one whose second parent is not on the base all stop
+        # as before, naming the tip for a person to read; the pin stays and nothing merges.
+        for parents, base_side in (([LA], '{"s": "behind", "b": 0}'),
+                                   ([LC, LA], '{"s": "behind", "b": 0}'),
+                                   ([LA, LC], '{"s": "diverged", "b": 1}'),
+                                   ([LA, LC, LB], '{"s": "behind", "b": 0}')):
+            with self.subTest(parents=[p[:1] for p in parents], base=base_side):
+                self.w.api.clear()
+                self.update_tip_pr(parents, base_side)
+                e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                                  seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+                self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "update_head_unread", LA))
+                self.assertNotIn("update_tip_clean", [h["event"] for h in e["history"]])
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_clean_update_tip_the_pr_never_shows_stops_naming_what_syncs_it(self):
+        # GitHub's PR for cmux#53921 still said 52aafe8c 2 h after its ref went to the update's ccc62452: a re-pin
+        # cannot help there. Past LAND_PR_SYNC_MAX the stop says so, and names what makes GitHub sync the PR.
+        self.update_tip_pr([LA, LC])
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_SYNC_MAX * 2, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_unsynced", LA))
+        self.assertGreaterEqual(self.t - start, gg.LAND_PR_SYNC_MAX)
+        self.assertLess(self.t - start, gg.LAND_PR_SYNC_MAX + 2 * gg.LAND_HEAD_TIMEOUT)
+        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
         # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
         # at once at that head, and a merge there lands it.
@@ -32125,6 +32187,85 @@ class LandTest(Base):
         e = self.tick(gg.LAND_STEP_BACKOFF + 1)
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
+    def union_unread_tick(self, head: str, refresh: Any) -> dict:
+        """As union_conflict_tick, except this host has never read the PR's branch or base (its first full read still
+        in flight, as it was for leo-workspace#10571): REFRESH is the read the step makes of its own."""
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head), self.t)  # no headRefName/baseRefName: nothing has read them here
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        self.q.refresh = refresh
+        return self.tick()
+
+    def test_a_union_merge_reads_the_prs_branch_itself_when_this_host_never_read_the_pr(self):
+        """One land queue, 2026-11-25: 46 of 127 stopped land rows were conflict stops and 41 named no file, because the base
+        merge read the PR's branch and base only from this host's cache. leo-workspace#10571 stopped in the same
+        second its first full read landed, #10649 and #10864 minutes before theirs. The step reads the PR itself."""
+        head, base = self.union_origin()
+
+        def refresh(key: str) -> None:
+            self.w.refreshed.append(key)
+            self.w.set_pr(key, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+            return None
+        e = self.union_unread_tick(head, refresh)
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+
+    def test_a_union_merge_whose_own_read_names_no_branch_says_so_and_is_tried_again(self):
+        """An unread PR decided nothing about the head: the step waits and names this host's missing read and the
+        read's own reason (before: "the PR's branch '' or base '' is not read or not a plain branch name", a
+        terminal stop naming no file), and a re-land once the read landed merges."""
+        head, base = self.union_origin()
+        reads: list[str] = []
+
+        def refresh(key: str) -> str:
+            reads.append(key)
+            return "a read gh refused"
+        e = self.union_unread_tick(head, refresh)
+        # the merged transient path (main, base_merge): no verdict at all, a backoff, and the reason names the read
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertEqual((e["stepTransient"]["kind"], e["stepTransient"]["count"]), ("base_merge", 1))
+        again = self.q.branch_base(e, head)  # the bound: one read of its own per head, never a read a judgment
+        self.assertEqual((again[0], again[1], again[3]), ("", "", True))
+        self.assertIn("the one read this step makes per head named no branch", again[2])
+        self.assertEqual(reads, [self.KEY])
+        self.assertIn("o/r#1's branch and base could not be read from this host", e["wait"]["why"])
+        self.assertIn("a read gh refused", e["wait"]["why"])
+        self.assertNotIn("unionMerge", e)
+        # the read lands, the backoff ends, and the same head's merge goes through: nothing was decided against it
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:],
+                         [head, base])
+
+    def test_a_stacked_rebase_of_a_pr_this_host_never_read_refuses_the_step_not_the_branch_name(self):
+        """The same unread cache in the sibling step: a refused step (the base unchanged, named again next judgment),
+        never a refusal blaming the PR's own branch name."""
+        sha = self.stacked_origin()
+        owners = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        owners.start()
+        self.addCleanup(owners.stop)
+        self.w.set_pr(self.KEY, land_pr(sha["b"]), self.t)  # no headRefName/baseRefName here either
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=sha["b"])
+        self.w.answers.append(refusal("stacked_base", sha["b"], {"kind": "retarget", "base": "main"}))
+        self.q.refresh = lambda key: "a read gh refused"
+        e = self.tick()
+        self.assertEqual(self.retargets(), [])
+        failed = [h for h in e["history"] if h["event"] == "stacked_rebase_failed"]
+        self.assertEqual(len(failed), 1, e.get("history"))
+        self.assertIn("o/r#1's branch and base could not be read from this host", failed[0]["why"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
 
     def judge_conflict_refusal(self, head: str) -> None:
         self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
