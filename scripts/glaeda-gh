@@ -6455,6 +6455,8 @@ class Daemon:
         self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
         self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
         self.heads_between_read = 0  # heads a look sent this tick (HEADS_BETWEEN_TICK_MAX)
+        self.tick_splits: dict[str, int] = {}  # queries each kind added this tick by splitting (GQL_SPLITS)
+        self.tick_asked: dict[str, bool] = {}  # a kind sent a query this tick: a share's UNTIL may cut its next call
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
@@ -9649,6 +9651,7 @@ class Daemon:
         self.errors = []
         self.refunded = {}
         self.spill = []
+        self.tick_splits, self.tick_asked = {}, {}
         self.policy = daemon_policy()
         self.jobs_only = []
         self.heads_direct = []
@@ -9715,6 +9718,11 @@ class Daemon:
         blocked = {kind: [e for e in due[kind] if urgent(e)] for kind in kinds}
         blocked["head"].sort(key=self.head_rank)  # the newest ask of a head never tried first (rest_order)
         floor: set[str] = set()
+        # The heads' share (REST_HEAD_BUDGET) is one deadline for every head read of the tick while a waited PR or run is
+        # due: the plain floor batch, the blocked batches, the round robin's turn and the App share. It bounded only the
+        # blocked batches, so the floor batch and the round robin's turn read heads for as long as the splits ran (the
+        # land host, 2026-11-25, as at GQL_SPLITS). The first head query of the tick still goes (batched's UNTIL).
+        until_of = {"head": time.monotonic() + REST_HEAD_BUDGET if blocked["pr"] or blocked["run"] else None}
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
             if over[kind] != "graphql":
                 continue
@@ -9725,15 +9733,13 @@ class Daemon:
                 floor |= {e["key"] for e in chunk}
                 before = len(self.gql_log)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, chunk, self.graphql_fetch[kind])
+                    spilled += self.batched(kind, chunk, self.graphql_fetch[kind], until=until_of.get(kind))
                 if len(self.gql_log) > before:
                     self.plain_at[kind] = self.now
             if blocked[kind]:
                 # the blocked heads go first, within the heads' share while a waited PR or run is due (REST_HEAD_BUDGET)
-                until = (time.monotonic() + REST_HEAD_BUDGET
-                         if kind == "head" and (blocked["pr"] or blocked["run"]) else None)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind], until=until)
+                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind], until=until_of.get(kind))
                 self.post_between()
         self.gql_paced = None
         sent = len(self.gql_log)
@@ -9743,7 +9749,7 @@ class Daemon:
                 before = len(self.gql_log)
                 with self.phase(f"read {kind}"):
                     spilled += self.batched(kind, [e for e in due[kind] if not urgent(e) and e["key"] not in floor],
-                                            self.graphql_fetch[kind])
+                                            self.graphql_fetch[kind], until=until_of.get(kind))
                 if len(self.gql_log) > before:
                     self.plain_at[kind] = self.now
                 if self.gql_paced == kind:
@@ -9759,7 +9765,7 @@ class Daemon:
             keys = {e["key"] for e in picked}
             due[kind] = [e for e in due[kind] if e["key"] not in keys]
             with self.phase(f"read {kind}"):
-                spilled += self.batched(kind, picked, self.graphql_fetch[kind])
+                spilled += self.batched(kind, picked, self.graphql_fetch[kind], until=until_of.get(kind))
             self.post_between()
         over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
         # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary
@@ -10859,9 +10865,16 @@ class Daemon:
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = (oldest_first(chunks([e for e in entries if self.waited(e)]))
                  + oldest_first(chunks([e for e in entries if not self.waited(e)])))
-        splits, shrunk = 0, False
+        # GQL_SPLITS is the tick's, per kind, not each call's: a tick calls batched() for a kind up to four times (the
+        # plain floor, the blocked batches, the round robin's turn, the App share), and each call split afresh. The land
+        # host, 2026-11-25 13:0xZ to 15:1xZ: head batches GitHub answered 502 after 10.5 s split into more 10 s queries
+        # in every call, ticks spent 450 to 480 of each 600 s in read head, 3 or 4 PR reads were stored per 600 s, and
+        # the waited manaflow-ai/cmux#56503 kept data 7,800 s old.
+        splits = self.tick_splits
+        splits.setdefault(kind, 0)
+        shrunk = False
         to_rest: list[dict] = list(backing_off)
-        asked = False  # a query was sent: UNTIL may cut the rest
+        asked = bool(self.tick_asked.get(kind))  # a query of this kind was sent this tick: UNTIL may cut the rest
         while queue:
             if kind != "head":
                 self.heads_between()  # a head asked meanwhile is read before the next chunk, not next tick
@@ -10889,7 +10902,7 @@ class Daemon:
                 continue
             self.gql_limited = False
             self.gql_reason = kind
-            asked = True
+            asked = self.tick_asked[kind] = True
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
             try:
@@ -10912,8 +10925,8 @@ class Daemon:
                 message = f"graphql: {describe(failure)} at {error_site(failure)}"
                 self.errors.append(message)
                 self.spill = []
-                if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS:
-                    splits += 2
+                if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS:
+                    splits[kind] += 2
                     half = (len(chunk) + 1) // 2
                     queue = [chunk[:half], chunk[half:]] + queue
                     continue
@@ -10941,9 +10954,9 @@ class Daemon:
                          "partial": len(limited), "of": len(chunk)})
                 size = min(self.batch[kind], max(1, len(chunk) // 2))
                 redo = [limited[i:i + size] for i in range(0, len(limited), size)]
-                if splits + len(redo) > GQL_SPLITS:
+                if splits[kind] + len(redo) > GQL_SPLITS:
                     redo = []  # this tick's re-reads are spent: they wait for the next cycle, at the smaller size
-                splits += len(redo)
+                splits[kind] += len(redo)
                 left = [e for c in queue for e in c]
                 size = self.batch[kind]
                 queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
@@ -10959,8 +10972,8 @@ class Daemon:
             if error and (down or SLOW.search(error)):
                 what = (f"{kind} {key_name(chunk[0]['key'])}" if len(chunk) == 1
                         else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
-                then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS)
-                        else "split into halves and retried" if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS
+                then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS)
+                        else "split into halves and retried" if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS
                         else "REST reads it this tick")  # a lone timeout: too heavy for GraphQL even alone
                 self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
@@ -10987,7 +11000,7 @@ class Daemon:
                     self.clean[kind] = 0
                 continue
             slow = bool(SLOW.search(error))
-            if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS):
+            if down and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS):
                 to_rest += chunk  # GitHub failed it and splitting cannot help any more: REST reads it this tick
                 continue
             if not slow and not down or len(chunk) < 2:
@@ -10997,8 +11010,8 @@ class Daemon:
                 shrunk = True
                 self.batch[kind] = max(GQL_BATCH_MIN, self.batch[kind] // 2)
                 log({"event": "batch", "kind": kind, "size": self.batch[kind], "after": error})
-            if splits + 2 <= GQL_SPLITS:
-                splits += 2
+            if splits[kind] + 2 <= GQL_SPLITS:
+                splits[kind] += 2
                 half = (len(chunk) + 1) // 2
                 left = [e for c in queue for e in c]
                 size = self.batch[kind]
