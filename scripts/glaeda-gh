@@ -185,10 +185,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   ci-watch-token.json the key home pushes, while unexpired): `gh_app_token.py token ci-watch`, also
   kept only in memory. Without it, or when the App refuses, the read is the login's, as
   before (AppPool). daemon.json appPool and `budget` say what the App served.
+- A host that follows the controller's change feed also holds one long-poll open on it (FeedStream, a thread):
+  an event after the daemon's cursor wakes the tick, which reads the feed at once, and a run or suite event on the
+  head or branch of an open land entry nudges that PR so its land is judged in seconds, not at the next poll. The
+  feed poll drops to a FEED_STREAM_BACKSTOP while the stream answers; daemon.json controller.stream says whether it
+  does. GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves).
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
   carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
-  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds, and UPSTREAM_NEW after a
+  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds (UPSTREAM_LAND_EVERY for a PR
+  in an open land entry), and UPSTREAM_NEW after a
   key appears with no data yet, it runs that program once with every watched key as one JSON line on
   stdin, {"keys": [{"key": "pr:o/r#1", "jobs": false}, ...]}, and caches what it prints,
   {"entries": {KEY: {"data", "dataAt", "error", "jobs"?} or null}}, keeping the upstream's dataAt. That
