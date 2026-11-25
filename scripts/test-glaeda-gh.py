@@ -32436,6 +32436,18 @@ class LandTest(Base):
         self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
         self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
 
+    def test_a_request_between_passes_is_a_row_in_the_refills_line(self):
+        # cmux-cp-1, 2026-11-25: a forwarded land waited p50 58 s, p90 297 s in requests/ for the next pass
+        self.pr(LA)
+        self.tick()  # one pass: this host executes its lands
+        gg.land_request("land", "o/r#1", [], "host/lane")
+        self.assertEqual(self.q.ingest_between(), 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["state"], "queued")
+        self.assertIn(self.KEY, self.q.next_up)
+        self.assertEqual(self.q.ingest_between(), 0)
+        self.assertEqual(self.q.next_up.count(self.KEY), 1)
+
     def forwarded_row(self, sha: str = "") -> dict:
         """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
         read nothing: the row is "forwarded" (finding hq#19725's rows)."""
@@ -37909,6 +37921,114 @@ class LandForwardTest(Base):
         self.assertIn("big-exec's land queue stopped it (checks_red): ci failed at LA", e["stop"]["reason"])
         self.assertEqual(e["stop"]["next"], "fix ci")
         self.assertEqual(len(self.w.sent()), told)
+
+    def test_a_forwarding_host_leaves_its_requests_to_forward_tick_between_passes(self):
+        self.q = self.forwarding()
+        self.tick()
+        gg.land_request("land", "o/r#1", [], "cosmic/coord")
+        self.assertEqual(self.q.ingest_between(), 0)
+        self.assertNotIn(self.KEY, self.q.entries)
+
+    def exec_do(self, x: Any, fn: Callable[[dict], None]) -> None:
+        """FN on the executor's row of o/r#1, under its lock and over its own BASE, saved there."""
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.now = self.t
+            fn(x.entries[self.KEY])
+            x.save(x.entries[self.KEY])
+
+    def test_a_far_stop_of_this_rows_own_request_is_its_outcome_after_a_re_send(self):
+        # cosmic-gray, 2026-11-25 08:16Z: 18 rows were re-sent under the id cmux-cp-1 had already stopped (conflict,
+        # block, ...); cmux-cp-1 applies an id once, so its stop stayed older than the re-send, the answer read as "no
+        # row of it" (forward_missing), and each stopped forward_no_outcome with the far host's reason never said.
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "conflict", "merge main into o/r#1", "resolve and push")
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardResent"] = {"at": self.t + 5, "n": 1, "to": "big-exec"}  # re-sent after the far stop
+            self.q.save(e)
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "forward_stopped"),
+                         e.get("history", [])[-3:])
+        self.assertIn("big-exec's land queue stopped it (conflict): merge main into o/r#1", e["stop"]["reason"])
+        self.assertFalse(any(h.get("event") == "forward_missing" for h in e["history"]))
+
+    def test_a_far_stopped_forward_follows_the_far_rearm_and_merge(self):
+        # cmux-cp-1, 2026-11-25 13:20Z: 5 of cosmic-gray's 23 forward_stopped rows were queued or waiting again there
+        # (a base red fixed, a retry): a stopped forward keeps asking its far host, and its rearm and merge reach here.
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "own_red", "base red at LA", "wait for the base")
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual(e["stop"]["code"], "forward_stopped")
+        told = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)  # asked again: nothing new there, still stopped
+        self.assertEqual(e["state"], "stopped")
+        self.exec_do(x, lambda r: r.update(state="queued", stop=None))  # the far queue rearms it
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["forwardHeld"]["state"]), ("forwarded", "queued"))
+        self.assertEqual(e["history"][-1]["event"], "forward_far_rearmed")
+        self.exec_do(x, lambda r: r.update(state="merged", mergeSha="f" * 40))
+        e = self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), told)  # the far host told the requester; nothing from here
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_row_stopped_no_outcome_takes_its_far_stop_of_the_same_request_in_its_words(self):
+        # cosmic-gray and huge-blue, 2026-11-25: 66 rows stopped forward_no_outcome in a day while cmux-cp-1 held each
+        # stopped (conflict, block, update_branch_conflict) on the very request they had sent
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "block", "a BLOCK at this head", "push a fix")
+        with self.q.lock:
+            self.q.forward_give_up(self.q.entries[self.KEY], "OPEN", "big-exec", True, "no outcome either")
+        told = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertIn("big-exec's land queue stopped it (block): a BLOCK at this head", e["stop"]["reason"])
+        self.assertEqual(len(self.w.sent()), told)
+
+    def test_a_far_stop_older_than_a_day_is_not_asked_about(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "conflict", "merge main", "resolve")
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        asked = len(self.asks)
+        self.tick(gg.LAND_FORWARD_STOPPED_FOLLOW + 1)
+        self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual(len(self.asks), asked)
+
+    def test_a_re_land_after_a_repair_is_a_new_request_on_a_fresh_give_up_clock(self):
+        # cosmic-gray, 2026-11-25 08:15Z: the repair reopened 56 rows and cleared forwardRelanded; their re-land reused
+        # the 11-23 re-land's id, which apply here and on cmux-cp-1 both took as applied before, so nothing was judged
+        # and each stopped forward_no_outcome ~2 min later, "handed to cmux-cp-1's land queue 170373 s ago".
+        self.forwarded_to_executor()
+        with self.q.lock:
+            self.q.forward_reland(self.q.entries[self.KEY], LA, "big-exec", True)
+        first = self.q.entries[self.KEY]["requestId"]
+        e = self.tick()
+        self.assertEqual((e["state"], self.sent_batches[-1]["requests"][0]["id"]), ("forwarded", first))
+        with self.q.lock:  # the repair's reopen (repair_forwarded): an old clock, forwardRelanded cleared
+            e = self.q.entries[self.KEY]
+            e.pop("forwardRelanded", None)
+            e["forwardFirst"] = self.t - gg.LAND_FORWARD_GIVE_UP - 1
+            self.q.forward_reland(e, LA, "big-exec", True)
+        e = self.q.entries[self.KEY]
+        self.assertNotEqual(e["requestId"], first)
+        self.assertEqual((e["state"], e.get("forwardFirst")), ("queued", None))
+        e = self.tick()
+        self.assertEqual((e["state"], self.sent_batches[-1]["requests"][0]["id"]), ("forwarded", e["requestId"]))
+        for _ in range(5):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "forwarded")  # not given up on the first hand-off's clock
 
     def test_a_forward_the_executor_holds_open_is_never_given_up_and_never_re_sent(self):
         self.forwarded_to_executor()
