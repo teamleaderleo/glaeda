@@ -23682,6 +23682,35 @@ class CmuxWaitsRollupGateTest(CmuxWaitsRestCostTest):
         d.now += gg.CONTROLLER_ROLLUP_DOWN
         self.assertEqual(d.controller_suites("/repos/o/cmux", sha)["via"], "controller")
 
+    def test_a_land_pass_of_slow_rollups_stays_within_its_budget(self) -> None:
+        """hq#20521: every land row's rollup timing out (cold, seeding from a GitHub answering 502s) made one land pass
+        longer than WATCHDOG_AFTER, so the daemon restarted every ~5 min and served PR data 560-1150 s old. The asks
+        of a pass share LAND_ROLLUP_BUDGET; the rows past it are not asked, keep no answer, and are asked next pass."""
+        d, asked = self.daemon, []
+
+        def slow(path: str, timeout: float | None = None) -> dict:
+            asked.append(path)
+            time.sleep(0.05)
+            raise gg.ControllerTimeout("controller: timed out")
+
+        self.ctl.get = slow
+        d.controller_down_until = 0.0
+        shas = [f"{i:040x}" for i in range(400)]
+        q = types.SimpleNamespace(now=d.now, rollup_seen={}, rollup_nodes=d.land_rollup_nodes)
+        with mock.patch.object(gg, "LAND_ROLLUP_BUDGET", 0.5), mock.patch.object(gg, "CONTROLLER_READ_TIMEOUT", 0.05):
+            started = time.monotonic()
+            with d.land_controller_budget():
+                for sha in shas:
+                    self.assertIsNone(gg.LandQueue.rollup_green(q, "pr:o/cmux#2", sha))
+            spent = time.monotonic() - started
+            self.assertLess(spent, 1.0, f"{len(asked)} asks")  # unbudgeted: 400 x 0.05 s = 20 s
+            self.assertLess(len(asked), 20)
+            self.assertEqual(len(q.rollup_seen), len(asked))  # the deferred rows keep nothing
+            self.assertEqual(d.controller_budget_end, float("inf"))  # put back after the pass
+            with d.land_controller_budget():  # the next pass asks the rows the last one deferred
+                gg.LandQueue.rollup_green(q, "pr:o/cmux#2", shas[-1])
+            self.assertIn(shas[-1], asked[-1])
+
 
 class ReexecDrainTest(Base):
     """cosmic-gray, 2026-11-17: an installed update waited on land steps from 12:39Z until a forced restart, because a

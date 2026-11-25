@@ -375,7 +375,7 @@ import urllib.request
 import weakref
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 BASE = Path(os.environ.get("GLAEDA_GH_DIR") or Path.home() / ".cache/glaeda/gh")
 API = "https://api.github.com"
@@ -1367,6 +1367,15 @@ PR_REST_SUITES_FROM_CONTROLLER = True
 CONTROLLER_ROLLUP_TIMEOUT = 2.0  # a complete rollup answers in 0.05-1.4 s; a cold one is seeding from GitHub
 CONTROLLER_ROLLUP_SLOW_SKIP = 15.0  # a head whose rollup timed out is not asked again for this long
 CONTROLLER_ROLLUP_DOWN = 30.0  # a controller that failed otherwise is not asked for a rollup for this long
+# The land queue's pass and refill ask the controller for each row's rollup (LAND_ROLLUP_JUDGE) on the serve loop's own
+# thread, and a timed-out ask skips only its own head (CONTROLLER_ROLLUP_SLOW_SKIP). So with the controller's cold
+# rollups seeding from a GitHub answering 502s, every row's ask spent its whole deadline, one pass ran past
+# WATCHDOG_AFTER, and the watchdog restarted the daemon: the control-plane host, 2026-11-25 10:19-11:39Z, eight
+# restarts (exit 75), the main thread each time in land_tick > rollup_green > controller_rollup_doc, and every lane VM
+# reading through it served PR data 560-1150 s old (hq#20521). A pass's and a refill's controller asks together get
+# this long (the same cut from_controller's CONTROLLER_TICK_BUDGET makes); a row past it keeps the GitHub snapshot
+# path and is asked on the next pass, not after LAND_ROLLUP_SEEN_TTL.
+LAND_ROLLUP_BUDGET = 20.0
 # The REST loop reads one PR at a time, and each read's requests went out one after another: ~650 waited PRs at ~2 s a
 # read is a ~1300 s pass however few requests each costs (huge-blue 2026-11-22). So the conditional GETs the next
 # REST_PREFETCH_AHEAD reads will send (the paths and ETags their last read kept: Daemon.prefetch_rest) go out early on
@@ -4697,6 +4706,11 @@ def cmd_read(text: str) -> int:
 
 
 # ---------------------------------------------------------------- cmux build controller
+
+
+class LandRollupDeferred(Exception):
+    """The land pass's LAND_ROLLUP_BUDGET is spent: this row's controller rollup is not asked now (rollup_green keeps
+    no answer for it, so the next pass asks)."""
 
 
 class OutOfTime(Exception):
@@ -10068,7 +10082,7 @@ class Daemon:
         self.land_refilled = at
         self.in_land = True
         try:
-            with self.phase("land refill"):
+            with self.phase("land refill"), self.land_controller_budget():
                 q.refill(None if getattr(self, "clock_real", True) else self.now)
         except Exception as error:  # noqa: BLE001  the land queue must never stop the reads
             self.errors.append(f"land refill: {describe(error)} at {error_site(error)}")
@@ -10109,7 +10123,8 @@ class Daemon:
             marker.unlink(missing_ok=True)
         self.in_land = True  # a request the pass makes (a /rate_limit reading) starts no refill inside it
         try:
-            self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
+            with self.land_controller_budget():
+                self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
         finally:
             self.in_land = False
         self.land_refilled = time.monotonic()
@@ -12365,7 +12380,24 @@ class Daemon:
         except ValueError:
             return None
         sha = str(sha or "").lower()
+        if getattr(self, "controller", None) is not None and not self.controller_room():
+            raise LandRollupDeferred(sha)  # this pass's LAND_ROLLUP_BUDGET is spent: asked next pass, not cached
         return controller_green_rollup(self.controller_rollup_doc(f"/repos/{owner}/{repo}", sha), sha)
+
+    @contextlib.contextmanager
+    def land_controller_budget(self) -> Iterator[None]:
+        """The land pass's (or refill's) controller asks within LAND_ROLLUP_BUDGET together, inside any budget already
+        running (a refill between a tick's reads), which is put back after."""
+        before = self.controller_budget_end
+        self.controller_budget_end = min(before, time.monotonic() + LAND_ROLLUP_BUDGET)
+        with contextlib.suppress(AttributeError):
+            self.controller.budget_end = self.controller_budget_end
+        try:
+            yield
+        finally:
+            self.controller_budget_end = before
+            with contextlib.suppress(AttributeError):
+                self.controller.budget_end = before
 
     def owed_steps_gated(self, e: dict, prior: dict, old: dict, root: str, sha: str) -> dict:
         """The steps a held read still owes (stepsOwed: a 5xx, a refusal past STEPS_RETRY, a read left for later),
@@ -20364,6 +20396,8 @@ class LandQueue:
             return seen[1]
         try:
             nodes = self.rollup_nodes(key, k[1])
+        except LandRollupDeferred:
+            return None  # not asked (LAND_ROLLUP_BUDGET): nothing to keep, the next pass asks
         except Exception:  # noqa: BLE001  the controller is an extra here: the GitHub snapshot path stands
             nodes = None
         if len(self.rollup_seen) > 4096:
