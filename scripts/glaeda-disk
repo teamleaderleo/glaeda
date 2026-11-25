@@ -13528,6 +13528,95 @@ DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
 OPEN_DELETED = "open-deleted (files a process still holds; lsof +L1 names them)"  # Linux has no purgeable space
 
+# A Linux gap used to be named open-deleted whole, unmeasured; on a lane VM it said 55.9G while the deleted
+# files processes held came to 2 KB and the bytes sat under overlay and FUSE mount points, where du -x never
+# looks. So a gap is split: what /proc says is held open (measured), the rest named as shadowed by mounts.
+_OPEN_DELETED_SRC = r"""
+import os
+def open_deleted(dev, proc="/proc"):
+    seen, held, denied = set(), {}, 0
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(proc + "/" + pid + "/fd")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            denied += 1
+            continue
+        for fd in fds:
+            link = proc + "/" + pid + "/fd/" + fd
+            try:
+                if not os.readlink(link).endswith(" (deleted)"):
+                    continue
+                st = os.stat(link)
+            except OSError:
+                continue
+            if st.st_dev != dev or (st.st_mode & 0o170000) != 0o100000 or (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            held[pid] = held.get(pid, 0) + st.st_blocks * 512
+    return held, denied
+"""
+_open_deleted_ns: dict[str, Any] = {}
+exec(_OPEN_DELETED_SRC, _open_deleted_ns)
+open_deleted_local = _open_deleted_ns["open_deleted"]
+
+
+def open_deleted_held(dev: int, timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[dict[str, int], int]:
+    """Bytes of deleted regular files on dev that processes still hold, by pid, and how many pids stayed
+    unreadable; read as root (`sudo -n`, bounded) when some pids are not ours to read."""
+    held, denied = open_deleted_local(dev)
+    if denied and sudo_reads():
+        code = _OPEN_DELETED_SRC + f"\nimport json, sys\nsys.stdout.write(json.dumps(open_deleted({int(dev)})))\n"
+        try:
+            out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)),
+                                  sys.executable or "/usr/bin/python3", "-I", "-c", code],
+                                 capture_output=True, text=True, timeout=timeout + 15)
+            got = json.loads(out.stdout) if out.returncode == 0 else None
+            if isinstance(got, list) and isinstance(got[0], dict) and isinstance(got[1], int):
+                held, denied = {str(k): int(v) for k, v in got[0].items()}, got[1]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+            pass
+    return held, denied
+
+
+def mounts_over(mount: str, mountinfo: str = "/proc/self/mountinfo") -> collections.Counter:
+    """Mount points sitting on the filesystem mounted at mount, by type: du -x stops at each and never
+    sees the bytes left on this filesystem underneath it."""
+    rows = []
+    try:
+        for line in Path(mountinfo).read_text().splitlines():
+            head, _, tail = line.partition(" - ")
+            f = head.split()
+            if len(f) >= 5 and tail:
+                rows.append((f[0], f[1], f[4].replace("\\040", " "), tail.split()[0]))
+    except OSError:
+        return collections.Counter()
+    ids = {mid for mid, _, point, _ in rows if point == mount}
+    return collections.Counter(kind for _, parent, point, kind in rows if parent in ids and point != mount)
+
+
+def linux_gap_residual(fs: "Fs", gap: int, shown: int = 3) -> str:
+    """Name a Linux volume's gap by measuring it: open-deleted bytes from /proc with their top holders,
+    and the rest as bytes under this filesystem's mount points or unmeasured."""
+    if gap <= 0:
+        return OPEN_DELETED
+    held, denied = open_deleted_held(fs.dev)
+    total = sum(held.values())
+    top = [kv for kv in sorted(held.items(), key=lambda kv: -kv[1])[:shown] if kv[1] >= 64 * 2**20]
+    parts = [f"open-deleted {gib(total).strip()} measured in /proc"
+             + (f" (top holders: {', '.join(f'pid {p} {gib(b).strip()}' for p, b in top)})" if top else "")
+             + (f", {denied} pids unreadable" if denied else "")]
+    rest = max(0, gap - total)
+    if rest:
+        over = mounts_over(fs.mount)
+        kinds = ", ".join(f"{n} {k}" for k, n in over.most_common(4))
+        parts.append(f"{gib(rest).strip()} under mount points or unmeasured"
+                     + (f" ({sum(over.values())} mounts on this fs: {kinds})" if over else ""))
+    return "; ".join(parts)
+
 
 _CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
 _PRIVATE_LINKS = ("var", "tmp", "etc")
@@ -14512,7 +14601,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
             sudo_measured = len(census.get("sudo_measured") or [])
             # an APFS volume (macOS, or its sibling volumes read) hides purgeable space; a Linux one only open-deleted files
-            residual = (APFS_INVISIBLE if DARWIN or volumes else OPEN_DELETED) + (
+            residual = (APFS_INVISIBLE if DARWIN or volumes else linux_gap_residual(fs, gap)) + (
                 f" and {unreadable} unreadable or skipped dirs (lower bounds)" if unreadable else "") \
                 + (f"; {sudo_measured} measured with sudo" if sudo_measured else "") \
                 + census_unreadable_named(census)
