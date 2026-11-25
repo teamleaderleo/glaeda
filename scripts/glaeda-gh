@@ -24156,9 +24156,13 @@ def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
 # added and removed line in order (hunk positions and context may move with the base). Two compare reads, once per
 # head, on a worker: GitHub's compare of BASE...HEAD (its merge base must be the second parent: that proves it is on
 # the base, and its files are HEAD's own diff) and of PARENT...PIN (the pin's own diff on its old merge base).
-# land_judge still judges the new head in full, CI included, before the pinned merge.
+# land_judge still judges the new head in full, CI included, before the pinned merge. A file GitHub gives no patch for
+# (a mode-only change, a binary, a patch too large) is compared by its blob at each compare's head (b) instead: the
+# same blob at the pin and at HEAD is the same file, so the base merge did not touch it. lw#10961, fs-agent-lane-12,
+# 2026-11-25 12:42Z and 13:13Z: four mode-only files (0 lines, no patch) stopped head_moved on each update_branch the
+# queue itself sent, "tools/perf_bug_land.py shows no patch", and each stop cost a hand re-pin and half an hour.
 LAND_BASE_MERGE_JQ = ("{mb: .merge_base_commit.sha, files: [.files[]? | {f: .filename, s: .status, "
-                      "p: .previous_filename, d: .patch}]}")
+                      "p: .previous_filename, d: .patch, b: .sha}]}")
 LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: a list that long may be cut short
 # base_merge_check's reads of one head that may fail before it stops head_moved, and the first wait between them
 # (doubled each time: 30 s to 16 min, about half an hour in all). A failed read stopped the land at once before.
@@ -24274,10 +24278,14 @@ def land_base_merge_why(pin: str, head: str, parent: str, base: str, was: dict, 
                     "base merge")
         side = {}
         for f in files:
-            if not isinstance(f, dict) or not isinstance(f.get("d"), str):
+            blob = str((f or {}).get("b") or "").lower() if isinstance(f, dict) else ""
+            if not isinstance(f, dict) or not (isinstance(f.get("d"), str) or SHA40.fullmatch(blob)):
                 name = (f or {}).get("f") if isinstance(f, dict) else "?"
-                return f"{name} shows no patch (binary or too large), so it is not shown to be only a base merge"
-            side[str(f.get("f") or "")] = (str(f.get("s") or ""), str(f.get("p") or ""), land_diff_lines(f["d"]))
+                return (f"{name} shows no patch (binary or too large) and no blob, so it is not shown to be only a "
+                        "base merge")
+            # no patch (mode-only, binary, too large): the file is its blob at the compare's head (LAND_BASE_MERGE_JQ)
+            lines = land_diff_lines(f["d"]) if isinstance(f.get("d"), str) else ("blob", blob)
+            side[str(f.get("f") or "")] = (str(f.get("s") or ""), str(f.get("p") or ""), lines)
         sides.append(side)
     if sides[0] != sides[1]:
         name = sorted(n for n in set(sides[0]) | set(sides[1]) if sides[0].get(n) != sides[1].get(n))[0]
