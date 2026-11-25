@@ -7519,6 +7519,58 @@ class OverloadTest(Base):
         for n in (1, 2, 4, 5, 6):
             self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["dataAt"], NOW + 11 * gg.CYCLE)  # the others never wait for it
 
+    def batch_poison(self, poison: int):
+        """A transport that answers 502 to a PR query of more than one PR that includes POISON (a rollup too big to
+        read beside others), and reads it alone; SEEN gets each PR query's numbers."""
+        seen = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
+                if "pullRequest(number:" in doc["query"]:
+                    seen.append(prs)
+                    if poison in prs and len(prs) > 1:
+                        return 502, {}, b'{"message": "Server Error"}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return seen
+
+    def test_a_pr_whose_batch_fails_every_tick_is_read_alone_and_says_why_meanwhile(self) -> None:
+        # cmux-cp-1, 2026-11-25: manaflow-ai/cmux#46795 (195-285 checks) poisoned every PR batch it sat in with a 502;
+        # GQL_SPLITS ran out before it was ever alone, its chunk went to REST (capped) and back to a deferral, and
+        # nothing was stored for 14 h: no read, no error, "data 838m ago" while the stale valve restarted the daemon.
+        keys = []
+        for n in range(1, 13):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1], waited=True, at={"touched": NOW, "waitedAt": NOW, "waitBegan": NOW})
+            # #3 the oldest: oldest_first puts it in the tick's first chunk every time
+            self.daemon.store(keys[-1], None, dataAt=NOW - (9000 if n == 3 else 100), data={"state": "OPEN", "number": n},
+                              via="graphql")
+        seen = self.batch_poison(3)
+        log = gg.BASE / gg.REFRESH_LOG
+        with mock.patch.object(self.daemon, "rest_room", return_value=False), mock.patch.object(gg, "GQL_SPLITS", 0):  # spent by the tick's other batches, as on cp-1
+            for tick in range(gg.UNREAD_ALONE_AFTER + 2):
+                t = NOW + tick * gg.CYCLE
+                for k in keys:
+                    os.utime(gg.watch_dir() / gg.file_name(k), (t,) * 2)
+                    gg.register(k, waited=True, at={"touched": t, "waitedAt": t, "waitBegan": NOW})
+                self.daemon.tick(t)
+                if tick == gg.UNREAD_ALONE_AFTER - 1:
+                    entry = gg.read_cache("pr:o/r#3")
+                    self.assertEqual(entry["dataAt"], NOW - 9000)  # not read yet: and the entry says why
+                    self.assertIn("not read for", entry.get("unreadWhy") or "")
+                    self.assertIn("502", entry["unreadWhy"])
+                    self.assertIn("not read for", gg.render("pr:o/r#3", entry, False))
+                    self.assertIn("o/r#3", log.read_text())
+        self.assertIn([3], seen)  # read alone at last
+        entry = gg.read_cache("pr:o/r#3")
+        self.assertGreater(entry["dataAt"], NOW)
+        self.assertIsNone(entry.get("unreadWhy"))  # a clean read clears the note
+        for k in keys:
+            self.assertGreater(gg.read_cache(k)["dataAt"], NOW, k)  # its batch neighbours are read too
+
     def test_chunks_are_read_oldest_data_first_across_repositories(self) -> None:
         # a repository at a time put one repository's newer data ahead of another's oldest when a tick ran out of time
         for repo, n, age in (("a", 1, 100), ("a", 2, 90), ("b", 3, 9000), ("b", 4, 8000)):
