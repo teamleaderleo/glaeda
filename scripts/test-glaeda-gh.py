@@ -26061,6 +26061,7 @@ class LandWorld:
         self.view_err: str | None = None  # a state read that fails, with these words
         self.view_head: str | None = None  # the headRefOid a `pr view --json headRefOid,...` answers (None: no field)
         self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
+        self.view_refs: dict | None = None  # what a `pr view --json headRefName,baseRefName` answers (None: it fails)
         self.raise_on: str | None = None
         self.nudged: list[str] = []
         self.refreshed: list[str] = []
@@ -26154,6 +26155,9 @@ class LandWorld:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"s": "diverged", "b": 1}) + "\n", "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
+            if words[:2] == ["pr", "view"] and words[-2:] == ["--json", "headRefName,baseRefName"]:
+                return subprocess.CompletedProcess(argv, 0 if self.view_refs else 1, json.dumps(self.view_refs or {}),
+                                                   "" if self.view_refs else "HTTP 502")
             if words[:2] == ["pr", "view"]:
                 merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]
                               or (c[1:4] == ["api", "-X", "PUT"] and c[4].endswith("/merge")))
@@ -31890,6 +31894,42 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(merged))
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_a_judge_conflict_whose_cached_row_has_no_ref_names_reads_them_and_merges(self):
+        """leo-workspace#10997, #10659, #11038, #11192, 2026-11-25: conflicts_base, and the base merge was skipped as
+        "the PR's branch '' or base '' is not read or not a plain branch name": the cached row held no ref names. The
+        queue reads them once (pr view) and merges."""
+        head, base = self.union_origin(main_path="goals/y.md")
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head, mergeable="CONFLICTING"), self.t)  # no headRefName, no baseRefName
+        self.w.view_refs = {"headRefName": "lane/x", "baseRefName": "main"}
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(len(self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefName,baseRefName")), 1)
+
+    def test_a_judge_conflict_whose_ref_names_cannot_be_read_stops_saying_so_and_retries(self):
+        head, _ = self.union_origin(main_path="goals/y.md")
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head, mergeable="CONFLICTING"), self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertIn("could not be read", " ".join(h.get("why", "") for h in e["history"]))
+        self.assertNotIn("unionMerge", e)  # decided nothing: a re-land at this head tries the merge again
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
 
     def test_a_judge_conflict_in_merge_union_files_only_is_merged_here(self):
         head, base = self.union_origin()  # both appended to goals/x.md, which main's .gitattributes marks merge=union

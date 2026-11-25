@@ -22651,6 +22651,19 @@ class LandQueue:
         return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e,
                          extra)
 
+    def union_refs(self, e: dict, branch: str, base: str) -> tuple[str, str]:
+        """(branch, base) of E's PR from one `pr view` through the gh shim (its cache first), keeping BRANCH and BASE
+        where the read gives nothing: what union_plan merges when the cached row lacks them."""
+        gh = self.gh()
+        if gh is None:
+            return branch, base
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "headRefName,baseRefName"],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError):
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else {}
+            return str(doc.get("headRefName") or branch), str(doc.get("baseRefName") or base)
+        return branch, base
+
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
         """(merge commit, the PR's branch, base sha, "") when git's merge of the base into HEAD, honoring the base's
         .gitattributes, is clean, else ("", "", "", why not; a true conflict names its files). Writes only into this
@@ -22661,8 +22674,17 @@ class LandQueue:
                                 "pushes a base merge only to their own branches")
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+        if not (branch and base):
+            # cmux-cp-1, 2026-11-25: leo-workspace#10997, #10659, #11038 and #11192 stopped conflicts_base with the base
+            # merge skipped as "the PR's branch '' or base '' is not read": their cached rows held no ref names (a
+            # read that does not carry them). Read them once here; a read that fails decided nothing (retry).
+            branch, base = self.union_refs(e, branch, base)
+            if not (branch and base):
+                e["unionMerge"]["retry"] = True
+                return "", "", "", (f"the PR's branch {branch!r} or base {base!r} could not be read (neither the cache "
+                                    "nor a pr view held them)")
         if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
-            return "", "", "", f"the PR's branch {branch!r} or base {base!r} is not read or not a plain branch name"
+            return "", "", "", f"the PR's branch {branch!r} or base {base!r} is not a plain branch name"
         if not SHA40.fullmatch(head or ""):
             return "", "", "", "no 40-hex head to merge onto"
         gitdir = os.fspath(land_dir() / "union" / (repo.replace("/", "__") + ".git"))
