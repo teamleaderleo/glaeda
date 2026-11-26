@@ -6337,6 +6337,35 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
         os.close(gd._PRESSURE_PASS_HANDLE)
 
+    def test_a_skipped_pressure_apply_names_the_live_holder_and_the_last_pass(self) -> None:
+        # 2026-11-26: "another pressure pass is running" read as a stuck lock on two lane VMs at 95-96%; the holder
+        # was the timer's live pass, and every finished pass had freed 0 GiB with the rest held in use
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        lock = self.root / "pressure-pass.lock"
+        held = json.loads(lock.read_text())
+        self.assertEqual(held["pid"], os.getpid(), "the pass that takes the lock records itself in it")
+        os.close(gd._PRESSURE_PASS_HANDLE)
+        gd._PRESSURE_PASS_HANDLE = None
+        lock.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time() - 130, "caller": "timer"}))
+        with (self.root / "runs.jsonl").open("a") as log:
+            log.write(json.dumps({"at": "2026-11-26T06:14:50+0000", "mode": "pressure", "skipped": None,
+                                  "reclaimed_gib": 0.0, "free_gib_after": 12.5,
+                                  "blocked": {"user-cache": 38.7, "projects": 24.7}}) + "\n")
+        self.said = ""
+        with lock.open("a") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+        self.assertIn(f"pid {os.getpid()} (alive), started 2 min", self.said)
+        self.assertIn("by timer", self.said)
+        self.assertIn("freed 0.0 GiB; it found in use: user-cache 38.7 GiB, projects 24.7 GiB", self.said)
+        holder = rows[-1]["pressure_pass_holder"]
+        self.assertTrue(holder["holder"]["alive"])
+        self.assertEqual(holder["last_pass"]["blocked"]["user-cache"], 38.7)
+
     def test_a_second_pressure_apply_skips_before_queueing_behind_a_running_eviction(self) -> None:
         # 2026-11-21: with the pass lock taken after the evict.lock queue, 8 to 14 pressure applies still waited
         # in that queue at once on one mini; the second must leave at once, never join the queue
@@ -9613,10 +9642,15 @@ class VolumeCensusTest(unittest.TestCase):
 
     def test_open_deleted_counts_a_held_file_once(self) -> None:
         held = self.write("held", 4096 * 8)
+        dev = self.root.stat().st_dev
+        # The runner's process may already hold other deleted files on this fs (an earlier test's
+        # temp file not yet collected): measure the change this file makes, not the absolute total.
+        before, _ = gd.open_deleted_local(dev)
         with open(held, "rb") as one, open(held, "rb") as two:
             held.unlink()
-            got, _ = gd.open_deleted_local(self.root.stat().st_dev)
-        self.assertEqual(got.get(str(os.getpid())), 4096 * 8)
+            got, _ = gd.open_deleted_local(dev)
+        pid = str(os.getpid())
+        self.assertEqual(got.get(pid, 0) - before.get(pid, 0), 4096 * 8)
 
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent

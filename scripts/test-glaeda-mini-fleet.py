@@ -216,6 +216,106 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+
+class AdmitTests(unittest.TestCase):
+    """admit: new hosts into the manifest from what the probe saw."""
+
+    M5 = ("model\tMac17,9", "chip\tApple M5 Pro", "cpus\t15", f"memory_bytes\t{64 * 2**30}")
+
+    def m5_probe(self, hostname: str, extra_xcode: bool = True, node_id: str | None = None) -> str:
+        text = probe_text(hostname=hostname, node_id=node_id, sudo="password")
+        text = (text.replace("model\tMac16,11", self.M5[0]).replace("chip\tApple M4 Pro", self.M5[1])
+                .replace("cpus\t14", self.M5[2]).replace(f"memory_bytes\t{48 * 2**30}", self.M5[3]))
+        if extra_xcode:
+            text += "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|18A100\n" \
+                    "xcode_app\t/Applications/Xcode-beta.app|symlink|27.1|18B5\n"
+        return text
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "m.json"
+        shutil.copy(EXAMPLE, self.path)
+        self.manifest = mf.load_manifest(self.path)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_new_class_hosts_node_ids_and_installed_xcode_labels(self) -> None:
+        obs = observed(**{"cmux25": self.m5_probe("cmux25"), "cmux26": self.m5_probe("cmux26", extra_xcode=False)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["cmux25", "cmux26"], "std")
+        self.assertEqual(plan["hardware"], {"m5pro-64": {"model": "Mac17,9", "chip": "Apple M5 Pro", "cpus": 15,
+                                                         "memory_gib": 64}})
+        a, b = plan["hosts"]["cmux25"], plan["hosts"]["cmux26"]
+        self.assertEqual((a["node_id"], b["node_id"]), ("cmux-mac-003", "cmux-mac-004"))
+        self.assertEqual((a["hardware"], a["class"], a["availability"], a["roles"], a["sudo"]),
+                         ("m5pro-64", "std", "dedicated", ["ci-runner"], "password"))
+        # The symlinked beta is not a complete app; the real 27.0 becomes a label source.
+        paths = [x["path"] for x in a["overrides"]["xcode"]["apps"]]
+        self.assertIn("/Applications/Xcode_27.0.app", paths)
+        self.assertNotIn("/Applications/Xcode-beta.app", paths)
+        self.assertNotIn("overrides", b)
+        self.assertTrue(any("onboard --acceptance node" in n for n in notes))
+        raw = json.loads(self.path.read_text())
+        raw["hardware"].update(plan["hardware"])
+        raw["hosts"].update(plan["hosts"])
+        merged = mf.load_manifest(self.path, json.dumps(raw))
+        summary, why = mf.labels.member_labels(merged, "cmux25", lambda app: True)
+        self.assertIsNone(why)
+        self.assertIn("xcode-27.0", summary["labels"])
+        self.assertIn("xcode-26.3", summary["labels"])
+
+    def test_matching_hardware_is_reused_and_members_left_alone(self) -> None:
+        obs = observed(**{"build-mini-9": probe_text(hostname="build-mini-9", node_id=None)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["build-mini-9", "build-mini-1"], "xl")
+        self.assertEqual(plan["hardware"], {})
+        self.assertEqual(plan["hosts"]["build-mini-9"]["hardware"], "m4pro-48")
+        self.assertIn("build-mini-1: already a member; left alone", notes)
+
+    def test_refuses_unreachable_never_touch_and_wrong_hardware(self) -> None:
+        with self.assertRaisesRegex(mf.Failure, "not reachable"):
+            mf.admit_plan(self.manifest, {"hosts": {"x": {"reachable": False, "error": "timeout"}}}, ["x"], "std")
+        with self.assertRaisesRegex(mf.Failure, "never_touch"):
+            mf.admit_plan(self.manifest, {"hosts": {}}, ["coordinator-mini"], "std")
+        obs = observed(cmux25=self.m5_probe("cmux25"))
+        with self.assertRaisesRegex(mf.Failure, "not hardware m4pro-48"):
+            mf.admit_plan(self.manifest, obs, ["cmux25"], "std", "m4pro-48")
+
+    def test_cli_dry_run_then_yes_writes_a_manifest_that_loads(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"))))
+        before = self.path.read_text()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path)]), 0)
+        self.assertIn('"m5pro-64"', out.getvalue())
+        self.assertIn("dry run", out.getvalue())
+        self.assertEqual(self.path.read_text(), before)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path), "--yes"]), 0)
+        self.assertEqual(mf.load_manifest(self.path)["hosts"]["cmux25"]["hardware"], "m5pro-64")
+
+
+    def test_bringup_dry_run_prints_the_seed_sequence_and_changes_nothing(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"), cmux26=self.m5_probe("cmux26"))))
+        before = self.path.read_text()
+        proc = subprocess.run([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-mini-bringup"), "cmux25", "cmux26",
+                               "--manifest", os.fspath(self.path), "--observed", os.fspath(obs_path),
+                               "--registry-out", self.tmp.name], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("onboard cmux25 --manifest", out)
+        self.assertIn("--acceptance node", out)
+        self.assertIn("upgrade cmux25", out)
+        self.assertIn("onboard cmux26 --manifest", out)
+        self.assertIn("--from cmux25", out)
+        self.assertIn("--hosts cmux25,cmux26", out)
+        self.assertEqual(self.path.read_text(), before)
+        entry = json.loads((Path(self.tmp.name) / "cmux25.json").read_text())
+        self.assertEqual((entry["runs"], entry["address"]["manaflow"]), (["ci-runner"], "cmux25.tail137216.ts.net"))
+
 class TransportTests(unittest.TestCase):
     def route_manifest(self) -> dict:
         return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {

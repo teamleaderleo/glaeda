@@ -46,7 +46,8 @@ re-runs it elsewhere) when:
     drifted from its class receipt, or gh is not on the job PATH. Eligibility is the node status that glaeda-mini-enroll reads, from the
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
-    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly. First,
+    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly (a probe that
+    reads nothing is a failed probe that warns, never drift: PROBE_EMPTY_WARNS). First,
     rustup, rustc or cargo that cannot run at all (missing, or a link that dangles) refuses by path
     or is not on the job PATH, which is the runner's own (toolchain_missing); the gate then holds every such runner at once, and ci-step fits
     advertises nothing.
@@ -4357,10 +4358,28 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     if diff and want.get("diffRustcVersion"):  # the DiffSidecar pin, run the way cmux runs it
         have["diffRustcVersion"] = _probe(["rustup", "run", diff, "rustc", "--version"], env, home, deadline)
         fields.append("diffRustcVersion")
+    # PROBE_EMPTY_WARNS: only a probe that answered with another string is drift. One that printed nothing (exited
+    # non-zero, timed out, or the tool is gone) is a probe that failed: it warns in the note and never refuses (Leo:
+    # "disk floors and probes warn, never refuse"). 2026-11-22: cruft-sweep reclaimed ~/.rustup/toolchains/1.88.0-*
+    # on m6-16 minis, `rustup run 1.88.0 rustc --version` exited 1 ("toolchain ... is not installed") and every
+    # fast-tier job was refused as "diffRustcVersion '' != 'rustc 1.88.0 ...'" (cmuxterm-hq#19552 fault 2), though
+    # cmux's install-rust-ci.sh installs the DiffSidecar toolchain itself.
+    failed = [field for field in fields if not have.get(field)]
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields
-             if have.get(field) != str(want[field])]
-    drifted = out_of_time(f"node not eligible (toolchain drifted from the {fleet_class} class receipt: "
-                          f"{'; '.join(drift)})", any(not have.get(field) for field in fields)) if drift else None
+             if have.get(field) and have[field] != str(want[field])]
+    if failed:
+        why = ""
+        if "diffRustcVersion" in failed:
+            names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home,
+                                                        max(deadline, time.monotonic() + 5)).splitlines()
+                     if line.strip()]
+            if names and not any(name == diff or name.startswith(diff + "-") for name in names):
+                why = f" (rust toolchain {diff} is not installed; cmux's install-rust-ci.sh installs it)"
+        note = "; ".join(x for x in (note, f"warning: toolchain probe failed, not drift: "
+                                           f"{', '.join(f'{field} read nothing (receipt {str(want[field])!r})' for field in failed)}"
+                                           f"{why}") if x)
+    drifted = (f"node not eligible (toolchain drifted from the {fleet_class} class receipt: "
+               f"{'; '.join(drift)})") if drift else None
     # judged before the Xcode probe, which runs on its own budget after the deadline
     if xcode_app:
         # after the receipt probes and on its own budget, so slow Xcode probes never starve them into a '' drift;
@@ -14365,15 +14384,23 @@ def core_busy(before: list[tuple[int, ...]], after: list[tuple[int, ...]]) -> li
 
 
 def efficiency_cores() -> int | None:
-    """How many efficiency cores the mini has (hw.perflevel1.logicalcpu; on Apple silicon they are the
-    lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM) or when unreadable."""
+    """How many efficiency cores the mini has (the lowest perf level's logicalcpu when its name is Efficiency; on
+    Apple silicon they are the lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM),
+    with no efficiency level, or when unreadable. The M5 Pro has two levels and no efficiency cores (5 super, 10
+    performance: hw.perflevel1 is its performance cores), so a bare hw.perflevel1 read would call its performance
+    cores efficiency cores and the P-core stall check could hold and drain-reboot a healthy mini."""
     try:
-        out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels", "hw.perflevel1.logicalcpu"],
-                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split()
-        levels, ecores = int(out[0]), int(out[1])
+        levels = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=5).stdout.strip())
+        if levels < 2:
+            return None
+        low = f"hw.perflevel{levels - 1}"
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", f"{low}.name", f"{low}.logicalcpu"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split("\n")
+        name, ecores = out[0].strip(), int(out[1])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
-    return ecores if levels >= 2 and ecores > 0 else None
+    return ecores if name == "Efficiency" and ecores > 0 else None
 
 
 def boot_epoch() -> int | None:
