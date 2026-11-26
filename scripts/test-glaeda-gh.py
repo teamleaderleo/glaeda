@@ -33619,6 +33619,11 @@ class LandTest(Base):
         self.assertFalse(gg.land_handoff_transient(1, progress + "lane-gh call land_handoff: refused: unknown argument "
                                                       "'nominated'"))
         self.assertTrue(gg.land_handoff_transient(1, progress))  # still busy when lane-gh's window ran out
+        for which in ("the call's 120 s bound", "the command's deadline", "the queue bound", "300 s"):
+            with self.subTest(which=which):
+                line = ("lane-gh land_handoff: the broker is busy (busy: admission queue full); nothing was started; "
+                        f"asking again in 2.0 s (try 3), 90 s left of {which}\n")
+                self.assertFalse(gg.land_handoff_transient(1, line + "refused: unknown argument 'nominated'"))
         self.broker = True
         self.pr(LA)
         self.land()
