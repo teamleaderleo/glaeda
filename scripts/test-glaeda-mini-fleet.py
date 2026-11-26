@@ -3558,12 +3558,14 @@ class ShareTests(unittest.TestCase):
             with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
                     mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
                                       (commands.append(c), options_seen.extend(options),
-                                       1 if "share_have" in c else 0)[2]):
+                                       1 if remote_call(c).startswith("share_have ") else 0)[2]):
                 ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
             self.assertTrue(ok, thing)
-            recv = next(c for c in commands if "share_recv" in c)
-            self.assertIn(gate + "share_recv " + thing, recv, thing)
-            self.assertTrue(remote_call(commands[-1]).startswith(gate + "share_finish " + thing), (thing, remote_call(commands[-1])))
+            # Every command carries the whole library; the call line is what names the step and its gate.
+            have, pipeline, finish = commands
+            self.assertTrue(remote_call(have).startswith("share_have " + thing), remote_call(have))
+            self.assertIn(gate + "share_recv " + thing, pipeline, thing)
+            self.assertTrue(remote_call(finish).startswith(gate + "share_finish " + thing), (thing, remote_call(finish)))
             self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
         # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
         for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
