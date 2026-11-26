@@ -587,6 +587,18 @@ def heavy_pause(fails: int) -> float:
 
 
 HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
+# A due PR no tick stores a clean read of (Daemon.note_unread). cmux-cp-1, 2026-11-25: manaflow-ai/cmux#46795 (195-285
+# checks) made every PR batch it sat in answer 502; the tick's GQL_SPLITS ran out before it was ever read alone, so
+# `heavy` never learned it, its chunk went to REST (capped) and back to a deferral, and for 14 h nothing was stored:
+# no read, no error, "data 838m ago" while the stale valve re-executed the daemon every 30 min to no effect. A PR whose
+# GraphQL chunk was sent and failed it on UNREAD_ALONE_AFTER ticks is read alone, ahead of the batches (at most
+# UNREAD_ALONE_MAX a call), so it cannot keep failing its batch or wait on the split budget; and a waited one unread on
+# that many due ticks says so, on its entry (unreadWhy, which `status` prints) and in the refresh log, naming the PR
+# and what held it, every UNREAD_NOTE_EVERY while it lasts (UNREAD_NOTE_LINES lines a tick, the rest counted).
+UNREAD_ALONE_AFTER = 2
+UNREAD_ALONE_MAX = 3
+UNREAD_NOTE_EVERY = 300.0
+UNREAD_NOTE_LINES = 5
 # GraphQL down, REST up. huge-blue 2026-11-17: GitHub's GraphQL answered 502 for long stretches (and the controller
 # URLError) and waited PR data reached 3585 s, then 1392 s old, with the heartbeat fresh, both times until a session
 # restarted the daemon. A 502 only split the batch and left it for the next cycle, so a kind routed to GraphQL was
@@ -6354,6 +6366,11 @@ class Daemon:
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
+        # key -> {"since", "ticks": due ticks unread, "tries": of them, ticks its chunk was sent, "why", "noted"}
+        self.unread: dict[str, dict] = {}  # (note_unread)
+        self.tick_read: set[str] = set()  # keys a clean read was stored for this tick (note_read)
+        self.tick_tried: set[str] = set()  # keys whose GraphQL chunk was sent this tick (batched)
+        self.miss_why: dict[str, str] = {}  # key -> what kept it unread this tick (a failed chunk, a deferral)
         self.gql_down_streak = 0  # GraphQL answers in a row that were a 5xx or no answer (GQL_DOWN)
         self.gql_down_since = 0.0  # when the first of them came
         self.gql_down_strikes = 0  # times GraphQL was taken out since its last clean answer: each doubles the next
@@ -6566,6 +6583,7 @@ class Daemon:
     def note_read(self, key: str) -> None:
         """A read of KEY stored data (dataAt): the daemon made progress on its kind."""
         kind = split_key(key)[0] if ":" in key else ""
+        self.__dict__.setdefault("tick_read", set()).add(key)
         if kind in self.read_done:
             self.read_done[kind].append(self.now)
 
@@ -9654,8 +9672,11 @@ class Daemon:
         """Read ENTRIES first next tick. WHY (the budget, pace or limit that held them) is kept per kind for
         deferral(): old waited data behind a deferral is the budget's, not a stuck reader's."""
         self.deferred.update(e["key"] for e in entries)
+        miss = self.__dict__.setdefault("miss_why", {})
         for e in entries:
             self.refund(e["key"])
+            # the first reason this tick stands: a failed chunk's error is why it came to be deferred
+            miss.setdefault(e["key"], why or "the tick's time (TICK_BUDGET) ran out before it was read")
         if why:
             for kind in {split_key(e["key"])[0] for e in entries if ":" in e["key"]}:
                 self.defer_why[kind] = (self.now, why)
@@ -9665,6 +9686,7 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
         self.phase_now = None
+        self.tick_read, self.tick_tried, self.miss_why = set(), set(), {}  # (note_unread)
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -10010,10 +10032,51 @@ class Daemon:
                 held += self.batched(kind, mine, self.graphql_fetch[kind])
         self.defer(held, f"REST {self.rest_hold()} and GraphQL stopped partway")
 
+    def note_unread(self, entries: list[dict], due: list[dict]) -> None:
+        """Count, per due PR, the ticks that stored no clean read of it (UNREAD_ALONE_AFTER): one read since ends its
+        count, a watch no longer held drops it. batched() reads one whose chunk was sent and failed it that often alone,
+        first; a waited one unread that often says what held it, on its entry and in the refresh log (UNREAD_NOTE_EVERY).
+        Before, a PR that every tick skipped (a deferral) or failed in its batch stored nothing at all, so its entry said
+        "error": null over data hours old, and the only signal was the stale valve's restart, which could not help."""
+        read, tried, miss = self.tick_read, self.tick_tried, self.miss_why
+        held = {e["key"] for e in entries}
+        unread = {k: u for k, u in self.unread.items() if k in held and k not in read}
+        notes: list[tuple[dict, dict, str]] = []
+        for e in due:
+            key = e["key"]
+            if not key.startswith("pr:") or key in read:
+                continue
+            u = unread.setdefault(key, {"since": self.now, "ticks": 0, "tries": 0, "why": "", "noted": None})
+            u["ticks"] += 1
+            u["tries"] += key in tried
+            u["why"] = miss.get(key) or u["why"] or "due, but no read of this tick reached it"
+            if u["ticks"] >= UNREAD_ALONE_AFTER and self.waited(e) \
+                    and (u["noted"] is None or self.now - u["noted"] >= UNREAD_NOTE_EVERY):
+                u["noted"] = self.now
+                then = ("next: read alone over GraphQL, ahead of the batches" if u["tries"] >= UNREAD_ALONE_AFTER
+                        else "next: read first once that lets it")
+                text = (f"not read for {int(self.now - u['since'])}s ({u['ticks']} due ticks, its query sent on "
+                        f"{u['tries']}): {u['why']}; {then}")
+                notes.append((e, u, text))
+        self.unread = unread
+        for i, (e, u, text) in enumerate(notes):
+            current = read_cache(e["key"]) or e.get("cache") or {}
+            if current.get("data") is not None:
+                # the data stays, its fetchedAt too (no cycle is moved by a note); the last error is kept beside it
+                self.store(e["key"], current, unreadWhy=text[:400], error=current.get("error"),
+                           fetchedAt=current.get("fetchedAt", self.now))
+            if i < UNREAD_NOTE_LINES:
+                refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: pr {key_name(e['key'])} {text[:400]}")
+        if len(notes) > UNREAD_NOTE_LINES:
+            refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: {len(notes) - UNREAD_NOTE_LINES} more "
+                              f"waited PRs not read on {UNREAD_ALONE_AFTER}+ due ticks (their entries say why)")
+
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
         """Rule on the waits, prune, and write the heartbeat: the end of every tick, whatever read it."""
         self.phase_now = None  # (reexec_now: the phases from here write)
+        with contextlib.suppress(Exception):  # noqa: BLE001  a note must never stop the tick's end
+            self.note_unread(entries, prs)
         # ScriptWake cuts the read phase when fast-patch swaps this file.  If no claimed land step is running,
         # the next image can safely take over the in-memory queue and all deferred bookkeeping.  Do not restore the
         # deadline or walk the end-of-tick phases here: on an upstream host those phases were the wake-to-reexec gap.
@@ -10851,11 +10914,22 @@ class Daemon:
         # Then it is read alone over GraphQL on its own back-off (heavy_pause), and only it: the batches are not slowed.
         rest_reads = self.mode("rest") != "stop" and not self.rest_capped()
 
+        unread = self.__dict__.setdefault("unread", {})
+        lone_unread: set[str] = set()
+
         def chunks(group: list[dict]) -> list[list[dict]]:
             alone, rest = [], []
+            # its chunk failed it tick after tick: alone, first, the oldest data of them first (UNREAD_ALONE_AFTER)
+            failing = [e for e in group if e["key"] not in self.heavy
+                       and (unread.get(e["key"]) or {}).get("tries", 0) >= UNREAD_ALONE_AFTER]
+            failing.sort(key=lambda e: float((e.get("cache") or {}).get("dataAt") or 0))
+            lone = {e["key"] for e in failing[:max(0, UNREAD_ALONE_MAX - len(lone_unread))]}
+            lone_unread.update(lone)
             for e in group:
                 h = self.heavy.get(e["key"])
-                if h is None:
+                if e["key"] in lone:
+                    alone.append([e])
+                elif h is None:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
@@ -10886,7 +10960,8 @@ class Daemon:
             """Chunks by the oldest data in each (never read first). The chunks above run one repository at a time, then
             heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only inside a chunk:
             a tick that ran out of time read the first repository's newest data before another's oldest."""
-            return sorted(queue, key=lambda c: min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c))
+            return sorted(queue, key=lambda c: (not (len(c) == 1 and c[0]["key"] in lone_unread),
+                                                min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c)))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = (oldest_first(chunks([e for e in entries if self.waited(e)]))
                  + oldest_first(chunks([e for e in entries if not self.waited(e)])))
@@ -10930,6 +11005,8 @@ class Daemon:
             asked = self.tick_asked[kind] = True
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
+            self.__dict__.setdefault("tick_tried", set()).update(e["key"] for e in chunk)
+            miss = self.__dict__.setdefault("miss_why", {})
             try:
                 began = time.monotonic()
                 with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
@@ -10939,6 +11016,8 @@ class Daemon:
                     self.note_read_seconds(kind, "graphql", time.monotonic() - began, len(chunk) - len(spilled))
                 limited, self.limited = self.limited, []
             except OutOfTime:
+                for e in chunk:
+                    miss[e["key"]] = f"the tick's time (TICK_BUDGET) ran out while its {kind} batch of {len(chunk)} was read"
                 self.defer(chunk + [e for c in queue for e in c])  # no reason, as in the REST loop
                 return to_rest
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
@@ -10949,6 +11028,8 @@ class Daemon:
                 # `wait` say what failed and oldestData shows it. Bounded by GQL_SPLITS like a timeout's split.
                 message = f"graphql: {describe(failure)} at {error_site(failure)}"
                 self.errors.append(message)
+                for e in chunk:
+                    miss[e["key"]] = f"{message[:200]} (in a {kind} batch of {len(chunk)})"
                 self.spill = []
                 if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS:
                     splits[kind] += 2
@@ -10959,6 +11040,9 @@ class Daemon:
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
                 continue
+            if error is not None:
+                for e in chunk:
+                    miss[e["key"]] = f"{' '.join(error.split())[:200]} (in a {kind} batch of {len(chunk)})"
             if (error or self.gql_limited) and self.mode("graphql") == "stop":
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
                 # whatever it stored for them, REST reads them this tick and replaces it
@@ -28441,6 +28525,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          "for a rescue attempt")
         lines.append(str(data.get("html_url") or ""))
     note = f"  (last error: {entry['error']})" if entry.get("error") else ""
+    if entry.get("unreadWhy"):
+        note += f"  ({entry['unreadWhy']})"  # what keeps it from a read (Daemon.note_unread)
     via = {"rest": ", read over REST", "graphql": ", read over GraphQL",
            "graphql-probe": ", confirmed unchanged over GraphQL"}.get(entry.get("via"), "")
     lines.append(f"data {age(entry.get('dataAt'))}{via}{note}")
