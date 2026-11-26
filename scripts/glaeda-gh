@@ -340,7 +340,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
-from collections import deque
+from collections import Counter, deque
 import contextlib
 import datetime as dt
 import errno
@@ -1490,13 +1490,26 @@ PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs 
 # host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
 # then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
 FULL_PR_SECS_FILE = "full-pr-secs.json"
+# A head read is the same cost in another query: a cmux head's first 100 checks, its suites and its check-of-record
+# commit. It had no measure at all: the head batch restarted at GQL_BATCH_START on every reexec (the stale valve's, a
+# fast-patch swap's) and, between the once-a-tick halvings, grew back by one per GQL_GROW_AFTER clean queries to 10-13,
+# where GitHub cut it again. The land host, 2026-11-26 02:47-07:02Z: 24 logged head batches of 6 to 13 cmux heads,
+# each cut at 10.6-32.4 s (373.9 s of failed queries, the halves that failed after them not counted), and ticks spent
+# 250-263 s of each 600 s in "read head" for 78 head reads stored (3.2 s each) while waited PR data aged past 3,000 s.
+# So fetch_heads sizes its queries the way fetch_prs sizes full reads: by the seconds per head measured for the
+# repository (head_secs), kept in HEAD_SECS_FILE so a reexec starts from it.
+HEAD_QUERY_SECONDS = PR_FULL_QUERY_SECONDS
+HEAD_SECS_FILE = "head-secs.json"
 # A land-queue PR whose checks are still running changes its fingerprint (the counts by state) every time one check
 # finishes, and every change was a full read: 160+ checks of a cmux PR, ~4.4 s of GitHub's time, for a row that cannot
 # merge yet. The land host, 2026-11-26 02:39-03:39Z: 470 queued rows, 262 gated, PR data p50 4,580 s, GraphQL in stop
 # mode. Such a row (same head, state, mergeability and review, a rollup still PENDING, only the counts moved) is
 # confirmed by its probe and read in full at most this often; a rollup that settles, a new head or a
-# changed merge state is read at once.
-PR_FULL_PENDING_EVERY = 900
+# changed merge state is read at once. The same bound replaces PR_FULL_EVERY/PR_FULL_BEHIND_EVERY in probe_ok for such
+# a row, which cannot merge until its rollup settles: at 900 s (#2853) no row qualified, as the land host's queued rows
+# were all past an hour since their last full read (05:38-06:04Z: 0 confirmed, PR data p50 2,580 s, the hourly GraphQL
+# quota under its reserve), and every one of them went back to a full read.
+PR_FULL_PENDING_EVERY = 7200
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -5495,6 +5508,30 @@ def confirmed_updated(cache: dict | None, node: dict | None, now: float) -> dict
     return fields
 
 
+PR_FP_FIELDS = ("state", "isDraft", "merged", "mergeable", "mergeStateStatus", "headRefOid", "reviewDecision",
+                "rollup", "contexts", "checkRuns", "statuses", "suites")
+# What GitHub answers for mergeStateStatus while a PR's checks run: it flips between these from one read to the next
+# (manaflow-ai/cmux#49086 and #57841, 2026-11-26 07:3xZ: UNKNOWN with 3 checks queued or pending, read between
+# BLOCKED and UNSTABLE answers), so a pending PR's probe compares it as one value. BEHIND, DIRTY and CLEAN are not here.
+PENDING_MERGE_STATES = frozenset({"UNKNOWN", "BLOCKED", "UNSTABLE", "HAS_HOOKS", None})
+
+
+def pending_fp_moved(old: Any, new: Any) -> list[str]:
+    """The fingerprint fields (PR_FP_FIELDS) that moved between OLD and NEW, two pr_fingerprint lists of a PR whose
+    rollup is pending, ignoring the check counts and what GitHub flips while checks run: mergeable UNKNOWN on either
+    side, mergeStateStatus within PENDING_MERGE_STATES. Empty: only the counts moved."""
+    if not (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == len(PR_FP_FIELDS)):
+        return ["unreadable"]
+    moved = []
+    for i, name in enumerate(PR_FP_FIELDS[:8]):
+        a, b = old[i], new[i]
+        if a == b or (name == "mergeable" and "UNKNOWN" in (a, b)) \
+                or (name == "mergeStateStatus" and a in PENDING_MERGE_STATES and b in PENDING_MERGE_STATES):
+            continue
+        moved.append(name)
+    return moved
+
+
 def pr_fingerprint(node: dict | None) -> str | None:
     """What a PR node says that a verdict or a wait reads, as one string: its state, mergeability, head and review, its
     rollup's state, and its check runs and statuses counted by state, and its suite count. The same from the full read
@@ -6449,6 +6486,9 @@ class Daemon:
         # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
         self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
         self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
+        # owner/repo -> seconds per head of a GraphQL head read (fetch_heads), carried across a reexec (HEAD_SECS_FILE)
+        self.head_secs_path: Path | None = BASE / HEAD_SECS_FILE
+        self.head_secs: dict[str, float] = load_full_pr_secs(self.head_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -11993,18 +12033,36 @@ class Daemon:
     def full_pr_size(self, full: list[dict]) -> int:
         """How many of FULL (one repository's PRs, as batched() groups them) one full-read query may carry: as many as
         fit PR_FULL_QUERY_SECONDS at the seconds per PR measured for the repository, all of them while none is."""
-        if not full:
+        return self.measured_size("full_pr_secs", full, PR_FULL_QUERY_SECONDS)
+
+    def head_size(self, heads: list[dict]) -> int:
+        """How many of HEADS (one repository's, as batched() groups them) one head query may carry (HEAD_QUERY_SECONDS
+        at the repository's measured seconds per head, head_secs; all of them while none is measured)."""
+        return self.measured_size("head_secs", heads, HEAD_QUERY_SECONDS)
+
+    def measured_size(self, attr: str, entries: list[dict], budget: float) -> int:
+        if not entries:
             return 1
-        secs = self.__dict__.setdefault("full_pr_secs", {}).get("/".join(split_key(full[0]["key"])[1:3]).lower())
-        return len(full) if secs is None else max(1, min(len(full), int(PR_FULL_QUERY_SECONDS // max(0.01, secs))))
+        secs = self.__dict__.setdefault(attr, {}).get("/".join(split_key(entries[0]["key"])[1:3]).lower())
+        return len(entries) if secs is None else max(1, min(len(entries), int(budget // max(0.01, secs))))
 
     def note_full_pr_secs(self, entries: list[dict], seconds: float, answered: bool) -> None:
         """Learn a repository's seconds per full PR read from one query of ENTRIES that took SECONDS: an answer moves
         the measure a third of the way to it; a failure slower than PR_FULL_SLOW_AT says the PRs cost at least that
         much between them (a query cut at ~10 s took longer than it shows), so the next query carries fewer."""
+        self.note_query_secs("full_pr_secs", "full_pr_secs_path", "pr-full-seconds", PR_FULL_QUERY_SECONDS,
+                             entries, seconds, answered)
+
+    def note_head_secs(self, entries: list[dict], seconds: float, answered: bool) -> None:
+        """note_full_pr_secs for a head query (head_secs, HEAD_SECS_FILE)."""
+        self.note_query_secs("head_secs", "head_secs_path", "head-seconds", HEAD_QUERY_SECONDS,
+                             entries, seconds, answered)
+
+    def note_query_secs(self, attr: str, path_attr: str, event: str, budget: float, entries: list[dict],
+                        seconds: float, answered: bool) -> None:
         repo = "/".join(split_key(entries[0]["key"])[1:3]).lower()
         per = seconds / len(entries)
-        measured = self.__dict__.setdefault("full_pr_secs", {})
+        measured = self.__dict__.setdefault(attr, {})
         known = measured.get(repo)
         if answered:
             measured[repo] = per if known is None else known + (per - known) / 3
@@ -12012,9 +12070,9 @@ class Daemon:
             floor = seconds * 1.25 / len(entries)
             if known is None or known < floor:
                 measured[repo] = floor
-                log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
-                     "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
-        path = getattr(self, "full_pr_secs_path", None)
+                log({"event": event, "repo": repo, "seconds": round(floor, 2),
+                     "size": self.measured_size(attr, entries, budget), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, path_attr, None)
         if path is not None and measured.get(repo) != known:
             with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
                 write_json(path, {k: round(v, 3) for k, v in measured.items()})
@@ -12024,16 +12082,31 @@ class Daemon:
         (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY (PR_FULL_BEHIND_EVERY while
         PR reads are behind, pr_behind), still open, and every
         failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
+        return self.probe_refusal(e) is None
+
+    def probe_refusal(self, e: dict) -> str | None:
+        """Why probe_ok refuses E a probe (the first condition it fails, a short name), or None when it takes one."""
         c = e.get("cache") or {}
         data = c.get("data")
+        if not isinstance(c.get("fp"), str):
+            return "no-fp"
+        if c.get("via") not in ("graphql", "graphql-probe") or c.get("error"):
+            return "not-graphql"
         # (an answer from an upstream keeps this host's old fp: never confirmed against it)
-        return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
-                and c.get("source") != "upstream"
-                and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
-                and isinstance(c.get("fullAt"), (int, float))
-                and self.now - c["fullAt"] < (PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
-                and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
-                and not self.rollup_stale(e["key"], c))
+        if c.get("source") == "upstream":
+            return "upstream"
+        if not isinstance(data, dict) or data.get("checksPageError") or data.get("state") != "OPEN":
+            return "not-open-whole"
+        if not isinstance(c.get("fullAt"), (int, float)):
+            return "no-full"
+        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+                                      else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY):
+            return "full-due"
+        if any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []):
+            return "steps"
+        if self.rollup_stale(e["key"], c):
+            return "rollup-stale"
+        return None
 
     def pr_behind(self, cache: dict) -> bool:
         """Whether PR reads are behind, so probe_ok lets a probe stand in for a full read up to PR_FULL_BEHIND_EVERY:
@@ -12191,6 +12264,8 @@ class Daemon:
             node = (data.get(f"p{i}") or {}).get("pullRequest")
             if f"p{i}" in failed or pr_fingerprint(node) != (e.get("cache") or {}).get("fp"):
                 if f"p{i}" in failed or not self.pending_counts_only(e, node):
+                    if f"p{i}" not in failed and self.queued_pending(e):
+                        self.note_probe_moved(e, node)
                     changed.append(e)
                     continue
                 # (the fingerprint stays the cached one, so the next probe asks again until PR_FULL_PENDING_EVERY)
@@ -12200,33 +12275,76 @@ class Daemon:
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
+    def queued_pending(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
+        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+        if e["key"] not in self.rollup_wanted():
+            return False
+        try:
+            fp = json.loads((e.get("cache") or {}).get("fp") or "null")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and fp[7] in ("PENDING", "EXPECTED")
+
     def pending_counts_only(self, e: dict, node: dict | None) -> bool:
-        """Whether E, a land-queue PR, differs from its cached answer only in the counts of its running checks: the
-        same head, state, mergeability and review, a rollup that was and is PENDING, and its last full read within
+        """Whether E, a queued_pending PR, differs from its cached answer only in the counts of its running checks:
+        the same head, state, mergeability and review, a rollup still PENDING, and its last full read within
         PR_FULL_PENDING_EVERY."""
         cache = e.get("cache") or {}
         full = cache.get("fullAt")
-        if e["key"] not in self.rollup_wanted() or not isinstance(full, (int, float)) \
-                or self.now - full >= PR_FULL_PENDING_EVERY:
+        if not isinstance(full, (int, float)) or self.now - full >= PR_FULL_PENDING_EVERY or not self.queued_pending(e):
             return False
         try:
             old, new = json.loads(cache.get("fp") or "null"), json.loads(pr_fingerprint(node) or "null")
         except (TypeError, ValueError):
             return False
-        return (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == 12
-                and old[:8] == new[:8] and old[0] == "OPEN" and old[7] in ("PENDING", "EXPECTED"))
+        return isinstance(new, list) and len(new) == 12 and not pending_fp_moved(old, new)
+
+    def note_probe_moved(self, e: dict, node: dict | None) -> None:
+        """Count, for land_direct_read_many's summary, what moved in a queued_pending PR's probe that sent it to a full
+        read: the fingerprint fields (pending_fp_moved) or the age bound."""
+        moved = getattr(self, "probe_moved", None)
+        if moved is None:
+            moved = self.probe_moved = Counter()
+        try:
+            new = json.loads(pr_fingerprint(node) or "null")
+            old = json.loads((e.get("cache") or {}).get("fp") or "null")
+        except (TypeError, ValueError):
+            new = old = None
+        fields = pending_fp_moved(old, new) if isinstance(new, list) and len(new) == 12 else ["unreadable"]
+        moved.update(fields or ["age"])
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
 
     def fetch_heads(self, entries: list[dict]) -> str | None:
-        """Every check on each head commit, one aliased query for the batch (a head with more than 100
-        contexts is followed page by page). None, or the error when the whole query failed."""
-        entries = [e for e in entries if not self.head_folded_now(e)]
+        """Every check on each head commit, in aliased queries sized by the repository's measured cost per head
+        (head_size). None, or the error of the first query that failed: the heads it and the ones after it carried
+        are left to batched(), which splits them, and a head an earlier query of this tick stored is not read again."""
+        entries = [e for e in entries if not self.head_folded_now(e) and not self.head_read_now(e)]
         if not entries:
             return None
+        size = self.head_size(entries)
+        for i in range(0, len(entries), size):
+            error = self.fetch_head_chunk(entries[i:i + size])
+            if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
+                if error is not None:
+                    for e in entries[i + size:]:
+                        self.refund(e["key"])  # never sent: as the whole chunk's failure refunded it before
+                return error
+        return None
+
+    def head_read_now(self, e: dict) -> bool:
+        """Whether a head query of this tick already stored this head (fetch_heads, before a later query failed)."""
+        at, keys = self.__dict__.get("head_read_tick", (None, frozenset()))
+        return at == self.now and e["key"] in keys
+
+    def fetch_head_chunk(self, entries: list[dict]) -> str | None:
+        """One aliased query for ENTRIES (a head with more than 100 contexts is followed page by page)."""
         self.reads += [(self.now, "head", "graphql")] * len(entries)
+        began = time.monotonic()
         doc, error = self.graphql(heads_query([e["key"] for e in entries]), {})
+        self.note_head_secs(entries, time.monotonic() - began, doc is not None and bool(doc.get("data")))
         if doc is None:
             self.fail(entries, error or "graphql: no response")
             for e in entries:
@@ -12294,6 +12412,10 @@ class Daemon:
             else:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
                 self.head_answered(e["key"])
+                at, keys = self.__dict__.get("head_read_tick", (None, set()))
+                if at != self.now:  # one tick's keys only: the set never outgrows a tick's heads
+                    self.head_read_tick = at, keys = self.now, set()
+                keys.add(e["key"])
 
     def last_real_contexts(self, suites: list[str] | str) -> tuple[list[dict], str | None]:
         """Check-run context nodes (statusCheckRollup's shape, marked lastRealAttempt) for every attempt of SUITES,
@@ -14327,6 +14449,10 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
+# LAND_CLOSED_BEFORE_REQUEST: a reopened PR stayed CLOSED in the cache (a terminal copy is re-read rarely, and never
+# while reads are scarce), and every re-request stopped at once "closed unmerged (the cache shows it closed)": cmux#57225,
+# 2026-11-26 05:57-06:50Z, copy read mid close-and-reopen, three re-requests each stopped on it. A CLOSED copy read
+# before the entry's latest request ends it only after one read since that request (closed_copy_stale).
 # LAND_BEFORE_REQUEST_READ: a land request with no --sha, sent right after a push, was judged on the copy read before
 # the push. It stopped at once on land_judge's conflict verdict for the old head, and the requester got that back as its answer: a forwarded
 # `land --wait` returned "head <old> conflict" seconds after the push (incident hq#20521's second data point). A
@@ -14540,6 +14666,19 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
+def land_own_token_pool(now: float | None = None) -> bool:
+    """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
+    as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
+    through the broker and holds none reads GitHub only through the broker (LAND_PEER_SILENT's comment)."""
+    tool = app_pool_tool()
+    for role in app_pool_chain(APP_POOL_SPARES):
+        if tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file():
+            return True
+        if app_pool_pushed_owners(role, now):
+            return True
+    return False
+
+
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
                             force: str = "") -> list[str]:
     """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
@@ -14650,8 +14789,11 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
             with daemon.calling(*caller_of(todo[0]), "tool:glaeda-gh land (batched refresh)"):
                 daemon.gql_reason = "pr-land-batch"
                 # the probes first, LAND_REFRESH_BATCH a query: the PRs whose fingerprint held are confirmed by it
-                probe = [e for e in entries if daemon.probe_ok(e)]
-                full = [e for e in entries if not daemon.probe_ok(e)]
+                refused = {e["key"]: daemon.probe_refusal(e) for e in entries}
+                probe = [e for e in entries if refused[e["key"]] is None]
+                full = [e for e in entries if refused[e["key"]] is not None]
+                daemon.probe_moved = Counter()
+                confirmed = 0
                 for i in range(0, len(probe), LAND_REFRESH_BATCH):
                     part = probe[i:i + LAND_REFRESH_BATCH]
                     changed, error = daemon.probe_prs(part)
@@ -14659,6 +14801,13 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                         errors.update({e["key"]: error for e in part})
                         continue
                     full += part if error else changed
+                    confirmed += 0 if error else len(part) - len(changed)
+                # why each row was or was not read in full: the land host's cache is not readable from elsewhere, and
+                # #2853 and its follow-up confirmed no row there for an hour with nothing to say which check refused it
+                log({"event": "land-probe-split", "n": len(entries), "probed": len(probe), "confirmed": confirmed,
+                     "pending": sum(1 for e in entries if daemon.queued_pending(e)),
+                     "refused": dict(Counter(r for r in refused.values() if r)),
+                     "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
                 left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
@@ -15723,6 +15872,14 @@ LAND_OWNER_REMIND_CAP = 2
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+
+# LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
+# reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
+# lw#9376's reminder said 4a7ee5cb2b6a, and re-queued there the row stopped again at 0d18d91f773a. 53 of this host's
+# 110 live stopped rows quote their own stop's head that way, and 3 of 9 head_moved reminders acted on 2026-11-25
+# pointed at state the PR had already moved past. The read LAND_OWNER_REMIND_READ already asks gives the head now for
+# free: when it moved, the reminder dates the stop and names the re-queue at the head now. Detector: test-glaeda-gh.py
+# test_a_reminder_names_the_head_now_when_the_stop_head_moved.
 # LAND_OWNER_REMIND_ENDS: a reminder that finds its PR over ends the row (merged, or stopped `closed`) with no word to
 # anyone, and a reminder of a stop that is still real goes as an inbox fyi (class fyi), never a blocker: its requester
 # was told at the stop, with the stop's one step. gcp-codex-lane-10, 2026-11-26 05:00Z: one lane got 11 "still stopped
@@ -16552,8 +16709,54 @@ LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
 LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
+# A judgment that read nothing because a git read of this host's own mirror timed out (land_judge's classifier
+# archive, "git archive ... tried twice: Command '[...git...]' timed out after 24 seconds") is no GitHub read the
+# broker host does better: it is this disk, busy for the moment. a lane VM, 2026-11-26: leo-workspace#11598
+# answered unreadable while a fetch of the 3.8 G cmux mirror ran, the archive timing out at 24 s twice (0.56 s after),
+# and was handed off on that. Such an answer is judged here again, LAND_LOCAL_GIT_RETRIES times per head, first.
+LAND_LOCAL_GIT_TIMEOUT = re.compile(r"\bgit\b[^\n]{0,400}?\btimed out\b")
+LAND_LOCAL_GIT_RETRIES = 2
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
-LAND_HANDOFF_DEADLINE = 60.0
+LAND_HANDOFF_DEADLINE = 120.0
+# LAND_HANDOFF_TRANSIENT: a hand-off the broker did not take because it could not answer -- the call cut at
+# LAND_HANDOFF_DEADLINE (exit 124), a 5xx or a dropped connection (LAND_STEP_TRANSIENT), the broker's own "busy:
+# admission queue full" past lane-gh's retry window, or its login's rate-limit latch ("... is spent for login until
+# HH:MMZ (reset); not sent, retry after ...") -- is not a refusal of this PR: nothing was judged, and the same call
+# is taken once the broker answers again. It used to count toward LAND_STEP_STOP like a real refusal and stop the row
+# handoff_refused, a code nothing re-arms. gcp-agent-lane-2, 2026-11-22 05Z-11-23 08Z, with the broker CPU-bound
+# ("busy: admission queue full (the broker is CPU-bound)"): 336 of the 411 handoff_refused events in its land store
+# were "timed out after 60s", and 59 rows (cmux#49887, cmux#50116, leo-workspace#6140, ...) sat stopped 75-123 h
+# though the same host's hand-offs were taken again from 11-23 03Z on. A transient refusal now backs off on its own
+# count (e["handoffTransient"], per head), never counts toward LAND_STEP_STOP, and after LAND_RETRY_STREAK_STOP at
+# one head stops "handoff_transient", which LAND_REARM_CODES re-arms (hourly, LAND_REARM_CAP a day), as a step's timeout
+# does. The two counts never reset each other: a head whose hand-offs alternate between a timeout and a real refusal
+# still stops at one of the two bounds, never loops. A legacy handoff_refused stop whose last refusal was transient is re-armed the same way (rearm). The deadline
+# is LAND_HANDOFF_DEADLINE = 120 s, lane-gh's own STEP_BUSY_S: a 60 s cut ended the call inside lane-gh's busy retry.
+# Detector: test-glaeda-gh.py test_a_hand_off_the_broker_could_not_answer_backs_off_and_is_rearmed_not_stopped.
+LAND_HANDOFF_TRANSIENT = re.compile(r"\bbusy: admission queue full\b|\bconnection reset by peer\b"
+                                    r"|\bis spent for login until \S+ \(reset\); not sent, retry after\b", re.I)
+
+
+# lane-gh's own progress line while it asks a busy broker again (tools/lane-gh ask_while_busy, admission_loop): "lane-gh
+# TOOL: the broker is busy (...); [nothing was started; ]asking again in 1.1 s (try 2), 300 s left of the 300 s retry
+# window". It precedes the call's final answer on stderr whatever that answer is, so only what follows the last one is
+# the broker's answer: a busy retry that ended in a real refusal ("unknown argument 'nominated'") is a real refusal.
+# Every form ends "N s left of" the bound it counts down: "300 s retry window", "the call's 120 s bound", "the queue
+# bound", "the command's deadline" (ask_while_busy, admission_loop, the queue wait): cut after its last word.
+LAND_HANDOFF_BUSY_PROGRESS = re.compile(r"asking again in [\d.]+ s \(try \d+\), \d+ s left of (?:the )?"
+                                        r"(?:\d+ s retry window|\d+ s(?! retry)|[^\n]*?(?:bound|deadline))\b")
+
+
+def land_handoff_transient(rc: int, said: str) -> bool:
+    """A hand-off refusal the broker gave without judging anything (LAND_HANDOFF_TRANSIENT's comment). SAID is the
+    broker's answer; any lane-gh busy-retry progress before it is skipped (LAND_HANDOFF_BUSY_PROGRESS)."""
+    if rc == 124:
+        return True
+    last = None
+    for last in LAND_HANDOFF_BUSY_PROGRESS.finditer(said):
+        pass
+    answer = said[last.end():] if last is not None and said[last.end():].strip() else said
+    return bool(LAND_STEP_TRANSIENT.search(answer) or LAND_HANDOFF_TRANSIENT.search(answer))
 # A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
 # read its PR again, so it never learned that the far host merged it, closed it or lost it. Finding hq#19725
 # (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
@@ -16585,6 +16788,12 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # read of the PR (outcome_read: one peek, LAND_FORWARD_READ_WAIT for it to land), so a merged PR is never told
 # "no outcome".
 LAND_FORWARD_ASK_FIRST = 300.0
+# LAND_BROKER_ASK: a lane VM has no `land serve` program to ask (far_command: no executor, no overflow peer), so its
+# handed-off rows were never asked and ran blind to the re-send and the give-up. a lane VM, 2026-11-26:
+# leo-workspace#11598 handed off at 03:59Z and 04:20Z, 0 land-forward-asked events, re-sent at 05:08Z, re-landed by
+# its give-up at 05:20Z. It asks through the broker instead (broker_ask_command: `lane-gh call land_handoff REPO`
+# {"outcomes": [N, ...]}, cmuxterm-hq parts/49-calls-land-handoff.py), one call per repo and pass, and the answer is
+# read as a far host's is. A broker that does not know `outcomes` refuses it: an ask failure, which changes nothing.
 # A row its far host stopped (forward_stopped) is asked about this long after its stop, this often: the far queue
 # rearms a stop that clears by itself (rearm), and its merge or reopen then reaches the forwarding host's row.
 LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
@@ -16617,6 +16826,13 @@ LAND_FORWARD_STATE_FRESH = 900.0
 # retrying (unjudgeable_here, early_hand_off, infra_read_stop), and a forwarded row it handed for a judgment is taken
 # back to be judged here (forward_reclaim). An ownership hand-off still goes (no merge of another lane's PR is possible
 # here), and an overflow skips a silent peer for the next one (overflow_send).
+# Not on a lane VM with no token pool of its own (land_own_token_pool false): there a judgment made here reads GitHub
+# through the same broker that went quiet, unauthenticated, and reads nothing. One lane VM's log held 460 "no-token"
+# lookups and 42 of 70 land judgments unreadable after a take-back; another's five days held 1,024 "unreadable" of the
+# 2,263 judgments of the 141 rows it took back (2026-11-21..26). Such a lane keeps the rows forwarded: no
+# take-back, and a row that cannot be judged here is still handed to the broker host. Each forwarded row is re-sent on
+# its own bound (LAND_FORWARD_RESEND, doubling), so the broker host gets it again once it answers, and its first
+# outcome ends the silence for every other row (silent_peers).
 LAND_PEER_SILENT = 1800.0
 LAND_PEER_SILENT_ROWS = 3
 LAND_PEER_SILENT_HOLD = 7200.0
@@ -17615,6 +17831,7 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
+                 own_pool: Callable[[], bool] = land_own_token_pool,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
                  head_watch: Callable[[str], None] | None = None,
@@ -17639,6 +17856,8 @@ class LandQueue:
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
+        self.own_pool = own_pool  # this host holds a token pool of its own (land_own_token_pool, LAND_PEER_SILENT)
+        self.own_pool_seen = (float("-inf"), False)  # (until, held): own_pool's file reads once per APP_POOL_TTL
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
@@ -18048,7 +18267,8 @@ class LandQueue:
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
-                     stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
+                     lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
                      forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
@@ -18704,14 +18924,31 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "")
-        if state == "CLOSED":
-            at = c.get("dataAt")
-            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
-                return False
+        if state == "CLOSED" and self.closed_copy_stale(e, c):
+            return False
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
             return True
         return self.stop_moved_pin(e, c, data)
+
+    def closed_copy_stale(self, e: dict, c: dict) -> bool:
+        """Under the lock. Whether a CLOSED copy of E's PR is too old to end E on: read before E was queued, or before
+        its last land request (requestedAt, a re-request's too) and not read since. A reopen lands between the two, so
+        that copy predates it: the first such look asks for one read (readBeforeStop, refresh_due's before-request
+        read) instead of stopping, and a fresh copy that still reads CLOSED ends E (LAND_CLOSED_BEFORE_REQUEST)."""
+        at = c.get("dataAt")
+        if not _finite(at) or at < float(e.get("created") or 0):
+            return True
+        asked = e.get("requestedAt")
+        last = (e.get("refresh") or {}).get("at")
+        if not _finite(asked) or at >= asked or (_finite(last) and last >= asked):
+            return False
+        if e.get("readBeforeStop") != asked:
+            e["readBeforeStop"] = asked
+            self.history(e, "stop_read_first", code="closed", age=round(asked - at))
+            self.save(e)
+            log({"event": "land-stop-read-first", "key": e["key"], "code": "closed", "age": round(asked - at)})
+        return True
 
     def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
         """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
@@ -19032,11 +19269,13 @@ class LandQueue:
                         or self.now - self.forward_asked.get(key, float("-inf")) < LAND_FORWARD_ASK_EVERY:
                     continue
                 host = self.forward_host(e)
-                command = self.far_command(host)
+                command, group = self.far_command(host), host
+                if command is None:
+                    command, group = self.broker_ask_command(e), f"{host}\t{e.get('repo')}"
                 if command is None:
                     continue
                 self.forward_asked[key] = self.now
-                groups.setdefault(host, (command, []))[1].append(key)
+                groups.setdefault(group, (command, []))[1].append(key)
             if len(self.forward_asked) > 4 * max(1, len(self.entries)):
                 self.forward_asked = {k: t for k, t in self.forward_asked.items() if k in self.entries}
         if not groups:
@@ -19051,12 +19290,16 @@ class LandQueue:
     def forward_ask(self, groups: dict[str, tuple[list[str], list[str]]], at: float) -> None:
         """GROUPS: far host -> (its program, the keys to ask about). Each answer, or why it could not be had, is kept
         in forward_answers as {"at", "host", "row"} or {"at", "host", "error"}."""
-        for host, (command, keys) in groups.items():
+        for group, (command, keys) in groups.items():
+            host = group.split("\t", 1)[0]
             for i in range(0, len(keys), LAND_OUTCOMES_MAX):
                 part = keys[i:i + LAND_OUTCOMES_MAX]
                 try:
-                    answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
-                                          LAND_FORWARD_DEADLINE)
+                    if command[1:3] == ["call", LAND_HANDOFF_TOOL]:
+                        answer = self.broker_outcomes(command, part)
+                    else:
+                        answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
+                                              LAND_FORWARD_DEADLINE)
                     rows = answer.get("outcomes")
                     if not answer.get("ok") or not isinstance(rows, dict):
                         raise WatchError(f"{host}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
@@ -19070,6 +19313,31 @@ class LandQueue:
                     log({"event": "land-forward-ask-failed", "host": host, "asked": len(part), "error": why})
                 with self.lock:
                     self.forward_answers.update(got)
+
+    def broker_ask_command(self, e: dict) -> list[str] | None:
+        """Under the lock. On a lane VM (broker_client), the broker call that asks its host's queue about E, a row
+        handed there (handedOff): `lane-gh call land_handoff REPO` with {"outcomes": [N, ...]} (LAND_BROKER_ASK's
+        comment); else None."""
+        if not e.get("handedOff") or not self.broker_client() or not isinstance(e.get("repo"), str):
+            return None
+        return [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "call", LAND_HANDOFF_TOOL, e["repo"]]
+
+    def broker_outcomes(self, command: list[str], keys: list[str]) -> dict:
+        """The broker host's queue's rows for KEYS (one repo's PRs) through COMMAND (broker_ask_command), in `land
+        serve` outcomes' shape ({"ok", "host", "outcomes": {key: row}}), or WatchError: no answer."""
+        numbers = {int(split_key(k)[3]): k for k in keys}
+        got = self.call([*command, json.dumps({"outcomes": sorted(numbers)})], LAND_HANDOFF_DEADLINE)
+        envelope: Any = None
+        with contextlib.suppress(ValueError):
+            envelope = json.loads(got.stdout or "")
+        doc = envelope.get("data") if isinstance(envelope, dict) else None
+        rows = doc.get("outcomes") if isinstance(doc, dict) else None
+        if got.returncode != 0 or not isinstance(rows, dict):
+            said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 200) or f"exit {got.returncode}"
+            raise WatchError(f"the broker's {LAND_HANDOFF_TOOL} outcomes: {said}")
+        repo = command[3]
+        return {"ok": True, "host": doc.get("host"),
+                "outcomes": {k: rows.get(f"{repo}#{n}") for n, k in numbers.items()}}
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -19122,9 +19390,21 @@ class LandQueue:
         self.peer_quiet = quiet
         return quiet
 
-    def broker_peer_silent(self) -> str:
-        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or ""."""
+    def tokenless(self) -> bool:
+        """Under the lock. A broker client with no token pool of its own (own_pool, read once per APP_POOL_TTL): its
+        judgments read GitHub only through the broker, so it keeps rows forwarded to a silent peer (LAND_PEER_SILENT)."""
         if not self.broker_client():
+            return False
+        until, held = self.own_pool_seen
+        if self.now >= until:
+            held = bool(self.own_pool())
+            self.own_pool_seen = (self.now + APP_POOL_TTL, held)
+        return not held
+
+    def broker_peer_silent(self) -> str:
+        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or "".
+        Always "" on a tokenless lane VM: it keeps handing rows to the broker host (LAND_PEER_SILENT's comment)."""
+        if not self.broker_client() or self.tokenless():
             return ""
         quiet = self.silent_peers()
         return quiet.get(self.broker_peer, "") if self.broker_peer else ""
@@ -19217,7 +19497,8 @@ class LandQueue:
         last = e.get("forwardResent") or {}
         if not executor and e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e):
             quiet = self.silent_peers().get(str(e.get("forwardedTo") or ""))
-            if quiet:  # re-sending to a peer that answers none only waits longer (LAND_PEER_SILENT's comment)
+            # a tokenless lane VM keeps it forwarded and re-sends it on its bound (LAND_PEER_SILENT's comment)
+            if quiet and not self.tokenless():  # re-sending to a peer that answers none only waits longer
                 self.forward_reclaim(e, host, quiet)
                 return False
         if not e.get("forwardFirst"):
@@ -19755,7 +20036,7 @@ class LandQueue:
         """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not LAND_REARM_CODES.match(code):
+        if not LAND_REARM_CODES.match(code) and not self.handoff_stop_transient(e):
             return False
         # A PR that merged or closed since the stop is over: it ends its entry (merged, or stopped "closed"), never a
         # re-arm. gcp-codex-swarm-06, 2026-11-20/21: hq#14618, merged long before, re-armed retry_deadline hour after
@@ -19778,7 +20059,7 @@ class LandQueue:
         n = int(r.get("n") or 0) if r.get("day") == day else 0
         if n >= LAND_REARM_CAP:
             return False
-        e["rearms"] = {"day": day, "n": n + 1}
+        e["rearms"] = {"day": day, "n": n + 1, "at": self.now, "code": code}  # attributable to the stop it answered
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
         if latched:
@@ -19790,6 +20071,16 @@ class LandQueue:
         self.save(e)
         return True
 
+    @staticmethod
+    def handoff_stop_transient(e: dict) -> bool:
+        """E is stopped handoff_refused and its last refusal was one the broker gave without judging anything: a
+        stop from before LAND_HANDOFF_TRANSIENT, re-armed as a handoff_transient stop is."""
+        st = e.get("stop") or {}
+        if st.get("code") != "handoff_refused":
+            return False
+        why = str((e.get("handoffFail") or {}).get("why") or st.get("reason") or "")
+        return land_handoff_transient(0, why)
+
     def remind(self, e: dict) -> bool:
         """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
         (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
@@ -19797,7 +20088,8 @@ class LandQueue:
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code) \
+                or self.handoff_stop_transient(e):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
         to = str(e.get("requester") or "")
         if not to:
@@ -19817,17 +20109,32 @@ class LandQueue:
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
+        cache = self.cache_of(e["key"]) or {}
+        data = cache.get("data") or {}
+        read_at = [t for t in (cache.get("dataAt"), cache.get("updatedAtAt"), cache.get("fetchedAt")) if _finite(t)]
+        head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
+        was = str(st.get("head") or "").lower()
+        moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
+        e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
+                        **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
         if st.get("next"):
             msg += f" next: {land_trim(str(st['next']), 300)}"
+        if moved:
+            # The stop is evidence at a commit the PR has moved past, so its one step names a sha that is no longer the
+            # head: the re-queue at the head now comes first, and the stop's own sha is dated.
+            msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
+                    f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
+        elif not head and was:
+            msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
-        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
+        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
+                     **({"moved": head[:12]} if moved else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1)})
+             "hours": round(hours, 1), "moved": moved})
         self.save(e)
         self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS)  # told at the stop; a repeat is an inbox fyi
         return True
@@ -20737,7 +21044,10 @@ class LandQueue:
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
-        if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
+        state = str(data.get("state") or "")
+        if state == "CLOSED" and self.closed_copy_stale(e, c or {}):
+            return  # refresh_due reads it first (LAND_CLOSED_BEFORE_REQUEST)
+        if self.ended(e, state, e.get("mergeSha") or "", "the cache shows it"):
             return
         infra = e.pop("infraHandoff", None)
         if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED \
@@ -22725,6 +23035,13 @@ class LandQueue:
             return ""
         if self.broker_peer_silent():
             return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
+        if LAND_LOCAL_GIT_TIMEOUT.search(str(answer.get("reason") or "")):
+            tries = e.get("localGitRetry") if isinstance(e.get("localGitRetry"), dict) else {}
+            n = int(tries.get("count") or 0) + 1 if tries.get("head") == head else 1
+            if n <= LAND_LOCAL_GIT_RETRIES:
+                e["localGitRetry"] = {"head": head, "count": n, "at": self.now}
+                self.history(e, "local_git_retry", head=head[:12], n=n)
+                return ""  # judged here again (LAND_LOCAL_GIT_TIMEOUT's comment)
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
@@ -24376,6 +24693,7 @@ class LandQueue:
                 host = str(doc.get("host") or "the broker host")
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
+                e.pop("handoffTransient", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
                                   "request": str(doc.get("request") or ""),
                                   "kind": "judgment" if due.get("kind") == "judgment" else "ownership"}
@@ -24394,6 +24712,24 @@ class LandQueue:
             self.hand_off(e, live, repinned=True)  # off the lock, as the first call was
             return
         with self.lock:
+            answer = said
+            if isinstance(envelope, dict):
+                inner = doc.get("error") or doc.get("reason") if isinstance(doc, dict) else ""
+                answer = f"{envelope.get('error') or ''} {inner or ''}".strip() or said
+            if land_handoff_transient(got.returncode, answer):
+                last = e.get("handoffTransient") or {}
+                n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+                e["handoffTransient"] = {"head": head, "count": n, "at": self.now, "why": said}
+                self.history(e, "handoff_refused", head=head[:12], why=land_trim(said, 160), n=0, transient=n)
+                if n >= LAND_RETRY_STREAK_STOP:
+                    self.stop(e, "handoff_transient", f"{what}, and the broker host's land queue could not answer "
+                              f"the hand-off {n} times at this head: {said}",
+                              f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+                    return
+                after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+                self.wait(e, {"kind": "retry", "why": f"the broker host's land queue could not answer the hand-off "
+                              f"({land_trim(said, 80)}): backoff {after:.0f} s"}, after)
+                return
             last = e.get("handoffFail") or {}
             n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}
@@ -34941,12 +35277,47 @@ def path_gh_after(directory: Path) -> Path | None:
 
 def broker_guard_comes_back(guard: Path) -> bool:
     """Whether the gh-quota guard would hand the call back to this broker: the next `gh` after it on PATH is this
-    broker's own shim. A merge and a create go to the guard either way (one is refused without it, the other has a
-    pause only it can ask), but for every other call this is the condition that makes the hand-off free: without
-    it the guard runs the real gh behind this broker's back, and the call loses the answer cache, the source
-    refusal and the repeat hold -- a worse trade than the quota route it would gain."""
+    broker's own shim. When it is, the hand-off keeps the answer cache, the source refusal and the repeat hold."""
     following = path_gh_after(guard.parent)
     return following is not None and BROKER_MARK.encode() in file_head(following)
+
+
+# Where `glaeda-gh gh --install-shim` writes the broker's shim; GLAEDA_GH_SHIM_DIR names another (tests).
+BROKER_SHIM_DIR = Path(".local/lib/glaeda-gh/bin")
+
+
+def broker_installed_shim_dir() -> Path | None:
+    """The directory of this host's installed broker shim (a `gh` carrying BROKER_MARK), or None."""
+    directory = Path(os.environ.get("GLAEDA_GH_SHIM_DIR") or Path.home() / BROKER_SHIM_DIR)
+    shim = directory / "gh"
+    if shim.is_file() and os.access(shim, os.X_OK) and BROKER_MARK.encode() in file_head(shim):
+        return directory
+    return None
+
+
+def broker_handoff_path(guard: Path) -> str:
+    """The PATH the gh-quota guard is exec'd with: its own directory first, then -- when the next `gh` after it would
+    not be this broker -- the installed broker shim's directory, so the guard hands the call back here and the call
+    keeps the answer cache, the source refusal and the repeat hold. With no shim installed the guard runs the real
+    gh itself: the call is charged to the login's ledger either way, which is the point of the hand-off.
+
+    Before 2026-11-26 the hand-off was skipped whenever the guard would not come back, which is every `glaeda-gh gh`
+    run from a timer, a LaunchAgent or a systemd unit (their PATH has the guard after nothing, or not at all). Those
+    calls ran the real gh outside the gh-quota shim, so its ledger never saw them: measured 2026-11-26 03:40Z, 240 s
+    on seven login hosts, 238 `gh` processes started by this broker without GH_QUOTA_DEPTH (air-blue's leo-asks
+    tick alone 58 GraphQL searches), against a NOW quota-untallied red of 2144 of 2379 GraphQL points untallied."""
+    rest = os.environ.get("PATH", "")
+    parts = [str(guard.parent)]
+    if not broker_guard_comes_back(guard):
+        shim_dir = broker_installed_shim_dir()
+        if shim_dir is not None and shim_dir != guard.parent:
+            parts.append(str(shim_dir))
+        elif path_gh_after(guard.parent) is None:
+            # A LaunchAgent's PATH can hold no gh at all: the guard would fall back to a bare `gh` and fail where
+            # this broker finds one in the usual install paths. Name that one's directory last.
+            with contextlib.suppress(Exception):
+                rest = os.pathsep.join(entry for entry in (rest, str(Path(broker_real_gh()).parent)) if entry)
+    return os.pathsep.join([*parts, rest]) if rest else os.pathsep.join(parts)
 
 
 def broker_real_gh() -> str:
@@ -37234,8 +37605,9 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         # -- which is what this tool's own next-step lines print -- the call had one route and no ledger entry.
         # Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr edit 2358 -R
         # teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the
-        # identical bare `gh pr edit` answered over REST at once. Unlike a merge or a create, this hand-off is taken only when the guard would hand the
-        # call back here (broker_guard_comes_back) and not for this daemon's own reads, which keep their route.
+        # identical bare `gh pr edit` answered over REST at once. The hand-off is taken whether or not the guard would hand the
+        # call back here (broker_handoff_path puts the installed shim after it when it would not), and not for this
+        # daemon's own reads, which keep their route.
         # CMUX_GH_BROKER_DISABLE is honoured here, unlike for a merge or a create: a merge may never be sent
         # past land_judge and a create may never skip the login's pause, but for an ordinary call that switch is
         # a person asking for the real gh and the line they typed, and it is the escape hatch the loop message
@@ -37247,15 +37619,13 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         if create or other:
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-                if guard.is_file() and os.access(guard, os.X_OK) \
-                        and (create or broker_guard_comes_back(guard)):
+                if guard.is_file() and os.access(guard, os.X_OK):
                     # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
                     # to the process being started. Mutating this process first leaves the guard's directory on
                     # PATH and the hop mark set for every later call in the same process, which is wrong for
                     # every in-process caller (a test, the daemon) whenever the exec does not happen.
                     # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
-                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
-                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()), "PATH": broker_handoff_path(guard)}
                     os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
