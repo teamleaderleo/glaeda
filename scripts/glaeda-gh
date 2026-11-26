@@ -1398,6 +1398,9 @@ PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in ful
 # from the rollup; the probe at 2026-11-25 00:15Z found all 57 of the most recently updated open cmux and cmuxterm-hq
 # heads' rollups complete.
 PR_REST_SUITES_FROM_CONTROLLER = True
+# The REST PR read's pulls/N comes from the controller's webhook-fed PR row when it is seeded and fresh
+# (Daemon.controller_pull): glaeda-upstream asked pulls/{n} 567 and issues/{n} 214 times an hour (2026-11-26).
+PR_PULL_FROM_CONTROLLER = True
 CONTROLLER_ROLLUP_TIMEOUT = 2.0  # a complete rollup answers in 0.05-1.4 s; a cold one is seeding from GitHub
 CONTROLLER_ROLLUP_SLOW_SKIP = 15.0  # a head whose rollup timed out is not asked again for this long
 CONTROLLER_ROLLUP_DOWN = 30.0  # a controller that failed otherwise is not asked for a rollup for this long
@@ -2517,6 +2520,15 @@ def iso_epoch(text: str | None) -> float | None:
         return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def github_time(text: Any) -> str | None:
+    """A Go RFC 3339 time (the controller's rows) as GitHub's REST API writes it, 2026-11-26T07:00:00Z, so a
+    controller answer and GitHub's compare equal; the text itself when it does not parse."""
+    at = iso_epoch(stream_time(text)) if isinstance(text, str) else None
+    if at is None:
+        return text
+    return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def stream_time(text: Any) -> str | None:
@@ -10540,6 +10552,28 @@ class Daemon:
             reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
+    def land_ingest_idle(self) -> int:
+        """From the forward scheduler's thread, every TICK, on a host that executes its own lands: apply the requests
+        that came since the last pass (LandQueue.ingest_between), so a `land` is a row in seconds. land_refill does it
+        only between two of this login's own requests, and a host that reads through an upstream makes none: there a
+        request waited for the next whole pass, once a tick (a lane VM, 2026-11-26: passes ~5 min apart, and `land
+        status` showed no row meanwhile). Never inside a pass or a refill (land_pass_lock); refill stays the tick's."""
+        q = self.land_queue
+        if q is None or self.reexec_waiting or getattr(self, "in_land", False) or not getattr(q, "executes", False):
+            return 0
+        d = q.requests_dir()
+        if not d.is_dir() or not any(d.glob("*.json")):
+            return 0
+        if not self.land_pass_lock.acquire(blocking=False):
+            return 0
+        try:
+            if land_executor(q.config()) is not None:
+                return 0
+            q.now = time.time() if getattr(self, "clock_real", True) else self.now
+            return q.ingest_between()
+        finally:
+            self.land_pass_lock.release()
+
     def land_tick(self, forward_only: bool = False) -> None:
         """The forward scheduler and read tick share one queue, including when its executor changes at runtime."""
         if not self.land_pass_lock.acquire(blocking=False):
@@ -12129,10 +12163,16 @@ class Daemon:
             return keys
         q = self.land_queue
         if q is None:
-            keys = frozenset()
-        else:
-            with q.lock:
-                keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
+            # A process with no land queue (a wait's direct read, a free reading): the PRs the serving daemon's queue
+            # holds, from its entries on disk, so a full read of one here keeps its snapshot too. It never sweeps:
+            # its queue is not the queue. The land host, 2026-11-26 07:47-08:07Z: of 55 batched land refreshes, 32
+            # were refused a probe as rollup-stale, because each such process's first read swept with an empty set
+            # and removed every PR's rollup snapshot (and the land queue's per-judgment copies).
+            keys = land_queue_keys_on_disk()
+            self.rollup_keys = (self.now, keys)
+            return keys
+        with q.lock:
+            keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
         self.rollup_keys = (self.now, keys)
         if self.now - self.rollup_swept >= ROLLUP_SWEEP_EVERY:
             self.rollup_swept = self.now
@@ -13317,6 +13357,13 @@ class Daemon:
         manaflow-ai/cmux#44595), so a 304 on it means unchanged since that pull. A failed issue read falls back to
         reading the pull. Raises WatchError (the pull's), OutOfTime."""
         path, gate = f"{root}/pulls/{number}", f"{root}/issues/{number}"
+        row = self.controller_pull(root, number) if reuse else None
+        if row is not None:  # the controller's webhook-fed row answers: no issues/N, no pulls/N
+            parts[path] = row
+            if gate not in parts and not self.etags:
+                parts[gate] = {"doc": slim_issue_gate(row["doc"])}
+            # reused: when every check settles and something changed, fetch_pr_rest reads GitHub's merge state
+            return row["doc"], True
         kept = old.get(path) or {}
         at = kept.get("at")
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
@@ -13349,6 +13396,50 @@ class Daemon:
         if (parts.get(gate) or {}).get("doc", {}).get("updated_at") != pull.get("updated_at"):
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
+
+    def controller_pull(self, root: str, number: Any) -> dict | None:
+        """GET pulls/N's part (slim_pull) from the controller's webhook-fed PR row (/v1/github/prs/N/verdict), else
+        None (off, out, slow, failed, not seeded, or an open row whose mergeability is unknown or was stored
+        PULL_REUSE_MAX ago or more: the bound a kept pull has). A closed or merged row answers at any age: that
+        state is final until a reopen, which the controller's delivery moves. No GitHub request. Why
+        (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 23:15Z-11-26 05:15Z): glaeda-upstream, every lane
+        VM's direct reads, asked pulls/{n} 567 and issues/{n} 214 times an hour while the controller held each row."""
+        if not PR_PULL_FROM_CONTROLLER:
+            return None
+        own = self.controller is not None
+        get = getattr(self.controller if own else self.rollup_controller, "get", None)
+        if (not callable(get) or (own and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT))
+                or self.now < self.rollup_down_until or not str(number).isdigit()):
+            return None
+        repo = root.removeprefix("/repos/")
+        try:
+            body = get(f"/v1/github/prs/{int(number)}/verdict?repo=" + urllib.parse.quote(repo, safe="/"),
+                       timeout=CONTROLLER_ROLLUP_TIMEOUT)
+        except (ControllerTimeout, NoReceiver):  # slow, or no such route or row: GitHub answers
+            return None
+        except WatchError:
+            self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
+            return None
+        row = body.get("pr") if isinstance(body, dict) and body.get("found") is True \
+            and body.get("seeded") is True else None
+        if (not isinstance(row, dict) or row.get("number") != int(number)
+                or str(row.get("repo") or "").lower() != repo.lower()
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", str(row.get("head_sha") or ""))
+                or row.get("state") not in ("open", "closed") or not row.get("updated_at")):
+            return None
+        stored = iso_epoch(stream_time(row.get("received_at")))
+        if row["state"] == "open" and (not isinstance(row.get("mergeable"), bool) or stored is None
+                                       or self.now - stored >= PULL_REUSE_MAX):
+            return None
+        doc = slim_pull({"number": row["number"], "html_url": row.get("url"), "title": row.get("title"),
+                         "state": row["state"], "draft": bool(row.get("draft")), "merged": bool(row.get("merged")),
+                         "merged_at": github_time(row.get("merged_at")) if row.get("merged") else None,
+                         "mergeable": row.get("mergeable"),
+                         "mergeable_state": row.get("mergeable_state") or None,
+                         "updated_at": github_time(row["updated_at"]),
+                         "head": {"sha": str(row["head_sha"]).lower(), "ref": row.get("head_ref")},
+                         "base": {"ref": row.get("base_ref")}})
+        return {"doc": doc, "at": min(self.now, stored or self.now), "via": "controller"}
 
     def issue_vouches(self, held: dict) -> bool:
         """Whether HELD, a kept GET issues/N answer, can say a PR has not changed (issue_same): its ETag, or with no
@@ -14675,6 +14766,14 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
+def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
+    """The gh argv that takes LAND_UNLABEL off REPO#NUMBER: the broker's `pr edit --remove-label` form (BROKER, a lane
+    VM: the broker sends no REST DELETE), else GitHub's REST DELETE of the issue label."""
+    if broker:
+        return ["pr", "edit", number, "-R", repo, "--remove-label", LAND_UNLABEL]
+    return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
+
+
 def land_own_token_pool(now: float | None = None) -> bool:
     """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
     as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
@@ -14721,6 +14820,19 @@ LAND_REPLACED_HEAD_WAIT = 300.0
 LAND_MOVED_NEXT = re.compile(r"--(?:sha|match-head-commit) ([0-9a-f]{40})\b")
 
 
+# leo-workspace tools/wip_checkpoint.py's own words for the PRs it opens: the body line and the title's start (today's
+# CHECKPOINT_TITLE and the earlier "... of a gone session, do not land"). Copied, since this file imports nothing of it.
+CHECKPOINT_MARK = "HOLD: machine-made checkpoint"
+CHECKPOINT_TITLE_PREFIX = "WIP (machine checkpoint"
+
+
+def land_machine_hold(reason: str, data: dict) -> bool:
+    """Whether a `hold` stop is a machine-made checkpoint's (LAND_OWNER_REMIND_BACKOFF's comment): land_judge quotes
+    the body's CHECKPOINT_MARK in its reason, or the cached PR's title is a checkpoint's (CHECKPOINT_TITLE_PREFIX)."""
+    title = str(data.get("title") or "") if isinstance(data, dict) else ""
+    return CHECKPOINT_MARK in (reason or "") or title.startswith(CHECKPOINT_TITLE_PREFIX)
+
+
 def land_replaced_head(e: dict, head: str, now: float) -> bool:
     """True when HEAD is the pin E's last head_moved stop said GitHub had replaced, E is now pinned at the head that stop
     read, and the re-pin is younger than LAND_REPLACED_HEAD_WAIT: a copy older than the stop's own read."""
@@ -14753,6 +14865,20 @@ def land_direct_read(key: str) -> str | None:
 # that follows reads the daemon's copy instead of GitHub.
 LAND_REFRESH_BATCH = 50  # PRs per batched refresh (one probe query of ~3 requests a PR: 50 is about 2 points)
 LAND_REFRESH_BATCH_BUDGET = 180.0  # seconds one batch's reads may take (a single read's is DIRECT_READ_BUDGET)
+
+
+def land_queue_keys_on_disk() -> frozenset[str]:
+    """The keys of the land queue's entries on disk that are not done (LandQueue.load's view, read only): the PRs
+    whose full reads keep a rollup snapshot, for a process that holds no land queue of its own."""
+    d = LandQueue.entries_dir()
+    keys = set()
+    with contextlib.suppress(OSError):
+        for p in d.glob("*.json"):
+            e = read_json(p)
+            if isinstance(e, dict) and isinstance(e.get("key"), str) and e.get("state") in LAND_STATES \
+                    and e.get("state") not in LAND_DONE:
+                keys.add(e["key"])
+    return frozenset(keys)
 
 
 def land_read_keeps_rollups(daemon: "Daemon", keys: list[str]) -> None:
@@ -14823,6 +14949,12 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")
+                # A row batched() deferred (the GraphQL pace, the tick's share or budget, a split limit) waits for a
+                # next tick this throwaway Daemon never has: name the limit that held it. The land host, 2026-11-26
+                # 08:41-09:03Z: 69 batched rows ended "no data stored", about half of each 50-row batch, with no reason.
+                miss = getattr(daemon, "miss_why", None) or {}
+                for k in daemon.deferred:
+                    errors.setdefault(k, "not read: deferred, " + (miss.get(k) or "no reason kept"))
         except OutOfTime as stop:
             why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
             errors.update({k: why for k in todo if k not in errors})
@@ -15512,6 +15644,18 @@ LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
+# shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
+# another commit, the PR object is what lags, not the branch: GitHub made the branch's new head (someone's update-branch, a
+# push) and has not synchronized the PR to it, so no further update-branch can succeed and none is counted toward
+# LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_SYNC_STUCK it stops pr_head_unsynced, naming the
+# one step that made GitHub read the branch again: closing and reopening the PR (a new commit pushed at 08:02Z did
+# not; the reopen at 08:08Z read head 1fd256a5 at once). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
+# own update-branch made 40818337 (07:28:42Z, committer web-flow), and 30 min later pulls/56682 still read head
+# 54746b5f, updated_at 06:06Z, with no check run at 40818337; this queue sent update-branch at 54746b5f five times
+# (07:29-07:41Z), each refused for the head mismatch and counted as a refusal of the PR.
+LAND_HEAD_MISMATCH = re.compile(r"expected head sha|head sha didn.?t match|head branch was modified", re.I)
+LAND_PR_SYNC_STUCK = 1200.0
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
 LAND_PIN_PARENT_WAIT = 300.0
@@ -15521,6 +15665,17 @@ LAND_PIN_PARENT_WAIT = 300.0
 # (2026-11-25 17:12Z-19:59Z, manaflow-ai/cmux#53399, #55811, #53921, #53968: 3 update_head_unread stops asked for a
 # re-pin, and each re-pin stopped head_moved 300 s later, the PR still at the old head).
 LAND_PR_SYNC_MAX = 1800.0
+# How long that same wait goes before the daemon closes and reopens the PR itself (LandQueue.pr_reopen), once per
+# update: GitHub syncs a PR's head to its branch on reopen. 2026-11-25: manaflow-ai/cmux#57070 (3309 s) and #54988
+# (4896 s) stopped pr_head_unsynced within one hour; each time a person ran `gh pr close && gh pr reopen` and the PR
+# showed the update's commit within ~25 s. Only for the queue's own clean base merge (update_tip_clean), with the
+# branch ref read again just before the close; the pin then follows the new head only through pin_follow (its first
+# parent is the pin the update was sent at), so a foreign push is never carried and land_judge judges the new head.
+LAND_PR_REOPEN_AFTER = 600.0
+# A copy of the PR reading CLOSED that was read before a reopen of the daemon's own, or this soon after it (GitHub's
+# reads lag), is that close's, not a person's: it does not end the row (retire_from_cache).
+LAND_PR_REOPEN_LAG = 120.0
+LAND_PR_REOPEN_TRIES = 3  # a closed PR left closed by one failed reopen is worse than two more calls
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -15863,14 +16018,24 @@ LAND_REARM_CAP = 3
 # work, so the drain is work, not garbage. Re-judging them would be wrong (land_judge's conflicts_base: "no retry or
 # fetch clears a conflict, only a merge of the base into the head", guarded by its test_land_judge_no_spiral), so the
 # reminder judges nothing: the row stays stopped at the same gen and its requester gets the stop's own one step again,
-# with its age, every LAND_OWNER_REMIND_EVERY, at most LAND_OWNER_REMIND_CAP a UTC day. The precedent is in this file:
+# with its age, on LAND_OWNER_REMIND_BACKOFF's schedule. The precedent is in this file:
 # a *forwarded* stopped row's far host is re-asked every LAND_FORWARD_STOPPED_ASK_EVERY; the local owner had no
 # equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
 # the requester's to act on. Detector: test-glaeda-gh.py
 # test_a_stop_that_never_rearms_still_reaches_its_owner.
-LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate|machine_hold)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
-LAND_OWNER_REMIND_CAP = 2
+# LAND_OWNER_REMIND_BACKOFF: "2 a UTC day" never ended, so a row nobody acts on was reminded for as long as LAND_KEEP
+# kept it. gcp-codex-lane-11, 2026-11-26 04:43Z, its first night: four rows that could never land were reminded, among
+# them hq#18246, a wip_checkpoint PR whose body holds it as a machine-made checkpoint (stopped `hold` 90 h). Two rules:
+# - the n-th reminder comes LAND_OWNER_REMIND_EVERY * 2**(n-1) after the one before it (6, 12, 24, 48 h), at most
+#   LAND_OWNER_REMIND_MAX in all (never more than 2 in any 24 h, so it replaces the daily cap), each saying "reminder
+#   n of 4" and when the next is due; past the last the row is still listed by `land status`;
+# - a `hold` whose reason or title is a machine-made checkpoint's (CHECKPOINT_MARK, CHECKPOINT_TITLE_PREFIX) stops
+#   `machine_hold`: said once at the stop, never re-armed or reminded, since nobody is meant to clear it.
+# Detectors: test-glaeda-gh.py test_a_stop_that_never_rearms_still_reaches_its_owner,
+# test_a_machine_checkpoint_hold_is_said_once_and_never_reminded.
+LAND_OWNER_REMIND_MAX = 4
 # LAND_OWNER_REMIND_READ: "a PR that is over owes nothing" was decided on whatever copy the cache held, and a stopped row
 # is unwatched, so that copy is the one from before the stop or none at all (a lane VM keeps no copy of an unwatched PR).
 # gcp-agent-lane-2, 2026-11-26 04:42Z: cmux#55358 stopped update_branch_refused at 03:08Z on 11-25, merged at 07:56Z by
@@ -15878,18 +16043,26 @@ LAND_OWNER_REMIND_CAP = 2
 # reminder whose copy is missing or older than its last word (the stop, or the last reminder) first asks one direct
 # read (refresh_job, as after_blind_read does) and is decided on the pass after it lands. Bounded: past
 # LAND_OWNER_REMIND_READ_WAIT beyond due with no read (a hold, a full pool, a failed read) it is told on the copy there
-# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
+# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_MAX a row in all. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_OWNER_REMIND_UNREAD_ONCE: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
+# repeats a copy from before the stop. cmux16, 2026-11-26 09:30Z: one requester got 20 "still stopped after 46-88 h"
+# reminders in an hour; 16 of those 20 PRs had merged or closed days before, but cmux16's reads of them never landed, so
+# each was told on its old OPEN copy. A stop now gets at most one reminder on a copy no read refreshed (the head moving
+# since the stop is new evidence and starts it again); past it, the row stays stopped and says nothing until a read
+# lands (history remind_held). LAND_OWNER_REMIND_MAX stays the one bound on how many in all. Detector:
+# test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_told_once_per_stop.
 # LAND_OWNER_REMIND_STALE: a reminder is an inbox fyi (LAND_OWNER_REMIND_ENDS), and an fyi wakes nobody, so a stop its
 # requester did not act on in the first day was never heard again: cmux-cp-1, 2026-11-26, ~45 rows "still stopped
-# after 29-65 h" (lw#8652 ... lw#10988, cmux#53146, hq#26188), each reminded twice a day as fyi to a coordinator
-# that had queued them for helpers long gone. Of 25 open leo-workspace ones, 17 were base-red fixes main had fixed
-# another way (close), 4 merged main cleanly (re-queue) and 4 needed a hand merge: all one decision away. The first
-# reminder past LAND_OWNER_REMIND_STALE_AFTER at a head unmoved since the stop goes as a blocker (it wakes), names that
-# decision, and is also a coordinator notice (land-stopped-stale); once per stop head (reminds.staleHead), every later
-# reminder of that stop is an fyi again. Detector: test-glaeda-gh.py
-# test_a_stop_unmoved_past_a_day_wakes_its_owner_once.
+# after 29-65 h" (lw#8652 ... lw#10988, cmux#53146, hq#26188), each reminded as fyi to a coordinator that had queued
+# them for helpers long gone. Of 25 open leo-workspace ones, 17 were base-red fixes main had fixed another way (close),
+# 4 merged main cleanly (re-queue) and 4 needed a hand merge: all one decision away. The first reminder past
+# LAND_OWNER_REMIND_STALE_AFTER at a head unmoved since the stop, on a copy a read refreshed (an unread copy may be a PR
+# merged since: LAND_OWNER_REMIND_UNREAD_ONCE holds it first), goes as a blocker (it wakes), names that decision, and is
+# also a coordinator notice (land-stopped-stale); once per stop head (reminds.staleHead), every later reminder of that
+# stop is an fyi again. Detectors: test-glaeda-gh.py test_a_stop_unmoved_past_a_day_wakes_its_owner_once,
+# test_a_stale_stop_on_an_unread_copy_is_held_and_wakes_nobody.
 LAND_OWNER_REMIND_STALE_AFTER = 86400.0
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
@@ -15915,7 +16088,10 @@ LAND_OWNER_REMIND_STALE_AFTER = 86400.0
 # Taken off: a `cancelled` entry, a `closed` stop at once, and any other stop LAND_UNLABEL_AFTER after it when it will
 # not re-arm by itself (rearm: not a LAND_REARM_CODES code, or today's LAND_REARM_CAP spent). Never: full-ci (a person
 # or agent set that on purpose), a teammate's PR (a `teammate` stop in the history: their label is their opt-in), a
-# forwarded row (its executor's own loop takes it off), a broker client (no GitHub login of its own). One REST DELETE
+# forwarded row or one handed to the broker host's queue (that executor's own loop takes it off). A broker client (a
+# lane VM, no GitHub login of its own) sends it as the broker's `gh pr edit N --remove-label ready-to-land`
+# (land_unlabel_args): until 2026-11-26 it skipped, and lane VMs' queues never took a label off, so 998 open cmux PRs
+# still carried it (ci-min-per-pr-30). One REST DELETE (or broker pr edit)
 # per ended land (e["unlabeled"]), a 404 counting as gone, at most LAND_UNLABEL_BATCH a pass, off the pass thread;
 # a refused one is retried after LAND_UNLABEL_AFTER, LAND_UNLABEL_TRIES times. Detector: test-glaeda-gh.py -k unlabel.
 LAND_UNLABEL = "ready-to-land"
@@ -17125,8 +17301,17 @@ def land_checks_running(data: dict, head: str) -> bool:
     a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
-    return (any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
-            or pending_on_every_page(data) > 0)
+    if pending_on_every_page(data) > 0:
+        return True
+    # LAND_GATE_ONLY: a check whose own description says a label starts it (land_gate_labels) is not running, it is
+    # waiting for the label. cmux#58041, 2026-11-26: its only unfinished checks were clippy and cmux/land-tier, both
+    # "Cheap tier: ... runs when ready-to-land ... is added"; the queue read them as running, so land_judge (which adds
+    # the label: land_tier_pending) was never asked, and the row slept a LAND_WAIT_DEFAULT wake after wake with the label
+    # never on. A head whose every unfinished check is label-gated is judged now. Detector: test-glaeda-gh.py
+    # test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on.
+    return any(str(c.get("status") or "").upper() not in ("COMPLETED", "")
+               and not (isinstance(c.get("description"), str) and LAND_GATE_SAID.search(c["description"]))
+               for c in data.get("checks") or [])
 
 
 def land_pending_status(data: dict) -> bool:
@@ -18943,7 +19128,7 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "")
-        if state == "CLOSED" and self.closed_copy_stale(e, c):
+        if state == "CLOSED" and (self.closed_copy_stale(e, c) or self.own_close_copy(e, c)):
             return False
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
@@ -18967,6 +19152,19 @@ class LandQueue:
             self.history(e, "stop_read_first", code="closed", age=round(asked - at))
             self.save(e)
             log({"event": "land-stop-read-first", "key": e["key"], "code": "closed", "age": round(asked - at)})
+        return True
+
+    def own_close_copy(self, e: dict, c: dict | None) -> bool:
+        """Under the lock. Whether C, a copy of E's PR, reads CLOSED from this queue's own close-and-reopen (pr_reopen):
+        read before that reopen or within LAND_PR_REOPEN_LAG after it. Such a copy ends nothing; the PR is read again."""
+        data = (c or {}).get("data") or {}
+        own = e.get("selfReopen") or {}
+        at = (c or {}).get("dataAt")
+        if str(data.get("state") or "") != "CLOSED" or not isinstance(own.get("at"), (int, float)):
+            return False
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and at >= float(own["at"]) + LAND_PR_REOPEN_LAG:
+            return False
+        self.nudge(e["key"])
         return True
 
     def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
@@ -20115,16 +20313,16 @@ class LandQueue:
             return False  # notify's land-unnotified already said it at the stop
         if self.remind_ended(e):
             return False  # a PR that is over owes its requester nothing: its row ends, quietly
-        day = land_day(self.now)
         r = e.get("reminds") or {}
-        n = int(r.get("n") or 0) if r.get("day") == day else 0
-        if n >= LAND_OWNER_REMIND_CAP:
-            return False
+        n = int(r.get("n") or 0)
+        if n >= LAND_OWNER_REMIND_MAX:
+            return False  # LAND_OWNER_REMIND_BACKOFF: the last was said; `land status` still lists the row
         at = float(st.get("at") or 0)
         last = float(r.get("at") or 0) or at
-        if self.now - last < LAND_OWNER_REMIND_EVERY:
+        every = LAND_OWNER_REMIND_EVERY * (2 ** n)
+        if self.now - last < every:
             return False
-        if self.remind_read_pending(e, last):
+        if self.remind_read_pending(e, last, every):
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
@@ -20134,11 +20332,25 @@ class LandQueue:
         head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
         was = str(st.get("head") or "").lower()
         moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
-        # LAND_OWNER_REMIND_STALE: past a day at the stop's own head, once per stop head, a blocker
-        stale = (not moved and bool(was) and self.now - at >= LAND_OWNER_REMIND_STALE_AFTER
+        life = e.get("remindLife") or {}
+        if life.get("stopAt") != at or (moved and life.get("head") != head):
+            life = {"stopAt": at, "unread": 0, **({"head": head} if moved else {})}
+        if not head and int(life.get("unread") or 0) >= 1:  # LAND_OWNER_REMIND_UNREAD_ONCE
+            # its next due pass asks a fresh read first (remind_read_pending), so a merge, a close or a push still ends
+            # or restarts it; the reminder itself stays quiet and spends none of LAND_OWNER_REMIND_MAX
+            e["reminds"] = {**r, "n": n, "at": self.now, "code": code}
+            if e.get("remindHeld") != [at, "unread"]:
+                e["remindHeld"] = [at, "unread"]
+                self.history(e, "remind_held", code=code, why="unread", n=n)
+                log({"event": "land-remind-held", "key": e["key"], "code": code, "why": "unread"})
+            self.save(e)
+            return False
+        # LAND_OWNER_REMIND_STALE: past a day at the stop's own head, read now (head), once per stop head, a blocker
+        stale = (bool(head) and not moved and bool(was) and self.now - at >= LAND_OWNER_REMIND_STALE_AFTER
                  and str(r.get("staleHead") or "") != was)
         stale_head = was if stale else str(r.get("staleHead") or "")
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
+        e["remindLife"] = {**life, "unread": int(life.get("unread") or 0) + (0 if head else 1)}
+        e["reminds"] = {"n": n + 1, "at": self.now, "code": code,
                         **({"head": head} if head else {}),  # attributable to the stop it answered, at the head read
                         **({"staleHead": stale_head} if stale_head else {})}
         hours = (self.now - at) / 3600.0
@@ -20158,6 +20370,11 @@ class LandQueue:
                     f"the PR naming what superseded it, or hand it to a live owner; this wakes you once for this head")
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
+        if n + 1 < LAND_OWNER_REMIND_MAX:
+            msg += (f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}; the next in "
+                    f"{LAND_OWNER_REMIND_EVERY * 2 ** (n + 1) / 3600.0:.0f} h if it still sits)")
+        else:
+            msg += f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}, the last; `glaeda-gh land status` still lists it)"
         self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
                      **({"moved": head[:12]} if moved else {}), **({"stale": True} if stale else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
@@ -20185,15 +20402,15 @@ class LandQueue:
             return True
         return False
 
-    def remind_read_pending(self, e: dict, last: float) -> bool:
+    def remind_read_pending(self, e: dict, last: float, every: float = LAND_OWNER_REMIND_EVERY) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
         (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
-        LAND_OWNER_REMIND_READ_WAIT past due."""
+        LAND_OWNER_REMIND_READ_WAIT past due (EVERY after LAST, LAND_OWNER_REMIND_BACKOFF)."""
         def read_since() -> list[float]:
             c = self.cache_of(e["key"]) or {}
             return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
         reads = read_since()
-        if (reads and max(reads) > last) or self.now - (last + LAND_OWNER_REMIND_EVERY) >= LAND_OWNER_REMIND_READ_WAIT:
+        if (reads and max(reads) > last) or self.now - (last + every) >= LAND_OWNER_REMIND_READ_WAIT:
             return False
         if float(e.get("remindReadAt") or 0) > last:
             return True  # asked since the last word: told on the pass after it lands
@@ -20211,8 +20428,10 @@ class LandQueue:
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
         state = e.get("state")
-        if state not in ("stopped", "cancelled") or e.get("unlabeled") or self.broker_client():
+        if state not in ("stopped", "cancelled") or e.get("unlabeled"):
             return False
+        if self.broker_client() and e.get("handedOff"):
+            return False  # its host's queue owns the row and takes the label off itself
         if any(h.get("code") == "teammate" for h in e.get("history") or []):
             return False  # a teammate's label is their opt-in
         fail = e.get("unlabelFail") or {}
@@ -20257,8 +20476,8 @@ class LandQueue:
                 e = self.entries.get(key)
                 if e is None:
                     continue
-                path = f"repos/{e['repo']}/issues/{e['number']}/labels/{LAND_UNLABEL}"
-                got = self.call([gh, "api", "-X", "DELETE", path], LAND_GH_DEADLINE, None)
+                argv = land_unlabel_args(str(e["repo"]), str(e["number"]), self.broker_client())
+                got = self.call([gh, *argv], LAND_GH_DEADLINE, None)
                 said = f"{got.stderr or ''} {got.stdout or ''}"
                 gone = got.returncode == 0 or "404" in said or "Label does not exist" in said
                 with self.lock:
@@ -21074,6 +21293,8 @@ class LandQueue:
         if self.refresh_due(e, c):
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
+        if self.own_close_copy(e, c):
+            return  # the queue's own close (pr_reopen), not a person's: judged once a read shows it reopened
         data = (c or {}).get("data") or {}
         state = str(data.get("state") or "")
         if state == "CLOSED" and self.closed_copy_stale(e, c or {}):
@@ -23740,6 +23961,11 @@ class LandQueue:
                 self.save(e)
         got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
+        ref = ""
+        if kind == "update_branch" and got.returncode not in (0, 124) \
+                and LAND_HEAD_MISMATCH.search(f"{got.stderr or ''}\n{got.stdout or ''}"):
+            # off the lock: one read of the branch ref, only for this refusal
+            ref = self.update_live_tip(e, (self.cache_of(e["key"]) or {}).get("data") or {})[0]
         with self.lock:
             if kind == "update_branch" and got.returncode not in (0, 124):
                 # refused: not sent; step_refused counts and backs off its retries. A timeout (124) may have reached
@@ -23763,7 +23989,7 @@ class LandQueue:
                 # Refused at this head (moved, nothing to update, or a broker that cannot run this form): the refusal's
                 # own next step, else a backoff that doubles, and a stop at LAND_STEP_STOP (step_refused).
                 self.nudge(e["key"])
-                named = self.step_refused(e, kind, head, got)
+                named = self.step_refused(e, kind, head, got, branch_ref=ref)
         if named == "hand_off":
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
@@ -24420,6 +24646,8 @@ class LandQueue:
         if tip and tip != head:
             # Read on the second look only (the first waits, and most reads catch up by then).
             clean = (e.get("updateUnread") or {}).get("head") == head and self.update_tip_clean(e, head, tip, base)
+            if clean and self.pr_reopen_due(e, head) and self.pr_reopen(e, head, tip, data):
+                return True
             with self.lock:
                 if (e.get("updateUnread") or {}).get("head") != head:
                     e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
@@ -24443,10 +24671,21 @@ class LandQueue:
                               min(LAND_HEAD_TIMEOUT, LAND_PR_SYNC_MAX - (self.now - since)))
                     return True
                 if clean:
+                    tried = u.get("reopen") or {}
+                    if tried.get("reopened"):
+                        self.stop(e, "pr_head_unsynced",
+                                  f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with "
+                                  f"{base}, GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
+                                  f"{self.now - since:.0f} s, {self.now - float(tried.get('at') or self.now):.0f} s "
+                                  "after this queue closed and reopened it: GitHub has not synced the PR to its branch",
+                                  f"gh pr view {number} -R {repo} --json headRefOid (when it shows {tip[:12]}: "
+                                  f"glaeda-gh land {name} --sha {tip})")
+                        return True
                     self.stop(e, "pr_head_unsynced",
                               f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with {base}, "
                               f"GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
-                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch",
+                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch"
+                              + (f" (this queue's close-and-reopen failed: {tried['why']})" if tried.get("why") else ""),
                               f"gh pr close {number} -R {repo} && gh pr reopen {number} -R {repo} (GitHub syncs the "
                               f"PR's head on reopen), then glaeda-gh land {name} --sha {tip}")
                     return True
@@ -24480,6 +24719,66 @@ class LandQueue:
                 return True
         self.base_merge_first(e, head, LAND_UPDATE_LOCAL, reason, nxt)
         return True
+
+    def pr_reopen_due(self, e: dict, head: str) -> bool:
+        """Whether the queue closes and reopens E's PR now (LAND_PR_REOPEN_AFTER): its own update at HEAD made a clean
+        base merge GitHub's PR has not shown for that long, and no close-and-reopen was tried for this update yet."""
+        u = e.get("updateUnread") or {}
+        if u.get("head") != head or u.get("reopen"):
+            return False
+        return self.now - float(u.get("at") or self.now) >= LAND_PR_REOPEN_AFTER
+
+    def pr_reopen(self, e: dict, head: str, tip: str, data: dict) -> bool:
+        """Close and reopen E's PR so GitHub syncs its head to TIP, the branch ref this queue's own update-branch at
+        HEAD made (a checked clean base merge: update_tip_clean), once per update (LAND_PR_REOPEN_AFTER's comment).
+        The ref is read again just before the close: when it is no longer TIP (a push since), nothing is sent and
+        False goes back to the old wait-or-stop. True when this decided E: reopened (it waits for the new head, which
+        pin_follow carries the pin to only when its first parent is the pin, and land_judge judges, reviews included)
+        or left closed by a failed reopen (stopped pr_reopen_failed, naming the reopen). False when the close failed:
+        nothing changed, and the old wait goes on to its pr_head_unsynced stop, which names the failure."""
+        repo, number, name, gh = e["repo"], str(e["number"]), key_name(e["key"]), self.gh()
+        if gh is None:
+            return False
+        now_tip, branch = self.update_live_tip(e, data)
+        if now_tip != tip:
+            return False
+        closed = self.call([gh, "pr", "close", number, "-R", repo], LAND_GH_DEADLINE, e)
+        reopened: subprocess.CompletedProcess | None = None
+        if closed.returncode == 0:
+            for _ in range(LAND_PR_REOPEN_TRIES):
+                reopened = self.call([gh, "pr", "reopen", number, "-R", repo], LAND_GH_DEADLINE, e)
+                if reopened.returncode == 0:
+                    break
+        with self.lock:
+            u = e.setdefault("updateUnread", {"head": head, "tip": tip, "at": self.now})
+            if closed.returncode != 0:
+                why = land_trim(land_tail(f"{closed.stderr or ''} {closed.stdout or ''}".strip()
+                                          or f"exit {closed.returncode}"), 200)
+                u["reopen"] = {"at": self.now, "tip": tip, "why": f"the close: {why}"}
+                self.history(e, "pr_reopen_failed", head=head[:12], tip=tip[:12], why=f"the close: {why}")
+                self.save(e)
+                return False
+            e["selfReopen"] = {"at": self.now, "head": head, "tip": tip}
+            if reopened is None or reopened.returncode != 0:
+                got = reopened or closed
+                why = land_trim(land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip()
+                                          or f"exit {got.returncode}"), 200)
+                u["reopen"] = {"at": self.now, "tip": tip, "why": f"the reopen: {why}"}
+                self.history(e, "pr_reopen_failed", head=head[:12], tip=tip[:12], why=f"the reopen: {why}")
+                self.stop(e, "pr_reopen_failed",
+                          f"GitHub's PR still showed {head[:12]} {self.now - float(u.get('at') or self.now):.0f} s "
+                          f"after this queue's update-branch made {tip[:12]} (GitHub's {branch} ref); the queue "
+                          f"closed the PR to sync its head, and the reopen failed: {why}. The PR is closed",
+                          f"gh pr reopen {number} -R {repo}, then glaeda-gh land {name} --sha {tip}")
+                return True
+            u["reopen"] = {"at": self.now, "tip": tip, "reopened": True}
+            self.history(e, "pr_reopened", head=head[:12], tip=tip[:12],
+                         why=f"GitHub's PR still showed {head[:12]} {self.now - float(u.get('at') or self.now):.0f} s "
+                             f"after the update made {tip[:12]}: closed and reopened so GitHub syncs its head")
+            log({"event": "land-pr-reopened", "key": e["key"], "head": head, "tip": tip})
+            self.nudge(e["key"])
+            self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+            return True
 
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
@@ -24563,7 +24862,34 @@ class LandQueue:
         self.push_step(e, "update_branch", head,
                        land_update_branch_args(repo, number, head, list(needs or []), self.broker_client(), force))
 
-    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
+    def branch_ahead(self, e: dict, head: str, ref: str, out: str) -> None:
+        """Under the lock. The update-branch at HEAD was refused for the head mismatch and the branch ref reads REF, not
+        HEAD: GitHub's PR has not followed its branch (LAND_HEAD_MISMATCH's comment). Not counted; a wait for the PR
+        to show the new head, or a stop naming the resync once LAND_PR_SYNC_STUCK has passed."""
+        w = e.get("branchAhead")
+        if not isinstance(w, dict) or w.get("head") != head or w.get("ref") != ref:
+            w = e["branchAhead"] = {"head": head, "ref": ref, "since": self.now}
+        waited = self.now - float(w.get("since") or self.now)
+        self.history(e, "branch_ahead_of_pr", head=head[:12], ref=ref[:12], waited=round(waited))
+        e.pop("updateSent", None)
+        if waited >= LAND_PR_SYNC_STUCK:
+            name = key_name(e["key"])
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            branch = str(data.get("headRefName") or "the branch")
+            self.stop(e, "pr_head_unsynced",
+                      f"GitHub's PR still reads head {head[:12]} {waited / 60:.0f} min after its branch {branch} moved "
+                      f"to {ref[:12]}: GitHub has not synchronized the PR to its branch, so update-branch at "
+                      f"{head[:12]} is refused ({land_trim(land_tail(out), 160)})",
+                      f"close and reopen the PR so GitHub reads its branch again (gh pr close {e['number']} -R "
+                      f"{e['repo']} && gh pr reopen {e['number']} -R {e['repo']}; nothing in {branch} changes), then "
+                      f"glaeda-gh land {name} --sha <the head it then reads>")
+            return
+        self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
+                      "why": f"the branch is at {ref[:12]}; GitHub's PR still reads {head[:12]}"},
+                  min(LAND_HEAD_TIMEOUT, max(60.0, LAND_PR_SYNC_STUCK - waited)))
+
+    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess,
+                     branch_ref: str = "") -> str | None:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
@@ -24618,6 +24944,10 @@ class LandQueue:
             self.history(e, "step_closed", kind=kind, head=head[:12], why=land_step_class(out))
             self.wait(e, {"kind": "retry", "why": f"{kind} refused: GitHub says the PR is closed; its state is read "
                           "next"}, float(NUDGE_MIN))
+            return None
+        if kind == "update_branch" and SHA40.fullmatch(branch_ref or "") and branch_ref != str(head or "").lower() \
+                and LAND_HEAD_MISMATCH.search(out):
+            self.branch_ahead(e, str(head or "").lower(), branch_ref, out)
             return None
         cls = land_step_class(out)
         if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):
@@ -25071,7 +25401,12 @@ class LandQueue:
             self.merged(e, merge_sha or e.get("mergeSha") or "", f"{how} merged")
             return True
         if state == "CLOSED":
-            self.stop(e, "closed", f"closed unmerged ({how} closed)", "")
+            # LAND_CLOSED_FYI: someone closed it on purpose, so its requester has nothing to act on: an inbox fyi, not
+            # a WARN blocker. gcp-agent-lane-2, 2026-11-26 09:40Z: after glaeda#2862 re-armed old handoff_refused rows,
+            # each one whose PR had closed days before woke its requester with "stopped: closed: closed unmerged"
+            # (cmux#44639, #49288, #46842, #50262, #47264, #44490, hq#14780, #14909, #14242). Detector:
+            # test-glaeda-gh.py test_a_row_whose_pr_was_closed_ends_with_an_fyi_not_a_blocker.
+            self.stop(e, "closed", f"closed unmerged ({how} closed)", "", tell="fyi")
             return True
         return False
 
@@ -25149,6 +25484,12 @@ class LandQueue:
         TELL "quiet" not at all (a line in the log and E's history only). DETAIL (a conflict's hunks) follows the
         message's `next:` and is kept on the stop, so `land status` shows it too."""
         self.check(e)
+        if code == "hold" and land_machine_hold(reason, (self.cache_of(e["key"]) or {}).get("data") or {}):
+            # LAND_OWNER_REMIND_BACKOFF: a machine-made checkpoint's HOLD is nobody's to clear, so the row is
+            # dropped: said once here, never re-armed or reminded.
+            code = "machine_hold"
+            nxt = ("none: a machine-made checkpoint never lands; land the PR that finishes its work instead"
+                   + (f" ({land_trim(nxt, 120)})" if nxt else ""))
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
             return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
@@ -26039,15 +26380,54 @@ def land_override_history(e: dict) -> dict:
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
 
 
+# A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only
+# then a row in entries/. `land status` read entries/ alone, so for that window a land that had answered "requested"
+# showed no row and "nothing queued" (exit 1): a lane VM, 2026-11-26 07:47Z, cmuxterm-hq#28163 pinned 3f3a3c12 read as
+# dropped, and was queued again by hand from another directory (its history: "queued" then "updated" in the same
+# pass, 07:47:56Z, both requests applied). On a host whose daemon reads through an upstream, the pass ran once a tick,
+# every ~5 min, so the window was minutes. Now status lists what still waits in requests/ (land_pending_requests).
+def land_pending_requests(target_key: str | None = None) -> list[dict]:
+    """What waits in requests/ for the daemon's next pass, oldest first: {key, op, requester, sha, at, id}. Files only."""
+    d = LandQueue.requests_dir()
+    out: list[dict] = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        req = read_json(p)
+        if not isinstance(req, dict) or not isinstance(req.get("key"), str):
+            continue
+        if target_key and req["key"] != target_key:
+            continue
+        at = req.get("at")
+        out.append({"key": req["key"], "op": str(req.get("op") or ""), "requester": str(req.get("requester") or ""),
+                    "sha": str(req.get("sha") or ""), "id": str(req.get("id") or ""),
+                    "at": float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0})
+    return out
+
+
+def land_pending_line(req: dict, now: float) -> str:
+    """One `land status` line for a request not yet applied: it is accepted, and not a row yet."""
+    what = "cancel requested" if req.get("op") == LAND_WITHDRAW else "requested"
+    bits = [key_name(req["key"]), what]
+    if req.get("sha"):
+        bits.append(f"pin {req['sha'][:12]}")
+    age = f" {int(max(0.0, now - req['at']))}s ago" if req.get("at") else ""
+    bits.append(f"written{age}, not applied yet: the daemon applies requests/ on its next land pass")
+    if req.get("requester"):
+        bits.append(f"for {req['requester']}")
+    return "  ".join(bits)
+
+
 def land_status_doc(target: str | None) -> dict:
-    """What `land status` shows of this host's queue (`land serve`'s status answer too)."""
+    """What `land status` shows of this host's queue (`land serve`'s status answer too), with the requests still
+    waiting in requests/ for the daemon (pending, land_pending_requests)."""
     entries = land_entries()
-    if target:
-        key = land_key(target)[0]
+    key = land_key(target)[0] if target else None
+    if key:
         entries = [e for e in entries if e.get("key") == key]
+    pending = land_pending_requests(key)
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
-    return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
+    return {"ok": True, "entries": entries, "pending": pending, "steps": land_counts(),
+            "refused": refused if isinstance(refused, dict)
             else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries),
             "greenWait": land_green_waits(entries, read_cache, time.time())}
@@ -26128,6 +26508,23 @@ def land_green_since(e: dict, head: str) -> float:
     return float(first) if isinstance(first, (int, float)) and not isinstance(first, bool) else 0.0
 
 
+def land_green_at_pin(e: dict, data: dict, head: str, now: float) -> bool:
+    """Whether the land row E is green at HEAD (the cache's DATA): its queued pin, when it has one, is HEAD, and either
+    it carries a logged override (reason and receipt, both required to queue one) or every check the cache shows at
+    HEAD is green (check_verdict EXIT_OK; a partial or truncated read with a red, running or unread context is not).
+    A judgment's ok alone is not this: on 2026-11-26 rows paged "one merge away" from cmux-cp-1, cmux-cp-2 and
+    fs-agent-lane-3 while their heads showed reds (cmux#49990: Swift packages on Linux and react-apps-check failed;
+    cmux#57722: fast gates and pr pipeline / linux; cmuxterm-hq#27545: tests and polling-guard). Such a row waits on
+    its owner, who fixes the checks or overrides and merges, not on the queue."""
+    pin = str(e.get("pinSha") or "").lower()
+    if pin and not (head.startswith(pin) or pin.startswith(head)):
+        return False  # the head moved past the pin: the requester re-pins, the queue cannot merge it
+    o = e.get("override")
+    if isinstance(o, dict) and o.get("reason") and o.get("receipt"):
+        return True
+    return check_verdict(data, "green", now) == EXIT_OK
+
+
 def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | None], now: float) -> dict:
     """The land queue's wait clock (LAND_GREEN_WAIT_PAGE): the open rows that could merge now, and how long each has
     waited since it could. A row counts when its last judgment was ok with the merge step next at the head the cache
@@ -26135,13 +26532,13 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     CLEAN and no check running at its head though no ok judgment is on record there (judge_order's "one merge away"),
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
-    of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    of the first kind), "red" (rows not green at their pin, land_green_at_pin: never counted, whatever was judged),
+    "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest", "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
     hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
     clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
     queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
-    judged = 0
+    judged = red = 0
     for e in entries:
         if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
@@ -26149,6 +26546,9 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         data = (cache_of(e["key"]) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "").lower()
         if not head:
+            continue
+        if not land_green_at_pin(e, data, head, now):
+            red += 1  # its owner's to fix, re-pin or override (Leo: "fix the checks or ignore and just merge")
             continue
         if x.get("ok") and (x.get("action") or {}).get("kind") == "merge" and str(x.get("head") or "").lower() == head:
             judged += 1
@@ -26164,7 +26564,7 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         waits.append((max(0.0, now - since), e["key"]))
     waits.sort()
     rank = lambda q: int(waits[max(0, math.ceil(q * len(waits)) - 1)][0]) if waits else None  # noqa: E731
-    return {"rows": len(waits), "judged": judged, "p50S": rank(0.5), "p95S": rank(0.95),
+    return {"rows": len(waits), "judged": judged, "red": red, "p50S": rank(0.5), "p95S": rank(0.95),
             "past": sum(1 for w, _ in waits if w > LAND_GREEN_WAIT_PAGE),
             "oldest": key_name(waits[-1][1]) if waits else None, "oldestS": int(waits[-1][0]) if waits else None,
             "at": now}
@@ -26172,11 +26572,12 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
 
 def land_green_line(g: dict) -> str:
     """`land status`'s line for the wait clock (land_green_waits)."""
+    red = f"; {g['red']} not green at their pin (their owners' to fix or override)" if g.get("red") else ""
     if not g.get("rows"):
-        return "glaeda land: green waits: no row is one merge away"
+        return f"glaeda land: green waits: no row is one merge away{red}"
     return (f"glaeda land: green waits: {g['rows']} row(s) one merge away ({g.get('judged', 0)} judged ok), p50 {land_span(g['p50S'])}, "
             f"p95 {land_span(g['p95S'])}, {g['past']} past {land_span(LAND_GREEN_WAIT_PAGE)}; oldest {g['oldest']} "
-            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}")
+            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}{red}")
 
 
 def land_green_alarm(g: dict | None, host: str, open_rows: int | None = None) -> tuple[str, str, dict] | None:
@@ -26243,17 +26644,20 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         try:
             remote = land_forward(executor, {"op": "status", "target": target})
             remote_entries = [e for e in remote.get("entries") or [] if isinstance(e, dict)]
-            doc = {**remote, "entries": mine + remote_entries, "executor": name}
+            remote_pending = [r for r in remote.get("pending") or [] if isinstance(r, dict) and r.get("key")]
+            doc = {**remote, "entries": mine + remote_entries, "executor": name,
+                   "pending": doc["pending"] + remote_pending}
         except WatchError as error:
             doc = {**doc, "entries": mine, "executor": name, "executorError": str(error)}
         d = LandQueue.requests_dir()
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
     entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
+    pending = [r for r in doc.get("pending") or [] if isinstance(r, dict) and r.get("key")]
     doc["stoppedByCause"] = land_stopped_by_cause(entries)
     if as_json:
         print(json.dumps(doc, sort_keys=True))
-        return EXIT_OK if entries or not target else EXIT_FAIL
+        return EXIT_OK if entries or pending or not target else EXIT_FAIL
     now = time.time()
     if executor is not None:
         print(f"glaeda land: this host forwards its lands to {doc['executor']}"
@@ -26299,7 +26703,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
             st = e.get("stop") or {}
             if e.get("state") == "stopped" and st.get("next"):
                 print(f"next: {st['next']}")
-    if not entries:
+    for r in pending:
+        print(land_pending_line(r, now))
+    if not entries and not pending:
         print("glaeda land: nothing queued" + (f" for {target}" if target else ""))
     today = counts.get(land_day(now)) or {}
     week = {}
@@ -26320,7 +26726,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
               f"{split['redundant']} on a change the verdict does not depend on"
               + (f" ({why}): that share alone is skippable" if why else ": none skippable"))
     print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
-    if target and not entries:
+    if target and not entries and not pending:
         return EXIT_FAIL
     return EXIT_OK
 
@@ -26977,7 +27383,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if as_json:
         print(json.dumps(out, sort_keys=True))
     else:
-        print(land_line(entry, time.time()) if picked else f"{key_name(key)} requested; the daemon takes it next tick")
+        print(land_line(entry, time.time()) if picked else
+              f"{key_name(key)} requested; the daemon takes it next tick (a request in requests/, not a row yet: "
+              f"glaeda-gh land status {key_name(key)} shows it as requested until the daemon applies it)")
         if not running:
             say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
             say_waiting("next: glaeda-gh restart")
@@ -27012,6 +27420,24 @@ def cmd_land_cancel(target: str, as_json: bool) -> int:
                 say_waiting(f"glaeda land: {land_trim(got.get('reason') or got.get('code'), 200)}; the cancel waits "
                             "here and is forwarded when it answers")
     else:
+        # The queue applies a withdraw only to a row it can cancel (apply): one open, or stopped. Any other answered
+        # "cancel requested" and changed nothing, so a cancel of a PR this host never queued (or already merged or
+        # cancelled) read as done. Said here instead, with nothing written.
+        e = read_json(LandQueue.entries_dir() / file_name(key))
+        live = isinstance(e, dict) and (e.get("state") not in LAND_DONE or e.get("state") == "stopped")
+        waiting = any(r["op"] == "land" for r in land_pending_requests(key))
+        if executor is None and not live and not waiting:  # a forwarding host's row is the executor's to judge
+            state = e.get("state") if isinstance(e, dict) else None
+            why = (f"{key_name(key)} is {state} in this host's land queue, so there is nothing to cancel" if state
+                   else f"{key_name(key)} is not in this host's land queue ({LandQueue.entries_dir()}), so there "
+                        "is nothing to cancel")
+            nxt = "glaeda-gh land status, to see what this host holds"
+            if as_json:
+                print(json.dumps({"ok": False, "key": key, "code": "land_cancel_nothing", "reason": why,
+                                  "next": nxt, "state": state}, sort_keys=True))
+            else:
+                say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
+            return EXIT_FAIL
         land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
         print(json.dumps({"ok": True, "key": key, "state": "cancel requested"}))
@@ -27953,6 +28379,7 @@ def land_forward_loop(daemon: Daemon, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             daemon.land_tick(forward_only=True)
+            daemon.land_ingest_idle()
         except Exception as error:  # noqa: BLE001  retry on the next pass; requests remain on disk
             log({"event": "land-error", "error": describe(error), "site": error_site(error)})
         stop.wait(TICK)
