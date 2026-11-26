@@ -238,6 +238,10 @@ scripts/glaeda-mini-bringup cmux25 cmux26 ... cmux34 --registry-out /tmp/new-min
 scripts/glaeda-mini-bringup cmux25 cmux26 ... cmux34 --registry-out /tmp/new-minis --yes
 ```
 
+To rehearse on a mini already in the fleet, run `scripts/glaeda-mini-bringup-dryrun [SHA|TREE] [MANIFEST]`
+there: it treats that mini as new (a copy of the manifest without it) and prints the admit entry, the
+runner labels and every bringup step, changing nothing.
+
 At the screen first, per mini (no tool can do these): create the `cmux` admin user, log in to
 Tailscale with a `tag:mac-mini-cluster` key (Lawrence owns the tag), name it `cmuxNN`
 (`machines/host-naming.md`: the pool continues after cmux24), turn on Remote Login and Remote
