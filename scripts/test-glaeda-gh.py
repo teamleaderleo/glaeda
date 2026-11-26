@@ -30159,6 +30159,7 @@ class LandTest(Base):
         e = self.conflict_stop()
         sent, judged = len(self.w.sent()), len(self.w.explains())
         gen = e.get("gen")
+        self.fresh_head = LA  # each reminder's read of the PR (LAND_OWNER_REMIND_READ) answers: still open
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
         self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
         e = self.tick(20)
@@ -30177,7 +30178,51 @@ class LandTest(Base):
         sent = len(self.w.sent())
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("merged", None, sent))  # ended, quietly
+
+    def pruned_copy_reads(self, state: str) -> dict:
+        """LAND_OWNER_REMIND_READ: a conflict stop whose cache file was pruned (nothing watches a stopped row), its PR
+        STATE on GitHub. 2026-11-26 04:44Z: five "still stopped after 32 h" notices for PRs merged or closed a day
+        before, each with no cache file: an absent copy read as "still open"."""
+        self.conflict_stop()
+        sent, reads = len(self.w.sent()), len(self.w.refreshed)
+        del self.w.cache[self.KEY]
+
+        def read(key: str) -> str | None:
+            self.w.refreshed.append(key)
+            self.w.set_pr(key, land_pr(LA, state=state), self.t)
+            return None
+
+        self.q.refresh = read
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(len(self.w.refreshed), reads + 1)  # one read, before any word
+        self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((len(self.w.sent()), len(self.w.refreshed)), (sent, reads + 1))  # over: never again
+        return self.q.entries[self.KEY]
+
+    def test_a_stopped_row_whose_pr_copy_was_pruned_reads_it_before_reminding(self):
+        self.assertEqual(self.pruned_copy_reads("MERGED")["state"], "merged")
+
+    def test_a_stopped_row_whose_pruned_pr_reads_closed_ends_closed_quietly(self):
+        e = self.pruned_copy_reads("CLOSED")
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+
+    def test_a_stopped_row_whose_pr_is_open_is_reminded_after_one_read_and_a_failed_read_still_tells(self):
+        e = self.conflict_stop()
+        sent, reads = len(self.w.sent()), len(self.w.refreshed)
+        del self.w.cache[self.KEY]
+        self.fresh_head = LA  # the read answers: still open
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 1, sent + 1))
+        self.assertEqual(len(self.w.refreshed), reads + 1)
+        self.assertIn("still stopped after 6 h", self.w.sent()[-1][-1])
+        self.fresh_head = None  # the next slot's read fails: the reminder waits its bound, then tells as before
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent()), len(self.w.refreshed)), (1, sent + 1, reads + 2))
+        self.q.refresh_hold = None
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent()), len(self.w.refreshed)), (2, sent + 2, reads + 2))
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,

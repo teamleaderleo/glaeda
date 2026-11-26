@@ -15616,6 +15616,17 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_OWNER_REMIND_READ: a reminder read "still open" off a PR copy that was not there. The daemon prunes an unwatched
+# PR's cache file after CACHE_KEEP (1 h), and a stopped row is watched by nothing, so by the reminder's first slot (6 h)
+# nearly every stopped row's copy is gone, and an absent copy is not MERGED or CLOSED. One lane VM, 2026-11-26 04:44Z,
+# the first pass after the reminder shipped: 5 "still stopped after 32 h" notices in one second, every one for a PR
+# merged or closed a day or more before (cmux#54667, #54657, #53914 closed; #54610, cmuxterm-hq#24445 merged), none
+# with a cache file. So a reminder whose copy is older than LAND_OWNER_REMIND_READ_FRESH first reads the PR (one
+# land_direct_read, at most once per reminder slot: LAND_OWNER_REMIND_CAP a day per row) and ends a merged or closed
+# row quietly; a read that fails is told on the copy it has after LAND_OWNER_REMIND_READ_WAIT, as before. Detector:
+# test-glaeda-gh.py test_a_stopped_row_whose_pr_copy_was_pruned_reads_it_before_reminding.
+LAND_OWNER_REMIND_READ_FRESH = 600.0
+LAND_OWNER_REMIND_READ_WAIT = 900.0
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19667,9 +19678,9 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
-            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        c = self.cache_of(e["key"]) or {}
+        if self.remind_ended(e, c):
+            return False  # a PR that is over owes its requester nothing: its row ends, quietly
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0
@@ -19679,6 +19690,29 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
+        # LAND_OWNER_REMIND_READ: the copy a reminder judges "still open" by must be a recent read, not an absent one.
+        data_at = c.get("dataAt")
+        fresh = _finite(data_at) and self.now - float(data_at) < LAND_OWNER_REMIND_READ_FRESH
+        asked = e.get("remindReadAt")
+        if _finite(asked) and float(asked) < last:
+            asked = None  # an earlier slot's read: this slot reads again
+        if not fresh and not (_finite(asked) and self.now - float(asked) >= LAND_OWNER_REMIND_READ_WAIT):
+            if _finite(asked):
+                return False  # the read is still out
+            if self.refresh_held() or self.busy() >= self.workers():
+                return False  # asked on a later pass, when a worker or the login is free
+            e["remindReadAt"] = self.now
+            self.save(e)
+            log({"event": "land-remind-read", "key": e["key"],
+                 "age": round(self.now - float(data_at)) if _finite(data_at) else None})
+            self.submit(e["key"], self.refresh_job, e["key"])
+            c = self.cache_of(e["key"]) or {}  # an inline queue's read has stored its copy; a pool's is still out
+            if self.remind_ended(e, c):
+                return False
+            data_at = c.get("dataAt")
+            if not (_finite(data_at) and self.now - float(data_at) < LAND_OWNER_REMIND_READ_FRESH):
+                return False  # judged on a later pass, on the copy that read stores
+        e["remindReadAt"] = None  # a read that failed past its wait: told on the copy it has, as before
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
@@ -19692,6 +19726,22 @@ class LandQueue:
              "hours": round(hours, 1)})
         self.save(e)
         self.notify(e, to, msg)
+        return True
+
+    def remind_ended(self, e: dict, c: dict) -> bool:
+        """Under the lock. Ends a stopped E whose PR copy C reads MERGED or CLOSED, telling nobody (a reminder is all
+        that would have spoken, and the PR being over is no step for its requester). True when it ended."""
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state == "MERGED":
+            sha = str((data.get("mergeCommit") or {}).get("oid") or "") if isinstance(data.get("mergeCommit"), dict) \
+                else ""
+            self.merged(e, sha or e.get("mergeSha") or "", "remind: the PR's state shows it merged", wake=False)
+        elif state == "CLOSED":
+            self.stop(e, "closed", "closed unmerged (remind: the PR's state shows it closed)", "", tell="quiet")
+        else:
+            return False
+        log({"event": "land-remind-ended", "key": e["key"], "state": state})
         return True
 
     def unlabel_owed(self, e: dict) -> bool:
