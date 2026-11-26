@@ -15616,6 +15616,14 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_REMIND_FRESH: a reminder judges "is this PR over?" on the daemon's cached copy, and nothing refreshes a stopped
+# row's copy (its watch ended at the stop), so a PR merged by hand or by another queue after the stop reads OPEN forever.
+# lw#8046, gcp-agent-lane-12, 2026-11-26: merged 2026-11-25T03:12Z, then "still stopped after 64 h: head_moved ... next:
+# glaeda-gh land ... --sha" to its requester, an order to re-land a merged PR. A copy older than this is read once
+# (remind_read, off the pass thread) before the reminder: MERGED or CLOSED ends the row and says nothing. At most one
+# read per reminder, LAND_OWNER_REMIND_CAP a day per row. Detector: test-glaeda-gh.py
+# test_a_stopped_row_merged_after_its_copy_is_ended_not_reminded.
+LAND_REMIND_FRESH = 3600.0
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -17513,6 +17521,8 @@ class LandQueue:
         self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
         self.forward_thread: threading.Thread | None = None
         self.unlabel_thread: threading.Thread | None = None  # LAND_UNLABEL's sends, one batch at a time
+        self.remind_thread: threading.Thread | None = None  # LAND_REMIND_FRESH's state reads, one batch at a time
+        self.remind_reads: list[str] = []  # the stopped rows this pass's remind held for a stale copy
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
@@ -18017,6 +18027,7 @@ class LandQueue:
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
         self.unlabel_start(unlabel)
+        self.remind_read_start()
         if dirty is not None and not recovery and latch is None and ended is None:
             # The daemon tells us when a PR cache write or webhook changes a waiting head. A quiet CI wait
             # needs its watch renewed, but sorting it would reopen its cache on every daemon tick.
@@ -19667,7 +19678,8 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        cached = self.cache_of(e["key"]) or {}
+        data = cached.get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
             return False  # a PR that is over owes its requester nothing; `land status` still shows the row
         day = land_day(self.now)
@@ -19679,6 +19691,14 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
+        # LAND_REMIND_FRESH: a cached OPEN is only as true as its age, and nothing refreshes a stopped row's copy.
+        dat = cached.get("dataAt")
+        fresh = max(float(dat) if isinstance(dat, (int, float)) and not isinstance(dat, bool) else 0.0,
+                    float(e.get("stateReadAt") or 0), float(e.get("remindReadAt") or 0))
+        if self.now - fresh >= LAND_REMIND_FRESH:
+            if e["key"] not in self.remind_reads:
+                self.remind_reads.append(e["key"])
+            return False  # remind_read_start reads it off the pass thread, then reminds or ends the row
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
@@ -19719,6 +19739,47 @@ class LandQueue:
             if not (r.get("day") == land_day(self.now) and int(r.get("n") or 0) >= LAND_REARM_CAP):
                 return False  # it re-arms by itself, and lands with its label
         return self.now - float(st.get("at") or 0) >= LAND_UNLABEL_AFTER
+
+    def remind_read_start(self) -> None:
+        """Read the state of each stopped row remind held for a stale copy (LAND_REMIND_FRESH), off the pass thread."""
+        keys, self.remind_reads = self.remind_reads[:LAND_UNLABEL_BATCH], []
+        if not keys or (self.remind_thread is not None and self.remind_thread.is_alive()):
+            return
+        batch = [(k, int(self.entries[k].get("gen") or 0)) for k in keys if k in self.entries]
+        if self.inline:
+            self.remind_read(batch)
+        else:
+            self.remind_thread = threading.Thread(target=self.remind_read, args=(batch,), name="land-remind-read",
+                                                  daemon=True)
+            self.remind_thread.start()
+
+    def remind_read(self, batch: list[tuple[str, int]]) -> None:
+        """One state read per stopped row in BATCH (key, gen): MERGED or CLOSED ends it (ended) and tells nobody it is
+        still stopped; OPEN reminds now on that read; unreadable reminds on the old copy at the next pass, as before."""
+        for key, gen in batch:
+            try:
+                e = self.entries.get(key)
+                if e is None:
+                    continue
+                state, merge_sha, why = self.read_state(e)
+                with self.lock:
+                    if self.entries.get(key) is not e or int(e.get("gen") or 0) != gen or e.get("state") != "stopped":
+                        continue
+                    self.history(e, "state_read", state=state or "unreadable", before="remind",
+                                 why="the stopped row's copy is older than LAND_REMIND_FRESH")
+                    if self.ended(e, state, merge_sha, "a state read before its reminder shows it"):
+                        log({"event": "land-remind-ended", "key": key, "state": state})
+                        continue
+                    if state == "OPEN":
+                        e["stateReadAt"] = self.now
+                        self.save(e)
+                        self.remind(e)
+                    else:
+                        e["remindReadAt"] = self.now
+                        self.save(e)
+                        log({"event": "land-remind-unread", "key": key, "why": why})
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
     def unlabel_start(self, keys: list[str]) -> None:
         """Send the owed label removals (unlabel_owed), LAND_UNLABEL_BATCH at most, off the pass thread."""

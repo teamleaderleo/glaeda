@@ -30179,6 +30179,27 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
 
+    def test_a_stopped_row_merged_after_its_copy_is_ended_not_reminded(self):
+        # LAND_REMIND_FRESH: lw#8046 merged at 03:12Z, its stopped row's copy still read OPEN, and 64 h later its
+        # requester was told to re-land it. The copy is older than the bound, so one read comes first.
+        self.conflict_stop()
+        sent, views = len(self.w.sent()), len(self.w.gh_calls("pr", "view"))
+        self.w.view_state = "MERGED"  # merged by hand: GitHub knows, the daemon's copy does not
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))
+        self.assertFalse(any("still stopped" in c[-1] for c in self.w.sent()[sent:]))
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), views + 1)
+
+    def test_a_stopped_rows_reminder_reads_once_then_sends_on_that_read(self):
+        self.conflict_stop()
+        before = len(self.w.gh_calls("pr", "view"))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual((e["state"], e["reminds"]["n"]), ("stopped", 1))  # OPEN: reminded in the same pass
+        views = len(self.w.gh_calls("pr", "view"))
+        self.assertEqual(views, before + 1)
+        e = self.tick(60)
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), views)  # no read without a reminder due
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
