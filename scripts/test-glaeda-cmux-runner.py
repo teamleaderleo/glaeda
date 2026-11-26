@@ -673,7 +673,8 @@ class HookTest(unittest.TestCase):
                 "job": "integrations-production", "run_attempt": "1"}
         self.assertIsNone(hook.trusted_refusal(**args))
         self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
-        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml"):
+        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml",
+                     "screen-share-zero-touch-probe.yml", "new-tab-startup-probe.yml"):
             self.assertIsNone(hook.trusted_refusal(**{**args, "workflow_ref": wf.replace("synthetic-probes.yml", name)}))
         self.assertIsNone(hook.trusted_refusal(**{**args, "trusted_repo": "Manaflow-AI/cmuxterm-hq"}))
         for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):
@@ -2591,6 +2592,38 @@ class HookTest(unittest.TestCase):
             peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(runs)))
             self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY)[0], 4.0)
 
+    def test_own_writes_peak_charges_a_running_job_in_the_listener_hold(self) -> None:
+        """JOB_OWN_WRITTEN and RUNNER_JOBS_OWN_PEAK: a job that never ran alone has no solo peak, but what its runs
+        wrote themselves (disk_written_gib) is its own need; only own_writes reads it, and the listener hold charges
+        a running job that peak, less what it already wrote, instead of the flat fleet p95."""
+        log = self.peak_log([(100.0, 40.0, False)] * 3, {"mini-a": "build-app"})
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        for row in rows:
+            if row["event"] == "completed":
+                row[hook.JOB_OWN_WRITTEN_FIELD] = 30.0
+        rows[1][hook.JOB_OWN_WRITTEN_FIELD] = 25.0
+        log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        records = hook.job_log_tail(log)
+        self.assertEqual(hook.learned_job_peaks(records)[self.PEAK_KEY], (60.0, "p90 of 3 runs here"),
+                         "the warning's peak is unchanged")
+        self.assertNotIn(self.PEAK_KEY, hook.learned_job_peaks(records, alone_only=True),
+                         "JOB_DISK_OWN_NEED's refusal reads no own-writes peak")
+        self.assertEqual(hook.learned_job_peaks(records, own_writes=True)[self.PEAK_KEY],
+                         (30.0, "p90 of 3 runs here, its own writes"))
+        table = {**self.peak_runner("actions-runner-a", "mini-a", 4001),
+                 **self.peak_runner("actions-runner-b", "mini-b", 4002)}
+        running = [("actions-runner-a", 4001), ("actions-runner-b", 4002)]
+        self.assertEqual(hook.running_job_charges(self.dir, running, 5.3, log), {4001: 30.0},
+                         "mini-b's job has no peak here: the flat p95")
+        self.assertEqual(hook.running_job_charges(self.dir, running, 5.3, self.dir / "missing.jsonl"), {})
+        self.assertTrue(table)
+        # 2 running + this one at 5.3 = 25.9, plus 24.7 the build-app's own peak adds, less 8 it already wrote
+        why = hook.runner_jobs_refusal(40.0, 2, 5.3, "test", written_gib=8.0, extra_gib=24.7)
+        self.assertIn("40.0 GiB free, 42.6 GiB required", why or "")
+        self.assertIn("plus 24.7 GiB more the running jobs' own learned peaks here want (RUNNER_JOBS_OWN_PEAK)",
+                      why or "")
+        self.assertIsNone(hook.runner_jobs_refusal(43.0, 2, 5.3, "test", written_gib=8.0, extra_gib=24.7))
+
     def test_no_history_falls_back_to_the_flat_job_peak(self) -> None:
         with mock.patch.dict(os.environ):
             os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
@@ -4274,9 +4307,10 @@ class HookTest(unittest.TestCase):
             self.assertTrue(hook.probe(self.dir / "capacity/unit-10"), "the busy job took none of the free units")
         finally:
             self.finish("s1")
-        # a signing job holding the mini (every gateway token): nothing runs busy beside it
+        # a signing job holding the mini (every token its class takes): nothing runs busy beside it
         capacity = self.dir / "capacity"
-        signing = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX) for name in hook.GATEWAY_TOKENS]
+        signing = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX)
+                   for name in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
         try:
             beside = self.job("fast-tier", "s2", 14, None, env=self.FAST_TIER)
             self.assertEqual(beside.returncode, 1, beside.stdout)
@@ -4360,6 +4394,219 @@ class HookTest(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertFalse(hook.plain_side_runner(argparse.Namespace(**{**base, **change})))
 
+    def held_seed_roots(self, second: bool = True) -> tuple[list[Path], contextlib.ExitStack]:
+        """Two seed roots under the test dir; the first held, the second marked and held when second is set."""
+        roots = [self.dir / "seed/cmux", self.dir / "seed/cmux-2"]
+        stack = contextlib.ExitStack()
+        for n, root in enumerate(roots):
+            root.mkdir(parents=True, exist_ok=True)
+            (root / hook.SEED_ROOT_MARKER).touch()
+            if n == 0 or second:
+                f = stack.enter_context(open(root / hook.SEED_ROOT_LOCK, "w"))
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return roots, stack
+
+    def test_a_fast_tier_on_a_plain_side_runner_with_every_seed_root_held_is_refused_not_run_cold(self) -> None:
+        """SIDE_SEED_FREE: cut logs cmux18-2 and cmux18-5 (2026-11-22 07:02-07:25Z, one mini) read "the seed root is
+        busy ... taking a shared root" and built from scratch to the 20-minute limit. With every seed root held the
+        side runner refuses it before taking anything, and FAST_TIER_BUSY does not admit it busy."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "0"}
+        with stack:
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 1, side.stdout + side.stderr)
+                self.assertIn("refused: seed root: every fast-tier seed root here is held", side.stdout)
+                self.assertNotIn("admitted busy", side.stdout)
+            finally:
+                self.finish("s2")
+        try:  # the same roots free: admitted as before
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertNotIn("seed root:", side.stdout)
+        finally:
+            self.finish("s2")
+
+    def test_a_fast_tier_with_every_seed_root_held_waits_for_one_to_free_then_runs(self) -> None:
+        """SIDE_SEED_WAIT: after #2665, 57-69% of PR fast tiers an hour were refused at setup (12-18Z 11-23), each
+        re-run waiting out the Mac queue again. The side runner waits for a seed root instead, and runs on it."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "60"}
+        timer = threading.Timer(1.0, stack.close)
+        timer.start()
+        try:
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("SIDE_SEED_WAIT start", side.stdout)
+            self.assertIn("SIDE_SEED_WAIT end: free after", side.stdout)
+            self.assertNotIn("refused", side.stdout)
+        finally:
+            timer.cancel()
+            stack.close()
+            self.finish("s2")
+        self.assertEqual(list(self.dir.glob(hook.SIDE_SEED_WAITER + "*")), [], "the waiter marker is gone")
+
+    def test_a_seed_wait_past_its_bound_or_with_every_waiter_slot_taken_is_refused_as_before(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            why, cause = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=0.2,
+                                             poll=0.05)
+            self.assertEqual((why, cause), ("SIDE_SEED_FREE x", None))
+            self.assertIn("SIDE_SEED_WAIT end: refused", out.getvalue())
+            live = [subprocess.Popen(["sleep", "30"]) for _ in roots]
+            try:
+                for proc in live:
+                    (self.dir / f"{hook.SIDE_SEED_WAITER}{proc.pid}").touch()
+                (self.dir / f"{hook.SIDE_SEED_WAITER}999999999").touch()  # a dead hook's marker counts for nothing
+                self.assertEqual(hook.side_seed_waiters(self.dir), len(roots))
+                self.assertFalse((self.dir / f"{hook.SIDE_SEED_WAITER}999999999").exists())
+                start = time.monotonic()
+                why, _ = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30)
+                self.assertEqual(why, "SIDE_SEED_FREE x", "one waiter per seed root: the next is refused at once")
+                self.assertLess(time.monotonic() - start, 5)
+            finally:
+                for proc in live:
+                    proc.kill()
+                    proc.wait()
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots),
+                                                 bound=0), ("SIDE_SEED_FREE x", None), "bound 0: as before")
+
+    def test_a_seed_wait_gives_up_when_its_job_is_gone(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: "cancelled", tuple(roots),
+                                                 bound=30, poll=0.05), (None, "cancelled"))
+            self.assertIn("SIDE_SEED_WAIT end: abandoned", out.getvalue())
+
+    @staticmethod
+    def fast_tier_message(fleet_result: str = "skipped", verdict: str = "", ffi: str = "false",
+                          job: str = "fast-tier", run_id: str = "42") -> dict:
+        """A cmux-next fast tier's job message, its needs context serialized as the runner logs it."""
+        def d(**pairs: object) -> dict:
+            return {"t": 2, "d": [{"k": k.replace("_", "-") if k == "fast_tier_fleet" else k, "v": v}
+                                  for k, v in pairs.items()]}
+        return {"messageType": "PipelineAgentJobRequest", "contextData": {
+            "github": d(job=job, run_id=run_id),
+            "needs": d(fast_tier_fleet=d(result=fleet_result, outputs=d(verdict=verdict)),
+                       path_route=d(result="success", outputs=d(ffi_repin=ffi)))}}
+
+    def worker_log(self, message: dict, started: datetime.datetime) -> Path:
+        diag = self.dir / "_diag"
+        diag.mkdir(exist_ok=True)
+        (diag / "Worker_20261123-180000-utc.log").write_text(
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO Worker] Version: 2.330.0\n"
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO Worker] Job message:\n {json.dumps(message, indent=2)}\n"
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO JobRunner] Job ID 1\n")
+        return diag
+
+    def test_the_fast_tier_limit_follows_cmux_next_timeout_rule(self) -> None:
+        """SIDE_SEED_LIMIT: cmux-next.yml's fast-tier timeout-minutes is 5 when the build fleet gave a verdict, 35
+        when that verdict is queued, 50 for an ffi_repin route, else 120 (feat-cmux-next, 2026-11-24)."""
+        m = self.fast_tier_message
+        with mock.patch.dict(os.environ, {"GITHUB_JOB": "fast-tier", "GITHUB_RUN_ID": "42"}):
+            self.assertEqual(hook.fast_tier_limit(m("success", "pass")), (5, False))
+            self.assertEqual(hook.fast_tier_limit(m("failure", "fail")), (5, False))
+            self.assertEqual(hook.fast_tier_limit(m("success", "queued")), (35, True))
+            self.assertEqual(hook.fast_tier_limit(m("skipped", "", "true")), (50, True))
+            self.assertEqual(hook.fast_tier_limit(m("skipped")), (120, True))
+            self.assertIsNone(hook.fast_tier_limit(m(job="swift-canary")), "another job's log")
+            self.assertIsNone(hook.fast_tier_limit(m(run_id="7")), "another run's log")
+            self.assertIsNone(hook.fast_tier_limit({"contextData": {"needs": {"t": 2, "d": []}}}), "no needs read")
+            self.assertIsNone(hook.fast_tier_limit({}))
+
+    def test_a_cold_build_waits_only_within_its_limit_room(self) -> None:
+        """SIDE_SEED_LIMIT: cold fast tiers built in 37-53 min and ran 41-57 min (18:14-22:06Z 11-23), inside 120.
+        Room is the limit, less the time the job has run, less SIDE_SEED_COLD_S; none at 35 min; inf for report-only."""
+        start = datetime.datetime(2026, 11, 23, 18, 0, 0, tzinfo=datetime.timezone.utc)
+        now = start.timestamp() + 600
+        job = ("cmux-next.yml", "fast-tier")
+        env = {"GITHUB_JOB": "fast-tier", "GITHUB_RUN_ID": "42", hook.JOB_DIAG_ENV: os.fspath(self.dir / "_diag")}
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "no log: refused as before")
+            self.worker_log(self.fast_tier_message(), start)
+            room, note = hook.side_seed_cold_room(*job, None, self.dir, now)
+            self.assertEqual(room, 120 * 60 - 600 - hook.SIDE_SEED_COLD_S)
+            self.assertIn("fits its 120 min limit after 10 min", note)
+            self.assertIsNone(hook.side_seed_cold_room("cmux-next.yml", "swift-canary", None, self.dir, now)[0])
+            late = start.timestamp() + 61 * 60
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, late)[0], "no room left: refused")
+            self.worker_log(self.fast_tier_message("success", "queued"), start)
+            room, note = hook.side_seed_cold_room(*job, None, self.dir, now)
+            self.assertIsNone(room)
+            self.assertIn("does not fit its 35 min limit", note)
+            self.worker_log(self.fast_tier_message("success", "pass"), start)
+            self.assertEqual(hook.side_seed_cold_room(*job, None, self.dir, now)[0], float("inf"))
+            self.worker_log(self.fast_tier_message(), start)
+            with mock.patch.dict(os.environ, {hook.SIDE_SEED_LIMIT_OFF_ENV: "1"}):
+                self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "off: refused as before")
+            (self.dir / hook.SIDE_SEED_LIMIT_OFF_FILE).touch()
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "the live off file too")
+
+    def test_a_seed_wait_with_cold_room_builds_cold_past_it_instead_of_refusing(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            start = time.monotonic()
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30,
+                                                 poll=0.05, cold_room=0.2), (None, None))
+            self.assertLess(time.monotonic() - start, 5, "the room bounds the wait, not SIDE_SEED_WAIT's bound")
+            self.assertIn("SIDE_SEED_WAIT end: cold", out.getvalue())
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30,
+                                                 cold_room=0), (None, None), "no room to wait: admitted cold at once")
+            live = [subprocess.Popen(["sleep", "30"]) for _ in roots]
+            try:
+                for proc in live:
+                    (self.dir / f"{hook.SIDE_SEED_WAITER}{proc.pid}").touch()
+                self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots),
+                                                     bound=30, cold_room=600), (None, None),
+                                 "every waiter slot taken: admitted cold, not refused")
+            finally:
+                for proc in live:
+                    proc.kill()
+                    proc.wait()
+
+    def test_a_fast_tier_whose_cold_build_fits_its_limit_runs_cold_with_every_seed_root_held(self) -> None:
+        """SIDE_SEED_LIMIT end to end: the 120 min fast tier is admitted cold; the 35 min one is refused as before."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        diag = self.worker_log(self.fast_tier_message(), datetime.datetime.now(datetime.timezone.utc))
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "0", hook.JOB_DIAG_ENV: os.fspath(diag), "GITHUB_RUN_ID": "42"}
+        with stack:
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+                self.assertIn("SIDE_SEED_LIMIT: a cold build (60 min) fits its 120 min limit", side.stdout)
+                self.assertIn("admitted cold", side.stdout)
+            finally:
+                self.finish("s2")
+            self.worker_log(self.fast_tier_message("success", "queued"),
+                            datetime.datetime.now(datetime.timezone.utc))
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 1, side.stdout + side.stderr)
+                self.assertIn("refused: seed root: every fast-tier seed root here is held", side.stdout)
+            finally:
+                self.finish("s2")
+
+    def test_a_seed_root_is_free_when_the_first_is_unheld_or_a_marked_second_is(self) -> None:
+        roots, stack = self.held_seed_roots(second=False)
+        with stack:
+            self.assertIsNone(hook.seed_root_refusal(tuple(roots)), "the marked second root is free")
+            (roots[1] / hook.SEED_ROOT_MARKER).unlink()
+            self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal(tuple(roots)) or "",
+                          "an unmarked second root is no seed: the job would build cold")
+            self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal((roots[0], self.dir / "absent")) or "")
+            with mock.patch.dict(os.environ, {hook.SIDE_SEED_FREE_OFF_ENV: "1"}):
+                self.assertIsNone(hook.seed_root_refusal((roots[0],)), "the off switch admits as before")
+            (self.dir / hook.SIDE_SEED_FREE_OFF_FILE).touch()
+            self.assertIsNone(hook.seed_root_refusal((roots[0],), capacity_dir=self.dir), "the live off file too")
+        self.assertIsNone(hook.seed_root_refusal(tuple(roots)), "the first root unheld")
+        self.assertIsNone(hook.seed_root_refusal((self.dir / "never-taken",)), "no lock file: no job ever took it")
+
     def test_the_fast_runner_refuses_every_other_job(self) -> None:
         """The fast runner keeps listening on a full mini (it needs no general units), so another job that
         reached it would wait there for units with no limit and idle the runner. It is refused instead, before
@@ -4405,6 +4652,12 @@ class HookTest(unittest.TestCase):
                          ("simulator-step", False))
         self.assertEqual(hook.job_class("walk", "manaflow-ai/cmux", workflow="ios-review-gate.yml"),
                          ("simulator-step", False))
+        # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
+        # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
+        for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step")):
+            with self.subTest(pr_router=job):
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
+                self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
         for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
@@ -4569,7 +4822,8 @@ class HookTest(unittest.TestCase):
                  ("fast-tier", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("swift-test", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("daemon-test", self.FAST_TIER, "manaflow-ai/cmux"),
-                 ("app-compile-fleet", other, "manaflow-ai/cmux"),
+                 # the bare id of a -fleet client builds on a Mac
+                 ("app-compile", other, "manaflow-ai/cmux"),
                  # an eval's job id from another workflow is not its client
                  ("bench", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("eval", other, "manaflow-ai/cmux"),
@@ -4578,7 +4832,10 @@ class HookTest(unittest.TestCase):
                  ("capture", other, "manaflow-ai/cmux"),
                  ("build", gallery, "manaflow-ai/cmux"),
                  ("capture", guest_gallery, "manaflow-ai/cmuxterm-hq"),
-                 ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"))
+                 ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"),
+                 # a guest's -fleet job is not a home-repository client, and a bare "-fleet" is no job id
+                 ("link-ffi-fleet", other, "manaflow-ai/cmuxterm-hq"),
+                 ("-fleet", other, "manaflow-ai/cmux"))
         for index, (job, env, repo) in enumerate(cases):
             with self.subTest(job=job, env=env, repo=repo):
                 runner = f"n{index}"
@@ -4599,7 +4856,12 @@ class HookTest(unittest.TestCase):
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                              ("fleet-rd-host-macos.yml", "check")):
+                              ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
+                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                              ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab"),
+                              # GATEWAY_FLEET_SUFFIX: a -fleet job id from any home-repository workflow
+                              ("cmux-next-ios-kit.yml", "link-ffi-fleet"), ("other.yml", "new-client-fleet")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
@@ -5302,6 +5564,37 @@ class HookTest(unittest.TestCase):
             self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
         finally:
             self.finish("s0")
+
+    def test_dedicated_job_started_links_the_root_shim_too(self) -> None:
+        # cmux7s runs only dedicated runners; its trusted-main seed calls glaeda-canonical-root take, which was missing
+        fleet = self.fleet()
+        (fleet / "bin").mkdir()
+        hooks = self.dir / "hooks"
+        hooks.mkdir()
+        shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
+        (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
+        admit = hooks / "admit.sh"
+        admit.write_text("#!/bin/sh\nexit 0\n")
+        admit.chmod(0o755)
+        state = self.dir / "state"
+        state.mkdir(exist_ok=True)
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "seed", "RUNNER_NAME": "d0"}
+        stale = state / "host-lock-holder-d0.roots"  # a crashed job's record
+        stale.write_text("root-1\n")
+        run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
+                              "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--dedicated-admit", os.fspath(admit),
+                              "--capacity-dir", os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(state),
+                              "--watch-pid", str(os.getpid())], env=environ, capture_output=True, text=True, timeout=30)
+        try:
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            link = fleet / "bin" / "glaeda-canonical-root"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
+            self.assertFalse(stale.exists())
+        finally:
+            self.finish("d0")
 
     def test_capacity_one_root_job_per_canonical_root(self) -> None:
         # a consumer's rm -rf of <root>/src must never meet a compile or another consumer in that root
@@ -13526,6 +13819,129 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.stat(listener.pid).startswith("T"), "thawed")
         self.assertEqual(gate.frozen, ())
 
+    def test_the_listener_is_frozen_before_the_gate_looks_at_the_exited_worker(self) -> None:
+        """cmuxs-mac-mini-6, 2026-11-25 20:03:21Z: runner glaeda-7's Worker exited, its listener went Online and
+        acknowledged the next PR job at 20:03:22 while the runner carried cmux-ci's RUNNER_DRAIN marker. nap() ran
+        /bin/ps on the unreaped Worker (load 108 on 14 cores) before it froze the listener. The freeze comes first."""
+        import threading
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        worker, listener = self.sleeper(), self.sleeper()
+        gate.watching, gate.freeze_at_exit = (worker.pid,), True
+        gate.listener_pids = (listener.pid,)
+        seen: list[str] = []
+
+        def zombie(pid: int) -> bool:
+            seen.append(self.stat(listener.pid))
+            return True
+
+        killer = threading.Timer(0.3, worker.kill)  # not reaped: a zombie, as under the listener before it reaps
+        killer.start()
+        self.addCleanup(killer.cancel)
+        with mock.patch.object(hook, "GATE_POLL_S", 30.0), mock.patch.object(gate, "_zombie", side_effect=zombie):
+            gate.nap()
+        self.assertTrue(seen, "the gate looked at the exited Worker")
+        self.assertTrue(all(stat.startswith("T") for stat in seen), f"listener not frozen before the look: {seen}")
+        self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
+        gate.thaw()
+
+    def drained_listener_with_worker(self) -> tuple[subprocess.Popen, int, Path]:
+        """A process whose command is this runner's Runner.Listener, with one child (its Worker); the runner carries
+        a live RUNNER_DRAIN marker. Returns the listener, the Worker's pid and the runner's glaeda-hooks/."""
+        hooks = self.runner / "glaeda-hooks"
+        hooks.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps({"until": time.time() + 600, "reason": "a hold"}))
+        listener = subprocess.Popen(
+            [sys.executable, "-c", "import subprocess, sys, time\n"
+             "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+             "print(c.pid, flush=True)\ntime.sleep(60)\n", os.fspath(self.runner / "bin/Runner.Listener")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(listener.wait)
+        self.addCleanup(listener.kill)
+        self.addCleanup(lambda: os.kill(listener.pid, signal.SIGCONT) if listener.poll() is None else None)
+        worker = int(listener.stdout.readline())
+
+        def end_worker() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(worker, signal.SIGKILL)
+        self.addCleanup(end_worker)
+        return listener, worker, hooks
+
+    def test_job_completed_freezes_a_draining_runners_listener_before_its_worker_exits(self) -> None:
+        """A lent mini, 2026-11-25 19:59-20:03Z: under cmux-ci's RUNNER_DRAIN marker, runners took new PR jobs
+        1-3 s after the last ended, before the gate's freeze at the Worker's exit (glaeda#2809 narrowed that race,
+        it did not close it). job-completed runs while the Worker still runs, so it freezes the listener first; with
+        no gate to take it over, the backstop thaws it soon after the Worker's exit."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 1.0), mock.patch.object(hook, "JOB_END_THAW_WAIT_S", 30.0):
+            note = hook.freeze_listener_at_job_end(hooks, worker)
+        self.assertIn(f"froze the listener (pid {listener.pid})", note or "")
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "the listener is frozen while its Worker runs")
+        doc = hook.job_end_frozen_doc(hooks / hook.JOB_END_FROZEN)
+        self.assertEqual((doc["listener"], doc["worker"]), (listener.pid, worker))
+        time.sleep(1.5)
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "still frozen: its Worker has not exited")
+        os.kill(worker, signal.SIGKILL)  # a zombie: the frozen listener cannot reap it
+        deadline = time.monotonic() + 15
+        while self.stat(listener.pid).startswith("T") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertFalse(self.stat(listener.pid).startswith("T"), "the backstop thawed a listener no gate took")
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_nothing_without_a_drain(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        (self.runner / hook.RUNNER_DRAIN_FILE).unlink()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, worker))
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_only_this_runners_listener(self) -> None:
+        """The Worker's parent must be this runner's own Runner.Listener: another parent is never signalled."""
+        _, _, hooks = self.drained_listener_with_worker()
+        other = self.sleeper()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, other.pid))  # its parent is this test process
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_the_gate_takes_over_the_listener_job_completed_froze_and_stops_it_under_the_drain(self) -> None:
+        """The gate takes the hook's frozen listener over only once the Worker has exited, in the state its own
+        JOB_END_FREEZE leaves (frozen, the Worker done, armed), so the poll after it stops the listener under the
+        drain and step() thaws it whatever it decided."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        marker = hooks / hook.JOB_END_FROZEN
+        with mock.patch.object(gate, "listener_list", return_value=(listener.pid,)):
+            gate.adopt_job_end_freeze()  # the Worker still runs: nothing taken over, the listener stays frozen
+            self.assertEqual(gate.frozen, ())
+            self.assertTrue(marker.exists())
+            self.assertTrue(self.stat(listener.pid).startswith("T"))
+            os.kill(worker, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while not self.stat(worker).startswith("Z") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, (listener.pid,))
+        self.assertIn(worker, gate.done)
+        self.assertTrue(gate.freeze_at_exit)
+        self.assertFalse(marker.exists(), "taken over: the backstop leaves it to the gate")
+        self.assertTrue(self.stat(listener.pid).startswith("T"))
+        gate.thaw()
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+
+    def test_the_gate_leaves_a_frozen_listener_of_another_tree_to_its_backstop(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        os.kill(worker, signal.SIGKILL)
+        with mock.patch.object(gate, "listener_list", return_value=()):
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, ())
+        self.assertTrue((hooks / hook.JOB_END_FROZEN).exists())
+
     def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
         """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
         it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
@@ -14658,6 +15074,43 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
         self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
         self.assertIsNone(self.full_gate(capacity).full(fresh=True))
+
+    def test_a_signing_listener_stands_down_while_a_signing_job_holds_or_drains_its_mac(self) -> None:
+        """SIGNER_SIBLING_YIELD, replaying cmux nightly-next 2026-11-25: keep-published-dsyms was handed this Mac's
+        other signing listener while nightly-next-one held the Mac and waited 37.8 min in "Set up runner" with the
+        other signer idle. While a signing job holds the Mac or waits for its drain, the signing listener takes no
+        job, so GitHub hands it to the other signer; an ordinary runner, and an unreadable ledger, change nothing."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(0)
+        script.write_text(base + " --instance 1 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        with mock.patch.object(hook.Gate, "low_disk", return_value=None), \
+                mock.patch.object(hook, "host_waiters", return_value=set()):
+            self.assertIsNone(self.full_gate(capacity).claimed(), "no signing job: it listens")
+            marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+            gate = self.full_gate(capacity)
+            self.assertIn("waits for this mini to drain", gate.claimed() or "")
+            self.assertIn("the other signing Mac", gate.confirmed() or "")
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)  # any other waiter holds nothing
+            self.assertIsNone(self.full_gate(capacity).claimed())
+            marker.unlink()
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+                   for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
+            try:
+                self.assertIn("holds this mini", self.full_gate(capacity).claimed() or "")
+                with mock.patch.object(hook, "exclusive_claim", side_effect=RuntimeError("ledger")):
+                    self.assertIsNone(self.full_gate(capacity).claimed(), "an unreadable ledger holds nothing")
+                script.write_text(base + " --instance 1\n")
+                self.assertNotIn("other signing Mac", self.full_gate(capacity).claimed() or "",
+                                 "an ordinary runner is not held by it")
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            script.write_text(base + " --instance 1 --trusted-next-signing\n")
+            self.assertIsNone(self.full_gate(capacity).claimed(), "listens again once the signing job lets go")
 
     def test_the_signing_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
         """SIGNER_FIRST, replaying cmux15's 2026-11-22 06:12-07:18Z gate log: "stopping the idle listener: a fleet
@@ -19288,6 +19741,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
         self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
         self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        # NO_RUST_GATE: the protected PATH has no Rust, so the hook's toolchain gate is off for the agent and listen.sh
+        self.assertEqual(agent["EnvironmentVariables"]["GLAEDA_RUNNER_TOOLCHAIN_GATE"], "0")
+        self.assertIn("export GLAEDA_RUNNER_TOOLCHAIN_GATE=0\n", listen)
         watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
         self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
         dot_path = (runner / ".path").read_text().strip().split(":")
@@ -19872,8 +20328,16 @@ class DedicatedHookTest(unittest.TestCase):
         hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
         self.assertIsNone(hook.exclusive_claim(capacity))
         marker.unlink()
-        # a signing job holding the mini: it holds both gateway tokens, which only the exclusive class takes together
+        # ordinary gateway jobs holding every gateway token are not a signing job (glaeda#1974 review F1)
         fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+        try:
+            self.assertIsNone(hook.exclusive_claim(capacity))
+        finally:
+            for fd in fds:
+                os.close(fd)
+        # a signing job holding the mini: it holds every token its class takes, the fast and gui tokens too
+        fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+               for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
         try:
             self.assertIn("holds this mini", hook.exclusive_claim(capacity))
             result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
@@ -19939,8 +20403,9 @@ class DedicatedHookTest(unittest.TestCase):
             hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
             self.assertIsNone(yielding.claimed())
             marker.unlink()
-            # the signing job holds the mini (both gateway tokens): held until it lets go, then it listens again
-            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+            # the signing job holds the mini (every token its class takes): held until it lets go, then it listens
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+                   for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
             try:
                 self.assertIn("holds this mini", yielding.claimed())
                 self.assertIsNone(plain.claimed())

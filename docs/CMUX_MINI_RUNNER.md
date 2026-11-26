@@ -1819,7 +1819,11 @@ in at the producer's root. So one root job per root per mini:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which
-  submits the cmux Dev device-app build `try.sh` reuses); job-started refuses any other job at once. Its gate is never held
+  submits the cmux Dev device-app build `try.sh` reuses, and `cmux-next-ios-gestures.yml`'s `gestures` and
+  `cmux-next-ios-keyboard-motion.yml`'s `bench`, which each submit one iOS simulator suite step, and
+  any home-repository job whose id ends in `-fleet` (`GATEWAY_FLEET_SUFFIX`, the name cmux gives its thin
+  clients, so a new one such as `cmux-next-ios-kit.yml`'s `link-ffi-fleet` needs no change here)); job-started refuses any
+  other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
   Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
@@ -1844,7 +1848,7 @@ in at the producer's root. So one root job per root per mini:
   runners between them.
 - With `canonicalRoots` above 1, consumers (gui and product jobs) take no root at job start. Their restore
   step runs `/Users/Shared/cmux-build-fleet/bin/glaeda-canonical-root take <root> --wait 1800` for the
-  producer's root (the path from the product receipt, or N). The job-started hook links that path to its
+  producer's root (the path from the product receipt, or N). The job-started hook (of every runner, a dedicated one too) links that path to its
   runner's generated shim, which runs the hook's `take-root`: an exclusive `root-N.token` held by a second
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
