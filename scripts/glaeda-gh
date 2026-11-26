@@ -12129,10 +12129,16 @@ class Daemon:
             return keys
         q = self.land_queue
         if q is None:
-            keys = frozenset()
-        else:
-            with q.lock:
-                keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
+            # A process with no land queue (a wait's direct read, a free reading): the PRs the serving daemon's queue
+            # holds, from its entries on disk, so a full read of one here keeps its snapshot too. It never sweeps:
+            # its queue is not the queue. The land host, 2026-11-26 07:47-08:07Z: of 55 batched land refreshes, 32
+            # were refused a probe as rollup-stale, because each such process's first read swept with an empty set
+            # and removed every PR's rollup snapshot (and the land queue's per-judgment copies).
+            keys = land_queue_keys_on_disk()
+            self.rollup_keys = (self.now, keys)
+            return keys
+        with q.lock:
+            keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
         self.rollup_keys = (self.now, keys)
         if self.now - self.rollup_swept >= ROLLUP_SWEEP_EVERY:
             self.rollup_swept = self.now
@@ -14744,6 +14750,20 @@ def land_direct_read(key: str) -> str | None:
 # that follows reads the daemon's copy instead of GitHub.
 LAND_REFRESH_BATCH = 50  # PRs per batched refresh (one probe query of ~3 requests a PR: 50 is about 2 points)
 LAND_REFRESH_BATCH_BUDGET = 180.0  # seconds one batch's reads may take (a single read's is DIRECT_READ_BUDGET)
+
+
+def land_queue_keys_on_disk() -> frozenset[str]:
+    """The keys of the land queue's entries on disk that are not done (LandQueue.load's view, read only): the PRs
+    whose full reads keep a rollup snapshot, for a process that holds no land queue of its own."""
+    d = LandQueue.entries_dir()
+    keys = set()
+    with contextlib.suppress(OSError):
+        for p in d.glob("*.json"):
+            e = read_json(p)
+            if isinstance(e, dict) and isinstance(e.get("key"), str) and e.get("state") in LAND_STATES \
+                    and e.get("state") not in LAND_DONE:
+                keys.add(e["key"])
+    return frozenset(keys)
 
 
 def land_read_keeps_rollups(daemon: "Daemon", keys: list[str]) -> None:
