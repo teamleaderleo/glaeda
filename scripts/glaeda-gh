@@ -15796,6 +15796,16 @@ def land_requester_idle_s(out: str, now: float) -> float | None:
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
+# LAND_MERGED_CLASS: this queue's own merge is a result, not a blocker: nothing waits on the requester. Sent as class
+# block, every merge reached its requester tagged [blocker] (gcp-codex-lane-10, 2026-11-26 12:49Z and 12:50Z: "merged
+# at 2f3de658" for lw#11661 and "merged at 951bc81f" for lw#11593, both class block), and a meta-audit read those as
+# merged PRs still raising blockers. Leo, 2026-11-24: "are there any like process level fixes?". A result waits up to
+# 15 min in an idle inbox (acpmux hub/inbox.rs), so it carries LAND_MERGED_WITHIN: the receiver still wakes within a
+# minute. An acpmux older than --within (it refuses the flag) gets the same send once without it. Detector:
+# test-glaeda-gh.py test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute.
+LAND_MERGED_CLASS = "result"
+LAND_MERGED_WITHIN = "60s"
+LAND_NOTIFY_NO_WITHIN = re.compile(r"unexpected argument '--within'")
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
 # An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
 # shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
@@ -15873,6 +15883,15 @@ LAND_FEED_QUIET_MAX = 1800.0
 # the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
 # never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
 LAND_TIMER_HELD = frozenset({"checks_running"})
+# LAND_ROLLUP_READY: a wait on the PR's checks whose copy still shows one running is judged as soon as the controller's
+# rollup of the head says every check run and commit status there is done and green (LandQueue.rollup_ready,
+# why=rollup_ready; the judgment's snapshot is that rollup, not the older GitHub read), at most once per head per
+# LAND_VERDICT_KEEP, asked only when the feed shows something for the PR since that verdict. The
+# check-completed event (below) needs a completed run or suite event after the verdict and spends each event once,
+# so a head whose last check was a commit status, or whose last event the rollup could not vouch for yet, slept to its
+# timer while its copy, starved of reads, still showed a check running. 2026-11-26: manaflow-ai/cmuxterm-hq#28474,
+# green at 10:06Z, last judged checks_running at 09:49Z, merged by hand at 10:13Z; at 11:05Z seven green, CLEAN PRs
+# sat unmerged with the queue's workers 13 busy of 7 and PR copies a median 2,500 s old.
 # A row whose PR the daemon's cache holds no copy of (the no-data path) was judged again LAND_NO_DATA_AFTER after
 # every answer, whatever wait that answer named: with no copy there is no fingerprint to wait on, so nothing held it.
 # no_data_backoff covered only answers that judged nothing. cmux-cp-1, 24 h to 2026-11-26 10:13Z: 24,322 judgments,
@@ -15972,7 +15991,7 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
                             "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", "checks_done",
-                            ""})
+                            "rollup_ready", ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
@@ -16272,6 +16291,18 @@ LAND_STOPPED_READ_EVERY = LAND_OWNER_REMIND_EVERY
 # nothing (history remind_held, once a stop) until a read lands, and then it ends (merged, closed) or is told. The
 # requester was told at the stop with its one step, so holding costs nobody a step. LAND_OWNER_REMIND_MAX stays the
 # one bound on how many in all. Detector: test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_never_told.
+# LAND_OWNER_REMIND_STALE: a reminder is an inbox fyi (LAND_OWNER_REMIND_ENDS), and an fyi wakes nobody, so a stop its
+# requester did not act on in the first day was never heard again: cmux-cp-1, 2026-11-26, ~45 rows "still stopped
+# after 29-65 h" (lw#8652 ... lw#10988, cmux#53146, hq#26188), each reminded as fyi to a coordinator that had queued
+# them for helpers long gone. Of 25 open leo-workspace ones, 17 were base-red fixes main had fixed another way (close),
+# 4 merged main cleanly (re-queue) and 4 needed a hand merge: all one decision away. The first reminder past
+# LAND_OWNER_REMIND_STALE_AFTER at a head unmoved since the stop goes as a blocker (it wakes), names that decision, and
+# is also a coordinator notice (land-stopped-stale); once per stop head (reminds.staleHead), every later reminder of
+# that stop is an fyi again. It is only ever a reminder LAND_OWNER_REMIND_UNREAD lets through, so only on a copy a read
+# refreshed since the row's last word: an unread copy (maybe a PR merged since) is held and wakes nobody. Detectors:
+# test-glaeda-gh.py test_a_stop_unmoved_past_a_day_wakes_its_owner_once,
+# test_a_stale_stop_on_an_unread_copy_is_held_and_wakes_nobody.
+LAND_OWNER_REMIND_STALE_AFTER = 86400.0
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -20624,9 +20655,14 @@ class LandQueue:
                 log({"event": "land-remind-held", "key": e["key"], "code": code, "why": "unread"})
             self.save(e)
             return False
+        # LAND_OWNER_REMIND_STALE: past a day at the stop's own head, read now (head), once per stop head, a blocker
+        stale = (bool(head) and not moved and bool(was) and self.now - at >= LAND_OWNER_REMIND_STALE_AFTER
+                 and str(r.get("staleHead") or "") != was)
+        stale_head = was if stale else str(r.get("staleHead") or "")
         e["remindLife"] = {**life, "unread": int(life.get("unread") or 0) + (0 if head else 1)}
         e["reminds"] = {"n": n + 1, "at": self.now, "code": code,
-                        **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
+                        **({"head": head} if head else {}),  # attributable to the stop it answered, at the head read
+                        **({"staleHead": stale_head} if stale_head else {})}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
@@ -20637,6 +20673,9 @@ class LandQueue:
             # head: the re-queue at the head now comes first, and the stop's own sha is dated.
             msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
                     f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
+        if stale:
+            msg += (f"\nunmoved {hours:.0f} h at {was[:12]}: take the step above and re-queue at the new head, or close "
+                    f"the PR naming what superseded it, or hand it to a live owner; this wakes you once for this head")
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
         if n + 1 < LAND_OWNER_REMIND_MAX:
@@ -20645,12 +20684,17 @@ class LandQueue:
         else:
             msg += f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}, the last; `glaeda-gh land status` still lists it)"
         self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
-                     **({"moved": head[:12]} if moved else {}))
+                     **({"moved": head[:12]} if moved else {}), **({"stale": True} if stale else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1), "moved": moved})
+             "hours": round(hours, 1), "moved": moved, "stale": stale})
         self.save(e)
-        # told at the stop; a repeat is an inbox fyi, and none to a lane idle past the reaper's bound
-        self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS, unless_idle=LAND_OWNER_REMIND_IDLE)
+        if stale:
+            with contextlib.suppress(Exception):
+                self.notice("land-stopped-stale", "warn", f"{msg} (requester {to})", {"pr": self.url(e), "to": to})
+        # told at the stop; a repeat is an inbox fyi, except the one LAND_OWNER_REMIND_STALE wake, and none to a lane
+        # idle past the reaper's bound (the coordinator notice above still says a stale one)
+        self.notify(e, to, msg, cls=LAND_NOTICE_CLASS if stale else LAND_FORWARD_FYI_CLASS,
+                    unless_idle=LAND_OWNER_REMIND_IDLE)
         return True
 
     def stopped_over(self, e: dict) -> bool:
@@ -21614,6 +21658,11 @@ class LandQueue:
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        if not ready and data.get("state") == "OPEN" and head:
+            # the controller's green rollup of the head, as last asked (no ask here): one merge away, whatever the
+            # stale copy shows (LAND_ROLLUP_READY)
+            seen = getattr(self, "rollup_seen", {}).get((key, head.lower()))
+            ready = seen is not None and seen[1] is not None
         tier = self.judge_tier(e)
         # a re-read (reread: its last answer judged nothing at this head) is never "one merge away", and goes behind
         # every other due entry: a lane VM, 2026-11-22, three CLEAN-looking PRs judged "unreadable" every few
@@ -21876,6 +21925,14 @@ class LandQueue:
                     # is not spent, asked again next pass. glaeda#2744, 2026-11-25: green 07:29Z, its done event met
                     # a quota-refused refresh, the event was marked seen and the row slept to its 08:23Z wake.
                     e.pop("doneEventSeen", None)
+                    self.save(e)
+            elif kind == "pr" and self.rollup_ready(e, head):
+                # the copy still shows a check running; the controller's rollup says every check run and commit
+                # status at the head is done and green (LAND_ROLLUP_READY): judged now, whatever event was missed
+                if self.judge(e, head, fp, counts=False, why="rollup_ready"):
+                    e["rollupReady"] = {"head": head, "at": self.now}
+                    self.count("rollup_ready")
+                    self.history(e, "rollup_ready", head=head[:12])
                     self.save(e)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
@@ -22212,6 +22269,20 @@ class LandQueue:
             self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
         return True
 
+    def rollup_ready(self, e: dict, head: str) -> bool:
+        """True when E, waiting on its checks at HEAD with the copy still showing one running, has not been judged on
+        a green rollup since its last verdict, the feed does not show the PR quiet since that verdict (feed_quiet: a
+        run, suite or commit status for it arrived, or there is no feed to say), and the controller's rollup of HEAD
+        (rollup_green, no GitHub request, asked at most every LAND_ROLLUP_SEEN_TTL) is done and green. At most once
+        per head per LAND_VERDICT_KEEP (rollupReady), spent only once handed to a worker (consider)."""
+        last = e.get("rollupReady") or {}
+        if not head or (last.get("head") == head and self.now - float(last.get("at") or 0) < LAND_VERDICT_KEEP):
+            return False  # judged on it at this head lately: a second ask within LAND_VERDICT_KEEP is the timer's
+        at = (e.get("explain") or {}).get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and self.feed_quiet(e["key"], head, at):
+            return False
+        return self.rollup_green(e["key"], head) is not None
+
     def feed_holds(self, e: dict, head: str) -> bool:
         """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
         for the PR, its head or its branch since that judgment started (feed_quiet), within LAND_FEED_QUIET_MAX of it:
@@ -22504,7 +22575,16 @@ class LandQueue:
         the daemon's next full read will write it, else the reason no snapshot will come for this judgment). A GitHub
         snapshot that is not ready gives way to the controller's green rollup of SHA (LAND_ROLLUP_JUDGE)."""
         snap, why = self.github_snapshot(key, sha)
-        if snap is not None or why in ("unpinned", "upstream"):
+        if snap is not None:
+            # a green controller rollup asked after the GitHub read the snapshot is of stands in for it: that read
+            # can show a check running that finished since (LAND_ROLLUP_READY judges on exactly that)
+            seen = self.rollup_seen.get((key, str(sha).lower()))
+            read = snap.get("dataAt")
+            if seen is not None and seen[1] is not None and isinstance(read, (int, float)) and seen[0] > read:
+                return {"rollup": {"nodes": seen[1]}, "complete": True, "head": sha, "readAt": seen[0],
+                        "dataAt": seen[0], "via": "controller"}, ""
+            return snap, why
+        if why in ("unpinned", "upstream"):
             return snap, why
         nodes = self.rollup_green(key, sha)
         if nodes is None:
@@ -26088,7 +26168,8 @@ class LandQueue:
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
-                    cls=None if own else LAND_FORWARD_FYI_CLASS)
+                    cls=LAND_MERGED_CLASS if own else LAND_FORWARD_FYI_CLASS,
+                    within=LAND_MERGED_WITHIN if own else None)
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -26237,7 +26318,7 @@ class LandQueue:
         self.notify(e, e.get("requester") or "", msg, wake=wake, cls=cls)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None,
-               unless_idle: float | None = None) -> None:
+               unless_idle: float | None = None, within: str | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -26250,7 +26331,8 @@ class LandQueue:
         land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone.
 
         UNLESS_IDLE: send nothing when the receiver has sat between turns that many seconds or longer, read once
-        before the send (LAND_OWNER_REMIND_IDLE)."""
+        before the send (LAND_OWNER_REMIND_IDLE). WITHIN: acpmux's --within, the latest the receiver is woken
+        (LAND_MERGED_WITHIN)."""
         to = land_notify_target(e, to)
         if not wake:
             log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
@@ -26277,7 +26359,8 @@ class LandQueue:
         # CLS (an inbox fyi: forward_give_up) is held in the receiver's inbox and wakes nobody
         severity = "info" if cls or message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
+                "--class", cls or LAND_NOTICE_CLASS, *(["--within", within] if within else []), "--title", title,
+                message]
 
         now = self.now
 
@@ -26306,6 +26389,17 @@ class LandQueue:
                          "severity": severity, "message": land_trim(message, 160)})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if "--within" in argv and LAND_NOTIFY_NO_WITHIN.search(whys[-1]):
+                    # LAND_MERGED_WITHIN's comment: an acpmux older than --within; the same send without it
+                    i = argv.index("--within")
+                    del argv[i:i + 2]
+                    got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                    if got.returncode == 0:
+                        gone.pop(to, None)
+                        log({"event": "land-notified", "key": e["key"], "to": to, "class": cls or LAND_NOTICE_CLASS,
+                             "severity": severity, "message": land_trim(message, 160), "within": "unsupported"})
+                        return
+                    whys[-1] = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
                 if LAND_NOTIFY_GONE.search(whys[-1]):
                     # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
                     gone[to] = time.time()
