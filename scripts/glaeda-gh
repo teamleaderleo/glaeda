@@ -1490,6 +1490,16 @@ PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs 
 # host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
 # then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
 FULL_PR_SECS_FILE = "full-pr-secs.json"
+# A head read is the same cost in another query: a cmux head's first 100 checks, its suites and its check-of-record
+# commit. It had no measure at all: the head batch restarted at GQL_BATCH_START on every reexec (the stale valve's, a
+# fast-patch swap's) and, between the once-a-tick halvings, grew back by one per GQL_GROW_AFTER clean queries to 10-13,
+# where GitHub cut it again. The land host, 2026-11-26 02:47-07:02Z: 24 logged head batches of 6 to 13 cmux heads,
+# each cut at 10.6-32.4 s (373.9 s of failed queries, the halves that failed after them not counted), and ticks spent
+# 250-263 s of each 600 s in "read head" for 78 head reads stored (3.2 s each) while waited PR data aged past 3,000 s.
+# So fetch_heads sizes its queries the way fetch_prs sizes full reads: by the seconds per head measured for the
+# repository (head_secs), kept in HEAD_SECS_FILE so a reexec starts from it.
+HEAD_QUERY_SECONDS = PR_FULL_QUERY_SECONDS
+HEAD_SECS_FILE = "head-secs.json"
 # A land-queue PR whose checks are still running changes its fingerprint (the counts by state) every time one check
 # finishes, and every change was a full read: 160+ checks of a cmux PR, ~4.4 s of GitHub's time, for a row that cannot
 # merge yet. The land host, 2026-11-26 02:39-03:39Z: 470 queued rows, 262 gated, PR data p50 4,580 s, GraphQL in stop
@@ -6476,6 +6486,9 @@ class Daemon:
         # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
         self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
         self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
+        # owner/repo -> seconds per head of a GraphQL head read (fetch_heads), carried across a reexec (HEAD_SECS_FILE)
+        self.head_secs_path: Path | None = BASE / HEAD_SECS_FILE
+        self.head_secs: dict[str, float] = load_full_pr_secs(self.head_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -12042,18 +12055,36 @@ class Daemon:
     def full_pr_size(self, full: list[dict]) -> int:
         """How many of FULL (one repository's PRs, as batched() groups them) one full-read query may carry: as many as
         fit PR_FULL_QUERY_SECONDS at the seconds per PR measured for the repository, all of them while none is."""
-        if not full:
+        return self.measured_size("full_pr_secs", full, PR_FULL_QUERY_SECONDS)
+
+    def head_size(self, heads: list[dict]) -> int:
+        """How many of HEADS (one repository's, as batched() groups them) one head query may carry (HEAD_QUERY_SECONDS
+        at the repository's measured seconds per head, head_secs; all of them while none is measured)."""
+        return self.measured_size("head_secs", heads, HEAD_QUERY_SECONDS)
+
+    def measured_size(self, attr: str, entries: list[dict], budget: float) -> int:
+        if not entries:
             return 1
-        secs = self.__dict__.setdefault("full_pr_secs", {}).get("/".join(split_key(full[0]["key"])[1:3]).lower())
-        return len(full) if secs is None else max(1, min(len(full), int(PR_FULL_QUERY_SECONDS // max(0.01, secs))))
+        secs = self.__dict__.setdefault(attr, {}).get("/".join(split_key(entries[0]["key"])[1:3]).lower())
+        return len(entries) if secs is None else max(1, min(len(entries), int(budget // max(0.01, secs))))
 
     def note_full_pr_secs(self, entries: list[dict], seconds: float, answered: bool) -> None:
         """Learn a repository's seconds per full PR read from one query of ENTRIES that took SECONDS: an answer moves
         the measure a third of the way to it; a failure slower than PR_FULL_SLOW_AT says the PRs cost at least that
         much between them (a query cut at ~10 s took longer than it shows), so the next query carries fewer."""
+        self.note_query_secs("full_pr_secs", "full_pr_secs_path", "pr-full-seconds", PR_FULL_QUERY_SECONDS,
+                             entries, seconds, answered)
+
+    def note_head_secs(self, entries: list[dict], seconds: float, answered: bool) -> None:
+        """note_full_pr_secs for a head query (head_secs, HEAD_SECS_FILE)."""
+        self.note_query_secs("head_secs", "head_secs_path", "head-seconds", HEAD_QUERY_SECONDS,
+                             entries, seconds, answered)
+
+    def note_query_secs(self, attr: str, path_attr: str, event: str, budget: float, entries: list[dict],
+                        seconds: float, answered: bool) -> None:
         repo = "/".join(split_key(entries[0]["key"])[1:3]).lower()
         per = seconds / len(entries)
-        measured = self.__dict__.setdefault("full_pr_secs", {})
+        measured = self.__dict__.setdefault(attr, {})
         known = measured.get(repo)
         if answered:
             measured[repo] = per if known is None else known + (per - known) / 3
@@ -12061,9 +12092,9 @@ class Daemon:
             floor = seconds * 1.25 / len(entries)
             if known is None or known < floor:
                 measured[repo] = floor
-                log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
-                     "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
-        path = getattr(self, "full_pr_secs_path", None)
+                log({"event": event, "repo": repo, "seconds": round(floor, 2),
+                     "size": self.measured_size(attr, entries, budget), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, path_attr, None)
         if path is not None and measured.get(repo) != known:
             with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
                 write_json(path, {k: round(v, 3) for k, v in measured.items()})
@@ -12309,13 +12340,33 @@ class Daemon:
         return self.fetch_aliased(entries, "comment")
 
     def fetch_heads(self, entries: list[dict]) -> str | None:
-        """Every check on each head commit, one aliased query for the batch (a head with more than 100
-        contexts is followed page by page). None, or the error when the whole query failed."""
-        entries = [e for e in entries if not self.head_folded_now(e)]
+        """Every check on each head commit, in aliased queries sized by the repository's measured cost per head
+        (head_size). None, or the error of the first query that failed: the heads it and the ones after it carried
+        are left to batched(), which splits them, and a head an earlier query of this tick stored is not read again."""
+        entries = [e for e in entries if not self.head_folded_now(e) and not self.head_read_now(e)]
         if not entries:
             return None
+        size = self.head_size(entries)
+        for i in range(0, len(entries), size):
+            error = self.fetch_head_chunk(entries[i:i + size])
+            if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
+                if error is not None:
+                    for e in entries[i + size:]:
+                        self.refund(e["key"])  # never sent: as the whole chunk's failure refunded it before
+                return error
+        return None
+
+    def head_read_now(self, e: dict) -> bool:
+        """Whether a head query of this tick already stored this head (fetch_heads, before a later query failed)."""
+        at, keys = self.__dict__.get("head_read_tick", (None, frozenset()))
+        return at == self.now and e["key"] in keys
+
+    def fetch_head_chunk(self, entries: list[dict]) -> str | None:
+        """One aliased query for ENTRIES (a head with more than 100 contexts is followed page by page)."""
         self.reads += [(self.now, "head", "graphql")] * len(entries)
+        began = time.monotonic()
         doc, error = self.graphql(heads_query([e["key"] for e in entries]), {})
+        self.note_head_secs(entries, time.monotonic() - began, doc is not None and bool(doc.get("data")))
         if doc is None:
             self.fail(entries, error or "graphql: no response")
             for e in entries:
@@ -12383,6 +12434,10 @@ class Daemon:
             else:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
                 self.head_answered(e["key"])
+                at, keys = self.__dict__.get("head_read_tick", (None, set()))
+                if at != self.now:  # one tick's keys only: the set never outgrows a tick's heads
+                    self.head_read_tick = at, keys = self.now, set()
+                keys.add(e["key"])
 
     def last_real_contexts(self, suites: list[str] | str) -> tuple[list[dict], str | None]:
         """Check-run context nodes (statusCheckRollup's shape, marked lastRealAttempt) for every attempt of SUITES,
@@ -14403,6 +14458,15 @@ LAND_REFRESH_BROKER = re.compile(r"^no answer within \d|\bdirect: (?:busy\b|.*\b
 LAND_REFRESH_BROKER_HOLD = 30.0
 LAND_REFRESH_BROKER_HOLD_MAX = 600.0
 LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land status` names the entry's (count, error)
+
+
+def land_refresh_last_error(e: dict) -> dict:
+    """The error E's last refresh ended with, kept on the record a new refresh starts ({"error": ...}, else {}), so
+    `land status` names it while that refresh runs. gcp-agent-lane-14, 2026-11-26 07:29Z: "refresh unanswered 4x: ?"
+    on cmux#54723, #54705 and #54158, each refused by the broker's commit-checks sweep count every time, because each
+    start replaced the record and dropped the error the refresh before it had answered."""
+    error = (e.get("refresh") or {}).get("error") if int(e.get("refreshUnanswered") or 0) else None
+    return {"error": error} if error else {}
 # A host with its own login (the broker host) reads its landing PRs in the daemon's waited pass, and the land worker's
 # nudge only marks the PR waited there. With hundreds of waited PRs that pass ran hours behind, and nothing else read a
 # due entry's PR: 2026-11-22 01:00Z, a PR (157/157 green, three pinned land requests at one head) sat on a copy
@@ -14631,6 +14695,19 @@ def land_broker_client(client: Path | None = None) -> bool:
         return "lane-gh-credential" in (client or LAND_LANE_GH_CLIENT).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+
+
+def land_own_token_pool(now: float | None = None) -> bool:
+    """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
+    as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
+    through the broker and holds none reads GitHub only through the broker (LAND_PEER_SILENT's comment)."""
+    tool = app_pool_tool()
+    for role in app_pool_chain(APP_POOL_SPARES):
+        if tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file():
+            return True
+        if app_pool_pushed_owners(role, now):
+            return True
+    return False
 
 
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
@@ -16671,7 +16748,46 @@ LAND_HANDOFF_TOOL = "land_handoff"
 LAND_LOCAL_GIT_TIMEOUT = re.compile(r"\bgit\b[^\n]{0,400}?\btimed out\b")
 LAND_LOCAL_GIT_RETRIES = 2
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
-LAND_HANDOFF_DEADLINE = 60.0
+LAND_HANDOFF_DEADLINE = 120.0
+# LAND_HANDOFF_TRANSIENT: a hand-off the broker did not take because it could not answer -- the call cut at
+# LAND_HANDOFF_DEADLINE (exit 124), a 5xx or a dropped connection (LAND_STEP_TRANSIENT), the broker's own "busy:
+# admission queue full" past lane-gh's retry window, or its login's rate-limit latch ("... is spent for login until
+# HH:MMZ (reset); not sent, retry after ...") -- is not a refusal of this PR: nothing was judged, and the same call
+# is taken once the broker answers again. It used to count toward LAND_STEP_STOP like a real refusal and stop the row
+# handoff_refused, a code nothing re-arms. gcp-agent-lane-2, 2026-11-22 05Z-11-23 08Z, with the broker CPU-bound
+# ("busy: admission queue full (the broker is CPU-bound)"): 336 of the 411 handoff_refused events in its land store
+# were "timed out after 60s", and 59 rows (cmux#49887, cmux#50116, leo-workspace#6140, ...) sat stopped 75-123 h
+# though the same host's hand-offs were taken again from 11-23 03Z on. A transient refusal now backs off on its own
+# count (e["handoffTransient"], per head), never counts toward LAND_STEP_STOP, and after LAND_RETRY_STREAK_STOP at
+# one head stops "handoff_transient", which LAND_REARM_CODES re-arms (hourly, LAND_REARM_CAP a day), as a step's timeout
+# does. The two counts never reset each other: a head whose hand-offs alternate between a timeout and a real refusal
+# still stops at one of the two bounds, never loops. A legacy handoff_refused stop whose last refusal was transient is re-armed the same way (rearm). The deadline
+# is LAND_HANDOFF_DEADLINE = 120 s, lane-gh's own STEP_BUSY_S: a 60 s cut ended the call inside lane-gh's busy retry.
+# Detector: test-glaeda-gh.py test_a_hand_off_the_broker_could_not_answer_backs_off_and_is_rearmed_not_stopped.
+LAND_HANDOFF_TRANSIENT = re.compile(r"\bbusy: admission queue full\b|\bconnection reset by peer\b"
+                                    r"|\bis spent for login until \S+ \(reset\); not sent, retry after\b", re.I)
+
+
+# lane-gh's own progress line while it asks a busy broker again (tools/lane-gh ask_while_busy, admission_loop): "lane-gh
+# TOOL: the broker is busy (...); [nothing was started; ]asking again in 1.1 s (try 2), 300 s left of the 300 s retry
+# window". It precedes the call's final answer on stderr whatever that answer is, so only what follows the last one is
+# the broker's answer: a busy retry that ended in a real refusal ("unknown argument 'nominated'") is a real refusal.
+# Every form ends "N s left of" the bound it counts down: "300 s retry window", "the call's 120 s bound", "the queue
+# bound", "the command's deadline" (ask_while_busy, admission_loop, the queue wait): cut after its last word.
+LAND_HANDOFF_BUSY_PROGRESS = re.compile(r"asking again in [\d.]+ s \(try \d+\), \d+ s left of (?:the )?"
+                                        r"(?:\d+ s retry window|\d+ s(?! retry)|[^\n]*?(?:bound|deadline))\b")
+
+
+def land_handoff_transient(rc: int, said: str) -> bool:
+    """A hand-off refusal the broker gave without judging anything (LAND_HANDOFF_TRANSIENT's comment). SAID is the
+    broker's answer; any lane-gh busy-retry progress before it is skipped (LAND_HANDOFF_BUSY_PROGRESS)."""
+    if rc == 124:
+        return True
+    last = None
+    for last in LAND_HANDOFF_BUSY_PROGRESS.finditer(said):
+        pass
+    answer = said[last.end():] if last is not None and said[last.end():].strip() else said
+    return bool(LAND_STEP_TRANSIENT.search(answer) or LAND_HANDOFF_TRANSIENT.search(answer))
 # A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
 # read its PR again, so it never learned that the far host merged it, closed it or lost it. Finding hq#19725
 # (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
@@ -16741,6 +16857,13 @@ LAND_FORWARD_STATE_FRESH = 900.0
 # retrying (unjudgeable_here, early_hand_off, infra_read_stop), and a forwarded row it handed for a judgment is taken
 # back to be judged here (forward_reclaim). An ownership hand-off still goes (no merge of another lane's PR is possible
 # here), and an overflow skips a silent peer for the next one (overflow_send).
+# Not on a lane VM with no token pool of its own (land_own_token_pool false): there a judgment made here reads GitHub
+# through the same broker that went quiet, unauthenticated, and reads nothing. One lane VM's log held 460 "no-token"
+# lookups and 42 of 70 land judgments unreadable after a take-back; another's five days held 1,024 "unreadable" of the
+# 2,263 judgments of the 141 rows it took back (2026-11-21..26). Such a lane keeps the rows forwarded: no
+# take-back, and a row that cannot be judged here is still handed to the broker host. Each forwarded row is re-sent on
+# its own bound (LAND_FORWARD_RESEND, doubling), so the broker host gets it again once it answers, and its first
+# outcome ends the silence for every other row (silent_peers).
 LAND_PEER_SILENT = 1800.0
 LAND_PEER_SILENT_ROWS = 3
 LAND_PEER_SILENT_HOLD = 7200.0
@@ -17739,6 +17862,7 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
+                 own_pool: Callable[[], bool] = land_own_token_pool,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
                  head_watch: Callable[[str], None] | None = None,
@@ -17763,6 +17887,8 @@ class LandQueue:
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
+        self.own_pool = own_pool  # this host holds a token pool of its own (land_own_token_pool, LAND_PEER_SILENT)
+        self.own_pool_seen = (float("-inf"), False)  # (until, held): own_pool's file reads once per APP_POOL_TTL
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
@@ -18172,7 +18298,8 @@ class LandQueue:
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
-                     stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
+                     lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
                      forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
@@ -19294,9 +19421,21 @@ class LandQueue:
         self.peer_quiet = quiet
         return quiet
 
-    def broker_peer_silent(self) -> str:
-        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or ""."""
+    def tokenless(self) -> bool:
+        """Under the lock. A broker client with no token pool of its own (own_pool, read once per APP_POOL_TTL): its
+        judgments read GitHub only through the broker, so it keeps rows forwarded to a silent peer (LAND_PEER_SILENT)."""
         if not self.broker_client():
+            return False
+        until, held = self.own_pool_seen
+        if self.now >= until:
+            held = bool(self.own_pool())
+            self.own_pool_seen = (self.now + APP_POOL_TTL, held)
+        return not held
+
+    def broker_peer_silent(self) -> str:
+        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or "".
+        Always "" on a tokenless lane VM: it keeps handing rows to the broker host (LAND_PEER_SILENT's comment)."""
+        if not self.broker_client() or self.tokenless():
             return ""
         quiet = self.silent_peers()
         return quiet.get(self.broker_peer, "") if self.broker_peer else ""
@@ -19389,7 +19528,8 @@ class LandQueue:
         last = e.get("forwardResent") or {}
         if not executor and e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e):
             quiet = self.silent_peers().get(str(e.get("forwardedTo") or ""))
-            if quiet:  # re-sending to a peer that answers none only waits longer (LAND_PEER_SILENT's comment)
+            # a tokenless lane VM keeps it forwarded and re-sends it on its bound (LAND_PEER_SILENT's comment)
+            if quiet and not self.tokenless():  # re-sending to a peer that answers none only waits longer
                 self.forward_reclaim(e, host, quiet)
                 return False
         if not e.get("forwardFirst"):
@@ -19927,7 +20067,7 @@ class LandQueue:
         """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not LAND_REARM_CODES.match(code):
+        if not LAND_REARM_CODES.match(code) and not self.handoff_stop_transient(e):
             return False
         # A PR that merged or closed since the stop is over: it ends its entry (merged, or stopped "closed"), never a
         # re-arm. gcp-codex-swarm-06, 2026-11-20/21: hq#14618, merged long before, re-armed retry_deadline hour after
@@ -19962,6 +20102,16 @@ class LandQueue:
         self.save(e)
         return True
 
+    @staticmethod
+    def handoff_stop_transient(e: dict) -> bool:
+        """E is stopped handoff_refused and its last refusal was one the broker gave without judging anything: a
+        stop from before LAND_HANDOFF_TRANSIENT, re-armed as a handoff_transient stop is."""
+        st = e.get("stop") or {}
+        if st.get("code") != "handoff_refused":
+            return False
+        why = str((e.get("handoffFail") or {}).get("why") or st.get("reason") or "")
+        return land_handoff_transient(0, why)
+
     def remind(self, e: dict) -> bool:
         """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
         (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
@@ -19969,7 +20119,8 @@ class LandQueue:
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code) \
+                or self.handoff_stop_transient(e):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
         to = str(e.get("requester") or "")
         if not to:
@@ -21229,7 +21380,7 @@ class LandQueue:
                 # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
-                                **self.refresh_starting(e["key"])}
+                                **self.refresh_starting(e["key"]), **land_refresh_last_error(e)}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
@@ -21462,7 +21613,8 @@ class LandQueue:
         if not joins and self.busy() + self.refresh_batches() >= self.workers():
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
-        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
+        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"]),
+                        **land_refresh_last_error(e)}
         if own:
             self.own_refreshed.append(self.now)
         self.save(e)
@@ -22039,6 +22191,24 @@ class LandQueue:
         repo_n = f"{e['repo']}#{e['number']}"
         if live == pin:
             e.pop("baseMergeUnread", None)
+            kept = e.get("staleLive") if isinstance(e.get("staleLive"), dict) else {}
+            if kept.get("head") != head or kept.get("pin") != pin:
+                kept = {"head": head, "pin": pin, "since": self.now, "n": 0}
+            kept["n"] = int(kept.get("n") or 0) + 1
+            e["staleLive"] = kept
+            if self.now - float(kept["since"]) >= LAND_STALE_LIVE_MAX:
+                # LAND_STALE_LIVE_MAX: GitHub's PR has shown HEAD that long while its branch is at the pin; no read
+                # here catches it up, so the requester is told what does (a push of the branch) instead of a wait
+                e.pop("staleLive", None)
+                e.pop("oldPinWait", None)
+                self.stop(e, "pr_head_lags_branch",
+                          f"GitHub's PR still shows {head[:12]}, an older commit of the pin, while its branch ref is "
+                          f"at the pin {pin[:12]} ({kept['n']} reads of the branch over "
+                          f"{int((self.now - float(kept['since'])) // 60)} min): GitHub has not synced the PR to its "
+                          "branch, so no merge at the pin can pass --match-head-commit",
+                          f"push the branch again so GitHub re-syncs the PR (an empty commit on {pin[:12]}), then "
+                          f"glaeda-gh land {repo_n} --sha NEW_HEAD")
+                return True
             e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
             self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
                          why="an older commit of the pin; GitHub's branch is at the pin")
@@ -22433,6 +22603,7 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
+        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()
@@ -24573,6 +24744,7 @@ class LandQueue:
                 host = str(doc.get("host") or "the broker host")
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
+                e.pop("handoffTransient", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
                                   "request": str(doc.get("request") or ""),
                                   "kind": "judgment" if due.get("kind") == "judgment" else "ownership"}
@@ -24591,6 +24763,24 @@ class LandQueue:
             self.hand_off(e, live, repinned=True)  # off the lock, as the first call was
             return
         with self.lock:
+            answer = said
+            if isinstance(envelope, dict):
+                inner = doc.get("error") or doc.get("reason") if isinstance(doc, dict) else ""
+                answer = f"{envelope.get('error') or ''} {inner or ''}".strip() or said
+            if land_handoff_transient(got.returncode, answer):
+                last = e.get("handoffTransient") or {}
+                n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+                e["handoffTransient"] = {"head": head, "count": n, "at": self.now, "why": said}
+                self.history(e, "handoff_refused", head=head[:12], why=land_trim(said, 160), n=0, transient=n)
+                if n >= LAND_RETRY_STREAK_STOP:
+                    self.stop(e, "handoff_transient", f"{what}, and the broker host's land queue could not answer "
+                              f"the hand-off {n} times at this head: {said}",
+                              f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+                    return
+                after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+                self.wait(e, {"kind": "retry", "why": f"the broker host's land queue could not answer the hand-off "
+                              f"({land_trim(said, 80)}): backoff {after:.0f} s"}, after)
+                return
             last = e.get("handoffFail") or {}
             n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}
@@ -25589,6 +25779,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
 # and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
+# LAND_STALE_LIVE_MAX: how long stale_live keeps the pin while GitHub's PR shows the same older commit of it. Past it
+# the copy is no lag a read waits out: GitHub's PR itself is behind its branch ref, and the land stops
+# pr_head_lags_branch naming the push that re-syncs it. gcp-agent-lane-14, 2026-11-25 23:55Z to 2026-11-26 07:28Z:
+# cmux#54723's branch ref at the pin 7a36daca, pulls/54723 at 1e7bbef5 (65 commits behind) for 7.5 h; stale_head_kept
+# 33 times, the row requeued after each and read "due since 00:42:40Z: every worker busy" in `land status` throughout.
+LAND_STALE_LIVE_MAX = 1800.0
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 
