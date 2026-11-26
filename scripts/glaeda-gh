@@ -15872,6 +15872,20 @@ LAND_OWNER_REMIND_CAP = 2
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_OWNER_REMIND_BLIND: when that read never landed, the reminder was told blind ("the PR could not be read just
+# now") at every due time, LAND_OWNER_REMIND_CAP a day, for as long as the reads kept failing. And each one saved the
+# row, so its `updated` never aged past LAND_KEEP and the row was never pruned: it was reminded for ever. air-blue,
+# 2026-11-26 08:02Z: hq#16363, stopped unreadable_repeated at df24b4015efb on 11-22, merged at 83fa9b31 on 11-23 by
+# another host's queue, was still reminded "still stopped after 84 h ... could not be read just now" from a copy
+# from before the stop. Now a due reminder whose refresh brought no read asks GitHub's REST pulls/N once (one GET,
+# the REST bucket, not the GraphQL read that failed) off the lock: merged or closed ends the row quietly, open gives
+# the head now. A reminder that still has no read goes blind at most LAND_OWNER_REMIND_BLIND_CAP times in a row; after
+# that the row says nothing and saves nothing until a read lands (it still asks REST every LAND_OWNER_REMIND_EVERY),
+# so a merged PR whose reads all fail ages out at LAND_KEEP instead of being reminded for ever. Cost: one REST GET per
+# due reminder with no read. Detector: test-glaeda-gh.py
+# test_a_stopped_row_merged_whose_reads_all_fail_ends_by_its_rest_read (and -k blind).
+LAND_OWNER_REMIND_BLIND_CAP = 1
+LAND_OWNER_REMIND_REST_JQ = "{state: .state, merged: .merged, sha: .merge_commit_sha, head: .head.sha}"
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -17883,6 +17897,7 @@ class LandQueue:
         self.forward_reading: set[str] = set()
         self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
+        self.remind_resting: set[str] = set()  # keys whose reminder's REST state read runs (LAND_OWNER_REMIND_BLIND)
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.peer_quiet: dict[str, str] = {}  # silent peers, each to why (silent_peers, LAND_PEER_SILENT)
         self.peer_quiet_at = float("-inf")  # silent_peers reads the rows again after this
@@ -20105,7 +20120,10 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
-        if self.remind_read_pending(e, last):
+        b = e.get("remindBlind") if isinstance(e.get("remindBlind"), dict) else {}
+        blind = int(b.get("n") or 0) if float(b.get("stop") or -1) == at else 0  # counted for this stop only
+        paused = blind >= LAND_OWNER_REMIND_BLIND_CAP  # LAND_OWNER_REMIND_BLIND: no refresh, no save, until a read
+        if not paused and self.remind_read_pending(e, last):
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
@@ -20113,6 +20131,17 @@ class LandQueue:
         data = cache.get("data") or {}
         read_at = [t for t in (cache.get("dataAt"), cache.get("updatedAtAt"), cache.get("fetchedAt")) if _finite(t)]
         head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
+        if not head:
+            rest = self.remind_rest(e, last, paused)  # LAND_OWNER_REMIND_BLIND: GitHub's REST state, once
+            if rest is None:
+                return False  # asked, or the PR is over: decided on a later pass
+            head = rest
+        if not head and paused:
+            return False  # told blind LAND_OWNER_REMIND_BLIND_CAP times in a row: quiet until a read lands
+        if head:
+            e.pop("remindBlind", None)
+        else:
+            e["remindBlind"] = {"stop": at, "n": blind + 1}
         was = str(st.get("head") or "").lower()
         moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
@@ -20153,6 +20182,77 @@ class LandQueue:
             self.stop(e, "closed", "closed unmerged (reminder: the PR's copy shows it closed)", "", tell="quiet")
             return True
         return False
+
+    def remind_rest(self, e: dict, last: float, paused: bool) -> str | None:
+        """Under the lock. A due reminder of E with no read newer than LAST (LAND_OWNER_REMIND_BLIND): asks GitHub's
+        REST pulls/N for its state once (PAUSED: again every LAND_OWNER_REMIND_EVERY), off the lock (inline: here).
+        None while that read runs or waits, or when it ended the row; else the head it read, "" when it read none."""
+        key = e["key"]
+        if key in self.remind_resting:
+            return None
+        rest = e.get("remindRest") if isinstance(e.get("remindRest"), dict) else {}
+        asked = float(rest.get("asked") or 0)
+        if asked <= last or (paused and self.now - asked >= LAND_OWNER_REMIND_EVERY):
+            gh = self.gh()
+            if gh is None:
+                return ""  # nothing to read it with: told blind, as before
+            asked = self.now
+            e["remindRest"] = {"asked": asked}  # in memory only: a paused row is never saved by its probes
+            self.remind_resting.add(key)
+            token = (e.get("gen"), float((e.get("stop") or {}).get("at") or 0))
+
+            def read() -> None:
+                try:
+                    got = self.remind_rest_state(e, gh)
+                    with self.lock:
+                        now = self.entries.get(key)
+                        if now is not None and now.get("state") == "stopped" \
+                                and (now.get("gen"), float((now.get("stop") or {}).get("at") or 0)) == token:
+                            self.remind_rest_settle(now, asked, *got)
+                except Exception as error:  # noqa: BLE001  a reminder's extra read never stops the queue
+                    log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                finally:
+                    self.remind_resting.discard(key)
+
+            if not self.inline:
+                threading.Thread(target=read, name="land-remind-rest", daemon=True).start()
+                return None
+            read()
+            if e.get("state") != "stopped" or (e.get("stop") or {}).get("code") == "closed":
+                return None
+            rest = e.get("remindRest") if isinstance(e.get("remindRest"), dict) else {}
+        elif "state" not in rest and "error" not in rest and self.now - asked < LAND_OWNER_REMIND_READ_WAIT:
+            return None  # a read that has not answered yet (a thread holds it past remind_resting: never here)
+        return str(rest.get("head") or "") if rest.get("state") == "OPEN" and asked > last else ""
+
+    def remind_rest_state(self, e: dict, gh: str) -> tuple[str, str, str, str]:
+        """One REST read of E's PR (GET pulls/N, LAND_OWNER_REMIND_REST_JQ): (OPEN|MERGED|CLOSED, merge commit, head,
+        why not), the state empty when it could not be read."""
+        got = self.call([gh, "api", f"repos/{e['repo']}/pulls/{e['number']}", "--jq", LAND_OWNER_REMIND_REST_JQ],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError, TypeError):
+            doc = json.loads(got.stdout or "")
+            raw = str(doc.get("state") or "").lower()
+            if got.returncode == 0 and raw in ("open", "closed"):
+                state = "MERGED" if doc.get("merged") is True else "CLOSED" if raw == "closed" else "OPEN"
+                sha = str(doc.get("sha") or "").lower() if state == "MERGED" else ""
+                head = str(doc.get("head") or "").lower()
+                return state, sha if SHA40.fullmatch(sha) else "", head if SHA40.fullmatch(head) else "", ""
+        return "", "", "", land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip() or f"exit {got.returncode}", 300)
+
+    def remind_rest_settle(self, e: dict, asked: float, state: str, sha: str, head: str, why: str) -> None:
+        """Under the lock. Stopped E's REST state read (remind_rest) answered: merged or closed ends the row with no
+        word to anyone, as remind_ended does from the copy; open or unread is kept for its reminder."""
+        log({"event": "land-remind-rest", "key": e["key"], "state": state or None, "head": head[:12] or None,
+             **({"error": land_trim(why, 160)} if why else {})})
+        if state == "MERGED":
+            self.merged(e, sha or e.get("mergeSha") or "", "reminder: GitHub's REST read shows it merged", wake=False)
+        elif state == "CLOSED":
+            self.stop(e, "closed", "closed unmerged (reminder: GitHub's REST read shows it closed)", "", tell="quiet")
+        elif state:
+            e["remindRest"] = {"asked": asked, "state": state, "head": head}
+        else:
+            e["remindRest"] = {"asked": asked, "error": land_trim(why, 160)}
 
     def remind_read_pending(self, e: dict, last: float) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word

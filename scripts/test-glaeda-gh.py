@@ -30419,6 +30419,58 @@ class LandTest(Base):
         e = self.tick(60)
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
 
+    def rest_pull(self, state: str, merged: bool = False, head: str = LA) -> None:
+        """What GET repos/o/r/pulls/1 answers through LAND_OWNER_REMIND_REST_JQ."""
+        self.w.api["repos/o/r/pulls/1"] = json.dumps({"state": state, "merged": merged,
+                                                      "sha": "f" * 40 if merged else None, "head": head})
+
+    def rest_reads(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if c[1] == "repos/o/r/pulls/1"]
+
+    def test_a_stopped_row_merged_whose_reads_all_fail_ends_by_its_rest_read(self):
+        # LAND_OWNER_REMIND_BLIND: air-blue, 2026-11-26: hq#16363 merged on 11-23 by another host's queue, and its row
+        # there (stopped unreadable_repeated on 11-22) was reminded "still stopped after 84 h ... could not be read
+        # just now" because every refresh of it failed.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None  # every refresh fails
+        self.rest_pull("closed", merged=True)
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((e["state"], e.get("mergeSha"), e.get("reminds")), ("merged", "f" * 40, None))
+        self.assertEqual((len(self.rest_reads()), len(self.w.refreshed)), (1, 1))
+        self.assertTrue(all(c[c.index("--class") + 1] == "fyi" for c in self.w.sent()[sent:]))  # waking nobody
+
+    def test_a_stopped_row_closed_whose_reads_all_fail_ends_quietly_by_its_rest_read(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None
+        self.rest_pull("closed")
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("reminds"), len(self.w.sent())),
+                         ("stopped", "closed", None, sent))
+
+    def test_a_blind_reminder_is_told_once_then_the_row_waits_for_a_read(self):
+        # LAND_OWNER_REMIND_BLIND: no read at all (refresh and REST both fail) is told blind once, then nothing and no
+        # save, so the row ages out at LAND_KEEP; a read that lands later (REST open, at a new head) is told again.
+        e = self.conflict_stop()
+        self.fresh_head = None
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        sent, refreshed = len(self.w.sent()), len(self.w.refreshed)
+        self.assertEqual((e["reminds"]["n"], e["remindBlind"]["n"]), (1, 1))
+        self.assertIn("could not be read just now", self.w.sent()[-1][-1])
+        updated = e["updated"]
+        for _ in range(8):  # two days of due times
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((len(self.w.sent()), len(self.w.refreshed), e["updated"]), (sent, refreshed, updated))
+        self.assertEqual(len(self.rest_reads()), 1 + 8)  # one REST GET a due time, nothing else
+        self.rest_pull("open", head=LB)  # pushed since: the REST read gives the head now
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["head"], e.get("remindBlind")), ("stopped", LB, None))
+        self.assertIn(f"--pin {LB}", self.w.sent()[-1][-1])
+
     def test_a_reminder_names_the_head_now_when_the_stop_head_moved(self):
         # LAND_OWNER_REMIND_MOVED: lw#9376's reminder quoted 4a7ee5cb2b6a, the head its stop was read at; re-queued
         # there it stopped again at 0d18d91f773a. The read the reminder already asks for gives the head now for free.
