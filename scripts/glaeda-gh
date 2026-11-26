@@ -15503,6 +15503,17 @@ LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
+# shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, branch_ref). When the branch is at another
+# commit, the PR object is what lags, not the branch: GitHub made the branch's new head (someone's update-branch, a
+# push) and has not synchronized the PR to it, so no further update-branch can succeed and none is counted toward
+# LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_SYNC_STUCK it stops pr_head_unsynced, naming the
+# one step that makes GitHub read the branch again (a new commit on it). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
+# own update-branch made 40818337 (07:28:42Z, committer web-flow), and 30 min later pulls/56682 still read head
+# 54746b5f, updated_at 06:06Z, with no check run at 40818337; this queue sent update-branch at 54746b5f five times
+# (07:29-07:41Z), each refused for the head mismatch and counted as a refusal of the PR.
+LAND_HEAD_MISMATCH = re.compile(r"expected head sha|head sha didn.?t match|head branch was modified", re.I)
+LAND_PR_SYNC_STUCK = 1200.0
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
 LAND_PIN_PARENT_WAIT = 300.0
@@ -23689,6 +23700,10 @@ class LandQueue:
                 self.save(e)
         got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
+        ref = ""
+        if kind == "update_branch" and got.returncode not in (0, 124) \
+                and LAND_HEAD_MISMATCH.search(f"{got.stderr or ''}\n{got.stdout or ''}"):
+            ref = self.branch_ref(e, gh)  # off the lock: one read, only for this refusal
         with self.lock:
             if kind == "update_branch" and got.returncode not in (0, 124):
                 # refused: not sent; step_refused counts and backs off its retries. A timeout (124) may have reached
@@ -23712,7 +23727,7 @@ class LandQueue:
                 # Refused at this head (moved, nothing to update, or a broker that cannot run this form): the refusal's
                 # own next step, else a backoff that doubles, and a stop at LAND_STEP_STOP (step_refused).
                 self.nudge(e["key"])
-                named = self.step_refused(e, kind, head, got)
+                named = self.step_refused(e, kind, head, got, branch_ref=ref)
         if named == "hand_off":
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
@@ -24512,7 +24527,48 @@ class LandQueue:
         self.push_step(e, "update_branch", head,
                        land_update_branch_args(repo, number, head, list(needs or []), self.broker_client(), force))
 
-    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
+    def branch_ref(self, e: dict, gh: str) -> str:
+        """The PR's branch head as the branch ref reads it (git/ref/heads/BRANCH, not the PR object), or "" when the
+        cache names no branch or the read does not answer (LAND_HEAD_MISMATCH's comment)."""
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        branch = str(data.get("headRefName") or "")
+        if not branch or not BRANCH_SAFE.fullmatch(branch) or ".." in branch:
+            return ""
+        got = self.call([gh, "api", f"repos/{e['repo']}/git/ref/heads/{branch}", "--jq", ".object.sha"],
+                        LAND_GH_DEADLINE)
+        sha = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
+        return sha if SHA40.fullmatch(sha) else ""
+
+    def branch_ahead(self, e: dict, head: str, ref: str, out: str) -> None:
+        """Under the lock. The update-branch at HEAD was refused for the head mismatch and the branch ref reads REF, not
+        HEAD: GitHub's PR has not followed its branch (LAND_HEAD_MISMATCH's comment). Not counted; a wait for the PR
+        to show the new head, or a stop naming the resync once LAND_PR_SYNC_STUCK has passed."""
+        w = e.get("branchAhead")
+        if not isinstance(w, dict) or w.get("head") != head or w.get("ref") != ref:
+            w = e["branchAhead"] = {"head": head, "ref": ref, "since": self.now}
+        waited = self.now - float(w.get("since") or self.now)
+        self.history(e, "branch_ahead_of_pr", head=head[:12], ref=ref[:12], waited=round(waited))
+        e.pop("updateSent", None)
+        if waited >= LAND_PR_SYNC_STUCK:
+            name = key_name(e["key"])
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            branch = str(data.get("headRefName") or "the branch")
+            self.stop(e, "pr_head_unsynced",
+                      f"GitHub's PR still reads head {head[:12]} {waited / 60:.0f} min after its branch {branch} moved "
+                      f"to {ref[:12]}: GitHub has not synchronized the PR to its branch, so update-branch at "
+                      f"{head[:12]} is refused ({land_trim(land_tail(out), 160)})",
+                      f"push a commit to {branch} so GitHub reads it again (git fetch origin {branch} && git checkout "
+                      f"{ref} && git commit --allow-empty -m 'ci: resync the PR to its branch head' && git push origin "
+                      f"HEAD:{branch}); if GitHub does not follow that push either, close and reopen the PR (gh pr "
+                      f"close {e['number']} -R {e['repo']} && gh pr reopen {e['number']} -R {e['repo']}); then "
+                      f"glaeda-gh land {name} --sha <the new 40-hex head>")
+            return
+        self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
+                      "why": f"the branch is at {ref[:12]}; GitHub's PR still reads {head[:12]}"},
+                  min(LAND_HEAD_TIMEOUT, max(60.0, LAND_PR_SYNC_STUCK - waited)))
+
+    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess,
+                     branch_ref: str = "") -> str | None:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
@@ -24567,6 +24623,10 @@ class LandQueue:
             self.history(e, "step_closed", kind=kind, head=head[:12], why=land_step_class(out))
             self.wait(e, {"kind": "retry", "why": f"{kind} refused: GitHub says the PR is closed; its state is read "
                           "next"}, float(NUDGE_MIN))
+            return None
+        if kind == "update_branch" and SHA40.fullmatch(branch_ref or "") and branch_ref != str(head or "").lower() \
+                and LAND_HEAD_MISMATCH.search(out):
+            self.branch_ahead(e, str(head or "").lower(), branch_ref, out)
             return None
         cls = land_step_class(out)
         if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):

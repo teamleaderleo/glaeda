@@ -31573,6 +31573,51 @@ class LandTest(Base):
         self.assertNotIn("allow-empty", json.dumps(e["wait"]))
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    MISMATCH = '{"message":"expected head sha didn\u2019t match current head ref.","status":"422"}'
+
+    def stale_pr_round(self, head: str, seconds: float) -> dict:
+        """One judgment at HEAD naming update_branch, which GitHub refuses for the head mismatch, the PR read still at
+        HEAD (its branch, lane/x, read through the cache)."""
+        self.pr(head)
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.answers.append(refusal("red_not_excused", head, {"kind": "update_branch", "expected_head_sha": head,
+                                                                "needs_newer_base": ["ci"]}))
+        return self.tick(seconds)
+
+    def test_an_update_refused_for_a_branch_the_pr_never_follows_is_not_counted_and_names_the_resync(self):
+        # manaflow-ai/cmux#56682, 2026-11-26 (LAND_HEAD_MISMATCH's comment): GitHub's update-branch made 40818337 and
+        # the PR kept reading 54746b5f; five pinned sends were each counted as a refusal of the PR.
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.MISMATCH
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        e = self.stale_pr_round(LA, 2)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertEqual((e["wait"]["kind"], e["wait"]["before"]), ("head_change", LA))
+        self.assertIsNone(e.get("stepFail"))
+        self.assertEqual(e["branchAhead"]["ref"], LB)
+        rounds = 0
+        while e.get("state") != "stopped" and rounds < 20:
+            e = self.stale_pr_round(LA, gg.LAND_HEAD_TIMEOUT + 1)
+            rounds += 1
+        self.assertEqual(e["stop"]["code"], "pr_head_unsynced", e.get("stop"))
+        self.assertIsNone(e.get("stepFail"))  # never counted toward LAND_STEP_STOP
+        self.assertIn("allow-empty", e["stop"]["next"])
+        self.assertIn("HEAD:lane/x", e["stop"]["next"])
+        self.assertIn("branch_ahead_of_pr", [h["event"] for h in e["history"]])
+        # one branch read per refused send, and no read on any other step
+        reads = [c for c in self.w.gh_calls("api") if "git/ref/heads/lane/x" in c[1]]
+        self.assertEqual(len(reads), rounds + 1)
+
+    def test_an_update_refused_for_the_mismatch_with_the_branch_at_the_pr_head_counts_as_before(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.MISMATCH
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        e = self.stale_pr_round(LA, 2)
+        self.assertEqual(e["stepFail"]["count"], 1)
+        self.assertIsNone(e.get("branchAhead"))
+
     def test_the_run_appearing_at_that_head_is_judged_as_usual(self):
         e = self.updated_to(LB)
         self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the repo's own pull_request run started
