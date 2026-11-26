@@ -4852,6 +4852,70 @@ class BalanceTest(Base):
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
         self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
 
+    def test_graphql_reading_is_the_counter_its_own_queries_draw_from(self) -> None:
+        """2026-11-25 22:40Z: a daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0 left
+        resetting at 22:41:25Z while the counter the login's queries spent had 4459 left until 23:11:10Z. The reading
+        is the counter the daemon's own queries name (cost given), and each counter keeps the points drawn from it."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 85)  # /rate_limit's counter: no query of ours drew on it
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 0)  # no draw yet: the poorest
+        self.daemon.note_budget("graphql", 5000, 4459, NOW + 1870, cost=3)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4459)
+        self.assertTrue(self.daemon.budget["graphql"]["drawn"])
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 85)  # /rate_limit again: still not the hold
+        self.daemon.note_budget("graphql", 5000, 4457, NOW + 1870, cost=2)
+        self.daemon.settle_counters("graphql")
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4457)
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        counters = {c["reset"]: c for c in self.daemon.budget["graphqlCounters"]}
+        self.assertEqual(counters[NOW + 1870]["spent"], 5)  # the settle's own re-merge counts no point twice
+        self.assertTrue(counters[NOW + 1870]["drawn"])
+        self.assertNotIn("drawn", counters[NOW + 85])
+        self.assertNotIn("spent", counters[NOW + 85])
+        view = self.daemon.graphql_counters_view()
+        self.assertEqual(sorted((c["remaining"], c["drawn"]) for c in view), [(0, False), (4457, True)])
+
+    def test_a_drawn_counter_that_runs_low_holds_the_reads(self) -> None:
+        """The other side: when the counter the queries draw from is the poor one, it is the hold, however rich the
+        other counter /rate_limit reports."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 40, NOW + 600, cost=1)
+        self.daemon.note_budget("graphql", 5000, 4751, NOW + 2040)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 40)
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+
+    def test_a_drawn_counter_past_its_reset_is_dropped_not_held(self) -> None:
+        """The counter the queries draw from reset: that is a fresh window, so neither its last "0 left" nor the
+        other, poorer counter the daemon does not draw from holds the reads; the next query names the new one."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 60, cost=1)
+        self.daemon.note_budget("graphql", 5000, 10, NOW + 3000)
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+        self.daemon.now = NOW + 61
+        self.daemon.settle_counters("graphql")
+        self.assertEqual([c["reset"] for c in self.daemon.budget["graphqlCounters"]], [NOW + 3000])
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        self.daemon.note_budget("graphql", 5000, 4990, NOW + 3661, cost=1)  # the new window's first answer
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4990)
+        self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 2)
+
+    def test_a_graphql_answer_names_its_counter_with_its_cost(self) -> None:
+        """Daemon.graphql passes the answer's rateLimit cost, so the counter it drew from is the reading."""
+        self.daemon.now = NOW
+        self.daemon.budget = {"graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 85, "seenAt": NOW}]}
+        reset = dt.datetime.fromtimestamp(NOW + 1870, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"data": {"rateLimit": {"limit": 5000, "remaining": 4459, "resetAt": reset, "cost": 4}}}
+        with mock.patch.object(self.daemon, "request", return_value=(200, {}, doc)):
+            got, error = self.daemon.graphql("query { rateLimit { limit remaining resetAt cost } }", {})
+        self.assertIsNone(error)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4459)
+        drawn = next(c for c in self.daemon.budget["graphqlCounters"] if c.get("drawn"))
+        self.assertEqual(drawn["spent"], 4)
+
     def test_graphql_reads_past_the_per_minute_ceiling_wait_for_the_next_minute(self) -> None:
         """A tick that would spend past graphqlPerMinute sends nothing more: its reads are deferred (first next tick),
         not spilled to REST, and once the minute has passed they are read."""
@@ -7836,6 +7900,21 @@ class BudgetOutputTest(Base):
         self.assertIn("0/5000 until", line)
         self.assertIn("4751/5000 until", line)
         self.assertIn("the one a read is refused against", line)
+
+    def test_budget_names_the_counter_the_daemon_draws_from(self) -> None:
+        """A page must say which counter is low: the reading is the drawn one, and the counters line marks it."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 4459, "reset": NOW + 1870, "seenAt": NOW - 10, "drawn": True},
+            "graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 85, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4459, "reset": NOW + 1870, "seenAt": NOW - 10,
+                                 "drawn": True, "spent": 12}]})
+        text = self.budget_text()
+        self.assertIn("graphql  4459/5000 left", text)
+        self.assertIn("the counter this daemon's queries draw from", text)
+        line = next(ln for ln in text.splitlines() if "GraphQL counters" in ln)
+        self.assertIn("0/5000 until", line)
+        self.assertIn("(drawn from, 12 points spent)", line)
+        self.assertIn("the one this daemon's queries draw from is the one above", line)
 
     def test_one_live_graphql_counter_prints_no_split_line(self) -> None:
         """Nothing to disambiguate when the bucket has a single live counter, including a second whose window ended."""

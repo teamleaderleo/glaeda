@@ -6079,6 +6079,8 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
         if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
             c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
                  "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
+            if "spent" in c or "spent" in seen:  # GraphQL: the points this daemon's queries drew from it
+                c["spent"] = int(c.get("spent") or 0) + int(seen.get("spent") or 0)
             tags = sorted(set(c.get("counters") or []) | set(seen.get("counters") or []))
             if tags:
                 c["counters"] = tags  # a counter keeps the tag any of its readings gave it (ACTIONS_COUNTER_PATH)
@@ -6087,6 +6089,19 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     if not merged:
         out.append(dict(seen))
     return sorted(out, key=lambda c: c["reset"])
+
+
+def graphql_drawn(budget: dict, live: list[dict], now: float) -> dict | None:
+    """The GraphQL counter the daemon's own queries last drew from (budget["graphqlDrawn"], Daemon.note_budget): the
+    live counter in LIVE within RESET_JITTER of its reset, or the drawn reading itself once its reset passed (that
+    counter has a fresh window), or None when no query has answered with a live reset (the poorest is the reading)."""
+    d = budget.get("graphqlDrawn")
+    if not (isinstance(d, dict) and isinstance(d.get("reset"), (int, float)) and isinstance(d.get("remaining"), int)
+            and isinstance(d.get("seenAt"), (int, float))):
+        return None
+    if d["reset"] <= now:
+        return d
+    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER), None)
 
 
 def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
@@ -7462,7 +7477,10 @@ class Daemon:
                 self.paths[kind] = current = OTHER[current]
         return current
 
-    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "") -> None:
+    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "",
+                    cost: int | None = None) -> None:
+        """One reading of BUCKET. COST (GraphQL only) marks it as the rateLimit of a query this daemon sent on the
+        login: the counter that query drew COST points from, which settle_counters reads as the GraphQL reading."""
         try:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
@@ -7473,10 +7491,19 @@ class Daemon:
             # :21 (cosmic-gray's reading jumped from 3850 left to 3938 between them at 06:02Z while the spending one
             # had 1664). The last answer alone let the daemon, and the gh guard reading budget.json, spend from a
             # counter that was nearly gone; every live one is kept and the poorest is the reading, as for REST.
+            #
+            # Which counter a read is held against is the one this daemon's own queries draw from, not the poorest:
+            # 2026-11-25 22:40Z one host's daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0
+            # left that reset at 22:41:25Z while the counter the login's queries were spending had 4459 left until
+            # 23:11:10Z, and merges went on succeeding. A query's own rateLimit (COST given) names its counter
+            # (graphqlDrawn, each counter's "spent" its points); /rate_limit and response headers only add counters.
             if not isinstance(reset, (int, float)):
                 if not rest_counters(self.budget, "graphqlCounters"):
                     self.budget[bucket] = seen
                 return
+            if cost is not None:
+                seen["spent"] = max(0, int(cost))
+                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt")}
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
@@ -7496,6 +7523,12 @@ class Daemon:
         self.budget["restCounters"] = merge_counter(rest_counters(self.budget), seen)
         self.settle_rest()
 
+    def graphql_counters_view(self) -> list[dict]:
+        """budget.json's live GraphQL counters as daemon.json carries them: left, limit, reset, drawn, spent."""
+        return [{"remaining": c["remaining"], "limit": c.get("limit"), "reset": c["reset"],
+                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {})}
+                for c in rest_counters(self.budget, "graphqlCounters") if c["reset"] > self.now]
+
     def settle_rest(self) -> None:
         """budget["rest"] is the core counter with the least left. GitHub answers one token's REST calls from
         two "core" counters with their own hourly windows (measured 2026-10-30: /actions/runs/N and
@@ -7509,20 +7542,36 @@ class Daemon:
         self.settle_counters("rest")
 
     def settle_counters(self, bucket: str) -> None:
-        """settle_rest for BUCKET ("rest": restCounters, "graphql": graphqlCounters)."""
+        """settle_rest for BUCKET ("rest": restCounters, "graphql": graphqlCounters). For GraphQL the reading is the
+        counter this daemon's own queries last drew from (graphql_drawn), and the poorest only before any did."""
         key = "restCounters" if bucket == "rest" else "graphqlCounters"
         counters = rest_counters(self.budget, key)
         cur = self.budget.get(bucket)
         if isinstance(cur, dict) and isinstance(cur.get("reset"), (int, float)) and isinstance(cur.get("remaining"), int):
-            # the reading itself counts too: a budget.json from before restCounters, or one lowered in place
+            # the reading itself counts too: a budget.json from before restCounters, or one lowered in place (its
+            # copy's "spent" and "drawn" are the counter's own already, so only the count itself is folded in)
             seen_at = cur.get("seenAt")
-            counters = merge_counter(counters, {**cur, "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now})
+            counters = merge_counter(counters, {**{k: v for k, v in cur.items() if k not in ("spent", "drawn")},
+                                                "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now})
         live = [c for c in counters if c["reset"] > self.now]
         live = sorted(live, key=lambda c: c["seenAt"], reverse=True)[:REST_COUNTERS]
+        drawn = graphql_drawn(self.budget, live, self.now) if bucket == "graphql" else None
+        if drawn is not None and drawn["reset"] <= self.now:
+            # the counter the daemon draws from has reset: a fresh window (mode() reads a passed reset as one), not a
+            # hold on another counter it does not draw from
+            self.budget[bucket] = {**drawn, "drawn": True}
         if not live:
             self.budget.pop(key, None)
             return
+        if bucket == "graphql":
+            live = [{**{k: v for k, v in c.items() if k != "drawn"},
+                     **({"drawn": True} if drawn is not None and c is drawn else {})} for c in live]
+            drawn = next((c for c in live if c.get("drawn")), drawn)
         self.budget[key] = sorted(live, key=lambda c: c["reset"])
+        if drawn is not None:
+            if drawn["reset"] > self.now:
+                self.budget[bucket] = dict(drawn)
+            return
         self.budget[bucket] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
 
     def refresh_budget(self) -> None:
@@ -8850,6 +8899,9 @@ class Daemon:
         cost = rate.get("cost") if isinstance(rate, dict) and isinstance(rate.get("cost"), int) else 1
         self.gql_log.append((self.clock(), reason, cost))
         self.note_spend("graphql", reason, 1, cost)
+        if isinstance(rate, dict) and rate.get("resetAt"):  # a write that asks its rateLimit names its counter too
+            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")),
+                             cost=cost)
         return status, h, doc
 
     @staticmethod
@@ -10106,6 +10158,9 @@ class Daemon:
                                  "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None,
                                  "stream": self.feed_stream_status()},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
+                  # every live GraphQL counter, the one this daemon's queries draw from (the hold's) marked, so a
+                  # reader (NOW's quota row) names which counter is low rather than one collapsed figure
+                  "graphqlCounters": self.graphql_counters_view(),
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
@@ -11279,7 +11334,8 @@ class Daemon:
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
         if rate and self.last_request_source != "app":
-            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
+            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")),
+                             cost=points)
         return doc, None
 
     def fetch_aliased(self, entries: list[dict], kind: str) -> str | None:
@@ -32430,7 +32486,12 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             when = dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime("%H:%M:%SZ") if reset else "?"
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
-            print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
+            which = ""
+            if bucket == "graphql" and len(rest_counters(budget, COUNTER_KEYS[bucket])) > 1:
+                which = (" (the counter this daemon's queries draw from)" if b.get("drawn")
+                         else " (the poorest counter: no query of this daemon's has named its counter yet)")
+            print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen "
+                  f"{age(b.get('seenAt'))}{which}")
             # Both buckets answer from two counters with their own windows (settle_counters), and GET /rate_limit
             # reports only one of them, so a reader who cross-checks this line against /rate_limit can see a rich
             # counter while the one their reads actually spend is at zero -- 2026-11-21: `budget` said GraphQL 0 left
@@ -32440,10 +32501,14 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             counters = [c for c in rest_counters(budget, COUNTER_KEYS[bucket]) if c["reset"] > time.time()]
             if len(counters) > 1:
                 label = "core" if bucket == "rest" else POOL_NAMES[bucket]
-                print(f"         {label} counters (the poorest is the one above, and the one a read is refused "
-                      f"against): " + "; ".join(
+                drew = any(c.get("drawn") for c in counters)
+                head = ("the one this daemon's queries draw from is the one above, and the one a read is refused "
+                        "against" if drew else "the poorest is the one above, and the one a read is refused against")
+                print(f"         {label} counters ({head}): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
-                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
+                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}"
+                    + (" (drawn from" + (f", {c['spent']} points spent" if isinstance(c.get("spent"), int) else "")
+                       + ")" if c.get("drawn") else "") for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
         if isinstance(paths, dict):
             name = {"graphql": "GraphQL", "rest": "REST"}
