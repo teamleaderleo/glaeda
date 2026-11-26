@@ -6262,7 +6262,11 @@ sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.u
   done
   return 1
 }
-case $sub in fetch|ls-remote|submodule) ;; *) exec "$real" "${orig[@]}" ;; esac
+# Any other command can fetch a missing blob in a partial clone (checkout, submodule foreach, cat-file): once
+# this job's proxy failed, it goes direct too, as fetches do (cmuxterm-hq run 45860743368: the HQ shim's twin gap).
+case $sub in fetch|ls-remote|submodule) ;; *)
+  [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
+  exec "$real" "${orig[@]}" ;; esac
 shift
 args=("$@")
 kind=cmux

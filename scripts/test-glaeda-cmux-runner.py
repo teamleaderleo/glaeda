@@ -23962,6 +23962,9 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(curl_argv.read_text(), before)
         self.assertEqual(argv.read_text().splitlines()[-1].count("http.https://github.com/.proxy="), 1)
         self.assertEqual(self.log(), ["github", "github"])
+        # any other git call (checkout's lazy blob fetch in a partial clone) skips the dead proxy too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
 
     def test_a_proxy_that_answers_is_used(self) -> None:
         argv, curl_argv, env = self.proxied(curl_exit=0)
