@@ -17602,6 +17602,24 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[1][4]), {"repo": "o/r", "number": 9, "expected_head_sha": "d" * 40})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
 
+    def test_a_broker_pacing_refusal_holds_a_queued_update_branch_instead_of_retiring_it_as_closed(self) -> None:
+        """cmux#57987, 2026-11-26: a queued base merge ended "superseded: the pull request is closed or merged" with
+        the PR open, because the broker's pacing refusal ends "nothing was merged". It waits out the pace instead."""
+        sha = "f" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        said = ("refused: content writes are paced for 30s more; not sent, retry after 13:46Z: o/r had 8 base merges "
+                "in the last 600 s (at most 8; each reruns the whole suite), so PR 7 waits its turn; nothing was merged")
+        d, ran = self.lane_vm((1, {"ok": False, "error": said}))
+        self.step(d, NOW)
+        self.assertEqual(len(ran), 1)
+        held = json.loads((gg.outbox_dir() / f"{item['id']}.json").read_text())
+        self.assertIn("limit", held["lastError"])
+        for text, closed in [("nothing was merged", False), ("8 base merges", False),
+                             ("Cannot update a closed pull request", True), ("pull request 9 is closed", True),
+                             ("Pull Request is already merged", True), ("merge conflict between base and head", False)]:
+            with self.subTest(text=text):
+                self.assertEqual(gg.update_branch_retired(422, text) is not None, closed)
+
     def test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_broker_call(self) -> None:
         """glaeda-lane 2026-11-25: every `gh pr update-branch N -R manaflow-ai/cmux` gh-quota queued on the login's
         create pause (no --match-head-commit, so no --sha) failed in the daemon: "the lane-gh broker did not make it:
