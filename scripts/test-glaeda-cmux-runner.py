@@ -15580,6 +15580,20 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.core_busy(before, after), [100.0, 0.0])
         self.assertIsNone(hook.core_busy(before, after[:1]))
 
+    def test_efficiency_cores_counts_only_an_efficiency_level(self) -> None:
+        """M4 Pro: perflevel1 is Efficiency. M5 Pro (5 super + 10 performance, no efficiency cores; Leo's
+        cmux25-34): perflevel1 is Performance, so the P-core stall check must not see efficiency cores there."""
+        def sysctl(levels: dict[str, str]):
+            def run(argv, **_kw):
+                return subprocess.CompletedProcess(argv, 0, stdout="\n".join(levels[k] for k in argv[2:]) + "\n")
+            return run
+        m4pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Efficiency", "hw.perflevel1.logicalcpu": "4"}
+        m5pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Performance", "hw.perflevel1.logicalcpu": "10"}
+        intel = {"hw.nperflevels": "1"}
+        for levels, want in ((m4pro, 4), (m5pro, None), (intel, None)):
+            with mock.patch.object(hook.subprocess, "run", side_effect=sysctl(levels)):
+                self.assertEqual(hook.efficiency_cores(), want, levels)
+
     def pcore_gate(self, busy: list[float], boot: int = 1794342904):
         totals: list[list[int]] = []
 

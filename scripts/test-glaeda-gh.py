@@ -34890,6 +34890,36 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.q.entries[self.KEY]["state"], "queued")
 
+    def test_a_re_request_on_a_closed_copy_read_before_it_reads_once_before_it_stops(self):
+        """LAND_CLOSED_BEFORE_REQUEST: cmux#57225, 2026-11-26: a copy read mid close-and-reopen kept the PR CLOSED in
+        the cache, and three re-requests after the reopen each stopped at once "closed unmerged (the cache shows it
+        closed)". A CLOSED copy read before the latest request is read again first; one read since that still says
+        CLOSED stops it."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        self.w.set_pr(self.KEY, land_pr(LA, state="CLOSED"), self.t)  # read mid close-and-reopen
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.t += 2 * gg.LAND_OWN_REFRESH_AFTER  # the PR is reopened; nothing re-reads a closed copy
+        self.fresh_head = LA
+        with mock.patch.object(gg.time, "time", return_value=self.t):  # the request is written now, after the copy
+            self.land()
+        e = self.tick()
+        self.assertNotEqual(e["state"], "stopped", e.get("stop"))
+        self.assertIn(self.KEY, self.w.refreshed)
+        self.assertEqual(self.w.cache[self.KEY]["data"]["state"], "OPEN")
+        # a re-request whose read since it still says CLOSED stops as before
+        self.w.set_pr(self.KEY, land_pr(LA, state="CLOSED"), self.t)
+        self.t += 10
+        self.fresh_head = None  # GitHub's read fails: the copy is the newest there is, and it was read once
+        with mock.patch.object(gg.time, "time", return_value=self.t):
+            self.land()
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "stop_read_first"]), 2)
+
     def test_a_merged_pr_leaves_the_queue_while_every_worker_is_busy_or_its_entry_is_parked(self):
         """A full pool (refresh_due waits for a free worker) and an entry parked on its own backoff both still let a
         merged PR leave at the next look."""
