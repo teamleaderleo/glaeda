@@ -1392,6 +1392,13 @@ dispatch as the others. It holds the Developer ID key for its whole run, so it i
 build included: one claim and one drain per nightly, where the two-run pipeline drained the mini once per signing
 job. No other runner class admits it, and main's `nightly.yml` has no such job (a dispatch of it stays refused).
 
+NIGHTLY_DELTA_ADMISSION (cmux#57000) admits `nightly-next-deltas`, the post-feed delta job, on that same exact
+nightly-next workflow and signing runner. Splitting work from a signing job must carry its admission and exclusive
+capacity class with it: this job still holds the nightly signing key. Detectors in `scripts/test-glaeda-cmux-runner.py`:
+`test_nightly_next_deltas_requires_exact_signing_provenance` covers push, dispatch, re-runs and refused provenance;
+`test_nightly_next_deltas_holds_the_whole_mini_before_credentials` checks draining, the exclusive claim and exclusion
+of concurrent jobs. Merge and deploy this admission before enabling the companion workflow job.
+
 AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
 whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
 copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a

@@ -548,6 +548,9 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # publishes in one job on the trusted signing runner, so the build no longer waits for a second
                 # run and a second drain. It holds the key for its whole run, build included: one claim, one drain.
                 ("nightly.yml", "nightly-next-one"),
+                # NIGHTLY_DELTA_ADMISSION (cmux#57000): the post-feed delta job still holds the nightly
+                # signing key, so splitting it from nightly-next-one preserves the exclusive signing claim.
+                ("nightly.yml", "nightly-next-deltas"),
                 # LIVE_CODE_VARIANT (Leo's design, docs/cmux-next/live-code.md in cmux): after nightly-next-one
                 # writes the feed, this job signs and notarizes the same commit's -interposable variant with the
                 # nightly's own identity and publishes it beside the DMG. It is a nightly.yml job on nightly-next
