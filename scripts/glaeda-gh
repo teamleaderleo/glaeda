@@ -16524,6 +16524,30 @@ def land_update_once() -> bool:
     return os.environ.get("GLAEDA_LAND_UPDATE_ONCE", "1").strip() != "0"
 
 
+# A forced base_update obeys the same rule (Leo, 2026-11-26: "de facto, im asking for 99% fewer minutes of ci time,
+# period."). land_judge's base_update step carries force (STALE_CI_FORCE, for the broker's base_sync_noop) and a stock
+# needs_newer_base entry (BASE_UPDATE_NEED, for the broker's SHIP rule): neither names a check, yet together they let
+# every base_update at this land's own head through as update_again. In the land entries on one land host to
+# 2026-11-26, 34 of 142 update_again sends followed a base_update, more than any other step. Now such a step at the
+# land's own head counts as unnamed (update_again_unnamed) unless its reason says the base changed files the PR
+# changes (stale_root_update, stale_main_update, the pool's stale merge base): a change touching its files is still
+# merged in. GLAEDA_LAND_BASE_UPDATE_ONCE=0 restores the bypass. Detector:
+# test-glaeda-gh.py LandTest.test_a_second_forced_base_update_at_this_lands_own_head_stops_by_name
+LAND_BASE_UPDATE_STOCK_NEED = "land-judge base update"  # land_judge BASE_UPDATE_NEED's start: a stock need, no check
+LAND_BASE_UPDATE_OWN_FILES = re.compile(r"(?:files?|which) the PR changes|the PR changes too", re.IGNORECASE)
+
+
+def land_base_update_once() -> bool:
+    return os.environ.get("GLAEDA_LAND_BASE_UPDATE_ONCE", "1").strip() != "0"
+
+
+def land_base_update_unnamed(code: str, reason: str) -> bool:
+    """True when a base_update step (CODE) names no check that needs the newer base: its REASON says nothing of the
+    PR's own files. Its force and stock need then do not lift the once-per-land rule."""
+    return (code == "base_update" and land_base_update_once()
+            and not LAND_BASE_UPDATE_OWN_FILES.search(str(reason or "")))
+
+
 # A stale merge is never replayed, at this land's own head too (gcp-agent-lane-1/coord-successor, 2026-11-26: "on a
 # stale_merge answer, call update_branch ... instead of rerun. Fix the class: any rerun path in the land daemon that
 # can replay a stale merge."). glaeda#2903 let an age-only stale rerun (stale_replay_why's "commits behind") go at a
@@ -24913,7 +24937,9 @@ class LandQueue:
             needs = act.get("needs_newer_base")
             force = act.get("force") if answer.get("code") == "base_update" else ""
             self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [],
-                               force if isinstance(force, str) else "")
+                               force if isinstance(force, str) else "",
+                               stock=land_base_update_unnamed(str(answer.get("code") or ""),
+                                                              str(answer.get("reason") or "")))
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -26317,7 +26343,7 @@ class LandQueue:
         return not (tried.get("head") == head and tried.get("tried"))
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "",
-                      named: bool = False) -> None:
+                      named: bool = False, stock: bool = False) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -26401,7 +26427,9 @@ class LandQueue:
                              why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
         e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
-            if land_update_once() and not needs and not force and not named:
+            # STOCK: a base_update whose force and stock need name no check (land_base_update_unnamed)
+            checked = [n for n in needs or [] if not str(n).startswith(LAND_BASE_UPDATE_STOCK_NEED)] if stock else needs
+            if land_update_once() and not checked and not (force and not stock) and not named:
                 # LAND_UPDATE_ONCE's comment: this land's one base merge is spent and no check is named as needing a
                 # newer one
                 with self.lock:
