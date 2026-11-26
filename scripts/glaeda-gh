@@ -14949,6 +14949,12 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")
+                # A row batched() deferred (the GraphQL pace, the tick's share or budget, a split limit) waits for a
+                # next tick this throwaway Daemon never has: name the limit that held it. The land host, 2026-11-26
+                # 08:41-09:03Z: 69 batched rows ended "no data stored", about half of each 50-row batch, with no reason.
+                miss = getattr(daemon, "miss_why", None) or {}
+                for k in daemon.deferred:
+                    errors.setdefault(k, "not read: deferred, " + (miss.get(k) or "no reason kept"))
         except OutOfTime as stop:
             why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
             errors.update({k: why for k in todo if k not in errors})
@@ -17284,8 +17290,17 @@ def land_checks_running(data: dict, head: str) -> bool:
     a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
-    return (any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
-            or pending_on_every_page(data) > 0)
+    if pending_on_every_page(data) > 0:
+        return True
+    # LAND_GATE_ONLY: a check whose own description says a label starts it (land_gate_labels) is not running, it is
+    # waiting for the label. cmux#58041, 2026-11-26: its only unfinished checks were clippy and cmux/land-tier, both
+    # "Cheap tier: ... runs when ready-to-land ... is added"; the queue read them as running, so land_judge (which adds
+    # the label: land_tier_pending) was never asked, and the row slept a LAND_WAIT_DEFAULT wake after wake with the label
+    # never on. A head whose every unfinished check is label-gated is judged now. Detector: test-glaeda-gh.py
+    # test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on.
+    return any(str(c.get("status") or "").upper() not in ("COMPLETED", "")
+               and not (isinstance(c.get("description"), str) and LAND_GATE_SAID.search(c["description"]))
+               for c in data.get("checks") or [])
 
 
 def land_pending_status(data: dict) -> bool:

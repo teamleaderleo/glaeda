@@ -25452,6 +25452,19 @@ class StaleDataTest(Base):
               f"unchanged PRs {single_probe} one at a time, {batched_probe} batched")
         self.assertEqual(batched_probe, 2)
 
+    def test_a_batched_land_refresh_names_why_a_deferred_row_was_not_read(self) -> None:
+        """The land host, 2026-11-26 08:41-09:03Z: 69 batched land rows ended "no data stored", with no reason. A row
+        batched() defers waits for a next tick the refresh's Daemon never has; its error now names the limit."""
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        with mock.patch.object(gg.Daemon, "gql_room", lambda self, cost=1: False):
+            _, out = self.land_refresh_reads(["pr:o/r#1", "pr:o/r#2", "pr:o/r#3"], batched=True)
+        self.assertEqual(len(out), 3)
+        for key, error in out.items():
+            self.assertIsNotNone(error, key)
+            self.assertTrue(error.startswith("not read: deferred, "), error)
+            self.assertNotIn("no data stored", error)
+
     def test_a_land_refresh_keeps_the_rollup_snapshot_its_judgment_is_handed(self) -> None:
         """A land refresh's own Daemon had no land queue, so its full read moved the cache's fingerprint and wrote no
         rollup snapshot: the snapshot stopped matching and the judgment read the head from GitHub itself (cmux-cp-1,
@@ -31098,6 +31111,24 @@ class LandTest(Base):
         self.assertIn("React Doctor (changed React projects) (pending)", reason)
         self.assertIn("the ready-to-land label starts", reason)
         self.assertIn("ready-to-land", self.w.sent()[-1][-1])
+
+    def test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on(self):
+        # LAND_GATE_ONLY: cmux#58041 (2026-11-26) waited 1.5 h on clippy and cmux/land-tier, both saying the
+        # ready-to-land label starts them; land_judge, which adds that label, was never asked.
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        gated = {"headRefOid": LA, "state": "OPEN",
+                 "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {"name": "clippy", "status": "PENDING", "description": said}]}
+        self.assertFalse(gg.land_checks_running(gated, LA))
+        gated["checks"].append({"name": "ws-check", "status": "PENDING", "description": "Queued on a Linux runner"})
+        self.assertTrue(gg.land_checks_running(gated, LA))  # an ordinary pending check still waits
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        self.w.answers.append(ok_answer(LA))  # land_judge is asked: the answer it gives is its own (land_tier_pending)
+        e = self.tick()
+        self.assertEqual(self.w.answers, [])
+        self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
     def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
         # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
