@@ -1080,17 +1080,22 @@ STREAMS_WANT = 90  # (the controller holds at most 90 streams; it answers the re
 STREAMS_VERSION = 1
 
 
+# pr-owner's owner comment (leo-workspace tools/pr_owner.py owner_body): a claim is the write a lane's next push waits on.
+OWNER_MARK = re.compile(r"^<!-- pr-owner \{")
+
+
 def outbox_gate(item: Any) -> bool:
-    """A write a merge waits on: queued with --gate, or a comment whose first
-    line is a review receipt (router-review's `Review (...): SHIP at SHA`). These go out ahead of every other queued
-    write, so a SHIP never waits behind a hundred awareness comments while the login's create pause spaces them."""
+    """A write a merge or a push waits on: queued with --gate, or a comment whose first line is a review receipt
+    (router-review's `Review (...): SHIP at SHA`) or a pr-owner claim (`<!-- pr-owner {...} -->`). These go out ahead
+    of every other queued write, so a SHIP or a claim never waits behind a hundred awareness comments while the login's
+    create pause spaces them (a dead lane's takeover waited 73 s and 5 min behind them, 2026-11-26)."""
     if not isinstance(item, dict):
         return False
     if item.get("gate") is True:
         return True
     body = str(item.get("body") or "")
     first = next((line for line in body.splitlines() if line.strip()), "").strip()
-    return item.get("kind") == "comment" and bool(RISK_RECEIPT.match(first))
+    return item.get("kind") == "comment" and bool(RISK_RECEIPT.match(first) or OWNER_MARK.match(first))
 
 
 def thread_of(item: Any) -> str:

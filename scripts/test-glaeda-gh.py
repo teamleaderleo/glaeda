@@ -19252,6 +19252,19 @@ class PostJoinTest(unittest.TestCase):
         # the receipt goes out first (outbox_gate); the prose it would have joined follows on its own
         self.assertEqual([c[2]["body"] for c in t.calls], ["Review (codex): SHIP " + "a" * 40, "one", "one", "two"])
 
+    def test_a_pr_owner_claim_goes_out_ahead_of_awareness_comments(self) -> None:
+        claim = '<!-- pr-owner {"id": "s1", "at": "2026-11-26T07:00:00Z"} -->\nOwned by **lane** on vm'
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#8", "--body", "two")
+        self.queue("comment", "o/r#9", "--body", claim)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        # a lane's push waits on its claim, so the claim is gated like a review receipt (outbox_gate)
+        self.assertEqual([c[2]["body"] for c in t.calls], [claim, "one", "two"])
+        self.assertFalse(gg.outbox_gate({"kind": "comment", "body": "see <!-- pr-owner {} -->"}))
+
     def test_a_crash_mid_join_releases_the_members(self) -> None:
         a = self.queue("comment", "o/r#7", "--body", "one")
         b = self.queue("comment", "o/r#7", "--body", "two")
