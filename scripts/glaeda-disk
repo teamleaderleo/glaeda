@@ -1392,6 +1392,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "4567868bceeae5751670caf375230bce235a1f5a90eea903aa18e66256109087",
     "2839c8e6956ffc6776f3553b4e2a4774459075b568437957a3a10f1eeef735e2",
     "63aba53442d623bb33e68927897a84cdda307baffd294383123bfc73a9d5bbe3",
+    "f349a345e89a2cc7e2984b50cd7c05c8ed4be5470124f21e4f418db42e04a8ef",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -8700,7 +8701,7 @@ def deletion_owner_live(path: Path) -> str:
     except OSError:
         pass  # another user's live process
     command = _owner_command(pid)
-    if not command or "glaeda-disk" in command:
+    if not command or "glaeda-disk" in command or "cmux-disk" in command:
         return f"glaeda-disk (pid {pid}) is still deleting it"
     return ""
 
@@ -15042,7 +15043,7 @@ def _take_over_stale_evict_owner() -> bool:
         # A dead owner has already released flock; retrying the acquisition is sufficient.
         return True
     command = _owner_command(pid)
-    if "glaeda-disk" not in command:
+    if "glaeda-disk" not in command and "cmux-disk" not in command:  # cmux-disk: its primary name runs the same code
         return False
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGTERM)
@@ -18917,7 +18918,9 @@ def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = su
     if put.returncode != 0:
         why = (put.stderr or b"").decode(errors="replace").strip()[-200:] or f"exit {put.returncode}"
         return {**row, "state": "not reached", "why": why}
+    # CMUX_NAME_AS: a copy this program runs itself is not a use of the old name (count_old_name); sudo drops the env
     argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
+            "CMUX_NAME_AS=cmux-disk",
             _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
     try:
         done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
