@@ -21744,7 +21744,14 @@ class LandQueue:
                     e["updatedHead"], e["updatedHeadAt"] = head, self.now
                     if self.pin_follow(e, head, data):
                         return  # the new head's first parent is not read yet: not judged on it
-                self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="head_moved")
+                # A head the pin does not cover is judged now, running checks or not: the judgment's worker reads its
+                # parents (base_merge_check) and follows the pin to it or stops. Waiting on its checks first kept the
+                # pin behind: cmux#53433, 2026-11-26, pin_parent_unread at 11:45:55Z for the queue's own update
+                # 7fc4fa9bf428 (pin b62052934d4f), then checks_running at the new head under the old pin for 80 min.
+                if running and not land_head_moved(str(e.get("pinSha") or ""), head):
+                    self.wait_running(e, head, fp)
+                else:
+                    self.judge(e, head, fp, why="head_moved")
             elif woke:
                 if self.judge(e, "", fp, why="head_timeout"):  # land_judge reads the head itself: the cache never showed the new one
                     self.history(e, "head_timeout", before=w.get("before"))
@@ -22999,11 +23006,27 @@ class LandQueue:
                 why = "no base branch to read it with: the copy here names none and the read of its PR did not answer"
         parents: Any = None
         chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        if gh and not parent and sent and not land_head_moved(pin, sent) and sent != head:
+            # The queue's own update_branch was sent at the pin and no read said HEAD's first parent in time
+            # (pin_follow's pin_parent_unread, glaeda#2364): one read of HEAD's commit says whether it is that update's
+            # merge (follow_own_update), before any base or compare read. A missed read never leaves the pin behind
+            # the queue's own update (cmux#53433, 2026-11-26: 80 min on a stale pin until a person re-queued it).
+            parents = self.head_parents_read(e, head, data)
+            if isinstance(parents, list):
+                with self.lock:
+                    self.check(e)
+                    if self.follow_own_update(e, head, parents) is None \
+                            and not land_head_moved(str(e.get("pinSha") or ""), head):
+                        e.pop("baseMergeUnread", None)
+                        return True
         if kept:
             why = kept  # read before, for this head and pin (ancestry_record): not read again
         elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
-            if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+            if isinstance(parents, list):
+                pass  # read above, for the queue's own update: not read twice
+            elif str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
                 parents = data["headParents"]  # the cache read them: no call
             else:
                 got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
@@ -23076,6 +23099,22 @@ class LandQueue:
                          **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def head_parents_read(self, e: dict, head: str, data: dict) -> list | None:
+        """On a worker: HEAD's parents, lower-case, from the cache when its read of HEAD carried them, else from one
+        read of repos/OWNER/REPO/commits/HEAD (repin_parents' read). None when the read did not answer."""
+        if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+            return [str(p).lower() for p in data["headParents"]]
+        gh = self.gh()
+        if not gh:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{head}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def base_ref_read(self, e: dict) -> tuple[str, str]:
         """On a worker, from base_merge_check: (E's PR's base branch, "") from one REST read of the PR, for a head

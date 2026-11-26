@@ -29053,6 +29053,43 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertIn("pin_parent_unread", [h["event"] for h in e["history"]])
 
+    def test_a_pin_follows_its_own_update_after_the_parent_wait_ran_out_while_checks_run(self):
+        # cmux#53433, 2026-11-26: the queue's update_branch at the pin b62052934d4f made 7fc4fa9bf428; no read said its
+        # first parent within LAND_PIN_PARENT_WAIT (pin_parent_unread at 11:45:55Z), its checks were running, so the
+        # row waited checks_running at the new head under the old pin for 80 minutes, and follow_own_update refused
+        # (glaeda#2364) until a person re-queued it. Past the wait it is judged now, and the judgment's worker reads
+        # the head's commit and follows the pin to the queue's own update.
+        running = [("ci", "IN_PROGRESS", None)]
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=running)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"], e["pinFollow"]["head"]), ("waiting", LA, LB))
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, "d" * 40])
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "timeout_s": 1800}))
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        events = [h["event"] for h in e["history"]]
+        self.assertIn("pin_parent_unread", events)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB), events)
+        self.assertEqual([(h["pin"], h["head"]) for h in e["history"] if h["event"] == "repin_own_update"],
+                         [(LA[:12], LB[:12])])
+        self.assertIn(["--sha", LB], [c[i:i + 2] for c in self.w.explains() for i in range(len(c))])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_push_after_the_parent_wait_ran_out_still_stops_head_moved(self):
+        # The same wait running out on a head whose parents are not the pin's update: someone's push still stops.
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick()
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC])
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        for _ in range(4):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertNotIn("repin_own_update", [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_a_first_parent_read_within_the_wait_is_followed(self):
         self.update_branch_moved_the_head()
         self.pr(LB)
