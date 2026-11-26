@@ -14327,6 +14327,15 @@ LAND_REFRESH_BROKER = re.compile(r"^no answer within \d|\bdirect: (?:busy\b|.*\b
 LAND_REFRESH_BROKER_HOLD = 30.0
 LAND_REFRESH_BROKER_HOLD_MAX = 600.0
 LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land status` names the entry's (count, error)
+
+
+def land_refresh_last_error(e: dict) -> dict:
+    """The error E's last refresh ended with, kept on the record a new refresh starts ({"error": ...}, else {}), so
+    `land status` names it while that refresh runs. gcp-agent-lane-14, 2026-11-26 07:29Z: "refresh unanswered 4x: ?"
+    on cmux#54723, #54705 and #54158, each refused by the broker's commit-checks sweep count every time, because each
+    start replaced the record and dropped the error the refresh before it had answered."""
+    error = (e.get("refresh") or {}).get("error") if int(e.get("refreshUnanswered") or 0) else None
+    return {"error": error} if error else {}
 # A host with its own login (the broker host) reads its landing PRs in the daemon's waited pass, and the land worker's
 # nudge only marks the PR waited there. With hundreds of waited PRs that pass ran hours behind, and nothing else read a
 # due entry's PR: 2026-11-22 01:00Z, a PR (157/157 green, three pinned land requests at one head) sat on a copy
@@ -21143,7 +21152,7 @@ class LandQueue:
                 # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
-                                **self.refresh_starting(e["key"])}
+                                **self.refresh_starting(e["key"]), **land_refresh_last_error(e)}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
@@ -21376,7 +21385,8 @@ class LandQueue:
         if not joins and self.busy() + self.refresh_batches() >= self.workers():
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
-        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
+        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"]),
+                        **land_refresh_last_error(e)}
         if own:
             self.own_refreshed.append(self.now)
         self.save(e)
@@ -21953,6 +21963,24 @@ class LandQueue:
         repo_n = f"{e['repo']}#{e['number']}"
         if live == pin:
             e.pop("baseMergeUnread", None)
+            kept = e.get("staleLive") if isinstance(e.get("staleLive"), dict) else {}
+            if kept.get("head") != head or kept.get("pin") != pin:
+                kept = {"head": head, "pin": pin, "since": self.now, "n": 0}
+            kept["n"] = int(kept.get("n") or 0) + 1
+            e["staleLive"] = kept
+            if self.now - float(kept["since"]) >= LAND_STALE_LIVE_MAX:
+                # LAND_STALE_LIVE_MAX: GitHub's PR has shown HEAD that long while its branch is at the pin; no read
+                # here catches it up, so the requester is told what does (a push of the branch) instead of a wait
+                e.pop("staleLive", None)
+                e.pop("oldPinWait", None)
+                self.stop(e, "pr_head_lags_branch",
+                          f"GitHub's PR still shows {head[:12]}, an older commit of the pin, while its branch ref is "
+                          f"at the pin {pin[:12]} ({kept['n']} reads of the branch over "
+                          f"{int((self.now - float(kept['since'])) // 60)} min): GitHub has not synced the PR to its "
+                          "branch, so no merge at the pin can pass --match-head-commit",
+                          f"push the branch again so GitHub re-syncs the PR (an empty commit on {pin[:12]}), then "
+                          f"glaeda-gh land {repo_n} --sha NEW_HEAD")
+                return True
             e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
             self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
                          why="an older commit of the pin; GitHub's branch is at the pin")
@@ -22347,6 +22375,7 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
+        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()
@@ -25503,6 +25532,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
 # and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
+# LAND_STALE_LIVE_MAX: how long stale_live keeps the pin while GitHub's PR shows the same older commit of it. Past it
+# the copy is no lag a read waits out: GitHub's PR itself is behind its branch ref, and the land stops
+# pr_head_lags_branch naming the push that re-syncs it. gcp-agent-lane-14, 2026-11-25 23:55Z to 2026-11-26 07:28Z:
+# cmux#54723's branch ref at the pin 7a36daca, pulls/54723 at 1e7bbef5 (65 commits behind) for 7.5 h; stale_head_kept
+# 33 times, the row requeued after each and read "due since 00:42:40Z: every worker busy" in `land status` throughout.
+LAND_STALE_LIVE_MAX = 1800.0
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 

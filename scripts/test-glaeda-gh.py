@@ -29521,6 +29521,28 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop")), ("merged", None))
         self.assert_merged_at(LA)
 
+    def test_a_pr_whose_github_head_lags_its_branch_at_the_pin_stops_after_the_bound_naming_the_push(self):
+        # gcp-agent-lane-14, 2026-11-26: cmux#54723's branch ref at the pin, pulls/54723 at an older commit of it for
+        # 7.5 h; stale_head_kept 33 times and the row read "every worker busy" the whole time (LAND_STALE_LIVE_MAX)
+        self.pinned_and_waiting()
+        self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        e = self.tick(30)
+        kept = 0
+        for _ in range(int(gg.LAND_STALE_LIVE_MAX // gg.LAND_HEAD_TIMEOUT) + 4):
+            if e["state"] == "stopped":
+                break
+            kept = max(kept, int((e.get("staleLive") or {}).get("n") or 0))
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertGreater(kept, 1)  # kept at the pin while the bound runs, as before
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_lags_branch", LA))
+        self.assertIn(f"GitHub's PR still shows {self.LE[:12]}", e["stop"]["reason"])
+        self.assertIn("push the branch again", e["stop"]["next"])
+        self.assertNotIn(f"--sha {self.LE}", e["stop"]["next"])  # never re-land at the stale older head
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertNotIn("staleLive", e)
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
@@ -38335,6 +38357,27 @@ class LandTest(Base):
         self.assertIn("refresh unanswered 3x (never answered): rest: HTTP 502 direct: GitHub GET pulls/1", line)
         e["refreshUnanswered"] = 2
         self.assertNotIn("refresh unanswered", gg.land_line(e, self.q.now, latch=None))
+
+    def test_land_status_keeps_the_last_refresh_error_while_the_next_refresh_runs(self):
+        # gcp-agent-lane-14, 2026-11-26 07:29Z: "refresh unanswered 4x: ?" on cmux#54723, #54705 and #54158: each new
+        # refresh's record dropped the error the one before it answered (land_refresh_last_error)
+        said = "rest: HTTP 502 direct: refused: sweep: this session read 20 distinct commits' checks"
+        refreshed, rows = self.held_refresh_queue([said])
+        for _ in range(3):
+            self.q.refresh_job(self.KEY)
+        self.q.refresh_hold = None
+        self.q.now += 3600
+        with mock.patch.object(self.q, "submit"):  # the next refresh starts and has not answered yet
+            self.q.refresh_many = None
+            self.due(self.KEY)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["refresh"]["at"], self.q.now)  # a new record, started
+        line = gg.land_line(e, self.q.now, latch=None)
+        self.assertIn(f"refresh unanswered 3x (never answered): {said}", line)
+        self.assertNotIn(": ?", line)
+        self.q.refresh_done(self.KEY, None)  # its answer: nothing is named any longer
+        self.assertNotIn("refresh unanswered", gg.land_line(e, self.q.now, latch=None))
+        self.assertEqual(gg.land_refresh_last_error(e), {})
 
     def test_refresh_pacing_and_only_on_upstream_hosts(self):
         self.pr(LA)
