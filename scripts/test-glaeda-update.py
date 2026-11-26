@@ -1593,6 +1593,62 @@ class UpdateTest(unittest.TestCase):
         self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
 
 
+class StaleHookClockTest(unittest.TestCase):
+    """A runner left on one old hook alerts from when it fell behind, not from the latest release (2026-11-26: a
+    runner on a hook five hours and three releases old read alertAfter two hours after the newest release)."""
+
+    def record(self, previous: dict, tag: str, hooks: list[dict], now: float, path: Path) -> dict:
+        running = {"tag": tag, "releaseHookSha256": "new-" + tag, "tools": {}, "hooks": hooks}
+        return gu.record_convergence({"host": "mini", "ring": "stable"}, {"result": "current"},
+                                     {"tag": tag, "source": "x"}, previous, now, running, [], path)
+
+    def test_a_runner_stale_on_the_same_hook_keeps_its_clock_through_new_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            old = {"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "glaeda_reservation.py": "m", "current": False}
+            first = self.record({}, "r-1", [dict(old)], t0, path)
+            self.assertEqual(first["running"]["hooks"][0]["staleSince"], first["at"])
+            # three releases later, the runner still has the same bytes: its clock and the alert hold
+            later = t0
+            doc = first
+            for n, tag in enumerate(("r-2", "r-3", "r-4"), 1):
+                later = t0 + n * 1800
+                doc = self.record(json.loads(path.read_text()), tag, [dict(old)], later, path)
+            self.assertEqual(doc["since"], doc["at"])  # the host's clock restarts with the release, as before
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], first["at"])
+            self.assertEqual(gu.parse_utc(doc["alertAfter"]), gu.parse_utc(first["at"]) + gu.ALERT_AFTER_S)
+
+    def test_a_runner_that_took_a_newer_hook_starts_a_new_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            self.record({}, "r-1", [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}], t0, path)
+            # it installed r-1's hook (other bytes), then r-2 shipped while it had a job
+            doc = self.record(json.loads(path.read_text()), "r-2",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "new-r-1", "current": False}],
+                              t0 + 1800, path)
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], doc["at"])
+            self.assertEqual(gu.parse_utc(doc["alertAfter"]), t0 + 1800 + gu.ALERT_AFTER_S)
+
+    def test_a_converged_run_drops_the_clocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            self.record({}, "r-1", [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}], t0, path)
+            doc = self.record(json.loads(path.read_text()), "r-2",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "new-r-2", "current": True}],
+                              t0 + 600, path)
+            self.assertTrue(doc["converged"])
+            self.assertIsNone(doc["alertAfter"])
+            self.assertNotIn("staleSince", doc["running"]["hooks"][0])
+            # it falls behind again later: a fresh clock, not the old one
+            doc = self.record(json.loads(path.read_text()), "r-3",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}],
+                              t0 + 1200, path)
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], doc["at"])
+
+
 class ScheduleReloadTest(unittest.TestCase):
     """setup writes the agent's new StartInterval but cannot reload the agent of the run that called it, so Macs that
     never log out kept running hourly after APPLY_EVERY_S became 600 (cosmic-gray, air-blue, cmux16, 2026-10-21)."""

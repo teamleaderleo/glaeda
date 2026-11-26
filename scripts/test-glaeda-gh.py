@@ -2564,6 +2564,48 @@ class GraphqlDietTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 2)  # its check event re-read it at once
         self.assertTrue(gg.read_cache(key)["data"]["settled"])
 
+    @mock.patch.object(gg, "HEAD_QUIET_FED_TTL", 400)  # under HEAD_INTEREST: register() stamps the wall clock
+    def test_a_running_head_the_feed_is_quiet_about_is_read_at_the_quiet_ttl(self) -> None:
+        # HEAD_QUIET_FED_TTL: the glaeda land host, 2026-11-26, spent 274 of each 600 s reading heads.
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        read_at = gg.read_cache(key)["dataAt"]
+        t = NOW + gg.TICK
+        while t < read_at + gg.HEAD_QUIET_FED_TTL - gg.HEAD_ALIGN - gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertGreater(t - read_at, gg.HEAD_PENDING_FED_TTL)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # quiet past the fed TTL: not polled
+        while t < read_at + gg.HEAD_QUIET_FED_TTL + gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # the quiet TTL: read once more (a lost delivery's bound)
+
+    def test_a_running_head_read_before_the_feed_went_live_keeps_the_fed_ttl(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        e = {"key": key, "cache": gg.read_cache(key)}
+        self.assertTrue(self.daemon.head_feed_quiet(e))
+        self.daemon.feed_live_since = e["cache"]["dataAt"] + 1  # a gap after the read: what came in it is unknown
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+        self.assertEqual(self.daemon.head_ttl(e), gg.HEAD_PENDING_FED_TTL)
+        self.daemon.feed_live_since = e["cache"]["dataAt"] - 1
+        self.daemon.feed_marks[f"sha:o/r@{sha}"] = e["cache"]["dataAt"] + 1  # an event on the commit since its read
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+
     def test_a_check_event_inside_the_retry_gate_is_kept_until_the_head_is_read(self) -> None:
         sha = "a" * 40
         self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
@@ -4910,6 +4952,33 @@ class BalanceTest(Base):
         self.daemon.settle_counters("graphql")
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
         self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
+
+    def test_counter_readings_carry_the_token_fingerprint(self) -> None:
+        """2026-11-26: `budget` showed GraphQL 0/5000 in 10:41-11:41Z and 4832/5000 in 11:12-12:12Z and nothing said
+        which credential each came from. Every reading carries sha256(token)[:8] (never the token), and another
+        token's reading with the same reset is another counter, not folded into the login's."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.token = "ghp_logintoken"
+        self.daemon.note_budget("graphql", 5000, 4832, NOW + 1800, cost=1)
+        self.daemon.note_budget("rest", 5000, 4000, NOW + 900)
+        login = gg.token_fingerprint("ghp_logintoken")
+        self.assertEqual(len(login), 8)
+        self.assertNotIn("ghp_logintoken", json.dumps(self.daemon.budget))
+        self.assertEqual({c["token"] for c in self.daemon.budget["graphqlCounters"]}, {login})
+        self.assertEqual(self.daemon.budget["graphqlDrawn"]["token"], login)
+        self.assertEqual(self.daemon.budget["rest"]["token"], login)
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 1800, token="ghs_othertoken")
+        self.assertEqual(sorted(c["token"] for c in self.daemon.budget["graphqlCounters"]),
+                         sorted([login, gg.token_fingerprint("ghs_othertoken")]))
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4832)  # the drawn one, the login's
+        self.assertEqual({c["token"] for c in self.daemon.graphql_counters_view()},
+                         {login, gg.token_fingerprint("ghs_othertoken")})
+        lines = gg.view_lines({"pools": [{"pool": "graphql", "used": 168, "attributed": 160, "unaccounted": 8,
+                                          "accounted_pct": 95, "counters": [
+                                              {"remaining": 4832, "limit": 5000, "window": "11:12:25Z .. 12:12:25Z",
+                                               "token": login, "reading_age_s": 5}]}]})
+        self.assertIn(f"token {login}", lines[1])
 
     def test_graphql_reading_is_the_counter_its_own_queries_draw_from(self) -> None:
         """2026-11-25 22:40Z: a daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0 left
@@ -13895,9 +13964,10 @@ class BudgetRefreshTest(Base):
         self.daemon.tick(NOW)
         self.gh.rest_remaining = 1057
         self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
-        self.assertEqual(self.daemon.budget["rest"], {"limit": 5000, "remaining": 1057,
-                                                      "reset": int(NOW + 1800),
-                                                      "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
+        rest = dict(self.daemon.budget["rest"])
+        self.assertRegex(rest.pop("token", ""), r"^[0-9a-f]{8}$", "the reading names the token it counts")
+        self.assertEqual(rest, {"limit": 5000, "remaining": 1057, "reset": int(NOW + 1800),
+                                "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
         self.assertEqual(self.daemon.status["lastHour"]["rest"], 0, "the refresh spends no REST")
 
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
@@ -22713,6 +22783,21 @@ class BrokerSweepTest(BrokerBase):
             later = time.time() + gg.GH_SWEEP_WINDOW + 1
             self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/jobs/4"], "GET", later))
 
+    def test_a_named_budget_is_one_host_bucket_apart_from_the_callers_own(self) -> None:
+        # 2026-11-26: a coordinator session's own reads filled its 30, and its queue-why pass was refused while the
+        # controller feed was down.
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 1), mock.patch.dict(gg.GH_SWEEP_BUDGETS, {"queue-why": 2}):
+            self.run_gh(["api", "repos/o/r/actions/jobs/1"])
+            self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/2"])[3])
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "queue-why"}):
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/10/jobs"])[3])
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/11/jobs"])[3])
+                code, _out, err, passed = self.run_gh(["api", "repos/o/r/actions/runs/12/jobs"])
+            self.assertEqual((code, passed), (gg.GH_SWEEP_EXIT, None))
+            self.assertIn("queue-why budget", err)
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "no-such-budget"}):
+                self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/3"])[3])
+
     def test_what_is_a_sweep_target(self) -> None:
         for path, want in (("repos/O/R/actions/runs/5/jobs?per_page=100", "o/r run 5"),
                            ("/repos/o/r/actions/runs/5/attempts/2/jobs", "o/r run 5"),
@@ -26974,6 +27059,7 @@ class LandWorld:
         self.refreshed: list[str] = []
         self.watched: list[str] = []
         self.notices: list[tuple] = []
+        self.session_info: dict | None = None  # what `acpmux session info --json` answers (None: nothing printed)
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
@@ -27025,6 +27111,9 @@ class LandWorld:
                 doc = {**doc, "cacheOnly": True,
                        "cacheMiss": doc.get("cacheMiss", doc.get("code") in ("quota", "unreadable", "regen_retry"))}
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
+        if argv[0] == "/fake/acpmux" and argv[1:3] == ["session", "info"]:
+            # the requester as a due reminder reads it (LAND_OWNER_REMIND_IDLE); unset, nothing certain: it is told
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.session_info) if self.session_info else "", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
@@ -27110,7 +27199,7 @@ class LandWorld:
         return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
 
     def sent(self) -> list[list[str]]:
-        return [c for c in self.calls if c[0] == "/fake/acpmux"]
+        return [c for c in self.calls if c[0] == "/fake/acpmux" and c[1:3] != ["session", "info"]]
 
 
 class LandCrash(BaseException):
@@ -27229,8 +27318,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
-                                                   "--class", "block", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:14], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "result", "--within", "60s", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -27241,15 +27330,29 @@ class LandTest(Base):
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
 
-    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
-        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
-        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+    def test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute(self):
+        # LAND_MERGED_CLASS: its own merge asks nothing of the requester, so it is a result, never a [blocker]
+        # (lw#11661 and #11593, 2026-11-26), and --within still wakes an idle lane within a minute.
         self.pr(LA)
         self.land()
         self.w.answers.append(ok_answer(LA))
         self.tick()
         sent = self.w.sent()[-1]
-        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
+        self.assertEqual(sent[sent.index("--within") + 1], "60s")
+        self.assertIn("merged", sent[-1])
+
+    def test_a_merged_notice_to_an_acpmux_without_within_is_sent_again_without_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--within' found\n")
+        real = self.q.call
+        self.q.call = lambda argv, *a, **k: (refused if "--within" in argv else real(argv, *a, **k))  # type: ignore
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertNotIn("--within", sent)
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
         self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
@@ -28224,6 +28327,81 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("api"), [])
         self.assertFalse(e.get("labelSent"))
 
+    PULSE = ("gh api -X DELETE repos/o/r/issues/1/labels/ready-to-land && "
+             "gh api -X POST repos/o/r/issues/1/labels -f 'labels[]=ready-to-land'")
+
+    def pulse_refusal(self, head: str) -> tuple[int, dict]:
+        return refusal("land_tier_pending", head, {"kind": "command", "text": self.PULSE}, self.PULSE,
+                       "land-judge: refused: cmux/land-tier is pending on the cheap tier and the PR already carries "
+                       f"ready-to-land at {head}")
+
+    def test_the_relabel_pulse_takes_the_label_off_and_on_once_per_head(self):
+        # cmux's head_tier runs the cheap tier for a push onto a PR that already carries ready-to-land: only a pulse
+        # (off, then on) sends the `labeled` event that runs the full tier at the head being landed.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.pulse_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [
+            ["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"],
+            ["api", "-X", "POST", "repos/o/r/issues/1/labels", "-f", "labels[]=ready-to-land"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "label", 0))
+        self.assertEqual((e["labelSent"]["head"], e["labelSent"]["pulse"]), (LA, True))
+        self.assertIn("label_pulse", [h["event"] for h in e["history"]])
+        for _ in range(3):  # still pending at the same head: never pulsed again
+            self.w.answers.append(self.pulse_refusal(LA))
+        for _ in range(3):
+            e = self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.gh_calls("api")), 2)
+
+    def test_the_relabel_pulse_on_a_lane_vm_goes_through_the_brokers_pr_edit_not_a_hand_off(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.pulse_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [
+            ["pr", "edit", "1", "-R", "o/r", "--remove-label", "ready-to-land"],
+            ["pr", "edit", "1", "-R", "o/r", "--add-label", "ready-to-land"]])
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.assertEqual([c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]],
+                         [])
+        self.assertEqual((e["state"], e["labelSent"]["head"]), ("waiting", LA))
+
+    def test_the_relabel_pulse_never_touches_a_teammates_label(self):
+        self.pr(LA)
+        self.land()
+        real = gg.LandQueue.pulse_here
+
+        def seen_teammate(q, e, act, head):  # a `teammate` stop in the row's history (unlabel_owed's test)
+            e.setdefault("history", []).append({"event": "stopped", "code": "teammate"})
+            return real(q, e, act, head)
+
+        self.w.answers.append(self.pulse_refusal(LA))
+        with mock.patch.object(gg.LandQueue, "pulse_here", seen_teammate):
+            e = self.tick()
+        self.assertNotIn("label_pulse", [h.get("event") for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        self.assertFalse(e.get("labelSent"))
+
+    def test_only_the_pulse_of_this_prs_own_ready_to_land_is_a_pulse(self):
+        act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                              "next": self.PULSE, "action": {"v": 1, "kind": "command", "text": self.PULSE,
+                                                             "repo": "o/r", "number": 1}}, LA)
+        self.assertEqual((act["kind"], act["label"], act["pulse"]), ("label", "ready-to-land", True))
+        for text, code in (
+            (self.PULSE, "checks_running"),
+            (self.PULSE.replace("issues/1/", "issues/2/"), "land_tier_pending"),
+            (self.PULSE.replace("repos/o/r/issues/1/labels -f", "repos/x/y/issues/1/labels -f"), "land_tier_pending"),
+            (self.PULSE.replace("ready-to-land", "full-ci"), "land_tier_pending"),
+            (self.PULSE + " && true", "land_tier_pending"),
+        ):
+            act = gg.land_action({"ok": False, "code": code, "repo": "o/r", "number": "1", "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r", "number": 1}}, LA)
+            self.assertEqual(act["kind"], "command", text)
+
     def test_only_the_land_tier_codes_own_label_command_is_taken(self):
         for text, code, repo, number in (
             ("gh pr edit 1 -R o/r --add-label ready-to-land", "red_not_excused", "o/r", "1"),
@@ -28973,6 +29151,43 @@ class LandTest(Base):
         e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertIn("pin_parent_unread", [h["event"] for h in e["history"]])
+
+    def test_a_pin_follows_its_own_update_after_the_parent_wait_ran_out_while_checks_run(self):
+        # cmux#53433, 2026-11-26: the queue's update_branch at the pin b62052934d4f made 7fc4fa9bf428; no read said its
+        # first parent within LAND_PIN_PARENT_WAIT (pin_parent_unread at 11:45:55Z), its checks were running, so the
+        # row waited checks_running at the new head under the old pin for 80 minutes, and follow_own_update refused
+        # (glaeda#2364) until a person re-queued it. Past the wait it is judged now, and the judgment's worker reads
+        # the head's commit and follows the pin to the queue's own update.
+        running = [("ci", "IN_PROGRESS", None)]
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=running)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"], e["pinFollow"]["head"]), ("waiting", LA, LB))
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, "d" * 40])
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "timeout_s": 1800}))
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        events = [h["event"] for h in e["history"]]
+        self.assertIn("pin_parent_unread", events)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB), events)
+        self.assertEqual([(h["pin"], h["head"]) for h in e["history"] if h["event"] == "repin_own_update"],
+                         [(LA[:12], LB[:12])])
+        self.assertIn(["--sha", LB], [c[i:i + 2] for c in self.w.explains() for i in range(len(c))])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_push_after_the_parent_wait_ran_out_still_stops_head_moved(self):
+        # The same wait running out on a head whose parents are not the pin's update: someone's push still stops.
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick()
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC])
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        for _ in range(4):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertNotIn("repin_own_update", [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_first_parent_read_within_the_wait_is_followed(self):
         self.update_branch_moved_the_head()
@@ -30678,6 +30893,81 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 16)  # past LAND_OWNER_REMIND_MAX: silent, still listed
         self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
 
+    def remind_until_stale(self):
+        """Tick the stopped row to each due reminder of LAND_OWNER_REMIND_BACKOFF (6 h, then 12 h, then 24 h after
+        the last), three in all, the third past LAND_OWNER_REMIND_STALE_AFTER; the entry after each."""
+        out = []
+        e = self.q.entries.get(self.KEY) or {}
+        for k in range(3):
+            last = float((e.get("reminds") or {}).get("at") or (e.get("stop") or {}).get("at"))
+            self.tick(last + gg.LAND_OWNER_REMIND_EVERY * 2 ** k - self.t)  # due: asks its read
+            e = self.tick()  # the read landed (or, with none, it waits)
+            if len(out) == k and (e.get("reminds") or {}).get("n", 0) == k:
+                e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)  # no read came: told, or held, on the copy there is
+            out.append(e)
+        return out
+
+    def test_a_stop_unmoved_past_a_day_wakes_its_owner_once(self):
+        # LAND_OWNER_REMIND_STALE: cmux-cp-1, 2026-11-26: ~45 rows sat stopped 29-65 h, reminded only as fyi.
+        self.conflict_stop()
+        self.fresh_head = LA  # each reminder's read lands: the PR is unchanged at the stop's head
+        classes = lambda: [c[c.index("--class") + 1] for c in self.w.sent()]  # noqa: E731
+        sent = len(self.w.sent())
+        e = self.remind_until_stale()[-1]
+        self.assertEqual(classes()[sent:], ["fyi", "fyi", gg.LAND_NOTICE_CLASS])  # the first day fyi; then one wake
+        said = self.w.sent()[-1][-1]
+        self.assertRegex(said, r"unmoved 4[2-3] h")
+        self.assertIn("close the PR naming what superseded it", said)
+        self.assertEqual((e["state"], e["reminds"]["staleHead"]), ("stopped", LA))
+        self.assertTrue([h for h in e["history"] if h.get("event") == "reminded" and h.get("stale")])
+        self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual(classes()[-1], "fyi")  # once per stop head, never again for it
+        self.assertEqual(e["reminds"]["staleHead"], LA)
+
+    def test_a_stale_stop_on_an_unread_copy_is_held_and_wakes_nobody(self):
+        # LAND_OWNER_REMIND_UNREAD before LAND_OWNER_REMIND_STALE: a copy no read refreshed may be a PR merged since, so
+        # it is never told (remind_held), past a day too: no fyi and no blocker; the wake waits for a read at the head
+        self.conflict_stop()
+        self.fresh_head = None  # every read fails
+        classes = lambda: [c[c.index("--class") + 1] for c in self.w.sent()]  # noqa: E731
+        sent = len(self.w.sent())
+        e = self.remind_until_stale()[-1]
+        self.assertEqual(classes()[sent:], [])  # nothing told on the unread copy: every reminder held
+        self.assertNotIn(gg.LAND_NOTICE_CLASS, classes()[sent:])
+        self.assertIsNone(e["reminds"].get("staleHead"))
+        self.assertIn("unread", [h.get("why") for h in e["history"] if h.get("event") == "remind_held"])
+        for _ in range(2):  # and stays held, never a blocker, while no read refreshes the copy
+            self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+            e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((classes()[sent:], e["state"]), ([], "stopped"))
+
+    def test_a_reminder_to_a_lane_idle_past_the_reaper_bound_wakes_nobody(self):
+        # LAND_OWNER_REMIND_IDLE: 2026-11-26, 53 of 406 live Claude sessions were finished lanes woken by "still
+        # stopped after N h" reminders, 38 of gcp-agent-lane-10's 40 idle 24 to 101 h before it (cmuxterm-hq#28514).
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        infos = lambda: [c for c in self.w.calls if c[0] == "/fake/acpmux" and c[1:3] == ["session", "info"]]  # noqa
+        idle_since = lambda h: {"status": "ready", "inputSince": None, "pendingPermissions": 0,  # noqa: E731
+                                "queued": 0, "lastTurn": {"endedAt": (self.t - h * 3600) * 1000}}
+        self.w.session_info = idle_since(30)  # finished 30 h ago: past the reaper's 12 h
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["n"]), ("stopped", 1))  # due, and spent
+        self.assertEqual(len(self.w.sent()), sent)  # but nobody was woken
+        self.assertEqual(len(infos()), 1)  # one read of the requester per due reminder
+        self.assertEqual(infos()[-1][3], self.w.sent()[-1][self.w.sent()[-1].index("--no-wait") + 1])  # the same one
+        # a lane that is still at work (ran a turn an hour ago) is told, as before
+        self.w.session_info = idle_since(1 - 2 * gg.LAND_OWNER_REMIND_EVERY / 3600)  # 1 h before the tick's time
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 1))
+        self.assertIn("still stopped after", self.w.sent()[-1][-1])
+        # a running one, or an answer with nothing certain in it, is told too: unsure tells
+        for info in ({**idle_since(30), "status": "running"}, {**idle_since(30), "queued": 1}, None):
+            self.assertIsNone(gg.land_requester_idle_s(json.dumps(info) if info else "", self.t), info)
+        self.assertGreater(gg.land_requester_idle_s(json.dumps(idle_since(30)), self.t), gg.LAND_OWNER_REMIND_IDLE)
+        self.assertEqual(gg.land_requester_idle_s(json.dumps({"status": "ready", "createdAt": (self.t - 60) * 1000}),
+                                                  self.t), 60.0)  # never ran a turn: idle since it was made
+
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
         sent = len(self.w.sent())
@@ -30698,6 +30988,32 @@ class LandTest(Base):
                          ("stopped", "closed", None, sent))
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
+
+    def test_a_stopped_row_whose_pr_merged_or_closed_elsewhere_is_read_and_ends(self):
+        # LAND_STOPPED_OVER: gcp-agent-lane-11, 2026-11-26: cmux#52553 merged 11-24 and cmux#54984 closed unmerged
+        # 11-25 sat stopped in the queue (no copy of an unwatched PR) until a lane cancelled them by hand.
+        for state, ended in (("CLOSED", ("stopped", "closed")), ("MERGED", ("merged", "conflict"))):
+            with self.subTest(state=state):
+                self.setUp()
+                e = self.conflict_stop()
+                sent = len(self.w.sent())
+                self.w.cache.pop(self.KEY, None)  # a lane VM keeps no copy of an unwatched PR
+                self.q.refresh = lambda key, state=state: (
+                    self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA, state=state), self.t))[1]
+                e = self.tick(gg.LAND_STOPPED_READ_EVERY - 60)
+                self.assertEqual((e["state"], self.w.refreshed), ("stopped", []))  # not before the cadence
+                e = self.tick(60)
+                self.assertEqual(self.w.refreshed, [self.KEY])  # one read, shared with the due reminder
+                e = self.tick(1)
+                self.assertEqual((e["state"], e["stop"]["code"] if e["state"] == "stopped" else "conflict"), ended)
+                self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+
+    def test_a_stopped_row_still_open_is_read_once_a_cadence(self):
+        e = self.conflict_stop()
+        self.q.refresh = lambda key: (self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA), self.t))[1]
+        for _ in range(6):
+            e = self.tick(gg.LAND_STOPPED_READ_EVERY / 6)
+        self.assertEqual((e["state"], len(self.w.refreshed)), ("stopped", 1))
 
     def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
         # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
@@ -32599,6 +32915,41 @@ class LandTest(Base):
         self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
         self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
+
+    def test_land_override_naming_only_files_outside_the_diff_updates_when_its_pin_merge_is_refused(self):
+        # lw#11929, 2026-11-26: overridden for base reds in test_reach and others, its pin merge refused behind main,
+        # stopped pinned_override_update and a person merged main by hand. Those files are not the PR's: update.
+        self.pr(LA)
+        self.w.files = ["tools/fanout_cap.py", "tools/test_fanout_cap.py"]
+        reason = "ws-check reds are base reds in files this PR does not touch (test_reach, tools/test_ws_check.py)"
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override={"reason": reason, "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertNotEqual(e.get("state"), "stopped", e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "override_update_outside_diff"],
+                         ["override_update_outside_diff"])
+        self.assertTrue(e.get("updateSent") or self.w.gh_calls("api", "-X", "PUT"), e["history"][-4:])
+
+    def test_land_override_naming_a_file_of_the_diff_still_stops_when_its_pin_merge_is_refused(self):
+        self.pr(LA)
+        self.w.files = ["tools/test_reach.py"]
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                        override={"reason": "test_reach red is flaky", "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
+
+    def test_land_override_files(self):
+        self.assertEqual(gg.land_override_files("base reds (test_reach, tools/test_ws_check.py; a/b.rs) on main 45810787066"),
+                         {"test_reach", "test_ws_check.py", "b.rs"})
+        self.assertEqual(gg.land_override_files("base red: ci fails the same way on main"), set())
 
     def test_land_override_pinned_row_merges_at_its_pin_past_running_or_red_checks(self):
         # cmux#52546 parked until 04:30Z and cmux#53958 (override recorded 03:30:35Z, judged checks_running 24 s later),
@@ -35040,8 +35391,8 @@ class LandTest(Base):
             [said] = [c for c in self.w.sent() if "merged" in c[-1]]
             return said[said.index("--class") + 1]
 
-        self.assertEqual(told("merged pinned"), gg.LAND_NOTICE_CLASS)
-        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("merged pinned"), gg.LAND_MERGED_CLASS)
+        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_MERGED_CLASS)
         self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
         self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
 
@@ -35052,9 +35403,10 @@ class LandTest(Base):
         self.w.calls.clear()
         self.w.cache[self.KEY]["data"]["state"] = "MERGED"
         self.q.stop(e, "forward_no_outcome", "no outcome", "land again")
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual(e["state"], "merged")  # LAND_STOP_SETTLE: the row ends with the PR's outcome
         self.assertEqual([c for c in self.w.sent() if "stopped" in c[-1]], [])
         self.w.cache[self.KEY]["data"]["state"] = "OPEN"
+        self.w.cache[self.KEY]["dataAt"] = self.q.now  # a fresh copy: told at once
         self.q.stop(e, "own_red", "ci failed", "fix it")
         self.assertEqual(len([c for c in self.w.sent() if "own_red" in c[-1]]), 1)  # an open PR's stop still tells
 
@@ -35365,6 +35717,133 @@ class LandTest(Base):
             e = self.past_give_up()
         self.assertEqual((e["state"], self.state_reads()), ("forwarded", []))
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+
+    # -- LAND_STOP_SETTLE: a stop or a reminder reads the PR first; merged or closed ends the row and tells nobody
+
+    def stop_reads(self) -> list[list[str]]:
+        return self.state_reads()
+
+    def stale_open_row(self) -> dict:
+        """A land of o/r#1 at LA waiting on its checks, its cached copy reading open but read long ago (a PR nobody
+        here watches any more): glaeda#2639's rows on 2026-11-23."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick()
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_STOP_STATE_FRESH - 1
+        self.w.calls.clear()
+        return e
+
+    def test_a_head_moved_stop_for_a_pr_that_merged_ends_merged_and_tells_nobody(self):
+        # glaeda#2639 merged 09:15:47Z; a row sent it a head_moved [blocker] more than an hour later on a copy that
+        # still read open. The stop's notice now waits on one read of the PR, which ends the row merged.
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "MERGED"
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        self.assertEqual((e["state"], e["stopNotice"]["kind"]), ("stopped", "stop"))
+        self.assertEqual(len(self.w.sent()), sent)  # held, not sent
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"], e.get("stopNotice")), ("merged", "f" * 40, None))
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.assertEqual(len(self.w.sent()), sent)  # nobody told
+        self.assertEqual(e["history"][-1]["quiet"], "stop_settled")
+        self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual(len(self.stop_reads()), 1)  # an ended row is read no more
+
+    def test_a_stop_for_a_pr_that_closed_stops_closed_and_tells_nobody(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "CLOSED"
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("stopNotice")), ("stopped", "closed", None))
+        self.assertEqual(len(self.w.sent()), sent)
+
+    def stop_read_tells(self, view_err: str | None) -> None:
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_err = view_err
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stopNotice")), ("stopped", None))
+        said = [c for c in self.w.sent()[sent:] if "stopped: head_moved" in c[-1]]
+        self.assertEqual(len(said), 1)
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.tick()
+        self.assertEqual(len(self.stop_reads()), 1)  # read once
+
+    def test_a_stop_whose_pr_reads_open_still_tells_its_requester(self):
+        self.stop_read_tells(None)
+
+    def test_a_stop_whose_pr_state_is_unread_still_tells_its_requester(self):
+        self.stop_read_tells("HTTP 502: Bad Gateway")  # an unread state never swallows a stop
+
+    def test_a_stop_a_fresh_copy_reads_open_tells_at_once_and_reads_nothing(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        self.assertEqual(len([c for c in self.w.sent()[sent:] if "own_red" in c[-1]]), 1)
+        self.tick()
+        self.assertEqual(self.stop_reads(), [])
+
+    def still_stopped_reminder(self, state: str) -> dict:
+        # glaeda#2639: "still stopped after 68 h ... reminded code=head_moved hours=67.9", 68 h after its merge.
+        # The reminder's one read is LAND_OWNER_REMIND_READ's; the stop path adds no second one.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: inside one UTC day
+        e = self.stale_open_row()
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        self.sent0 = len(self.w.sent())
+        self.w.refreshed = []
+        self.q.refresh = lambda key: (self.w.refreshed.append(key),
+                                      self.w.set_pr(key, land_pr(LB, state=state), self.t))[1]
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual(self.w.refreshed, [self.KEY])  # one read, the reminder's
+        self.assertEqual(self.stop_reads(), [])  # and no second one
+        return e
+
+    def test_a_still_stopped_reminder_for_a_pr_merged_since_ends_merged_and_tells_nobody(self):
+        e = self.still_stopped_reminder("MERGED")
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("merged", None, self.sent0))
+        self.assertNotIn("reminded", [h.get("event") for h in e["history"]])
+
+    def test_a_still_stopped_reminder_for_an_open_pr_is_sent_after_its_read(self):
+        e = self.still_stopped_reminder("OPEN")
+        self.assertEqual((e["state"], e["reminds"]["n"], e.get("stopNotice")), ("stopped", 1, None))
+        [said] = self.w.sent()[self.sent0:]
+        self.assertIn("still stopped after 6 h", said[-1])
+
+    def test_a_row_stopped_before_for_a_pr_merged_since_is_settled_at_load(self):
+        # rows stopped before this (no stopReadAt) whose PR merged by hand: read once at load, ended merged, silently
+        e = {"key": self.KEY, "repo": "o/r", "number": 1, "state": "stopped", "created": self.t - 3 * 86400,
+             "updated": self.t - 3 * 86400, "requester": "host/lane", "history": [],
+             "stop": {"code": "head_moved", "at": self.t - 3 * 86400, "reason": "o/r#1 moved"}}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3 * 86400
+        self.w.view_state = "MERGED"
+        self.q = self.queue()
+        sent = len(self.w.sent())
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual((len(self.stop_reads()), len(self.w.sent())), (1, sent))
+
+    def test_stop_state_reads_are_capped_per_pass(self):
+        e = self.stale_open_row()
+        self.w.view_state = "MERGED"
+        with mock.patch.object(gg, "LAND_STOP_STATE_READS", 0):
+            with self.q.lock:
+                self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+            e = self.tick()
+        self.assertEqual((e["state"], self.stop_reads()), ("stopped", []))
+        e = self.tick()
         self.assertEqual(e["state"], "merged")
 
     def test_a_pinned_rows_hand_off_to_an_executor_carries_its_pin(self):
@@ -37996,6 +38475,76 @@ class LandTest(Base):
         e = self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)
         self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_green_rollup_judges_a_checks_wait_whose_copy_still_shows_a_check_running(self):
+        """LAND_ROLLUP_READY. manaflow-ai/cmuxterm-hq#28474, 2026-11-26: judged checks_running at 09:49Z, every check
+        green by 10:06Z (the last a commit status), the copy starved of reads still showing one running, merged by
+        hand at 10:13Z. The controller's green rollup, asked once the feed shows anything for the PR, judges the row
+        at once, on that rollup; a quiet feed asks nothing; a second green within LAND_VERDICT_KEEP asks nothing."""
+        events = self.feed()
+        green: list = [None]
+        asked: list[str] = []
+
+        def nodes(key: str, sha: str):
+            asked.append(sha)
+            return green[0]
+        self.q.rollup_nodes = nodes
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "IN_PROGRESS", None)])  # the copy's next read
+        asked.clear()  # (the first judgment's snapshot asked it once)
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual((len(self.w.judgments()), asked), (1, []))  # a quiet feed: nothing to ask about
+        events.append(self.t)  # the last check (a status) went green; the copy (re-read, unchanged) still shows it running
+        for _ in range(3):
+            e = self.tick(1)
+        self.assertEqual((len(self.w.judgments()), len(asked)), (1, 1),
+                         [h.get("event") for h in e["history"]])  # the rollup is not green yet; asked once per TTL
+        green[0] = [{"__typename": "CheckRun", "name": "ci", "conclusion": "SUCCESS", "status": "COMPLETED"}]
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_ROLLUP_SEEN_TTL)
+        for _ in range(2):
+            if len(self.w.judgments()) < 2:
+                e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2, [h.get("event") for h in e["history"]])
+        self.assertIn("rollup_ready", [h.get("event") for h in e["history"]])
+        self.assertEqual([h for h in e["history"] if h.get("event") == "judged"][-1].get("why"), "rollup_ready")
+        self.assert_merged_at(LA)
+
+    def test_a_green_rollup_whose_judgment_still_waits_is_not_asked_again_before_the_verdict_keep(self):
+        """A rollup_ready judgment land_judge answers with the same wait (a status the rollup did not know of) asks no
+        more until LAND_VERDICT_KEEP; then a still-green rollup judges once more."""
+        events = self.feed()
+        self.q.rollup_nodes = lambda key, sha: [{"__typename": "CheckRun", "name": "ci", "conclusion": "SUCCESS"}]
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        events.append(self.t + 1)
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        for _ in range(3):
+            e = self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2, [h.get("event") for h in e["history"]])
+        events.append(self.t + 1)
+        for _ in range(5):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.t += gg.LAND_VERDICT_KEEP
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])  # read again, still behind
+        events.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(3):
+            if len(self.w.judgments()) < 3:
+                e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 3, [h.get("event") for h in e["history"]])
 
     def test_a_re_request_of_a_waiting_checks_row_judges_it_again(self):
         """glaeda#2744: two same-pin re-requests left the waiting row on its hour wake."""
