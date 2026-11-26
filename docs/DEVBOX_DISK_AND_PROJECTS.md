@@ -3,7 +3,7 @@
 Glaeda uses one policy surface for fleet minis and developer machines. The role is explicit:
 
 ```text
-glaeda-disk report --role devbox
+cmux-disk report --role devbox
 glaeda-disk keepup --role devbox --apply
 glaeda-projects tidy       # dry run
 glaeda-projects tidy --apply
