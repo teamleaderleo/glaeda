@@ -23772,7 +23772,9 @@ class GitShimTest(unittest.TestCase):
                 ("000", "7", ["-c", f"remote.origin.proxy={custom}"], fleet)):
             with self.subTest(status=status, rc=rc, options=options):
                 receipt.write_text("")
-                result = subprocess.run(["git", *options, "fetch", "--no-tags", "origin", self.pr_sha],
+                # A branch name requires a fresh advertisement on every subcase.
+                # Fetching the same object ID again can succeed entirely locally.
+                result = subprocess.run(["git", *options, "fetch", "--no-tags", "origin", "refs/heads/main"],
                                         cwd=self.ws, env={**env, "TEST_CONNECT": status, "TEST_CURL_EXIT": rc},
                                         capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
