@@ -45800,6 +45800,113 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
         self.assertEqual(d.sent, [10, 10])
 
 
+class FullPrReadFoldsItsHead(unittest.TestCase):
+    """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s
+    reading their heads again, the same commit's same rollup. A whole full read now stores the head entry too."""
+    SHA = "ab" * 20
+    RUN = {"__typename": "CheckRun", "id": "CR1", "databaseId": 11, "name": "build", "status": "COMPLETED",
+           "conclusion": "FAILURE", "detailsUrl": "u", "startedAt": "2026-11-26T01:00:00Z",
+           "completedAt": "2026-11-26T01:05:00Z", "isRequired": False,
+           "checkSuite": {"databaseId": 5, "conclusion": "FAILURE", "app": {"slug": "github-actions"},
+                          "workflowRun": {"databaseId": 7, "event": "pull_request",
+                                          "workflow": {"name": "CI", "databaseId": 3}}}}
+    STATUS = {"__typename": "StatusContext", "context": "deploy", "state": "PENDING", "description": "wait",
+              "targetUrl": None, "createdAt": "2026-11-26T01:00:00Z", "isRequired": False}
+    OLD = {"__typename": "CheckRun", "id": "CR0", "databaseId": 10, "name": "lint", "status": "COMPLETED",
+           "conclusion": "FAILURE", "startedAt": "", "completedAt": "", "lastRealAttempt": True,
+           "checkSuite": {"conclusion": "FAILURE", "app": {"slug": "github-actions"},
+                          "workflowRun": {"databaseId": 8, "workflow": {"name": "Lint", "databaseId": 4}}}}
+
+    def commit(self, more=False):
+        return {"oid": self.SHA, "parents": {"nodes": []},
+                "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"id": "S1", "latest": {"totalCount": 1}},
+                                          {"id": "S2", "latest": {"totalCount": 0}}]},
+                "statusCheckRollup": {"state": "FAILURE", "contexts": {
+                    "totalCount": 2, "pageInfo": {"hasNextPage": more, "endCursor": "c1"},
+                    "nodes": [dict(self.RUN), dict(self.STATUS)]}}}
+
+    def daemon(self, repo="manaflow-ai/cmux", watched=True, runs=None, more=False, wanted=False, page_error=None):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 1000.0
+        d.reads, d.spill, d.gql_limited, d.errors = [], [], False, []
+        d.stored, d.refunded, d.sent = {}, [], []
+        d.pr_key = f"pr:{repo}#1"
+        d.head_key = f"head:{repo}@{self.SHA}"
+        d.heads_between_seen = frozenset({d.head_key} if watched else ())
+        d.probe_ok = lambda e: False
+        d.unchanged_paged = lambda e, node: False
+        d.fail = lambda entries, message: None
+        d.fill_steps = lambda pairs: None
+        d.head_steps = lambda data, failed, root=None, route=None: None
+        d.save_rollup = lambda *a, **k: None
+        d.rollup_wanted = lambda: frozenset({d.pr_key} if wanted else ())
+        d.page_pr_contexts = lambda *a, **k: page_error
+        d.suite_runs = lambda *a, **k: (runs if runs is not None else {"S2": [dict(self.OLD)]}, None)
+        d.refund = d.refunded.append
+        d.head_answered = lambda key: None
+        d.mode = lambda path: "normal"
+
+        def store(key, prior, older_yields=False, **fields):
+            d.stored[key] = fields
+            return True
+        d.store = store
+        node = {"number": 1, "url": "u", "title": "t", "state": "OPEN", "isDraft": False, "merged": False,
+                "headRefOid": self.SHA, "headRefName": "b", "baseRefName": "main", "baseRef": None,
+                "commits": {"nodes": [{"commit": self.commit(more)}]}}
+
+        def graphql(query, variables):
+            d.sent.append(query)
+            if query.startswith("query{rateLimit"):  # fetch_heads: the head itself
+                return {"data": {"h0": {"object": self.commit()}}}, None
+            return {"data": {"p0": {"pullRequest": node}}}, None
+        d.graphql = graphql
+        return d
+
+    def read_pr(self, d):
+        with mock.patch.object(gg, "read_cache", lambda key: None):
+            self.assertIsNone(d.fetch_aliased([{"key": d.pr_key, "cache": {}}], "pr"))
+
+    def test_a_whole_pr_read_stores_its_head_as_a_head_read_would_and_the_head_read_is_skipped(self):
+        d = self.read_pr_and_fold()
+        folded = d.stored[d.head_key]
+        self.assertEqual((folded["dataAt"], folded["via"], folded["error"]), (1000.0, "graphql", None))
+        self.assertIn(("1000.0", "head", "fold"), [(str(t), k, b) for t, k, b in d.reads])
+        # the same tick's head read is skipped and refunded: no query
+        sent = len(d.sent)
+        self.assertIsNone(d.fetch_heads([{"key": d.head_key, "cache": {}}]))
+        self.assertEqual((len(d.sent), d.refunded), (sent, [d.head_key]))
+        # a real head read of the same commit, a tick later, stores the very same data (the last-real run included)
+        d.now = 1001.0
+        d.stored.clear()
+        self.assertIsNone(d.fetch_heads([{"key": d.head_key, "cache": {}}]))
+        self.assertEqual(d.stored[d.head_key]["data"], folded["data"])
+        self.assertIn("Lint / lint", folded["data"]["found"])
+        self.assertEqual(folded["data"]["found"]["CI / build"], ["completed", "failure"])
+
+    def read_pr_and_fold(self, **kw):
+        d = self.daemon(**kw)
+        self.read_pr(d)
+        self.assertIn(d.pr_key, d.stored)
+        return d
+
+    def test_a_land_pr_read_whole_over_its_pages_folds_its_head(self):
+        d = self.read_pr_and_fold(more=True, wanted=True)
+        self.assertIn(d.head_key, d.stored)
+
+    def test_anything_less_than_a_whole_read_leaves_the_head_to_its_own_read(self):
+        cases = {"a page held": dict(more=True, wanted=True, page_error="graphql: PR check pages over their hourly share"),
+                 "pages never read (not a land PR)": dict(more=True),
+                 "a last-real suite unread": dict(runs={"S2": "graphql: last real attempt: a suite could not be read"}),
+                 "a head nobody watches": dict(watched=False),
+                 "a CHECKS_OF_RECORD repository": dict(repo="teamleaderleo/glaeda")}
+        for why, kw in cases.items():
+            with self.subTest(why):
+                d = self.read_pr_and_fold(**kw)
+                self.assertNotIn(d.head_key, d.stored)
+                self.assertFalse([r for r in d.reads if r[2] == "fold"])
+
+
 class LandCarryTest(unittest.TestCase):
     """A manaflow-ai/glaeda PR cannot merge in the fork (ruleset "main: deploy keys only"): manaflow-ai/glaeda#43,
     2026-11-25, approved and green, answered "Cannot update this protected ref". `land` carries it upstream."""

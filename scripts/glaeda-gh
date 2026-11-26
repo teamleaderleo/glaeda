@@ -1539,6 +1539,16 @@ def suites_contexts(suites: list[str] | str, runs: dict[str, list[dict]],
     return [node for s in suites for node in runs[s]], None
 
 
+def first_page_more(node: dict) -> bool:
+    """Whether a PR NODE's rollup says more contexts follow its first page (or cannot say: never one whole page)."""
+    commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+    rollup = commit.get("statusCheckRollup")
+    if rollup is None:
+        return False
+    more = ((rollup.get("contexts") or {}).get("pageInfo") or {}).get("hasNextPage")
+    return more is not False
+
+
 COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt lastEditedAt
 author {{ login }} body }} }}"""
 ISSUE_FIELDS = f"""__typename ... on Issue {{ url state {COMMENT_FIELDS} }}
@@ -11346,6 +11356,11 @@ class Daemon:
                 page_error = None
                 if kind == "pr" and e["key"] in wanted:
                     captured[i] = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
+                # the head's snapshot (fold_pr_head), taken before the named reads and last-real runs are folded in
+                snap = captured.get(i) if kind == "pr" else None
+                if kind == "pr" and snap is None and self.pr_head_key(e, node) is not None \
+                        and not first_page_more(node):
+                    snap = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
                     page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
@@ -11362,6 +11377,8 @@ class Daemon:
                     fps[i] = None if page_error else pr_fingerprint(node)
                 if i in captured:
                     self.save_rollup(e["key"], node, captured[i], fps[i])
+                if snap is not None and not page_error:
+                    self.fold_pr_head(e, node, snap, attempts[i], suite_runs, suites_error)
         if kind == "pr":
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         self.limited = [e for i, e in enumerate(entries) if f"{alias}{i}" in limits]
@@ -11778,6 +11795,60 @@ class Daemon:
                                       "number": int(number), "head": head, "fp": fp, "readAt": self.now, **captured})
         self.rollups[key] = (head, fp)
 
+    # The land host, 2026-11-26 01:09-02:02Z: land-queue PR data 3,000-8,600 s old, each 600 s of ticks ~330 s in "read
+    # pr" and ~350 s in "read head". Every land PR was read twice: its full read, then its head (LandQueue.watch_head),
+    # the same commit's same rollup again. A full read that holds the head's whole rollup (capture_rollup: every page,
+    # no null context) and its last-real-attempt suites now stores the head entry too, and the head is not read again
+    # until its TTL. Anything less (a page held, a suite unread, a CHECKS_OF_RECORD repository, whose head also needs
+    # the other repository's commit) is not folded: the head is read as before, never smaller or greener.
+    def pr_head_key(self, e: dict, node: dict) -> str | None:
+        """The `head:` key of a PR NODE's head commit when this daemon watches it (the tick's watch read listed it) and
+        its repository has no CHECKS_OF_RECORD commit, else None."""
+        _, owner, repo, _ = split_key(e["key"])
+        sha = str(node.get("headRefOid") or "").lower()
+        if not SHA40.fullmatch(sha) or (owner.lower(), repo.lower()) in CHECKS_OF_RECORD:
+            return None
+        key = f"head:{owner.lower()}/{repo.lower()}@{sha}"
+        return key if key in getattr(self, "heads_between_seen", frozenset()) else None
+
+    def fold_pr_head(self, e: dict, node: dict, snap: dict, suites: list[str] | str, runs: dict,
+                     runs_error: str | None) -> bool:
+        """Store the head entry of a full PR read's head from SNAP (capture_rollup) and SUITES (ran_nothing_suites) out
+        of RUNS (suite_runs), as fetch_heads would from its own read; True when stored. Only a whole snapshot of the
+        commit the read names, with every such suite read, is folded."""
+        key = self.pr_head_key(e, node)
+        commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        if key is None or not snap.get("complete") or str(commit.get("oid") or "").lower() != key.rsplit("@", 1)[1]:
+            return False
+        extra, error = suites_contexts(suites, runs, runs_error)
+        if error:
+            return False
+        _, owner, repo, sha = split_key(key)
+        found: dict = {}
+        statuses: dict = {}
+        ids: dict = {}
+        order: dict = {}
+        failed: dict = {}
+        fold_contexts(((snap.get("rollup") or {}).get("nodes")), found, statuses, ids, "", order, failed)
+        fold_contexts(extra, found, statuses, ids, "", order, failed)
+        data = head_data(sha, found, statuses, ids, order)
+        self.head_steps(data, failed, route=[f"{owner}/{repo}"])
+        if not self.store(key, read_cache(key), error=None, dataAt=self.now, data=data, restParts=None, via="graphql"):
+            return False
+        folded = self.__dict__.setdefault("head_folded", {})
+        if len(folded) > 2000:
+            folded.clear()
+        folded[key] = self.now
+        self.reads.append((self.now, "head", "fold"))
+        return True
+
+    def head_folded_now(self, e: dict) -> bool:
+        """Whether a full PR read stored this head this tick (fold_pr_head): its read is skipped, its charge refunded."""
+        if self.__dict__.get("head_folded", {}).get(e["key"]) != self.now:
+            return False
+        self.refund(e["key"])
+        return True
+
     def probe_prs(self, entries: list[dict]) -> tuple[list[dict], str | None]:
         """One PR_PROBE query for ENTRIES: those whose fingerprint matches their cache are confirmed (dataAt and
         fetchedAt move, the answer stays); the ones that changed, or that the probe could not read, come back to be read
@@ -11811,6 +11882,9 @@ class Daemon:
     def fetch_heads(self, entries: list[dict]) -> str | None:
         """Every check on each head commit, one aliased query for the batch (a head with more than 100
         contexts is followed page by page). None, or the error when the whole query failed."""
+        entries = [e for e in entries if not self.head_folded_now(e)]
+        if not entries:
+            return None
         self.reads += [(self.now, "head", "graphql")] * len(entries)
         doc, error = self.graphql(heads_query([e["key"] for e in entries]), {})
         if doc is None:
@@ -12874,6 +12948,8 @@ class Daemon:
         """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
         _, owner, repo, sha = split_key(e["key"])
         prior = e["cache"] or {}
+        if self.head_folded_now(e):
+            return None
         if self.rest_oversized(e):
             # (a GraphQL read that spilled here this tick: due_heads leaves these out of REST's own turn)
             self.refund(e["key"])
