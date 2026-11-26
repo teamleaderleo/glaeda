@@ -23762,6 +23762,27 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.gitconfig.read_bytes(), original)
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
 
+    def test_hq_lazy_blob_fetch_from_another_command_goes_direct_after_a_dead_probe(self) -> None:
+        # cmuxterm-hq run 45860743368 (2026-11-26): fetch and checkout went direct, then checkout's
+        # "Removing auth" `git submodule foreach` read a blob outside the sparse set through the dead tunnel.
+        env, receipt = self.hq_checkout_fixture(refused_socket=True)
+        ref = "refs/remotes/origin/main"
+        late = ["cat-file", "-p", f"{ref}:b.txt"]
+        fetch = subprocess.run(["git", "fetch", "--no-tags", "--filter=blob:none", "--depth=1", "origin",
+                                f"+{self.pr_sha}:{ref}"], cwd=self.ws, env=env, capture_output=True, text=True,
+                               timeout=15)
+        self.assertEqual(fetch.returncode, 0, fetch.stderr)
+        self.assertTrue((Path(env["RUNNER_TEMP"]) / hook.HQ_GIT_SHIM_DEAD).exists())
+        receipt.write_text("")
+        result = subprocess.run(["git", *late], cwd=self.ws, env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "b\n")
+        self.assertEqual(receipt.read_text().splitlines(), [""])
+        env.pop("GITHUB_ACTION_REPOSITORY")  # a later step's git keeps the configured proxy
+        self.assertEqual(subprocess.run(["git", "config", "--get-urlmatch", "http.proxy", "https://github.com/"],
+                                        cwd=self.ws, env=env, capture_output=True, text=True).stdout.strip()[:17],
+                         "http://127.0.0.1:")
+
     def test_hq_keeps_configured_proxy_on_connect_response_or_override(self) -> None:
         env, receipt = self.hq_checkout_fixture()
         fleet = "http://127.0.0.1:18434"
@@ -23941,6 +23962,9 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(curl_argv.read_text(), before)
         self.assertEqual(argv.read_text().splitlines()[-1].count("http.https://github.com/.proxy="), 1)
         self.assertEqual(self.log(), ["github", "github"])
+        # any other git call (checkout's lazy blob fetch in a partial clone) skips the dead proxy too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
 
     def test_a_proxy_that_answers_is_used(self) -> None:
         argv, curl_argv, env = self.proxied(curl_exit=0)
@@ -24081,6 +24105,36 @@ class SubmoduleShimTest(unittest.TestCase):
         done = self.shim("submodule", "update", "--init", "--force", "--depth=1")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_dead_proxy_after_the_mirror_failed_goes_direct(self) -> None:
+        # cmux-next media run 45837430593: the mirror served ghostty but the update failed on a pin it lacked; the
+        # shim asked github.com once through the mini's loopback proxy, got "Failed to connect to 127.0.0.1 port
+        # 18434", and exited without going direct or trying again
+        self.warm_mirror()
+        with self.gitconfig.open("a") as f:
+            f.write('[http "https://github.com/"]\n\tproxy = http://127.0.0.1:18434\n')
+        argv = self.dir / "argv"
+        fake = self.dir / "fake-git"
+        fake.write_text(
+            "#!/bin/bash\n"
+            f"if [[ \" $* \" == *' submodule '* ]]; then echo \"$*\" >> {argv}\n"
+            "  if [[ \" $* \" != *' http.https://github.com/.proxy= '* ]]; then\n"
+            "    echo \"fatal: unable to access 'https://github.com/manaflow-ai/ghostty-next.git/': Failed to connect"
+            " to 127.0.0.1 port 18434 after 0 ms: Couldn't connect to server\" >&2; exit 1; fi; fi\n"
+            'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        (bindir / "curl").write_text("#!/bin/bash\nexit 7\n")
+        (bindir / "curl").chmod(0o755)
+        allow = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+        done = self.shim("-C", os.fspath(self.ws), "submodule", "update", "--init", "--recursive",
+                         env={"PATH": f"{bindir}:/usr/bin:/bin", **allow})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("going direct to github.com", done.stderr)
+        self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", argv.read_text().splitlines()[-1])
 
 
 if __name__ == "__main__":
