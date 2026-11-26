@@ -30498,13 +30498,16 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
 
     def remind_until_stale(self):
-        """Tick the stopped row through LAND_OWNER_REMIND_BACKOFF's reminders until the one past
-        LAND_OWNER_REMIND_STALE_AFTER is due (6 h, 18 h, then 42 h after the stop); the entry after each."""
+        """Tick the stopped row to each due reminder of LAND_OWNER_REMIND_BACKOFF (6 h, then 12 h, then 24 h after
+        the last), three in all, the third past LAND_OWNER_REMIND_STALE_AFTER; the entry after each."""
         out = []
-        for gap in (1, 2, 4):
-            e = self.tick(gg.LAND_OWNER_REMIND_EVERY * gap)
-            for _ in range(3):  # the due pass asks its read; the reminder goes once it lands or its wait runs out
-                e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        e = self.q.entries.get(self.KEY) or {}
+        for k in range(3):
+            last = float((e.get("reminds") or {}).get("at") or (e.get("stop") or {}).get("at"))
+            self.tick(last + gg.LAND_OWNER_REMIND_EVERY * 2 ** k - self.t)  # due: asks its read
+            e = self.tick()  # the read landed (or, with none, it waits)
+            if len(out) == k and (e.get("reminds") or {}).get("n", 0) == k:
+                e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)  # no read came: told, or held, on the copy there is
             out.append(e)
         return out
 
@@ -30517,7 +30520,7 @@ class LandTest(Base):
         e = self.remind_until_stale()[-1]
         self.assertEqual(classes()[sent:], ["fyi", "fyi", gg.LAND_NOTICE_CLASS])  # the first day fyi; then one wake
         said = self.w.sent()[-1][-1]
-        self.assertRegex(said, r"unmoved 4[2-4] h")
+        self.assertRegex(said, r"unmoved 4[2-3] h")
         self.assertIn("close the PR naming what superseded it", said)
         self.assertEqual((e["state"], e["reminds"]["staleHead"]), ("stopped", LA))
         self.assertTrue([h for h in e["history"] if h.get("event") == "reminded" and h.get("stale")])
