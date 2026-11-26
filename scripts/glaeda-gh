@@ -14787,6 +14787,17 @@ def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
     return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
 
 
+def land_pulse_args(repo: str, number: str, label: str, broker: bool) -> list[list[str]]:
+    """The two gh argvs of a relabel pulse (LAND_COMMAND_PULSE's comment): LABEL off REPO#NUMBER, then on again. A
+    broker client (a lane VM) sends the broker's `pr edit` forms; a host with its own login GitHub's REST DELETE and
+    POST (no `pr edit --add-label` there: its GraphQL read fails on projectCards, LAND_COMMAND_LABEL's comment)."""
+    if broker:
+        return [["pr", "edit", number, "-R", repo, "--remove-label", label],
+                ["pr", "edit", number, "-R", repo, "--add-label", label]]
+    return [["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{label}"],
+            ["api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={label}"]]
+
+
 def land_own_token_pool(now: float | None = None) -> bool:
     """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
     as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
@@ -16606,6 +16617,22 @@ LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]
 LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (?P<n>\d+) -R (?P<repo>[\w.-]+/[\w.-]+) --add-label (?P<label>ready-to-land|full-ci)\s*"
                                 r"|\s*gh api -X POST repos/(?P<repo2>[\w.-]+/[\w.-]+)/issues/(?P<n2>\d+)/labels -f "
                                 r"'?labels\[\]=(?P<label2>ready-to-land|full-ci)'?(?: --silent)?\s*")
+# LAND_COMMAND_PULSE: the relabel pulse land_judge's land_tier rule names (leo-workspace land_tier.pulse_command) for a
+# PR that already carries ready-to-land while its own land-tier status is pending on the cheap tier ("Cheap tier: the
+# full tier runs when ready-to-land or full-ci is added"). cmux's head_tier runs the cheap tier for a push with a
+# commit of its own onto a labelled PR (64% of the pushes after the label ran full, 11-25 22Z..11-26 11Z: about 440k
+# runner-min/day of full heads a later push replaced; Leo, 2026-11-21: "de facto, im asking for 99% fewer minutes of
+# ci time, period."), so the label is there and adding it sends nothing: only taking it off and adding it again sends
+# GitHub a fresh `labeled` event at this head, and the full tier runs on the head being landed. The queue runs the
+# pair itself for its own row, once per head (e["labelSent"] with pulse, written before the send), and on a lane VM
+# too, through the broker's `gh pr edit N -R R --remove-label/--add-label ready-to-land` (land_pulse_args): the
+# broker takes both for the lane's own PR, so it is never handed to the broker host's queue for it. Never on a
+# teammate's PR (a `teammate` stop in the history: their label is their opt-in), and never full-ci. Before cmux's
+# cheap-labelled-push rule lands a labelled head runs full and its land-tier is success, so this never fires.
+# Detector: test-glaeda-gh.py -k pulse.
+LAND_COMMAND_PULSE = re.compile(r"\s*gh api -X DELETE repos/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<n>\d+)/labels/"
+                                r"(?P<label>ready-to-land) && gh api -X POST repos/(?P=repo)/issues/(?P=n)/labels -f "
+                                r"'?labels\[\]=(?P=label)'?\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -17729,6 +17756,12 @@ def land_command_label(act: dict, answer: dict) -> dict | None:
     named = LAND_COMMAND_LABEL.fullmatch(text)
     repo = str(act.get("repo") or answer.get("repo") or "")
     number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
+    pulse = LAND_COMMAND_PULSE.fullmatch(text)
+    if pulse:
+        if not repo or pulse.group("repo").lower() != repo.lower() or pulse.group("n") != number:
+            return None
+        return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "label", "repo": repo,
+                "label": pulse.group("label"), "pulse": True, "text": text.strip(), "from": "command"}
     if not named:
         return None
     n, named_repo, label = (named.group("n") or named.group("n2"), named.group("repo") or named.group("repo2"),
@@ -23503,6 +23536,8 @@ class LandQueue:
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
             return ""
+        if self.pulse_here(e, act, head):
+            return ""  # LAND_COMMAND_PULSE's comment: the broker takes the lane's own pulse, run here
         if self.broker_peer_silent():
             return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
         if LAND_LOCAL_GIT_TIMEOUT.search(str(answer.get("reason") or "")):
@@ -23878,6 +23913,13 @@ class LandQueue:
                 return
             self.retarget(e, head, base, answer)
             return
+        if kind == "label" and act.get("pulse"):
+            if self.pulse_here(e, act, head):
+                self.do_pulse(e, act, head)
+                return
+            # a teammate's label, or a head already pulsed: stops as the command it was
+            act = {"v": 1, "kind": "command", "text": act.get("text")}
+            kind = "command"
         if kind == "label":
             sent = e.get("labelSent") or {}
             if self.broker_client() or not head or sent.get("head") == head:
@@ -24679,6 +24721,51 @@ class LandQueue:
             self.history(e, "union_merged", head=head[:12], merge=sha[:12], base=base_sha[:12],
                          paths=land_trim(", ".join(e["unionMerge"].get("paths") or []), 200))
             self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+
+    def pulse_here(self, e: dict, act: dict, head: str) -> bool:
+        """Whether this queue runs ACT, a relabel pulse at HEAD, for E itself (LAND_COMMAND_PULSE's comment): its own
+        row (no teammate stop in the history), a full head not pulsed yet."""
+        if not (act.get("kind") == "label" and act.get("pulse")) or not SHA40.fullmatch(head or ""):
+            return False
+        if any(h.get("code") == "teammate" for h in e.get("history") or []):
+            return False  # a teammate's label is their opt-in
+        return (e.get("labelSent") or {}).get("head") != head
+
+    def do_pulse(self, e: dict, act: dict, head: str) -> None:
+        """Take the label off and add it again (LAND_COMMAND_PULSE's comment), once per head, then judge again soon.
+        e["labelSent"] is written before the sends, so a restart mid-pulse counts it as sent. The add is sent whatever
+        the remove answered (a label already off is the pulse's first half done); a refused add is step_refused."""
+        gh = self.gh()
+        if gh is None:
+            with self.lock:
+                self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; the label is not sent around it",
+                          "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
+            return
+        label, repo, number = str(act["label"]), e["repo"], str(e["number"])
+        off, on = land_pulse_args(repo, number, label, self.broker_client())
+        with self.lock:
+            self.claim(e, "label", label=label)
+            e["labelSent"] = {"head": head, "at": self.now, "pulse": True}
+            self.history(e, "label_pulse", head=head[:12], label=label)
+            self.save(e)
+        removed = self.call([gh, *off], LAND_GH_DEADLINE, e)
+        got = self.call([gh, *on], LAND_GH_DEADLINE, e)
+        named = None
+        with self.lock:
+            if got.returncode not in (0, 124):
+                e.pop("labelSent", None)  # the add was refused: not sent (a timeout may have reached GitHub)
+            self.history(e, "label_pulsed", head=head[:12], off=removed.returncode, on=got.returncode)
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"pulsed {label}: the full tier's status is judged next"},
+                          NUDGE_MIN * 3)
+            else:
+                named = self.step_refused(e, "label", head, got)
+        if named == "update_branch":
+            self.update_branch(e, head, named=True)
 
     def do_label(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Add the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment), once per head, then judge
