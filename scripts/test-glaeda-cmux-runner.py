@@ -13855,6 +13855,44 @@ class GateTest(unittest.TestCase):
                 self.assertIn("a signing job waits for this mini to drain", stops[0])
             marker.unlink()
 
+    def test_a_dedicated_runner_that_yields_to_waiters_stops_listening_for_a_host_lock_waiter(self) -> None:
+        """YIELD_TO_WAITERS, cmux15 2026-11-26 07:58Z: the catch-up fill's slot waited for host.lock, and trusted-main,
+        a dedicated runner whose gate never read the waiters, started a Seed DerivedData job beside it, so the slot
+        yielded. With --yield-to-waiters the idle gate holds for the waiter (bounded by host_waiters); without it,
+        and on a dedicated runner, it reads no waiter at all, as before."""
+        for flags, held in ((" --yield-to-waiters", True), ("", False), (" --yield-to-exclusive", False)):
+            with self.subTest(flags=flags):
+                write_hook(self.runner, f"exec python3 /hook job-started --dedicated-admit /x/a.sh{flags}\n")
+                gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                                 waiters=False)  # listen.sh still says --no-waiters: the hook's flag decides
+                with mock.patch.object(hook, "host_waiters", return_value={77}) as lsof:
+                    why = gate.claimed()
+                    self.assertEqual(why, "a fleet build is waiting for the host (pid 77)" if held else None)
+                    self.assertEqual(lsof.call_count, 1 if held else 0)
+                    if held:
+                        gate.claimed()
+                        self.assertEqual(lsof.call_count, 1, "at most every GATE_WAITER_EVERY_S")
+                        gate.waiting_at -= hook.GATE_WAITER_EVERY_S
+                        lsof.return_value = set()
+                        self.assertIsNone(gate.claimed())
+
+    def test_a_waiter_seen_during_a_job_stops_a_waiter_yielding_dedicated_listener_as_the_job_ends(self) -> None:
+        """A seed job that ends while the fill's slot waits must not hand the next seed to the same listener."""
+        for flags, stopped in ((" --yield-to-waiters", True), ("", False)):
+            with self.subTest(flags=flags):
+                write_hook(self.runner, f"exec python3 /hook job-started --dedicated-admit /x/a.sh{flags}\n")
+                gate, stops = self.gate([None] * 3, busy=[True, True])
+                gate.waiters = False
+                gate.worker_pids = lambda: [4343]
+                with mock.patch.object(hook, "host_waiters", return_value={77}):
+                    gate.step()
+                    self.assertEqual((stops, gate.watching), ([], (4343,) if stopped else ()), "never under its job")
+                    gate.step()
+                    gate.step()  # the job ended
+                self.assertEqual(len(stops) >= 1, stopped, stops)
+                if stopped:
+                    self.assertIn("a fleet build is waiting for the host (pid 77)", stops[0])
+
     def test_a_signing_claim_gone_by_the_end_of_the_job_keeps_the_listener(self) -> None:
         capacity = self.tmp / "capacity"
         capacity.mkdir()
@@ -19853,7 +19891,8 @@ class DedicatedRunnerTest(unittest.TestCase):
         untrusted = {k: v for k, v in HQ_USER.items() if k not in ("trustedRef", "trustedRepo")}
         for entry, needle in (({**HQ_USER, "user": "root"}, "never root"), ({**HQ_USER, "user": "Bad User"}, "short name"),
                               ({**HQ_USER, "user": 5}, "short name"), (untrusted, "needs trustedRef"),
-                              ({**HQ_USER, "yieldToExclusive": True}, "without lanRelay and yieldToExclusive"),
+                              ({**HQ_USER, "yieldToExclusive": True}, "without lanRelay, yieldToExclusive"),
+                              ({**HQ_USER, "yieldToWaiters": True}, "and yieldToWaiters"),
                               ({**HQ_USER, "user": "cmux"}, "own ssh_user")):
             with self.subTest(entry=entry):
                 manifest = dedicated_manifest(entry)
@@ -20046,6 +20085,29 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertTrue(receipt["ready"], receipt["blocking"])
         hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
         self.assertIn(" --yield-to-exclusive", (hooks / "job-started.sh").read_text())
+
+    def test_an_entry_that_yields_to_waiters_passes_the_opt_in_to_its_hook(self) -> None:
+        """YIELD_TO_WAITERS: cmux15's trusted-main declares yieldToWaiters, so its job-started hook carries
+        --yield-to-waiters, which its listener gate reads; an entry without it is unchanged."""
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertFalse(good[0]["yieldToWaiters"])
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToWaiters": True}), "mini-std")
+        self.assertIsNone(why)
+        self.assertTrue(good[0]["yieldToWaiters"])
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToWaiters": bad}),
+                                                        "mini-std")
+                self.assertIn("yieldToWaiters", why or "")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "yieldToWaiters": True}),
+                                  "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
+        self.assertIn(" --yield-to-waiters", (hooks / "job-started.sh").read_text())
+        self.assertNotIn("--yield-to-exclusive", (hooks / "job-started.sh").read_text())
 
     def test_an_entry_floor_is_the_runner_floor_and_the_admission_sees_it(self) -> None:
         """A builder that needs more free disk than the member's floor declares minFreeGib: the dedicated runner's
