@@ -25735,6 +25735,23 @@ def land_green_since(e: dict, head: str) -> float:
     return float(first) if isinstance(first, (int, float)) and not isinstance(first, bool) else 0.0
 
 
+def land_green_at_pin(e: dict, data: dict, head: str, now: float) -> bool:
+    """Whether the land row E is green at HEAD (the cache's DATA): its queued pin, when it has one, is HEAD, and either
+    it carries a logged override (reason and receipt, both required to queue one) or every check the cache shows at
+    HEAD is green (check_verdict EXIT_OK; a partial or truncated read with a red, running or unread context is not).
+    A judgment's ok alone is not this: on 2026-11-26 rows paged "one merge away" from cmux-cp-1, cmux-cp-2 and
+    fs-agent-lane-3 while their heads showed reds (cmux#49990: Swift packages on Linux and react-apps-check failed;
+    cmux#57722: fast gates and pr pipeline / linux; cmuxterm-hq#27545: tests and polling-guard). Such a row waits on
+    its owner, who fixes the checks or overrides and merges, not on the queue."""
+    pin = str(e.get("pinSha") or "").lower()
+    if pin and not (head.startswith(pin) or pin.startswith(head)):
+        return False  # the head moved past the pin: the requester re-pins, the queue cannot merge it
+    o = e.get("override")
+    if isinstance(o, dict) and o.get("reason") and o.get("receipt"):
+        return True
+    return check_verdict(data, "green", now) == EXIT_OK
+
+
 def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | None], now: float) -> dict:
     """The land queue's wait clock (LAND_GREEN_WAIT_PAGE): the open rows that could merge now, and how long each has
     waited since it could. A row counts when its last judgment was ok with the merge step next at the head the cache
@@ -25742,13 +25759,13 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     CLEAN and no check running at its head though no ok judgment is on record there (judge_order's "one merge away"),
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
-    of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    of the first kind), "red" (rows not green at their pin, land_green_at_pin: never counted, whatever was judged),
+    "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest", "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
     hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
     clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
     queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
-    judged = 0
+    judged = red = 0
     for e in entries:
         if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
@@ -25756,6 +25773,9 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         data = (cache_of(e["key"]) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "").lower()
         if not head:
+            continue
+        if not land_green_at_pin(e, data, head, now):
+            red += 1  # its owner's to fix, re-pin or override (Leo: "fix the checks or ignore and just merge")
             continue
         if x.get("ok") and (x.get("action") or {}).get("kind") == "merge" and str(x.get("head") or "").lower() == head:
             judged += 1
@@ -25771,7 +25791,7 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         waits.append((max(0.0, now - since), e["key"]))
     waits.sort()
     rank = lambda q: int(waits[max(0, math.ceil(q * len(waits)) - 1)][0]) if waits else None  # noqa: E731
-    return {"rows": len(waits), "judged": judged, "p50S": rank(0.5), "p95S": rank(0.95),
+    return {"rows": len(waits), "judged": judged, "red": red, "p50S": rank(0.5), "p95S": rank(0.95),
             "past": sum(1 for w, _ in waits if w > LAND_GREEN_WAIT_PAGE),
             "oldest": key_name(waits[-1][1]) if waits else None, "oldestS": int(waits[-1][0]) if waits else None,
             "at": now}
@@ -25779,11 +25799,12 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
 
 def land_green_line(g: dict) -> str:
     """`land status`'s line for the wait clock (land_green_waits)."""
+    red = f"; {g['red']} not green at their pin (their owners' to fix or override)" if g.get("red") else ""
     if not g.get("rows"):
-        return "glaeda land: green waits: no row is one merge away"
+        return f"glaeda land: green waits: no row is one merge away{red}"
     return (f"glaeda land: green waits: {g['rows']} row(s) one merge away ({g.get('judged', 0)} judged ok), p50 {land_span(g['p50S'])}, "
             f"p95 {land_span(g['p95S'])}, {g['past']} past {land_span(LAND_GREEN_WAIT_PAGE)}; oldest {g['oldest']} "
-            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}")
+            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}{red}")
 
 
 def land_green_alarm(g: dict | None, host: str, open_rows: int | None = None) -> tuple[str, str, dict] | None:

@@ -40385,7 +40385,9 @@ class LandWaitAlarmTest(AlarmBase):
                             {"at": NOW - 5, "event": "judged", "head": self.HEAD[:12], "step": "merge", "code": "ok"}]}
 
     def cache(self, key: str) -> dict:
-        return {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD}}
+        return {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # green, and BLOCKED (a review)
+                                     "mergeStateStatus": "BLOCKED", "checks": [{"name": "ci", "workflow": "w", "status": "COMPLETED",
+                                                 "conclusion": "SUCCESS"}]}}
 
     def queue_with(self, rows: list[dict]) -> Any:
         gg.land_dir().mkdir(parents=True, exist_ok=True)
@@ -40411,7 +40413,7 @@ class LandWaitAlarmTest(AlarmBase):
     def test_a_clean_row_no_judgment_reached_counts_from_when_it_was_queued(self) -> None:
         """huge-blue, 2026-11-22 08:15Z: 653 rows queued, never judged; only 5 judged ok at their head."""
         clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
-                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"name": "ci", "workflow": "w", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
         queued = {"key": "pr:o/r#7", "state": "queued", "created": NOW - 7200, "dueAt": NOW - 4000}
         refused = {"key": "pr:o/r#8", "state": "waiting", "created": NOW - 9000,
                    "explain": {"at": NOW - 60, "ok": False, "head": self.HEAD, "action": {"kind": "review"}}}
@@ -40425,13 +40427,44 @@ class LandWaitAlarmTest(AlarmBase):
         """2026-11-26 04:00Z: a row queued --after a PR still open was a host clock's only row and paged "green PRs
         wait to merge: p50 88m"; its wait is its requester's order."""
         clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
-                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"name": "ci", "workflow": "w", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
         after = {"key": "pr:o/r#9", "state": "waiting_after", "created": NOW - 5280, "dueAt": NOW - 5280,
                  "after": ["pr:o/r#1"]}
         self.assertEqual(gg.land_green_waits([after], clean, NOW)["rows"], 0)
         self.assertIsNone(gg.land_green_alarm(gg.land_green_waits([after], clean, NOW), "h"))
         freed = {**after, "state": "queued", "dueAt": NOW - 60}  # after_merged: queued again, its clock from then
         self.assertEqual(gg.land_green_waits([freed], clean, NOW)["p50S"], 60)
+
+    def test_a_row_red_at_its_head_or_off_its_pin_is_never_one_merge_away(self) -> None:
+        """2026-11-26: cmux-cp-2 paged cmux#49990 "one merge away" 5h48m with Swift packages on Linux red at its head,
+        cmux-cp-1 cmux#57722 with fast gates and pr pipeline / linux red, fs-agent-lane-3 cmuxterm-hq#27545 with tests
+        and polling-guard red. Leo: "stop waiting on ci to get these fucking things in. if checks fail, fix the checks
+        or ignore and just merge": a red row is its owner's to fix or override, not the queue's wait."""
+        def red(key: str) -> dict:
+            data = self.cache(key)["data"]
+            return {"key": key, "data": {**data, "mergeStateStatus": "UNSTABLE", "checks": data["checks"] + [
+                {"name": "Swift packages on Linux (CmuxDeviceHub)", "workflow": "w", "status": "COMPLETED",
+                 "conclusion": "FAILURE"}]}}
+        judged = self.green(1, 20880)  # judged ok with the merge step next, at the head the cache shows
+        g = gg.land_green_waits([judged], red, NOW)
+        self.assertEqual((g["rows"], g["red"]), (0, 1))
+        self.assertIsNone(gg.land_green_alarm(g, "cmux-cp-2"))
+        self.assertEqual(gg.land_green_line(g), "glaeda land: green waits: no row is one merge away; 1 not green at "
+                                                "their pin (their owners' to fix or override)")
+        queued = {"key": "pr:o/r#2", "state": "queued", "created": NOW - 7200, "dueAt": NOW - 7200}
+        self.assertEqual(gg.land_green_waits([queued], red, NOW)["rows"], 0)
+        # a truncated rollup (cmux heads carry ~280 contexts) whose rollup says FAILURE is red too
+        trunc = lambda key: {"key": key, "data": {**self.cache(key)["data"], "checksTruncated": True,  # noqa: E731
+                                                  "checkState": "FAILURE"}}
+        self.assertEqual(gg.land_green_waits([judged], trunc, NOW)["rows"], 0)
+        # a logged override (reason and receipt) is the owner's "ignore and just merge": it counts, red or not
+        over = {**judged, "override": {"reason": "Swift pool red on base", "receipt": "job 1"}}
+        self.assertEqual(gg.land_green_waits([over], red, NOW)["rows"], 1)
+        self.assertEqual(gg.land_green_waits([{**judged, "override": {"reason": "no receipt"}}], red, NOW)["rows"], 0)
+        # green checks, but the head moved past the queued pin: the requester re-pins, the queue cannot merge it
+        moved = {**judged, "pinSha": "c" * 40}
+        g = gg.land_green_waits([moved, {**judged, "key": "pr:o/r#3", "pinSha": self.HEAD}], self.cache, NOW)
+        self.assertEqual((g["rows"], g["red"], g["oldest"]), (1, 1, "o/r#3"))
 
     def test_a_median_past_30_minutes_pages_and_under_it_stays_quiet(self) -> None:
         self.policy()
