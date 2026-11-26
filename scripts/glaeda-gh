@@ -589,6 +589,18 @@ def heavy_pause(fails: int) -> float:
 
 
 HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
+# A due PR no tick stores a clean read of (Daemon.note_unread). cmux-cp-1, 2026-11-25: manaflow-ai/cmux#46795 (195-285
+# checks) made every PR batch it sat in answer 502; the tick's GQL_SPLITS ran out before it was ever read alone, so
+# `heavy` never learned it, its chunk went to REST (capped) and back to a deferral, and for 14 h nothing was stored:
+# no read, no error, "data 838m ago" while the stale valve re-executed the daemon every 30 min to no effect. A PR whose
+# GraphQL chunk was sent and failed it on UNREAD_ALONE_AFTER ticks is read alone, ahead of the batches (at most
+# UNREAD_ALONE_MAX a call), so it cannot keep failing its batch or wait on the split budget; and a waited one unread on
+# that many due ticks says so, on its entry (unreadWhy, which `status` prints) and in the refresh log, naming the PR
+# and what held it, every UNREAD_NOTE_EVERY while it lasts (UNREAD_NOTE_LINES lines a tick, the rest counted).
+UNREAD_ALONE_AFTER = 2
+UNREAD_ALONE_MAX = 3
+UNREAD_NOTE_EVERY = 300.0
+UNREAD_NOTE_LINES = 5
 # GraphQL down, REST up. huge-blue 2026-11-17: GitHub's GraphQL answered 502 for long stretches (and the controller
 # URLError) and waited PR data reached 3585 s, then 1392 s old, with the heartbeat fresh, both times until a session
 # restarted the daemon. A 502 only split the batch and left it for the next cycle, so a kind routed to GraphQL was
@@ -1474,6 +1486,10 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
+# The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
+# host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
+# then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
+FULL_PR_SECS_FILE = "full-pr-secs.json"
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -1550,6 +1566,16 @@ def suites_contexts(suites: list[str] | str, runs: dict[str, list[dict]],
         if isinstance(runs[s], str):
             return [], runs[s]
     return [node for s in suites for node in runs[s]], None
+
+
+def first_page_more(node: dict) -> bool:
+    """Whether a PR NODE's rollup says more contexts follow its first page (or cannot say: never one whole page)."""
+    commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+    rollup = commit.get("statusCheckRollup")
+    if rollup is None:
+        return False
+    more = ((rollup.get("contexts") or {}).get("pageInfo") or {}).get("hasNextPage")
+    return more is not False
 
 
 COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt lastEditedAt
@@ -2272,6 +2298,13 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+
+
+def load_full_pr_secs(path: Path) -> dict[str, float]:
+    """The seconds per full PR read a daemon measured before its reexec (FULL_PR_SECS_FILE); {} when none is readable."""
+    saved = read_json(path)
+    return {str(k): float(v) for k, v in (saved.items() if isinstance(saved, dict) else ())
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 3600}
 
 
 def read_cache(key: str) -> dict | None:
@@ -6118,6 +6151,8 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
         if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
             c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
                  "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
+            if "spent" in c or "spent" in seen:  # GraphQL: the points this daemon's queries drew from it
+                c["spent"] = int(c.get("spent") or 0) + int(seen.get("spent") or 0)
             tags = sorted(set(c.get("counters") or []) | set(seen.get("counters") or []))
             if tags:
                 c["counters"] = tags  # a counter keeps the tag any of its readings gave it (ACTIONS_COUNTER_PATH)
@@ -6126,6 +6161,19 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     if not merged:
         out.append(dict(seen))
     return sorted(out, key=lambda c: c["reset"])
+
+
+def graphql_drawn(budget: dict, live: list[dict], now: float) -> dict | None:
+    """The GraphQL counter the daemon's own queries last drew from (budget["graphqlDrawn"], Daemon.note_budget): the
+    live counter in LIVE within RESET_JITTER of its reset, or the drawn reading itself once its reset passed (that
+    counter has a fresh window), or None when no query has answered with a live reset (the poorest is the reading)."""
+    d = budget.get("graphqlDrawn")
+    if not (isinstance(d, dict) and isinstance(d.get("reset"), (int, float)) and isinstance(d.get("remaining"), int)
+            and isinstance(d.get("seenAt"), (int, float))):
+        return None
+    if d["reset"] <= now:
+        return d
+    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER), None)
 
 
 def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
@@ -6391,10 +6439,17 @@ class Daemon:
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
         self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
-        self.full_pr_secs: dict[str, float] = {}  # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs)
+        # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
+        self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
+        self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
+        # key -> {"since", "ticks": due ticks unread, "tries": of them, ticks its chunk was sent, "why", "noted"}
+        self.unread: dict[str, dict] = {}  # (note_unread)
+        self.tick_read: set[str] = set()  # keys a clean read was stored for this tick (note_read)
+        self.tick_tried: set[str] = set()  # keys whose GraphQL chunk was sent this tick (batched)
+        self.miss_why: dict[str, str] = {}  # key -> what kept it unread this tick (a failed chunk, a deferral)
         self.gql_down_streak = 0  # GraphQL answers in a row that were a 5xx or no answer (GQL_DOWN)
         self.gql_down_since = 0.0  # when the first of them came
         self.gql_down_strikes = 0  # times GraphQL was taken out since its last clean answer: each doubles the next
@@ -6607,6 +6662,7 @@ class Daemon:
     def note_read(self, key: str) -> None:
         """A read of KEY stored data (dataAt): the daemon made progress on its kind."""
         kind = split_key(key)[0] if ":" in key else ""
+        self.__dict__.setdefault("tick_read", set()).add(key)
         if kind in self.read_done:
             self.read_done[kind].append(self.now)
 
@@ -7505,7 +7561,10 @@ class Daemon:
                 self.paths[kind] = current = OTHER[current]
         return current
 
-    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "") -> None:
+    def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "",
+                    cost: int | None = None) -> None:
+        """One reading of BUCKET. COST (GraphQL only) marks it as the rateLimit of a query this daemon sent on the
+        login: the counter that query drew COST points from, which settle_counters reads as the GraphQL reading."""
         try:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
@@ -7516,10 +7575,19 @@ class Daemon:
             # :21 (cosmic-gray's reading jumped from 3850 left to 3938 between them at 06:02Z while the spending one
             # had 1664). The last answer alone let the daemon, and the gh guard reading budget.json, spend from a
             # counter that was nearly gone; every live one is kept and the poorest is the reading, as for REST.
+            #
+            # Which counter a read is held against is the one this daemon's own queries draw from, not the poorest:
+            # 2026-11-25 22:40Z one host's daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0
+            # left that reset at 22:41:25Z while the counter the login's queries were spending had 4459 left until
+            # 23:11:10Z, and merges went on succeeding. A query's own rateLimit (COST given) names its counter
+            # (graphqlDrawn, each counter's "spent" its points); /rate_limit and response headers only add counters.
             if not isinstance(reset, (int, float)):
                 if not rest_counters(self.budget, "graphqlCounters"):
                     self.budget[bucket] = seen
                 return
+            if cost is not None:
+                seen["spent"] = max(0, int(cost))
+                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt")}
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
@@ -7539,6 +7607,12 @@ class Daemon:
         self.budget["restCounters"] = merge_counter(rest_counters(self.budget), seen)
         self.settle_rest()
 
+    def graphql_counters_view(self) -> list[dict]:
+        """budget.json's live GraphQL counters as daemon.json carries them: left, limit, reset, drawn, spent."""
+        return [{"remaining": c["remaining"], "limit": c.get("limit"), "reset": c["reset"],
+                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {})}
+                for c in rest_counters(self.budget, "graphqlCounters") if c["reset"] > self.now]
+
     def settle_rest(self) -> None:
         """budget["rest"] is the core counter with the least left. GitHub answers one token's REST calls from
         two "core" counters with their own hourly windows (measured 2026-10-30: /actions/runs/N and
@@ -7552,20 +7626,36 @@ class Daemon:
         self.settle_counters("rest")
 
     def settle_counters(self, bucket: str) -> None:
-        """settle_rest for BUCKET ("rest": restCounters, "graphql": graphqlCounters)."""
+        """settle_rest for BUCKET ("rest": restCounters, "graphql": graphqlCounters). For GraphQL the reading is the
+        counter this daemon's own queries last drew from (graphql_drawn), and the poorest only before any did."""
         key = "restCounters" if bucket == "rest" else "graphqlCounters"
         counters = rest_counters(self.budget, key)
         cur = self.budget.get(bucket)
         if isinstance(cur, dict) and isinstance(cur.get("reset"), (int, float)) and isinstance(cur.get("remaining"), int):
-            # the reading itself counts too: a budget.json from before restCounters, or one lowered in place
+            # the reading itself counts too: a budget.json from before restCounters, or one lowered in place (its
+            # copy's "spent" and "drawn" are the counter's own already, so only the count itself is folded in)
             seen_at = cur.get("seenAt")
-            counters = merge_counter(counters, {**cur, "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now})
+            counters = merge_counter(counters, {**{k: v for k, v in cur.items() if k not in ("spent", "drawn")},
+                                                "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now})
         live = [c for c in counters if c["reset"] > self.now]
         live = sorted(live, key=lambda c: c["seenAt"], reverse=True)[:REST_COUNTERS]
+        drawn = graphql_drawn(self.budget, live, self.now) if bucket == "graphql" else None
+        if drawn is not None and drawn["reset"] <= self.now:
+            # the counter the daemon draws from has reset: a fresh window (mode() reads a passed reset as one), not a
+            # hold on another counter it does not draw from
+            self.budget[bucket] = {**drawn, "drawn": True}
         if not live:
             self.budget.pop(key, None)
             return
+        if bucket == "graphql":
+            live = [{**{k: v for k, v in c.items() if k != "drawn"},
+                     **({"drawn": True} if drawn is not None and c is drawn else {})} for c in live]
+            drawn = next((c for c in live if c.get("drawn")), drawn)
         self.budget[key] = sorted(live, key=lambda c: c["reset"])
+        if drawn is not None:
+            if drawn["reset"] > self.now:
+                self.budget[bucket] = dict(drawn)
+            return
         self.budget[bucket] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
 
     def refresh_budget(self) -> None:
@@ -8893,6 +8983,9 @@ class Daemon:
         cost = rate.get("cost") if isinstance(rate, dict) and isinstance(rate.get("cost"), int) else 1
         self.gql_log.append((self.clock(), reason, cost))
         self.note_spend("graphql", reason, 1, cost)
+        if isinstance(rate, dict) and rate.get("resetAt"):  # a write that asks its rateLimit names its counter too
+            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")),
+                             cost=cost)
         return status, h, doc
 
     @staticmethod
@@ -9697,8 +9790,11 @@ class Daemon:
         """Read ENTRIES first next tick. WHY (the budget, pace or limit that held them) is kept per kind for
         deferral(): old waited data behind a deferral is the budget's, not a stuck reader's."""
         self.deferred.update(e["key"] for e in entries)
+        miss = self.__dict__.setdefault("miss_why", {})
         for e in entries:
             self.refund(e["key"])
+            # the first reason this tick stands: a failed chunk's error is why it came to be deferred
+            miss.setdefault(e["key"], why or "the tick's time (TICK_BUDGET) ran out before it was read")
         if why:
             for kind in {split_key(e["key"])[0] for e in entries if ":" in e["key"]}:
                 self.defer_why[kind] = (self.now, why)
@@ -9708,6 +9804,7 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
         self.phase_now = None
+        self.tick_read, self.tick_tried, self.miss_why = set(), set(), {}  # (note_unread)
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -10108,10 +10205,51 @@ class Daemon:
                 held += self.batched(kind, mine, self.graphql_fetch[kind])
         self.defer(held, f"REST {self.rest_hold()} and GraphQL stopped partway")
 
+    def note_unread(self, entries: list[dict], due: list[dict]) -> None:
+        """Count, per due PR, the ticks that stored no clean read of it (UNREAD_ALONE_AFTER): one read since ends its
+        count, a watch no longer held drops it. batched() reads one whose chunk was sent and failed it that often alone,
+        first; a waited one unread that often says what held it, on its entry and in the refresh log (UNREAD_NOTE_EVERY).
+        Before, a PR that every tick skipped (a deferral) or failed in its batch stored nothing at all, so its entry said
+        "error": null over data hours old, and the only signal was the stale valve's restart, which could not help."""
+        read, tried, miss = self.tick_read, self.tick_tried, self.miss_why
+        held = {e["key"] for e in entries}
+        unread = {k: u for k, u in self.unread.items() if k in held and k not in read}
+        notes: list[tuple[dict, dict, str]] = []
+        for e in due:
+            key = e["key"]
+            if not key.startswith("pr:") or key in read:
+                continue
+            u = unread.setdefault(key, {"since": self.now, "ticks": 0, "tries": 0, "why": "", "noted": None})
+            u["ticks"] += 1
+            u["tries"] += key in tried
+            u["why"] = miss.get(key) or u["why"] or "due, but no read of this tick reached it"
+            if u["ticks"] >= UNREAD_ALONE_AFTER and self.waited(e) \
+                    and (u["noted"] is None or self.now - u["noted"] >= UNREAD_NOTE_EVERY):
+                u["noted"] = self.now
+                then = ("next: read alone over GraphQL, ahead of the batches" if u["tries"] >= UNREAD_ALONE_AFTER
+                        else "next: read first once that lets it")
+                text = (f"not read for {int(self.now - u['since'])}s ({u['ticks']} due ticks, its query sent on "
+                        f"{u['tries']}): {u['why']}; {then}")
+                notes.append((e, u, text))
+        self.unread = unread
+        for i, (e, u, text) in enumerate(notes):
+            current = read_cache(e["key"]) or e.get("cache") or {}
+            if current.get("data") is not None:
+                # the data stays, its fetchedAt too (no cycle is moved by a note); the last error is kept beside it
+                self.store(e["key"], current, unreadWhy=text[:400], error=current.get("error"),
+                           fetchedAt=current.get("fetchedAt", self.now))
+            if i < UNREAD_NOTE_LINES:
+                refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: pr {key_name(e['key'])} {text[:400]}")
+        if len(notes) > UNREAD_NOTE_LINES:
+            refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: {len(notes) - UNREAD_NOTE_LINES} more "
+                              f"waited PRs not read on {UNREAD_ALONE_AFTER}+ due ticks (their entries say why)")
+
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
         """Rule on the waits, prune, and write the heartbeat: the end of every tick, whatever read it."""
         self.phase_now = None  # (reexec_now: the phases from here write)
+        with contextlib.suppress(Exception):  # noqa: BLE001  a note must never stop the tick's end
+            self.note_unread(entries, prs)
         # ScriptWake cuts the read phase when fast-patch swaps this file.  If no claimed land step is running,
         # the next image can safely take over the in-memory queue and all deferred bookkeeping.  Do not restore the
         # deadline or walk the end-of-tick phases here: on an upstream host those phases were the wake-to-reexec gap.
@@ -10207,6 +10345,9 @@ class Daemon:
                                  "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None,
                                  "stream": self.feed_stream_status()},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
+                  # every live GraphQL counter, the one this daemon's queries draw from (the hold's) marked, so a
+                  # reader (NOW's quota row) names which counter is low rather than one collapsed figure
+                  "graphqlCounters": self.graphql_counters_view(),
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
@@ -10978,11 +11119,22 @@ class Daemon:
         # Then it is read alone over GraphQL on its own back-off (heavy_pause), and only it: the batches are not slowed.
         rest_reads = self.mode("rest") != "stop" and not self.rest_capped()
 
+        unread = self.__dict__.setdefault("unread", {})
+        lone_unread: set[str] = set()
+
         def chunks(group: list[dict]) -> list[list[dict]]:
             alone, rest = [], []
+            # its chunk failed it tick after tick: alone, first, the oldest data of them first (UNREAD_ALONE_AFTER)
+            failing = [e for e in group if e["key"] not in self.heavy
+                       and (unread.get(e["key"]) or {}).get("tries", 0) >= UNREAD_ALONE_AFTER]
+            failing.sort(key=lambda e: float((e.get("cache") or {}).get("dataAt") or 0))
+            lone = {e["key"] for e in failing[:max(0, UNREAD_ALONE_MAX - len(lone_unread))]}
+            lone_unread.update(lone)
             for e in group:
                 h = self.heavy.get(e["key"])
-                if h is None:
+                if e["key"] in lone:
+                    alone.append([e])
+                elif h is None:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
@@ -11013,7 +11165,8 @@ class Daemon:
             """Chunks by the oldest data in each (never read first). The chunks above run one repository at a time, then
             heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only inside a chunk:
             a tick that ran out of time read the first repository's newest data before another's oldest."""
-            return sorted(queue, key=lambda c: min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c))
+            return sorted(queue, key=lambda c: (not (len(c) == 1 and c[0]["key"] in lone_unread),
+                                                min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c)))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = deque(oldest_first(chunks([e for e in entries if self.waited(e)]))
                       + oldest_first(chunks([e for e in entries if not self.waited(e)])))
@@ -11064,6 +11217,8 @@ class Daemon:
             self.gql_reason = kind
             asked = self.tick_asked[kind] = True
             self.limited = []
+            self.__dict__.setdefault("tick_tried", set()).update(e["key"] for e in chunk)
+            miss = self.__dict__.setdefault("miss_why", {})
             try:
                 began = time.monotonic()
                 with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
@@ -11073,6 +11228,8 @@ class Daemon:
                     self.note_read_seconds(kind, "graphql", time.monotonic() - began, len(chunk) - len(spilled))
                 limited, self.limited = self.limited, []
             except OutOfTime:
+                for e in chunk:
+                    miss[e["key"]] = f"the tick's time (TICK_BUDGET) ran out while its {kind} batch of {len(chunk)} was read"
                 self.defer(chunk + [e for c in queue for e in c])  # no reason, as in the REST loop
                 return to_rest
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
@@ -11083,6 +11240,8 @@ class Daemon:
                 # `wait` say what failed and oldestData shows it. Bounded by GQL_SPLITS like a timeout's split.
                 message = f"graphql: {describe(failure)} at {error_site(failure)}"
                 self.errors.append(message)
+                for e in chunk:
+                    miss[e["key"]] = f"{message[:200]} (in a {kind} batch of {len(chunk)})"
                 self.spill = []
                 if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS:
                     splits[kind] += 2
@@ -11093,6 +11252,9 @@ class Daemon:
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
                 continue
+            if error is not None:
+                for e in chunk:
+                    miss[e["key"]] = f"{' '.join(error.split())[:200]} (in a {kind} batch of {len(chunk)})"
             timed_out = error and GQL_GATEWAY_TIMEOUT.search(error)
             if timed_out and pr_timeout_rest and repo in pr_timeout_rest and self.rest_admits(kind, chunk[0]):
                 pr_timeout_rest[repo] = True
@@ -11439,7 +11601,8 @@ class Daemon:
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
         if rate and self.last_request_source != "app":
-            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
+            self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")),
+                             cost=points)
         return doc, None
 
     def fetch_aliased(self, entries: list[dict], kind: str) -> str | None:
@@ -11503,6 +11666,11 @@ class Daemon:
                 page_error = None
                 if kind == "pr" and e["key"] in wanted:
                     captured[i] = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
+                # the head's snapshot (fold_pr_head), taken before the named reads and last-real runs are folded in
+                snap = captured.get(i) if kind == "pr" else None
+                if kind == "pr" and snap is None and self.pr_head_key(e, node) is not None \
+                        and not first_page_more(node):
+                    snap = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
                     page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
@@ -11519,6 +11687,8 @@ class Daemon:
                     fps[i] = None if page_error else pr_fingerprint(node)
                 if i in captured:
                     self.save_rollup(e["key"], node, captured[i], fps[i])
+                if snap is not None and not page_error:
+                    self.fold_pr_head(e, node, snap, attempts[i], suite_runs, suites_error)
         if kind == "pr":
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         self.limited = [e for i, e in enumerate(entries) if f"{alias}{i}" in limits]
@@ -11837,6 +12007,10 @@ class Daemon:
                 measured[repo] = floor
                 log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
                      "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, "full_pr_secs_path", None)
+        if path is not None and measured.get(repo) != known:
+            with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
+                write_json(path, {k: round(v, 3) for k, v in measured.items()})
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
@@ -11935,6 +12109,60 @@ class Daemon:
                                       "number": int(number), "head": head, "fp": fp, "readAt": self.now, **captured})
         self.rollups[key] = (head, fp)
 
+    # The land host, 2026-11-26 01:09-02:02Z: land-queue PR data 3,000-8,600 s old, each 600 s of ticks ~330 s in "read
+    # pr" and ~350 s in "read head". Every land PR was read twice: its full read, then its head (LandQueue.watch_head),
+    # the same commit's same rollup again. A full read that holds the head's whole rollup (capture_rollup: every page,
+    # no null context) and its last-real-attempt suites now stores the head entry too, and the head is not read again
+    # until its TTL. Anything less (a page held, a suite unread, a CHECKS_OF_RECORD repository, whose head also needs
+    # the other repository's commit) is not folded: the head is read as before, never smaller or greener.
+    def pr_head_key(self, e: dict, node: dict) -> str | None:
+        """The `head:` key of a PR NODE's head commit when this daemon watches it (the tick's watch read listed it) and
+        its repository has no CHECKS_OF_RECORD commit, else None."""
+        _, owner, repo, _ = split_key(e["key"])
+        sha = str(node.get("headRefOid") or "").lower()
+        if not SHA40.fullmatch(sha) or (owner.lower(), repo.lower()) in CHECKS_OF_RECORD:
+            return None
+        key = f"head:{owner.lower()}/{repo.lower()}@{sha}"
+        return key if key in getattr(self, "heads_between_seen", frozenset()) else None
+
+    def fold_pr_head(self, e: dict, node: dict, snap: dict, suites: list[str] | str, runs: dict,
+                     runs_error: str | None) -> bool:
+        """Store the head entry of a full PR read's head from SNAP (capture_rollup) and SUITES (ran_nothing_suites) out
+        of RUNS (suite_runs), as fetch_heads would from its own read; True when stored. Only a whole snapshot of the
+        commit the read names, with every such suite read, is folded."""
+        key = self.pr_head_key(e, node)
+        commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        if key is None or not snap.get("complete") or str(commit.get("oid") or "").lower() != key.rsplit("@", 1)[1]:
+            return False
+        extra, error = suites_contexts(suites, runs, runs_error)
+        if error:
+            return False
+        _, owner, repo, sha = split_key(key)
+        found: dict = {}
+        statuses: dict = {}
+        ids: dict = {}
+        order: dict = {}
+        failed: dict = {}
+        fold_contexts(((snap.get("rollup") or {}).get("nodes")), found, statuses, ids, "", order, failed)
+        fold_contexts(extra, found, statuses, ids, "", order, failed)
+        data = head_data(sha, found, statuses, ids, order)
+        self.head_steps(data, failed, route=[f"{owner}/{repo}"])
+        if not self.store(key, read_cache(key), error=None, dataAt=self.now, data=data, restParts=None, via="graphql"):
+            return False
+        folded = self.__dict__.setdefault("head_folded", {})
+        if len(folded) > 2000:
+            folded.clear()
+        folded[key] = self.now
+        self.reads.append((self.now, "head", "fold"))
+        return True
+
+    def head_folded_now(self, e: dict) -> bool:
+        """Whether a full PR read stored this head this tick (fold_pr_head): its read is skipped, its charge refunded."""
+        if self.__dict__.get("head_folded", {}).get(e["key"]) != self.now:
+            return False
+        self.refund(e["key"])
+        return True
+
     def probe_prs(self, entries: list[dict]) -> tuple[list[dict], str | None]:
         """One PR_PROBE query for ENTRIES: those whose fingerprint matches their cache are confirmed (dataAt and
         fetchedAt move, the answer stays); the ones that changed, or that the probe could not read, come back to be read
@@ -11968,6 +12196,9 @@ class Daemon:
     def fetch_heads(self, entries: list[dict]) -> str | None:
         """Every check on each head commit, one aliased query for the batch (a head with more than 100
         contexts is followed page by page). None, or the error when the whole query failed."""
+        entries = [e for e in entries if not self.head_folded_now(e)]
+        if not entries:
+            return None
         self.reads += [(self.now, "head", "graphql")] * len(entries)
         doc, error = self.graphql(heads_query([e["key"] for e in entries]), {})
         if doc is None:
@@ -13053,6 +13284,8 @@ class Daemon:
         """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
         _, owner, repo, sha = split_key(e["key"])
         prior = e["cache"] or {}
+        if self.head_folded_now(e):
+            return None
         if self.rest_oversized(e):
             # (a GraphQL read that spilled here this tick: due_heads leaves these out of REST's own turn)
             self.refund(e["key"])
@@ -21314,11 +21547,15 @@ class LandQueue:
         (it is no ancestor of the pin, its reads never answered, or this host has no gh-quota shim to read it with)."""
         pin = str(e.get("pinSha") or "")
         head = str(head or "").lower()
-        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head) \
-                or self.head_ancestry(e, head, pin, data) is not None or self.gh() is None:
-            return False  # known (an ancestor's wait is old_pin_wait's, which the caller asked first), or no shim
-        if (e.get("oldPinWait") or {}).get("head") == head:
-            return False  # a pin it followed away from, whose wait ran out: an older commit already, no read
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head) or self.gh() is None:
+            return False  # no shim to read it with
+        known = self.head_ancestry(e, head, pin, data)
+        if known is True or (known is None and (e.get("oldPinWait") or {}).get("head") == head):
+            # an older commit of the pin, or a pin it followed away from, whose wait (old_pin_wait, which the caller
+            # asked first) ran out: GitHub's branch ref decides on a worker (stale_live_job), never a stop naming it
+            return self.stale_live_wait(e, head, pin)
+        if known is not None:
+            return False  # a commit made on the pin, or read to be no ancestor of it: the caller stops it
         if (e.get("baseMergeUnread") or {}).get("head") == head and e["state"] == "waiting" \
                 and float(e.get("wakeAt") or 0) > self.now:
             return True  # its read failed: read again on that wait's wake
@@ -21398,6 +21635,87 @@ class LandQueue:
         keep[f"{head}...{pin}"] = {**({"ancestor": ancestor} if ancestor is not None else {}), "at": self.now,
                                    **({"why": why} if why else {})}
         e["headAncestry"] = keep
+
+    def stale_live_wait(self, e: dict, head: str, pin: str) -> bool:
+        """Under the lock, from ancestry_wait: HEAD, which the copy shows, is an older commit of the pin (or a pin E
+        followed away from) and old_pin_wait's LAND_HEAD_TIMEOUT ran out. One read of GitHub's branch ref decides, on a
+        worker (stale_live_job) and no sooner than the wait a failed read set (base_merge_unread). Always True: the
+        caller does not stop E; the job keeps the pin, stops naming the branch's head, or waits (stale_live)."""
+        if (e.get("baseMergeUnread") or {}).get("head") == head and e["state"] == "waiting" \
+                and float(e.get("wakeAt") or 0) > self.now:
+            return True  # its read failed: read again on that wait's wake
+        if e["key"] in self.jobs:
+            return True
+        if self.busy() >= self.workers():
+            self.gated(e, ready=True)  # waits for a free worker like every other read (ancestry_wait's comment)
+            return True
+        self.submit(e["key"], self.stale_live_job, e["key"], head, pin, int(e.get("gen") or 0))
+        return True
+
+    def stale_live_job(self, key: str, head: str, pin: str, gen: int = 0) -> None:
+        """On a worker, from stale_live_wait: read GitHub's branch ref (update_live_tip) and let stale_live decide; at
+        HEAD itself the branch really is there, so E stops head_moved naming it as before. A `land cancel` or a newer
+        `land` meanwhile wins (check)."""
+        was, self.local.gen = getattr(self.local, "gen", None), gen
+        try:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            live = self.update_live_tip(e, (self.cache_of(key) or {}).get("data") or {})[0]
+            with self.lock:
+                self.check(e)
+                if str(e.get("pinSha") or "") != pin or e.get("state") == "stopped":
+                    return
+                if not self.stale_live(e, head, pin, live):
+                    e.pop("pinWait", None)
+                    self.stop(e, "head_moved", land_moved_clause(head, pin) + " (GitHub's branch ref is at it too)",
+                              f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+                self.save(e)
+        except LandCancelled:
+            pass
+        finally:
+            self.local.gen = was
+
+    def stale_live(self, e: dict, head: str, pin: str, live: str) -> bool:
+        """Under the lock (LAND_STALE_LIVE's comment): HEAD, the copy's head, is an older commit of PIN and its wait
+        ran out; LIVE is GitHub's branch ref read just now ("" when the read failed). True when this decided E: at the
+        pin it is kept and the wait starts again; at another head the stop names that head; a failed read waits and is
+        read again (base_merge_unread), and past LAND_BASE_MERGE_UNREAD_MAX failed reads it stops naming the pin, which
+        is newer than HEAD, never HEAD. False when the branch ref is at HEAD too: the caller stops it as before."""
+        repo_n = f"{e['repo']}#{e['number']}"
+        if live == pin:
+            e.pop("baseMergeUnread", None)
+            e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
+            self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
+                         why="an older commit of the pin; GitHub's branch is at the pin")
+            self.nudge(e["key"])
+            self.requeue(e)
+            return True
+        if SHA40.fullmatch(live or ""):
+            e.pop("baseMergeUnread", None)
+            if live == head:
+                return False
+            # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
+            self.stop(e, "head_moved", land_moved_clause(live, pin)
+                      + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
+                      f"glaeda-gh land {repo_n} --sha {live}")
+            return True
+        why = (f"GitHub's branch ref could not be read, and the copy here shows {head[:12]}, an older commit of the "
+               "pin")
+        if e["state"] == LAND_FORWARDED:  # a forwarded row keeps its state: read again on its next look
+            was = e.get("baseMergeUnread") if isinstance(e.get("baseMergeUnread"), dict) else {}
+            n = (int(was.get("n") or 0) if was.get("head") == head else 0) + 1
+            if n <= LAND_BASE_MERGE_UNREAD_MAX:
+                e["baseMergeUnread"] = {"head": head, "n": n}
+                self.history(e, "base_merge_unread", head=head[:12], n=n, why=land_trim(why, 200))
+                return True
+        elif self.base_merge_unread(e, head, why, ""):
+            return True
+        e.pop("baseMergeUnread", None)
+        self.stop(e, "head_moved", f"the copy here shows {head[:12]}, an older commit of the --sha {pin[:12]} it was "
+                  f"queued for, and GitHub's branch ref could not be read in {LAND_BASE_MERGE_UNREAD_MAX} tries, so "
+                  "the land is not judged on it", f"glaeda-gh land {repo_n} --sha {pin}")
+        return True
 
     def requeue(self, e: dict) -> None:
         """Under the lock: E, whose worker judged nothing, is looked at again on the next pass (its head checks first)."""
@@ -21505,7 +21823,7 @@ class LandQueue:
         older: Any = False
         if why and not unread and ancestor is None and gh:
             older = self.ancestry_read(e, head, pin)
-        live = ""
+        live: str | None = None  # None: not read (no older commit, or its wait has not run out)
         if why and (ancestor or (older is not False and older[0] is True)):
             w = e.get("oldPinWait") or {}
             if w.get("head") == head and self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
@@ -21520,21 +21838,8 @@ class LandQueue:
                 # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
                 self.requeue(e)
                 return False
-            if ancestor and live == pin:
-                # LAND_STALE_LIVE: GitHub's branch is still at the pin; the copy showing HEAD is stale. The pin is kept
-                # and the wait starts again (one branch read per LAND_HEAD_TIMEOUT), never a stop naming HEAD.
-                e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
-                self.history(e, "stale_head_kept", head=head[:12], pin=pin[:12],
-                             why="an older commit of the pin; GitHub's branch is at the pin")
-                self.nudge(e["key"])
-                self.requeue(e)
-                return False
-            if ancestor and SHA40.fullmatch(live) and live != head:
-                # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
-                self.stop(e, "head_moved", land_moved_clause(live, pin)
-                          + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
-                          f"glaeda-gh land {e['repo']}#{e['number']} --sha {live}")
-                return False
+            if ancestor and live is not None and self.stale_live(e, head, pin, live):
+                return False  # LAND_STALE_LIVE: GitHub's branch ref decided (kept, moved on, or read again)
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
             e.pop("baseMergeUnread", None)
@@ -24896,6 +25201,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # f1da65f70f9a", each an older merge of the branch while GitHub's head was still the pin; both were re-queued by hand
 # at the pin they already had. Past that wait, one read of GitHub's branch ref decides: at the pin, the pin is kept
 # and the wait starts again; at another head, the stop names that head.
+# cmux#55778 (pin bf57a2e2, stopped "the head is c8b20b4c7ea3") and cmux#54158 (pin b22889fc, stopped "the head is
+# a2eca4801414"), 2026-11-25 22:09Z and 22:27Z on cmux-cp-1: each pin a base merge whose first parent the stale copy
+# showed, while GitHub's branch ref and pulls/N were at the pin; the stop's next: line asked for the parent, which
+# parks the land. The decision is stale_live's for every path that held such a head (base_merge_check, and
+# ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
+# and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
@@ -24951,6 +25262,10 @@ def land_base_merge_chain(pin: str, head: str, doc: dict,
     parents are on the base is for the caller's reads."""
     head = str(head or "").lower()
     commits = (doc or {}).get("c")
+    if (doc or {}).get("s") in ("behind", "identical"):
+        # cmux#55778, #54158 (LAND_STALE_LIVE's comment): a copy showing an older commit of the pin is no base merge
+        # on it, and its stop said "its commits since the pin were not all listed", which hid that
+        return [], f"it is {(doc or {}).get('s')} the pin: an older commit of it, not a base merge on it"
     if not isinstance(commits, list) or (doc or {}).get("s") != "ahead":
         return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
     complete = (doc or {}).get("n") == len(commits)
@@ -28969,6 +29284,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          "for a rescue attempt")
         lines.append(str(data.get("html_url") or ""))
     note = f"  (last error: {entry['error']})" if entry.get("error") else ""
+    if entry.get("unreadWhy"):
+        note += f"  ({entry['unreadWhy']})"  # what keeps it from a read (Daemon.note_unread)
     via = {"rest": ", read over REST", "graphql": ", read over GraphQL",
            "graphql-probe": ", confirmed unchanged over GraphQL"}.get(entry.get("via"), "")
     lines.append(f"data {age(entry.get('dataAt'))}{via}{note}")
@@ -32971,7 +33288,12 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             when = dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime("%H:%M:%SZ") if reset else "?"
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
-            print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
+            which = ""
+            if bucket == "graphql" and len(rest_counters(budget, COUNTER_KEYS[bucket])) > 1:
+                which = (" (the counter this daemon's queries draw from)" if b.get("drawn")
+                         else " (the poorest counter: no query of this daemon's has named its counter yet)")
+            print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen "
+                  f"{age(b.get('seenAt'))}{which}")
             # Both buckets answer from two counters with their own windows (settle_counters), and GET /rate_limit
             # reports only one of them, so a reader who cross-checks this line against /rate_limit can see a rich
             # counter while the one their reads actually spend is at zero -- 2026-11-21: `budget` said GraphQL 0 left
@@ -32981,10 +33303,14 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             counters = [c for c in rest_counters(budget, COUNTER_KEYS[bucket]) if c["reset"] > time.time()]
             if len(counters) > 1:
                 label = "core" if bucket == "rest" else POOL_NAMES[bucket]
-                print(f"         {label} counters (the poorest is the one above, and the one a read is refused "
-                      f"against): " + "; ".join(
+                drew = any(c.get("drawn") for c in counters)
+                head = ("the one this daemon's queries draw from is the one above, and the one a read is refused "
+                        "against" if drew else "the poorest is the one above, and the one a read is refused against")
+                print(f"         {label} counters ({head}): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
-                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
+                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}"
+                    + (" (drawn from" + (f", {c['spent']} points spent" if isinstance(c.get("spent"), int) else "")
+                       + ")" if c.get("drawn") else "") for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
         if isinstance(paths, dict):
             name = {"graphql": "GraphQL", "rest": "REST"}

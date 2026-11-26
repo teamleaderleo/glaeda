@@ -4329,7 +4329,9 @@ class BalanceTest(Base):
         self.daemon.tick(NOW)  # equal buckets: GraphQL, as before
         over_graphql = gg.read_cache(key)["data"]
         self.assertEqual(self.gh.rest_calls(), [])
-        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 400, "reset": NOW + 3000}
+        # the counter the daemon's queries draw from (the fake's rateLimit resets at NOW + 1800) runs low; another
+        # counter's low reading would not hold them (settle_counters)
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 400, "reset": NOW + 1800}
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
         self.assertEqual(paths, ["pulls/1", "issues/1", f"commits/{'a' * 40}/check-suites?per_page=100",
@@ -4907,6 +4909,70 @@ class BalanceTest(Base):
         self.daemon.settle_counters("graphql")
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
         self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
+
+    def test_graphql_reading_is_the_counter_its_own_queries_draw_from(self) -> None:
+        """2026-11-25 22:40Z: a daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0 left
+        resetting at 22:41:25Z while the counter the login's queries spent had 4459 left until 23:11:10Z. The reading
+        is the counter the daemon's own queries name (cost given), and each counter keeps the points drawn from it."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 85)  # /rate_limit's counter: no query of ours drew on it
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 0)  # no draw yet: the poorest
+        self.daemon.note_budget("graphql", 5000, 4459, NOW + 1870, cost=3)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4459)
+        self.assertTrue(self.daemon.budget["graphql"]["drawn"])
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 85)  # /rate_limit again: still not the hold
+        self.daemon.note_budget("graphql", 5000, 4457, NOW + 1870, cost=2)
+        self.daemon.settle_counters("graphql")
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4457)
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        counters = {c["reset"]: c for c in self.daemon.budget["graphqlCounters"]}
+        self.assertEqual(counters[NOW + 1870]["spent"], 5)  # the settle's own re-merge counts no point twice
+        self.assertTrue(counters[NOW + 1870]["drawn"])
+        self.assertNotIn("drawn", counters[NOW + 85])
+        self.assertNotIn("spent", counters[NOW + 85])
+        view = self.daemon.graphql_counters_view()
+        self.assertEqual(sorted((c["remaining"], c["drawn"]) for c in view), [(0, False), (4457, True)])
+
+    def test_a_drawn_counter_that_runs_low_holds_the_reads(self) -> None:
+        """The other side: when the counter the queries draw from is the poor one, it is the hold, however rich the
+        other counter /rate_limit reports."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 40, NOW + 600, cost=1)
+        self.daemon.note_budget("graphql", 5000, 4751, NOW + 2040)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 40)
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+
+    def test_a_drawn_counter_past_its_reset_is_dropped_not_held(self) -> None:
+        """The counter the queries draw from reset: that is a fresh window, so neither its last "0 left" nor the
+        other, poorer counter the daemon does not draw from holds the reads; the next query names the new one."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 60, cost=1)
+        self.daemon.note_budget("graphql", 5000, 10, NOW + 3000)
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+        self.daemon.now = NOW + 61
+        self.daemon.settle_counters("graphql")
+        self.assertEqual([c["reset"] for c in self.daemon.budget["graphqlCounters"]], [NOW + 3000])
+        self.assertEqual(self.daemon.mode("graphql"), "normal")
+        self.daemon.note_budget("graphql", 5000, 4990, NOW + 3661, cost=1)  # the new window's first answer
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4990)
+        self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 2)
+
+    def test_a_graphql_answer_names_its_counter_with_its_cost(self) -> None:
+        """Daemon.graphql passes the answer's rateLimit cost, so the counter it drew from is the reading."""
+        self.daemon.now = NOW
+        self.daemon.budget = {"graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 85, "seenAt": NOW}]}
+        reset = dt.datetime.fromtimestamp(NOW + 1870, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"data": {"rateLimit": {"limit": 5000, "remaining": 4459, "resetAt": reset, "cost": 4}}}
+        with mock.patch.object(self.daemon, "request", return_value=(200, {}, doc)):
+            got, error = self.daemon.graphql("query { rateLimit { limit remaining resetAt cost } }", {})
+        self.assertIsNone(error)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4459)
+        drawn = next(c for c in self.daemon.budget["graphqlCounters"] if c.get("drawn"))
+        self.assertEqual(drawn["spent"], 4)
 
     def test_graphql_reads_past_the_per_minute_ceiling_wait_for_the_next_minute(self) -> None:
         """A tick that would spend past graphqlPerMinute sends nothing more: its reads are deferred (first next tick),
@@ -7791,6 +7857,61 @@ class OverloadTest(Base):
         for n in (1, 2, 4, 5, 6):
             self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["dataAt"], NOW + 11 * gg.CYCLE)  # the others never wait for it
 
+    def batch_poison(self, poison: int):
+        """A transport that answers 502 to a PR query of more than one PR that includes POISON (a rollup too big to
+        read beside others), and reads it alone; SEEN gets each PR query's numbers."""
+        seen = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
+                if "pullRequest(number:" in doc["query"]:
+                    seen.append(prs)
+                    if poison in prs and len(prs) > 1:
+                        return 502, {}, b'{"message": "Server Error"}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return seen
+
+    def test_a_pr_whose_batch_fails_every_tick_is_read_alone_and_says_why_meanwhile(self) -> None:
+        # cmux-cp-1, 2026-11-25: manaflow-ai/cmux#46795 (195-285 checks) poisoned every PR batch it sat in with a 502;
+        # GQL_SPLITS ran out before it was ever alone, its chunk went to REST (capped) and back to a deferral, and
+        # nothing was stored for 14 h: no read, no error, "data 838m ago" while the stale valve restarted the daemon.
+        keys = []
+        for n in range(1, 13):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1], waited=True, at={"touched": NOW, "waitedAt": NOW, "waitBegan": NOW})
+            # #3 the oldest: oldest_first puts it in the tick's first chunk every time
+            self.daemon.store(keys[-1], None, dataAt=NOW - (9000 if n == 3 else 100), data={"state": "OPEN", "number": n},
+                              via="graphql")
+        seen = self.batch_poison(3)
+        log = gg.BASE / gg.REFRESH_LOG
+        # starved_lead reads the oldest waited PR alone at once (its own tests); off here, so the batch path's
+        # read-alone-after-UNREAD_ALONE_AFTER, which covers every other PR, is what this test pins
+        with mock.patch.object(self.daemon, "rest_room", return_value=False), mock.patch.object(gg, "GQL_SPLITS", 0), \
+                mock.patch.object(self.daemon, "starved_lead", return_value=None):  # spent by the tick's other batches, as on cp-1
+            for tick in range(gg.UNREAD_ALONE_AFTER + 2):
+                t = NOW + tick * gg.CYCLE
+                for k in keys:
+                    os.utime(gg.watch_dir() / gg.file_name(k), (t,) * 2)
+                    gg.register(k, waited=True, at={"touched": t, "waitedAt": t, "waitBegan": NOW})
+                self.daemon.tick(t)
+                if tick == gg.UNREAD_ALONE_AFTER - 1:
+                    entry = gg.read_cache("pr:o/r#3")
+                    self.assertEqual(entry["dataAt"], NOW - 9000)  # not read yet: and the entry says why
+                    self.assertIn("not read for", entry.get("unreadWhy") or "")
+                    self.assertIn("502", entry["unreadWhy"])
+                    self.assertIn("not read for", gg.render("pr:o/r#3", entry, False))
+                    self.assertIn("o/r#3", log.read_text())
+        self.assertIn([3], seen)  # read alone at last
+        entry = gg.read_cache("pr:o/r#3")
+        self.assertGreater(entry["dataAt"], NOW)
+        self.assertIsNone(entry.get("unreadWhy"))  # a clean read clears the note
+        for k in keys:
+            self.assertGreater(gg.read_cache(k)["dataAt"], NOW, k)  # its batch neighbours are read too
+
     def test_chunks_are_read_oldest_data_first_across_repositories(self) -> None:
         # a repository at a time put one repository's newer data ahead of another's oldest when a tick ran out of time
         for repo, n, age in (("a", 1, 100), ("a", 2, 90), ("b", 3, 500), ("b", 4, 400)):
@@ -8108,6 +8229,21 @@ class BudgetOutputTest(Base):
         self.assertIn("0/5000 until", line)
         self.assertIn("4751/5000 until", line)
         self.assertIn("the one a read is refused against", line)
+
+    def test_budget_names_the_counter_the_daemon_draws_from(self) -> None:
+        """A page must say which counter is low: the reading is the drawn one, and the counters line marks it."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 4459, "reset": NOW + 1870, "seenAt": NOW - 10, "drawn": True},
+            "graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 85, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4459, "reset": NOW + 1870, "seenAt": NOW - 10,
+                                 "drawn": True, "spent": 12}]})
+        text = self.budget_text()
+        self.assertIn("graphql  4459/5000 left", text)
+        self.assertIn("the counter this daemon's queries draw from", text)
+        line = next(ln for ln in text.splitlines() if "GraphQL counters" in ln)
+        self.assertIn("0/5000 until", line)
+        self.assertIn("(drawn from, 12 points spent)", line)
+        self.assertIn("the one this daemon's queries draw from is the one above", line)
 
     def test_one_live_graphql_counter_prints_no_split_line(self) -> None:
         """Nothing to disambiguate when the bucket has a single live counter, including a second whose window ended."""
@@ -28877,10 +29013,13 @@ class LandTest(Base):
                                                               "timeout_s": 600}))
         self.tick(30)
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA  # GitHub's branch ref agrees: it was pushed back
         e = self.tick(700)
         self.assertIsNone(e.get("stop"))
         e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
@@ -29195,6 +29334,8 @@ class LandTest(Base):
         path = self.older_copy()
         self.w.cache[self.KEY]["data"]["baseRefName"] = "main"
         self.w.api[f"repos/o/r/commits/{self.LE}"] = json.dumps([self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = self.LE  # the branch really is at it (LAND_STALE_LIVE)
         e = self.tick(30)
         self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
         self.assertEqual((self.ancestry_reads(path), self.compares()), (1, []))  # no base merge compare
@@ -29203,7 +29344,8 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (no update_branch of this queue's "
                          f"made it, and its parents ({self.LD[:12]}) are not the pinned head and then one more "
                          "commit: a push, not a base merge on it)")
-        self.assertEqual((len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")), (2, []))  # nothing read again
+        # nothing read again but the branch ref, once
+        self.assertEqual((len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")), (3, []))
 
     def test_a_pin_wait_on_an_older_commit_of_the_pin_waits_for_the_pin(self):
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
@@ -29237,13 +29379,15 @@ class LandTest(Base):
     def test_an_older_commit_of_the_pin_still_shown_stops_after_the_wait(self):
         self.pinned_and_waiting()
         path = self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = self.LE  # the branch really is at it (LAND_STALE_LIVE)
         e = self.tick(30)
         self.assertIsNone(e.get("stop"))
         e = self.tick(gg.LAND_HEAD_TIMEOUT - 30)
         self.assertIsNone(e.get("stop"))
         e = self.tick(31)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
-        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA))
+        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (GitHub's branch ref is at it too)")
         self.assertEqual((self.ancestry_reads(path), self.w.gh_calls("pr", "merge")), (1, []))
 
     def test_an_ancestry_read_that_never_answers_stops_head_moved_after_its_reads(self):
@@ -29260,6 +29404,76 @@ class LandTest(Base):
         self.assertEqual(self.unread_events(e), list(range(1, gg.LAND_BASE_MERGE_UNREAD_MAX + 1)))
         self.assertEqual(self.ancestry_reads(path), gg.LAND_BASE_MERGE_UNREAD_MAX + 1)
         self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def stale_parent_copy(self, live: str | None) -> None:
+        """manaflow-ai/cmux#55778 and #54158, 2026-11-25: the pin LA is a base merge made on LE, and the copy here still
+        shows LE, itself a merge (parents LD, LF), read since the pin. compare LA...LE says behind (base_merge_chain),
+        compare LE...LA says LE is an older commit of LA, and GitHub's branch ref answers LIVE (None: the read fails)."""
+        self.pr(self.LE, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[self.LD, self.LF], headParent=self.LD, baseRefName="main",
+                                              headRefName="lane/x")
+        self.w.api[f"repos/o/r/compare/{LA}...{self.LE}"] = json.dumps({"s": "behind", "n": 0, "c": []})
+        self.w.api[f"repos/o/r/compare/{self.LE}...{LA}"] = json.dumps({"s": "ahead", "b": 0})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = live
+
+    def test_a_stale_copy_showing_the_first_parent_of_a_base_merge_pin_keeps_the_pin_and_lands_there(self):
+        # cmux#55778 (pin bf57a2e2, stopped "the head is c8b20b4c7ea3") and cmux#54158 (pin b22889fc, stopped "the head
+        # is a2eca4801414"): each pin a base merge whose first parent the stop named, while GitHub's branch ref and
+        # pulls/N were at the pin; the stop's next: line asked for the parent, which parks the land.
+        self.pinned_and_waiting()
+        self.stale_parent_copy(LA)
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        for _ in range(3):
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+            self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertIn(gg.LAND_STALE_LIVE, [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
+
+    def test_a_stale_copy_of_a_base_merge_pin_whose_branch_ref_read_fails_never_names_the_older_head(self):
+        self.pinned_and_waiting()
+        self.stale_parent_copy(None)
+        e = self.tick(30)
+        for _ in range(gg.LAND_BASE_MERGE_UNREAD_MAX + 3):
+            if e["state"] == "stopped":
+                break
+            self.assertNotEqual((e.get("stop") or {}).get("code"), "head_moved")
+            e = self.tick(max(gg.LAND_HEAD_TIMEOUT, gg.LAND_RETRY_MAX) + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("branch ref could not be read", e["stop"]["reason"])
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])  # the pin, newer than the copy's head, never the older head
+        self.assertNotIn(self.LE, e["stop"]["next"])
+        self.assertIn("base_merge_unread", [h["event"] for h in e["history"]])
+
+    def test_a_stale_copy_of_a_base_merge_pin_with_the_branch_really_at_the_older_head_stops_naming_it(self):
+        self.pinned_and_waiting()
+        self.stale_parent_copy(self.LE)  # somebody pushed the branch back: GitHub's ref agrees with the copy
+        e = self.tick(30)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {self.LE}", e["stop"]["next"])
+
+    def test_an_older_commit_of_the_pin_still_shown_with_the_branch_at_the_pin_keeps_the_pin(self):
+        # the same stale copy on the cache-only path (stop_moved_pin, pin_wait): one parent, so no base merge check
+        self.pinned_and_waiting()
+        self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        e = self.tick(30)
+        for _ in range(3):
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+            self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertIn(gg.LAND_STALE_LIVE, [h["event"] for h in e["history"]])
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
 
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
@@ -46357,6 +46571,135 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(10)))
             self.assertIsNone(d.fetch_prs(self.entries(10)))
         self.assertEqual(d.sent, [10, 10])
+
+    def test_a_restarted_daemon_starts_from_the_measure_it_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            d, clock = self.daemon(5.0)
+            d.full_pr_secs_path = path
+            with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lambda e: None):
+                d.fetch_prs(self.entries(3))  # learns cmux's cost from one 10.5 s cut
+            self.assertIn("manaflow-ai/cmux", gg.load_full_pr_secs(path))
+            fresh, clock2 = self.daemon(5.0)
+            fresh.full_pr_secs = gg.load_full_pr_secs(path)  # what __init__ reads after a reexec
+            with mock.patch.object(gg.time, "monotonic", lambda: clock2[0]):
+                self.assertIsNone(fresh.fetch_prs(self.entries(3)))
+            self.assertEqual(fresh.sent, [1, 1, 1])  # no 10.5 s cut first
+
+    def test_an_unreadable_measure_file_is_no_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            path.write_text('{"manaflow-ai/cmux": "x", "a/b": -1, "c/d": true, "e/f": 2.5}')
+            self.assertEqual(gg.load_full_pr_secs(path), {"e/f": 2.5})
+            path.write_text("not json")
+            self.assertEqual(gg.load_full_pr_secs(path), {})
+
+
+class FullPrReadFoldsItsHead(unittest.TestCase):
+    """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s
+    reading their heads again, the same commit's same rollup. A whole full read now stores the head entry too."""
+    SHA = "ab" * 20
+    RUN = {"__typename": "CheckRun", "id": "CR1", "databaseId": 11, "name": "build", "status": "COMPLETED",
+           "conclusion": "FAILURE", "detailsUrl": "u", "startedAt": "2026-11-26T01:00:00Z",
+           "completedAt": "2026-11-26T01:05:00Z", "isRequired": False,
+           "checkSuite": {"databaseId": 5, "conclusion": "FAILURE", "app": {"slug": "github-actions"},
+                          "workflowRun": {"databaseId": 7, "event": "pull_request",
+                                          "workflow": {"name": "CI", "databaseId": 3}}}}
+    STATUS = {"__typename": "StatusContext", "context": "deploy", "state": "PENDING", "description": "wait",
+              "targetUrl": None, "createdAt": "2026-11-26T01:00:00Z", "isRequired": False}
+    OLD = {"__typename": "CheckRun", "id": "CR0", "databaseId": 10, "name": "lint", "status": "COMPLETED",
+           "conclusion": "FAILURE", "startedAt": "", "completedAt": "", "lastRealAttempt": True,
+           "checkSuite": {"conclusion": "FAILURE", "app": {"slug": "github-actions"},
+                          "workflowRun": {"databaseId": 8, "workflow": {"name": "Lint", "databaseId": 4}}}}
+
+    def commit(self, more=False):
+        return {"oid": self.SHA, "parents": {"nodes": []},
+                "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"id": "S1", "latest": {"totalCount": 1}},
+                                          {"id": "S2", "latest": {"totalCount": 0}}]},
+                "statusCheckRollup": {"state": "FAILURE", "contexts": {
+                    "totalCount": 2, "pageInfo": {"hasNextPage": more, "endCursor": "c1"},
+                    "nodes": [dict(self.RUN), dict(self.STATUS)]}}}
+
+    def daemon(self, repo="manaflow-ai/cmux", watched=True, runs=None, more=False, wanted=False, page_error=None):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 1000.0
+        d.reads, d.spill, d.gql_limited, d.errors = [], [], False, []
+        d.stored, d.refunded, d.sent = {}, [], []
+        d.pr_key = f"pr:{repo}#1"
+        d.head_key = f"head:{repo}@{self.SHA}"
+        d.heads_between_seen = frozenset({d.head_key} if watched else ())
+        d.probe_ok = lambda e: False
+        d.unchanged_paged = lambda e, node: False
+        d.fail = lambda entries, message: None
+        d.fill_steps = lambda pairs: None
+        d.head_steps = lambda data, failed, root=None, route=None: None
+        d.save_rollup = lambda *a, **k: None
+        d.rollup_wanted = lambda: frozenset({d.pr_key} if wanted else ())
+        d.page_pr_contexts = lambda *a, **k: page_error
+        d.suite_runs = lambda *a, **k: (runs if runs is not None else {"S2": [dict(self.OLD)]}, None)
+        d.refund = d.refunded.append
+        d.head_answered = lambda key: None
+        d.mode = lambda path: "normal"
+
+        def store(key, prior, older_yields=False, **fields):
+            d.stored[key] = fields
+            return True
+        d.store = store
+        node = {"number": 1, "url": "u", "title": "t", "state": "OPEN", "isDraft": False, "merged": False,
+                "headRefOid": self.SHA, "headRefName": "b", "baseRefName": "main", "baseRef": None,
+                "commits": {"nodes": [{"commit": self.commit(more)}]}}
+
+        def graphql(query, variables):
+            d.sent.append(query)
+            if query.startswith("query{rateLimit"):  # fetch_heads: the head itself
+                return {"data": {"h0": {"object": self.commit()}}}, None
+            return {"data": {"p0": {"pullRequest": node}}}, None
+        d.graphql = graphql
+        return d
+
+    def read_pr(self, d):
+        with mock.patch.object(gg, "read_cache", lambda key: None):
+            self.assertIsNone(d.fetch_aliased([{"key": d.pr_key, "cache": {}}], "pr"))
+
+    def test_a_whole_pr_read_stores_its_head_as_a_head_read_would_and_the_head_read_is_skipped(self):
+        d = self.read_pr_and_fold()
+        folded = d.stored[d.head_key]
+        self.assertEqual((folded["dataAt"], folded["via"], folded["error"]), (1000.0, "graphql", None))
+        self.assertIn(("1000.0", "head", "fold"), [(str(t), k, b) for t, k, b in d.reads])
+        # the same tick's head read is skipped and refunded: no query
+        sent = len(d.sent)
+        self.assertIsNone(d.fetch_heads([{"key": d.head_key, "cache": {}}]))
+        self.assertEqual((len(d.sent), d.refunded), (sent, [d.head_key]))
+        # a real head read of the same commit, a tick later, stores the very same data (the last-real run included)
+        d.now = 1001.0
+        d.stored.clear()
+        self.assertIsNone(d.fetch_heads([{"key": d.head_key, "cache": {}}]))
+        self.assertEqual(d.stored[d.head_key]["data"], folded["data"])
+        self.assertIn("Lint / lint", folded["data"]["found"])
+        self.assertEqual(folded["data"]["found"]["CI / build"], ["completed", "failure"])
+
+    def read_pr_and_fold(self, **kw):
+        d = self.daemon(**kw)
+        self.read_pr(d)
+        self.assertIn(d.pr_key, d.stored)
+        return d
+
+    def test_a_land_pr_read_whole_over_its_pages_folds_its_head(self):
+        d = self.read_pr_and_fold(more=True, wanted=True)
+        self.assertIn(d.head_key, d.stored)
+
+    def test_anything_less_than_a_whole_read_leaves_the_head_to_its_own_read(self):
+        cases = {"a page held": dict(more=True, wanted=True, page_error="graphql: PR check pages over their hourly share"),
+                 "pages never read (not a land PR)": dict(more=True),
+                 "a last-real suite unread": dict(runs={"S2": "graphql: last real attempt: a suite could not be read"}),
+                 "a head nobody watches": dict(watched=False),
+                 "a CHECKS_OF_RECORD repository": dict(repo="teamleaderleo/glaeda")}
+        for why, kw in cases.items():
+            with self.subTest(why):
+                d = self.read_pr_and_fold(**kw)
+                self.assertNotIn(d.head_key, d.stored)
+                self.assertFalse([r for r in d.reads if r[2] == "fold"])
 
 
 class LandCarryTest(unittest.TestCase):
