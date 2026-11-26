@@ -27311,6 +27311,19 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
         self.assertNotIn("next:", self.w.sent()[-1][-1])
 
+    def test_a_row_whose_pr_was_closed_ends_with_an_fyi_not_a_blocker(self):
+        # LAND_CLOSED_FYI: the same closed stop, told as an inbox fyi that wakes nobody
+        self.lane_vm()
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.tip_merge() for _ in range(3)]
+        self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
+        self.w.view_state = "CLOSED"
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        argv = self.w.sent()[-1]
+        self.assertEqual(argv[argv.index("--class") + 1], "fyi")
+
     def test_a_refusal_of_any_code_on_a_pr_that_finished_ends_it_final_with_no_stop_notice(self):
         # cmux#51248 (merged 08:31Z) stopped "conflict", cmux#52236 (closed) "checks_stuck", cmux#55597 (merged)
         # "own_red", 2026-11-25: the cache said OPEN, the queue (its own login: no state read before a refusal) judged
@@ -30445,6 +30458,40 @@ class LandTest(Base):
         self.assertEqual((e["reminds"]["n"], e["reminds"].get("head")), (1, None))
         self.assertIn("could not be read just now", said)
         self.assertNotIn("--pin", said)
+
+    def test_a_stop_nobody_acts_on_is_reminded_a_bounded_number_of_times(self):
+        # LAND_OWNER_REMIND_TOTAL: the day's cap reset every UTC day, so a conflict its requester never resolved was
+        # told twice a day for the row's whole life (cmux16, 2026-11-26: 20 reminders in an hour, at 46-88 h).
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        for _ in range(12):  # three UTC days at the cadence
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(len(self.w.sent()), sent + gg.LAND_OWNER_REMIND_TOTAL)
+        self.assertEqual((e["state"], e["remindLife"]["n"]), ("stopped", gg.LAND_OWNER_REMIND_TOTAL))
+        held = [h for h in e["history"] if h.get("event") == "remind_held"]
+        self.assertEqual([h.get("why") for h in held], ["total"])  # said once in its history, not every pass
+        self.fresh_head = LB  # its owner pushed: new evidence, a new count
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(len(self.w.sent()), sent + gg.LAND_OWNER_REMIND_TOTAL + 1)
+        self.assertIn(f"--pin {LB}", self.w.sent()[-1][-1])
+
+    def test_a_reminder_on_an_unread_copy_is_told_once_per_stop(self):
+        # cmux16, 2026-11-26: 16 of 20 reminded PRs had merged or closed days before; its reads never landed, so every
+        # reminder repeated an OPEN copy from before the stop. One such reminder says so; later ones wait for a read.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None  # every read fails
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        self.assertIn("could not be read just now", self.w.sent()[-1][-1])
+        for _ in range(6):
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((len(self.w.sent()), e["state"]), (sent + 1, "stopped"))
+        self.assertIn("unread", [h.get("why") for h in e["history"] if h.get("event") == "remind_held"])
+        self.fresh_head = LA  # a read lands: the PR is unchanged and still stopped, told on the copy now
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(len(self.w.sent()), sent + 2)
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
