@@ -23712,7 +23712,8 @@ class GitShimTest(unittest.TestCase):
         url = "https://github.com/manaflow-ai/cmuxterm-hq"
         proxy = "http://127.0.0.1:18434"
         if refused_socket:
-            sock = self.enterContext(socket.socket())
+            sock = socket.socket()
+            self.addCleanup(sock.close)
             sock.bind(("127.0.0.1", 0))  # reserved for this test, never listens
             proxy = f"http://127.0.0.1:{sock.getsockname()[1]}"
         self.gitconfig.write_text(f'[http "https://github.com/"]\n\tproxy = {proxy}\n')
@@ -23736,7 +23737,8 @@ class GitShimTest(unittest.TestCase):
             '#!/bin/sh\n'
             f'/usr/bin/git config --get-urlmatch http.proxy "$2" >> {shlex.quote(str(receipt))}\n'
             '/usr/bin/git config --get test.checkout-header >/dev/null || exit 17\n'
-            f'exec {shlex.quote(git_exec)}/git-remote-ext "$1" "ext::git-upload-pack {self.github}"\n')
+            f'cd {shlex.quote(str(self.github))} || exit 1\n'
+            f'exec {shlex.quote(git_exec)}/git-remote-ext "$1" "git-upload-pack ."\n')
         helper.chmod(0o755)
         env = {**self.job_env, "PATH": f"{shim_dir}:/usr/bin:/bin", "GIT_EXEC_PATH": str(self.dir),
                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "test.checkout-header", "GIT_CONFIG_VALUE_0": "kept",
