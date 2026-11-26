@@ -42383,6 +42383,7 @@ class LandForwardTest(Base):
         self.assertNotIn("forwardTakenBack", e)
         self.assertIn("handed to big-exec", gg.land_line(e, self.t))
         self.assertIn("held requested there", gg.land_line(e, self.t))
+        self.assertRegex(gg.land_line(e, self.t), r"taken back in 1\.0 h \(")  # ahead, said so, not a bare clock
         e = self.hold_forwarded_for(3600 + gg.LAND_FORWARD_ASK_EVERY + 2)
         self.assertEqual((e["state"], e["pinSha"]), ("forwarded", LA))
         self.assertEqual(e["forwardTakenBack"]["far"], "requested")
@@ -42403,6 +42404,12 @@ class LandForwardTest(Base):
         self.assertIn("requested", e["stop"]["reason"])
         self.assertIn("16 h bound", e["stop"]["reason"])
         self.assertTrue([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
+
+    def test_a_bound_on_another_utc_day_reads_with_its_date_and_hours_left(self):
+        # lane-router, 2026-11-26: "taken back by 10:31:42Z" read at 19:36Z was tomorrow's 10:31, and read as past
+        now = 1795721760.0  # 2026-11-26 19:36Z
+        self.assertEqual(gg.utc_when(now + 14.9 * 3600, now), "in 14.9 h (11-27 10:30Z)")
+        self.assertEqual(gg.utc_when(now - 1800, now), "0.5 h ago (19:06Z)")
 
     def test_a_forward_bound_counts_from_the_first_hand_off_at_its_head_and_a_new_head_starts_it_again(self):
         self.forwarded_to_executor()

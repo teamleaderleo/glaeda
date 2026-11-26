@@ -27957,9 +27957,9 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         due = float(back["at"]) + LAND_FORWARD_GIVE_UP if taken else float(fb["at"]) + LAND_FORWARD_HELD_BOUND
         bits.append(f"handed to {e.get('forwardedTo') or 'another host'} {max(0.0, now - float(fb['at'])) / 3600:.1f} h ago"
                     + (f", held {far} there" if far else "")
-                    + (f"; {'stops' if taken else 'taken back'} {'by' if due > now else 'past'} {utc_clock(due)}"))
+                    + (f"; {'stops' if taken else 'taken back'} {utc_when(due, now)}"))
     if _finite(back.get("at")) and e["state"] != "stopped":
-        bits.append(f"taken back from {back.get('from')} {utc_clock(float(back['at']))} after "
+        bits.append(f"taken back from {back.get('from')} {utc_when(float(back['at']), now)} after "
                     f"{float(back.get('held') or 0) / 3600:.1f} h held {back.get('far') or 'open'} there")
     if e["state"] == "stopped":
         st = e.get("stop") or {}
@@ -31974,6 +31974,19 @@ def key_name(key: str) -> str:
     """OWNER/REPO#N for a PR or comment thread, OWNER/REPO/ID for a run: what a command takes back."""
     kind, owner, repo, number = split_key(key)
     return f"{owner}/{repo}{'/' if kind == 'run' else '#'}{number}"
+
+
+def utc_when(at: float, now: float) -> str:
+    """AT against NOW for a status line: `in 14.9 h (11-27 10:31Z)`, `0.3 h ago (10:31Z)`. The date shows when AT is
+    another UTC day than NOW: a bare `10:31Z` 15 h ahead read as long past (lane-router, 2026-11-26, on a forwarded
+    row's "taken back by 10:31:42Z" read at 19:36Z)."""
+    try:
+        day = time.strftime("%m-%d ", time.gmtime(at)) if time.gmtime(at)[:3] != time.gmtime(now)[:3] else ""
+        clock = day + time.strftime("%H:%MZ", time.gmtime(at))
+    except (ValueError, OSError, OverflowError):
+        return "unknown"
+    h = abs(at - now) / 3600
+    return f"in {h:.1f} h ({clock})" if at > now else f"{h:.1f} h ago ({clock})"
 
 
 def utc_clock(at: float) -> str:
