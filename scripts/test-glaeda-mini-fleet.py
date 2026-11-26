@@ -3545,6 +3545,33 @@ class ShareTests(unittest.TestCase):
         self.assertEqual(checks["xcode 27.0"]["action"],
                          {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
 
+    def test_an_xcode_copy_runs_beside_a_build_and_a_busy_seed_still_seeds(self) -> None:
+        # 2026-11-26: fix --wait for Xcode 27.0 on four busy fleet minis copied nothing for an hour: the targets'
+        # build workers free the host lock only between jobs, and every seed that had 27.0 was busy too
+        # (share_prepare exit 20). An Xcode lands on its own path, staged and moved in whole, which no job reads.
+        self.assertIn("xcode_share", mf.BUSY_HOST_REPAIRS)
+        self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
+            commands = []
+            with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
+                    mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                      (commands.append(c), 1 if "share_have" in c else 0)[1]):
+                ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
+            self.assertTrue(ok, thing)
+            recv = next(c for c in commands if "share_recv" in c)
+            self.assertIn(gate + "share_recv " + thing, recv, thing)
+            self.assertTrue(remote_call(commands[-1]).startswith(gate + "share_finish " + thing), (thing, remote_call(commands[-1])))
+        # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
+        for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
+            seen = []
+            mf.SEEDS_READY.clear()
+            with mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                   (seen.append(remote_call(c)), 0)[1]):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", thing, None, True, args=args))
+            self.assertTrue(seen[0].startswith(func if thing == "xcode" else "lock; " + func), seen)
+        mf.SEEDS_READY.clear()
+
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
                 manifest: Path = EXAMPLE, command: str = "onboard", after: dict[str, str] | None = None,
