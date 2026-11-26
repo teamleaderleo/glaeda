@@ -45689,5 +45689,70 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(10)))
         self.assertEqual(d.sent, [10, 10])
 
+
+class LandCarryTest(unittest.TestCase):
+    """A manaflow-ai/glaeda PR cannot merge in the fork (ruleset "main: deploy keys only"): manaflow-ai/glaeda#43,
+    2026-11-25, approved and green, answered "Cannot update this protected ref". `land` carries it upstream."""
+    HEAD = "2d1020d6eda41b4643371932a015b2c82372f17e"
+
+    def pr(self, **over):
+        pr = {"state": "OPEN", "isDraft": False, "isCrossRepository": False, "headRefOid": self.HEAD,
+              "title": "Admit rc", "url": "https://github.com/manaflow-ai/glaeda/pull/43",
+              "author": {"login": "azooz2003-bit"},
+              "reviews": {"nodes": [{"author": {"login": "teamleaderleo"}, "commit": {"oid": self.HEAD}}]}}
+        pr.update(over)
+        return pr
+
+    def test_a_teammates_pr_approved_at_its_head_is_carried(self):
+        self.assertEqual(gg.land_carry_refusal(self.pr(), ""), "")
+        self.assertEqual(gg.land_carry_refusal(self.pr(), self.HEAD[:12]), "")
+
+    def test_an_approval_of_an_older_head_or_by_the_author_is_no_review(self):
+        old = {"nodes": [{"author": {"login": "teamleaderleo"}, "commit": {"oid": "0" * 40}}]}
+        self.assertIn("no approving review", gg.land_carry_refusal(self.pr(reviews=old), ""))
+        own = {"nodes": [{"author": {"login": "azooz2003-bit"}, "commit": {"oid": self.HEAD}}]}
+        self.assertIn("no approving review", gg.land_carry_refusal(self.pr(reviews=own), ""))
+        self.assertEqual(gg.land_carry_refusal(self.pr(reviews=old, author={"login": "teamleaderleo"}), ""), "")
+
+    def test_a_closed_draft_foreign_or_moved_pr_is_not_carried(self):
+        self.assertIn("closed", gg.land_carry_refusal(self.pr(state="CLOSED"), ""))
+        self.assertIn("draft", gg.land_carry_refusal(self.pr(isDraft=True), ""))
+        self.assertIn("another fork", gg.land_carry_refusal(self.pr(isCrossRepository=True), ""))
+        self.assertIn("not the pinned", gg.land_carry_refusal(self.pr(), "abcdef1234567"))
+
+    def test_the_carry_pushes_the_head_and_opens_one_twin(self):
+        calls = []
+
+        def run(argv, timeout=None, **_):
+            calls.append(argv)
+            out = ""
+            if argv[:3] == ["gh", "api", "graphql"]:
+                out = json.dumps({"data": {"repository": {"pullRequest": self.pr()}}})
+            elif argv[:3] == ["gh", "pr", "create"]:
+                out = "https://github.com/teamleaderleo/glaeda/pull/2827\n"
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        with mock.patch.object(gg, "run_bounded", side_effect=run), mock.patch.object(gg, "say_waiting"):
+            self.assertEqual(gg.land_carry("manaflow-ai/glaeda", 43, ""), ("teamleaderleo/glaeda#2827", self.HEAD))
+        push = next(a for a in calls if "push" in a)
+        self.assertEqual(push[-2:], ["git@github.com:teamleaderleo/glaeda.git",
+                                     f"+{self.HEAD}:refs/heads/carry/manaflow-ai-glaeda-43"])
+        self.assertFalse(any("main" in a[-1] and "push" in a for a in calls[:-2] if a[0] == "git"))
+        create = next(a for a in calls if a[:3] == ["gh", "pr", "create"])
+        self.assertIn("carries manaflow-ai/glaeda#43", create[create.index("--title") + 1])
+
+    def test_an_unapproved_teammate_pr_is_refused_before_any_push(self):
+        calls = []
+
+        def run(argv, timeout=None, **_):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"data": {"repository": {"pullRequest": self.pr(reviews={"nodes": []})}}}), "")
+
+        with mock.patch.object(gg, "run_bounded", side_effect=run), self.assertRaises(gg.WatchError) as said:
+            gg.land_carry("manaflow-ai/glaeda", 43, "")
+        self.assertIn("no approving review", str(said.exception))
+        self.assertEqual(len(calls), 1)
+
 if __name__ == "__main__":
     unittest.main()

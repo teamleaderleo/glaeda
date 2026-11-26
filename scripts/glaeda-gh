@@ -25598,6 +25598,107 @@ def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool)
     return EXIT_FAIL
 
 
+# A land of a manaflow-ai/glaeda PR is carried into teamleaderleo/glaeda. The fork's main takes no merges (ruleset
+# "main: deploy keys only", docs/GLAEDA_OTA.md, Fleet mirror), so GitHub answers every merge of a PR opened there with
+# "Cannot update this protected ref", whatever its checks say. manaflow-ai/glaeda#43 (Aziz, 2026-11-25): approved and
+# green but for one flaky shard, it could not merge, and its author had to ask a person in Slack. Leo, 2026-11-25:
+# "this says cannot merge protected ref so we need to do it on ours etc". The carry pushes the PR's head, unchanged,
+# to carry/manaflow-ai-glaeda-N in the upstream repository, opens (or reuses) one PR there naming the original, and
+# queues that PR pinned to the same head: the fork's Verify at that commit is its check of record too
+# (CHECKS_OF_RECORD), and sync-main.yml brings the merge back to the fork's main. A carry takes only a PR from a
+# branch of the fork itself whose head an approving review covers (or ours, by an agent author): the upstream twin is
+# authored by this login, so the review at that exact head is what keeps a teammate's change to the root runner hook
+# behind a security review.
+LAND_CARRY = {"manaflow-ai/glaeda": "teamleaderleo/glaeda"}
+LAND_CARRY_OURS = frozenset({"teamleaderleo"})
+LAND_CARRY_QUERY = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){"
+                    "state isDraft isCrossRepository headRefOid title url author{login} "
+                    "reviews(last:50,states:APPROVED){nodes{author{login} commit{oid}}}}}}")
+
+
+def land_carry_branch(repo: str, number: int) -> str:
+    return f"carry/{repo.replace('/', '-').lower()}-{number}"
+
+
+def land_carry_refusal(pr: dict, sha: str) -> str:
+    """Why the fork PR PR (LAND_CARRY_QUERY's pullRequest) is not carried at SHA, or ""."""
+    if not isinstance(pr, dict):
+        return "GitHub returned no such pull request"
+    if pr.get("state") != "OPEN":
+        return f"it is {str(pr.get('state') or 'not open').lower()}"
+    if pr.get("isDraft"):
+        return "it is a draft"
+    if pr.get("isCrossRepository"):
+        return "it comes from another fork, not a branch of the fork itself"
+    head = str(pr.get("headRefOid") or "")
+    if sha and not head.startswith(sha):
+        return f"its head is {head[:12]}, not the pinned {sha[:12]}"
+    author = str((pr.get("author") or {}).get("login") or "").lower()
+    if author in LAND_CARRY_OURS:
+        return ""
+    for review in ((pr.get("reviews") or {}).get("nodes") or []):
+        who = str((review.get("author") or {}).get("login") or "").lower()
+        if who and who != author and str((review.get("commit") or {}).get("oid") or "") == head:
+            return ""
+    return (f"no approving review covers its head {head[:12]} (its author {author or '?'} is not an agent author): "
+            "approve that head, then land it again")
+
+
+def land_carry_twin_body(repo: str, number: int, pr: dict) -> str:
+    return (f"Carries {repo}#{number} ({pr.get('url') or ''}) by {(pr.get('author') or {}).get('login') or '?'}, "
+            f"at the same head {str(pr.get('headRefOid'))[:12]}, so the fork's Verify at that commit is this head's "
+            "check of record too.\n\nThe fork's `main` takes no merges (ruleset \"main: deploy keys only\", "
+            "docs/GLAEDA_OTA.md, Fleet mirror): changes merge here and sync-main.yml brings them to the fork. "
+            "`glaeda-gh land` opened this PR; the original's description and review are on it.\n")
+
+
+def land_carry(repo: str, number: int, sha: str) -> tuple[str, str]:
+    """(the upstream twin as OWNER/REPO#N, the head it is pinned to) for the fork PR REPO#NUMBER; raises WatchError
+    with the reason and the step when it is not carried."""
+    upstream = LAND_CARRY[repo.lower()]
+    owner, name = repo.split("/", 1)
+    read = run_bounded(["gh", "api", "graphql", "-f", f"query={LAND_CARRY_QUERY}", "-F", f"o={owner}", "-F",
+                        f"r={name}", "-F", f"n={number}"], timeout=60)
+    try:
+        pr = json.loads(read.stdout)["data"]["repository"]["pullRequest"]
+    except (ValueError, KeyError, TypeError):
+        raise WatchError(f"{repo}#{number} is carried into {upstream} (its main takes no merges), and reading it "
+                         f"failed: {(read.stderr or read.stdout).strip()[:300]}") from None
+    why = land_carry_refusal(pr, sha)
+    if why:
+        raise WatchError(f"{repo}#{number} lands by a carry into {upstream} (the fork's main takes no merges), and "
+                         f"it is not carried: {why}")
+    head = str(pr["headRefOid"])
+    branch = land_carry_branch(repo, number)
+    with tempfile.TemporaryDirectory(prefix="glaeda-carry-") as work:
+        steps = (["git", "init", "-q", "--bare", work],
+                 ["git", "-C", work, "fetch", "-q", "--depth=50", f"https://github.com/{repo}.git",
+                  f"+refs/pull/{number}/head:refs/heads/carry"],
+                 # the carry branch is this tool's own, so a head the PR moved to replaces it; main is never touched
+                 ["git", "-C", work, "push", "-q", f"git@github.com:{upstream}.git",
+                  f"+{head}:refs/heads/{branch}"])
+        for argv in steps:
+            done = run_bounded(argv, timeout=300)
+            if done.returncode != 0:
+                raise WatchError(f"carrying {repo}#{number} into {upstream}: `{' '.join(argv[:4])}` failed: "
+                                 f"{(done.stderr or done.stdout).strip()[:300]}")
+    found = run_bounded(["gh", "pr", "list", "-R", upstream, "--head", branch, "--state", "open", "--json",
+                         "number", "--jq", ".[0].number // empty"], timeout=60)
+    twin = (found.stdout or "").strip()
+    if found.returncode != 0 or not twin.isdigit():
+        made = run_bounded(["gh", "pr", "create", "-R", upstream, "--base", "main", "--head", branch, "--title",
+                            f"{pr.get('title') or branch} (carries {repo}#{number})", "--body",
+                            land_carry_twin_body(repo, number, pr)], timeout=120)
+        m = re.search(r"/pull/(\d+)", made.stdout or "")
+        if made.returncode != 0 or not m:
+            raise WatchError(f"carrying {repo}#{number}: opening the PR in {upstream} failed: "
+                             f"{(made.stderr or made.stdout).strip()[:300]}")
+        twin = m.group(1)
+    say_waiting(f"glaeda-gh land: {repo}#{number} is carried into {upstream}#{twin} at {head[:12]} (the fork's main "
+                f"takes no merges); landing that, pinned")
+    return f"{upstream}#{twin}", head
+
+
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
              pin: str | None = None, override: dict | None = None, ceiling: float | None = None,
              nominated: dict | None = None) -> int:
@@ -25609,6 +25710,11 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     pin = land_resolve_head_word(repo, number, key, pin)
     check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
+    if repo.lower() in LAND_CARRY:
+        # before everything else: every check below is of the PR that merges, the upstream twin
+        target, sha = land_carry(repo, number, sha)
+        pin = sha
+        key, repo, number = land_key(target)
     for a in after:
         land_key(a)
     null = land_pin_null_refusal(repo, number, sha) if sha else None
