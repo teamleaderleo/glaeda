@@ -15548,6 +15548,19 @@ LAND_NOTIFY_RETRY_S = 5.0
 LAND_NOTIFY_GONE = re.compile(r"\bno_session:")
 LAND_NOTIFY_BUSY = re.compile(r"\b(?:429|503)\b|mesh\.rate_limited|mesh\.unavailable")
 LAND_NOTIFY_BUSY_RETRY_S = 30.0
+# Every notice was its own thread running its own acpmux at once, so a pass that told many rows in one minute opened
+# more pipes than the daemon may hold (ulimit -n 1024 on cmux-cp-1) and ran more sends than acpmux answers in
+# LAND_NOTIFY_DEADLINE. cmux-cp-1, 2026-11-26 04:44Z, the minute after the GraphQL window reset: 2,078 reminders
+# (land-owner-reminded) fell due together; 1,433 ended land-notify-failed "OSError" and 516 "timed out after 30s",
+# so 1,949 of 2,078 (94%) reached nobody, and each had already spent one of its row's LAND_OWNER_REMIND_MAX. At most
+# LAND_NOTIFY_PARALLEL sends run at a time; the rest wait their turn in their threads, which hold no file.
+LAND_NOTIFY_PARALLEL = 8
+LAND_NOTIFY_SLOTS = threading.BoundedSemaphore(LAND_NOTIFY_PARALLEL)
+# A session acpmux said is gone (LAND_NOTIFY_GONE) is not asked again for LAND_NOTIFY_GONE_KEEP: the same 24 h on
+# cmux-cp-1 logged 2,114 land-notify-no-session to 146 names, 1,572 of them to one ended session (a coordinator's
+# helpers had queued hundreds of lands under it), each a whole acpmux send that held a slot a live requester's
+# notice waited for. The skipped notice is logged as the others are ("memo": the seconds since acpmux said so).
+LAND_NOTIFY_GONE_KEEP = 900.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
@@ -25304,6 +25317,13 @@ class LandQueue:
                             f"{e.get('queuedBy') or 'an unnamed caller'} with no --notify)",
                             {"pr": self.url(e), "queuedBy": e.get("queuedBy") or ""})
             return
+        gone = self.__dict__.setdefault("notify_gone", {})  # {HOST/SESSION: when acpmux said no_session}
+        said = gone.get(to)
+        if said is not None and 0 <= time.time() - said < LAND_NOTIFY_GONE_KEEP:
+            # LAND_NOTIFY_GONE_KEEP's comment: acpmux said minutes ago that this session has ended
+            log({"event": "land-notify-no-session", "key": e["key"], "to": to, "tries": 0,
+                 "why": "not sent: acpmux said no_session for it", "memo": round(time.time() - said)})
+            return
         acpmux = self.path("acpmux", Path(shutil.which("acpmux", path=self.env()["PATH"]) or "acpmux"))
         # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
         # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
@@ -25314,10 +25334,15 @@ class LandQueue:
                 "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
+            with LAND_NOTIFY_SLOTS:  # LAND_NOTIFY_PARALLEL's comment: a burst waits its turn, it does not fail
+                deliver()
+
+        def deliver() -> None:
             whys: list[str] = []
             for tried in range(1, LAND_NOTIFY_TRIES + 1):
                 got = self.call(argv, LAND_NOTIFY_DEADLINE)
                 if got.returncode == 0:
+                    gone.pop(to, None)
                     if whys:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
                     # every delivered notice, so a flood is counted from this log, not only from its receiver's
@@ -25327,6 +25352,7 @@ class LandQueue:
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
                 if LAND_NOTIFY_GONE.search(whys[-1]):
                     # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
+                    gone[to] = time.time()
                     log({"event": "land-notify-no-session", "key": e["key"], "to": to, "why": whys[-1],
                          "tries": tried})
                     return
