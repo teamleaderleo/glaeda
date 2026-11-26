@@ -1287,7 +1287,15 @@ CONTENT_PAUSE_RETRY = 60  # seconds after a failed or timed-out ask before the n
 # out). The --hold report runs off the post's path on the same kind of thread, bounded by the same: the keeper writes
 # the pause under a file lock that another writer on the host can hold for seconds, and a report killed at 2 s
 # mid-write never told the other writers of the pause it was sent to share.
-CONTENT_PAUSE_SLOW_DEADLINE = 15
+# 25 s, not 15: a host that is not the pause's primary asks it over `reach` (gh_quota.pause_now), bounded by the keeper's
+# own PAUSE_ASK_S (20 s) plus its interpreter start, so a 15 s kill cut a slow but answering ask short and threw away
+# the keeper's own fallback answer (2026-11-26 14:27-14:32Z, relayed by the desk coordinator: a PR create waited ~5 min
+# on "pause ask failed 2 in a row (2 timed out)"). The ask is on its own thread: a longer bound holds no tick.
+CONTENT_PAUSE_SLOW_DEADLINE = 25
+# While creates wait on an unknown pause (content_pause_unknown), a failed or timed-out ask is asked again this soon
+# rather than after CONTENT_PAUSE_RETRY: a 60 s gap after each failure turned two transient failures into minutes of
+# held creates. While the last answer still stands nothing is held, and the minute's gap is kept.
+CONTENT_PAUSE_FAIL_RETRY = 15
 CONTENT_PAUSE_REPORT_DEADLINE = 15
 # While no answer is newer than CONTENT_PAUSE_RETRY and the ask is failing or still running, the pause is unknown:
 # creates wait rather than go out into a pause other writers may have reported. For CONTENT_PAUSE_BLIND_MAX at most
@@ -8490,7 +8498,10 @@ class Daemon:
             return 0.0
         clock = self.clock()
         wait = 0.0
-        if self.pause_ask is None and clock >= self.pause_next:
+        # CONTENT_PAUSE_FAIL_RETRY: while creates wait on an unknown pause, a failed ask is asked again sooner
+        held = (self.pause_ask is None and self.pause_failures > 0 and self.content_pause_unknown()
+                and clock >= self.pause_next - CONTENT_PAUSE_RETRY + CONTENT_PAUSE_FAIL_RETRY)
+        if self.pause_ask is None and (clock >= self.pause_next or held):
             self.pause_next = clock + CONTENT_PAUSE_RETRY  # until it answers
             self.pause_first_ask = clock if self.pause_first_ask is None else self.pause_first_ask
             self.pause_result = None

@@ -18667,10 +18667,11 @@ class PostTest(unittest.TestCase):
             d.content_pause_settle(10)
             self.assertTrue(any(e.startswith("content pause:") for e in d.errors))
             self.assertEqual(d.pause_until, NOW + 100)
-            for at in (NOW + 40, NOW + 60, NOW + 79):
+            for at in (NOW + 40, NOW + 59):
                 clock[0] = at
                 self.step(d, at)
-            self.assertEqual(len(calls.read_text().splitlines()), 2)  # no ask within a minute of the failed one
+            # no ask again while the last answer stands (CONTENT_PAUSE_FAIL_RETRY is only for an unknown pause)
+            self.assertEqual(len(calls.read_text().splitlines()), 2)
             (calls.parent / "hang").unlink()
             clock[0] = NOW + 80
             self.step(d, NOW + 80)
@@ -18741,6 +18742,34 @@ class PostTest(unittest.TestCase):
             d.content_pause_settle(10)
         self.assertEqual((d.pause_failures, d.pause_timeouts, d.content_pause_unknown()), (0, 0, False))
         self.assertEqual(d.content_pause_status()["answeredAgo"], 0)
+
+    def test_a_failed_ask_is_asked_again_soon_and_outlasts_the_keepers_own_remote_bound(self) -> None:
+        # 2026-11-26 14:27Z: two timed-out asks held a PR create ~5 min; the next ask came only CONTENT_PAUSE_RETRY later,
+        # and the 15 s kill was shorter than the keeper's own 20 s remote ask (gh_quota PAUSE_ASK_S).
+        self.assertGreater(gg.CONTENT_PAUSE_SLOW_DEADLINE, 20 + 2)
+        self.assertLess(gg.CONTENT_PAUSE_FAIL_RETRY, gg.CONTENT_PAUSE_RETRY)
+        self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(0, level=0)
+        (calls.parent / "hang").touch()
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        clock = [NOW]
+        d.clock = lambda: clock[0]
+        with mock.patch.object(gg, "CONTENT_PAUSE_DEADLINE", 0.1), mock.patch.object(gg, "CONTENT_PAUSE_SLOW_DEADLINE", 0.3):
+            self.step(d, NOW)
+            d.content_pause_settle(10)
+            clock[0] = NOW + 1
+            self.step(d, NOW + 1)  # takes the timed-out answer
+            self.assertEqual(d.pause_failures, 1)
+            self.assertTrue(d.content_pause_unknown())  # never answered: creates wait
+            (calls.parent / "hang").unlink()
+            clock[0] = NOW + gg.CONTENT_PAUSE_FAIL_RETRY
+            self.step(d, clock[0])  # asked again, answered: no pause, the write goes on the next pass
+            d.content_pause_settle(10)
+            clock[0] += gg.POST_SPACING + 1
+            self.step(d, clock[0])
+        self.assertEqual(d.pause_failures, 0)
+        self.assertEqual(len(t.calls), 1)
 
     def test_a_keeper_without_content_pause_is_no_keeper_and_is_asked_again(self) -> None:
         # cosmic-gray, 2026-11-18: the installed gh-quota had no content-pause. Each ask's usage error counted as a
