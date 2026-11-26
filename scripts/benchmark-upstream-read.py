@@ -43,6 +43,7 @@ def main() -> int:
     os.environ["GLAEDA_GH_READER"] = "tool:benchmark"
     loader = importlib.machinery.SourceFileLoader("glaeda_gh", a.script)
     gg = importlib.util.module_from_spec(importlib.util.spec_from_loader("glaeda_gh", loader))
+    sys.modules[loader.name] = gg
     loader.exec_module(gg)
     gg.BASE = tmp
     lock = open(tmp / "daemon.lock", "w")
