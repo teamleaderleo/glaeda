@@ -69,6 +69,7 @@ SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
 os.environ.pop("CLAUDECODE", None)  # the suite run from a Claude Code shell is the CI run: CacheWarmCapTest sets it
+os.environ["GLAEDA_LAND_AGENT_WAIT_CAP"] = "0"  # likewise for an agent shell's session variables: LandAgentWaitCapTest
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -8955,6 +8956,51 @@ class Trickle:
     def close(self) -> None:
         self.stop.set()
         self.server.close()
+
+
+class LandAgentWaitCapTest(unittest.TestCase):
+    """An agent's `land --wait` never holds its turn: it waits at most LAND_AGENT_WAIT_CAP (150 s, leo-workspace#11193's
+    helper cap) and exits 2 with the land still queued (2026-11-25: a lane sat 137 min in `land --wait 1800`)."""
+
+    def setUp(self) -> None:
+        patch = mock.patch.dict(os.environ, {"GLAEDA_LAND_AGENT_WAIT_CAP": "1", "CLAUDECODE": ""}, clear=False)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for key in gg.READER_KEYS:
+            os.environ.pop(key, None)
+
+    def test_an_agent_land_wait_is_capped_and_says_how_to_go_on(self) -> None:
+        self.assertEqual(gg.LAND_AGENT_WAIT_CAP, 150)
+        for env in ({"ACPMUX_SESSION_NAME": "codex-26"}, {"CODEX_THREAD_ID": "t1"}, {"CLAUDECODE": "1"}):
+            with mock.patch.dict(os.environ, env):
+                wait, ceiling, words = gg.land_agent_wait_cap("o/r#1", 1800, None)
+            self.assertEqual((wait, ceiling), (150, 150), env)
+            self.assertIn("stays queued", words)
+            self.assertIn("cmux-gh wait pr o/r#1 --until merged --timeout 1800", words)
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "x"}):  # a short --wait with a long --max: capped
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", 60, 3000)[:2], (60, 150))
+
+    def test_no_agent_a_short_wait_no_wait_and_the_script_opt_out_are_untouched(self) -> None:
+        self.assertEqual(gg.land_agent_wait_cap("o/r#1", 1800, None), (1800, None, ""))
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "x"}):
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", 0, None), (0, None, ""))
+            short = gg.LAND_AGENT_WAIT_CAP / gg.WAIT_MAX_TIMES  # its default ceiling is the cap itself
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", short, None), (short, None, ""))
+            with mock.patch.dict(os.environ, {"GLAEDA_LAND_AGENT_WAIT_CAP": "0"}):
+                self.assertEqual(gg.land_agent_wait_cap("o/r#1", 900, 900), (900, 900, ""))
+
+    def test_main_hands_cmd_land_the_capped_wait(self) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_land(target, after, notify, wait, as_json, pin=None, override=None, ceiling=None, nominated=None):
+            seen.update(wait=wait, ceiling=ceiling)
+            return gg.EXIT_TIMEOUT
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "codex-26"}), \
+                mock.patch.object(gg, "cmd_land", fake_land), contextlib.redirect_stderr(err):
+            code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "1800"])
+        self.assertEqual((code, seen), (gg.EXIT_TIMEOUT, {"wait": 150, "ceiling": 150}))
 
 
 class CacheWarmCapTest(unittest.TestCase):
@@ -25452,6 +25498,19 @@ class StaleDataTest(Base):
               f"unchanged PRs {single_probe} one at a time, {batched_probe} batched")
         self.assertEqual(batched_probe, 2)
 
+    def test_a_batched_land_refresh_names_why_a_deferred_row_was_not_read(self) -> None:
+        """The land host, 2026-11-26 08:41-09:03Z: 69 batched land rows ended "no data stored", with no reason. A row
+        batched() defers waits for a next tick the refresh's Daemon never has; its error now names the limit."""
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        with mock.patch.object(gg.Daemon, "gql_room", lambda self, cost=1: False):
+            _, out = self.land_refresh_reads(["pr:o/r#1", "pr:o/r#2", "pr:o/r#3"], batched=True)
+        self.assertEqual(len(out), 3)
+        for key, error in out.items():
+            self.assertIsNotNone(error, key)
+            self.assertTrue(error.startswith("not read: deferred, "), error)
+            self.assertNotIn("no data stored", error)
+
     def test_a_land_refresh_keeps_the_rollup_snapshot_its_judgment_is_handed(self) -> None:
         """A land refresh's own Daemon had no land queue, so its full read moved the cache's fingerprint and wrote no
         rollup snapshot: the snapshot stopped matching and the judgment read the head from GitHub itself (cmux-cp-1,
@@ -29423,6 +29482,38 @@ class LandTest(Base):
         self.assertEqual(self.compares(), [])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    # LAND_BASE_REF_READ: a copy of the PR that names no base branch is a read not made yet, not "no base branch to
+    # read it with". cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 73 rows stopped head_moved on that reason.
+    def base_ref_reads(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if c[1] == "repos/o/r/pulls/1" and c[-1] == gg.LAND_BASE_REF_READ]
+
+    def test_a_base_merge_on_a_copy_with_no_base_branch_reads_the_base_and_is_followed(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = "main"
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual((len(self.base_ref_reads()), len(self.compares())), (1, 2))
+
+    def test_a_base_branch_read_that_fails_stops_saying_the_read_did_not_answer(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = None  # the read fails
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("the read of its PR did not answer", e["stop"]["reason"])
+        self.assertEqual((len(self.base_ref_reads()), self.compares(), self.w.gh_calls("pr", "merge")), (1, [], []))
+
+    def test_a_copy_that_names_its_base_branch_makes_no_base_branch_read(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], self.base_ref_reads()), ("merged", []))
+
     # A copy of the PR showing an older commit of the pin (one of its ancestors) is a stale read, not a moved head (the
     # host that executes forwarded lands, 2026-11-23 00:38-01:38Z: 11 of 26 head_moved stops in one hour were on a head
     # GitHub's compare said is behind the pin, ahead 0; LAND_ANCESTRY_JQ's comment).
@@ -31098,6 +31189,24 @@ class LandTest(Base):
         self.assertIn("React Doctor (changed React projects) (pending)", reason)
         self.assertIn("the ready-to-land label starts", reason)
         self.assertIn("ready-to-land", self.w.sent()[-1][-1])
+
+    def test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on(self):
+        # LAND_GATE_ONLY: cmux#58041 (2026-11-26) waited 1.5 h on clippy and cmux/land-tier, both saying the
+        # ready-to-land label starts them; land_judge, which adds that label, was never asked.
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        gated = {"headRefOid": LA, "state": "OPEN",
+                 "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {"name": "clippy", "status": "PENDING", "description": said}]}
+        self.assertFalse(gg.land_checks_running(gated, LA))
+        gated["checks"].append({"name": "ws-check", "status": "PENDING", "description": "Queued on a Linux runner"})
+        self.assertTrue(gg.land_checks_running(gated, LA))  # an ordinary pending check still waits
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        self.w.answers.append(ok_answer(LA))  # land_judge is asked: the answer it gives is its own (land_tier_pending)
+        e = self.tick()
+        self.assertEqual(self.w.answers, [])
+        self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
     def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
         # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
@@ -47620,6 +47729,31 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         settled[7] = "SUCCESS"
         e["cache"].update(fp=json.dumps(settled), fullAt=d.now - gg.PR_FULL_BEHIND_EVERY - 600)
         self.assertFalse(d.probe_ok(e))
+
+    def test_probe_stands_in_for_a_queued_red_row_past_an_hour_but_its_counts_moving_are_read(self):
+        """The land host, 2026-11-26 09:03-09:35Z: 39 of 172 batched land rows read in full as full-due, and a 50-row
+        batch's full reads ran out its budget with 15-24 unread. A red queued row is not near merging: probed."""
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 20000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"})
+        d.pr_behind = lambda c: True
+        d.rollup_stale = lambda key, c: False
+        for rollup in ("FAILURE", "ERROR"):
+            red = json.loads(self.fp())
+            red[7] = rollup
+            e = {"key": "pr:o/r#1", "cache": {"fp": json.dumps(red), "via": "graphql",
+                                              "data": {"state": "OPEN", "checks": []},
+                                              "fullAt": d.now - gg.PR_FULL_BEHIND_EVERY - 600}}
+            self.assertTrue(d.probe_ok(e), rollup)
+            self.assertFalse(d.queued_pending(e))
+            e["cache"]["fullAt"] = d.now - gg.PR_FULL_PENDING_EVERY
+            self.assertEqual(d.probe_refusal(e), "full-due")
+        moved = json.loads(self.fp())
+        moved[7] = "FAILURE"
+        red_counts = moved[:8] + [11, [["IN_PROGRESS", 2]], [], 4]
+        self.assertFalse(self.check(json.dumps(moved), json.dumps(red_counts)), "a red row's counts moving is read")
+        d.rollup_wanted = lambda: frozenset()
+        self.assertFalse(d.probe_ok(e), "not queued: the usual bound")
 
 
 class FullPrReadFoldsItsHead(unittest.TestCase):

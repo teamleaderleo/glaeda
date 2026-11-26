@@ -12133,7 +12133,7 @@ class Daemon:
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"
-        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e) or self.queued_red(e)
                                       else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY):
             return "full-due"
         if any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []):
@@ -12315,16 +12315,29 @@ class Daemon:
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
-    def queued_pending(self, e: dict) -> bool:
-        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
-        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+    def queued_rollup(self, e: dict) -> str | None:
+        """The cached rollup state of E when E is a land-queue PR, open, with a whole fingerprint; else None."""
         if e["key"] not in self.rollup_wanted():
-            return False
+            return None
         try:
             fp = json.loads((e.get("cache") or {}).get("fp") or "null")
         except (TypeError, ValueError):
-            return False
-        return isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and fp[7] in ("PENDING", "EXPECTED")
+            return None
+        return fp[7] if isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and isinstance(fp[7], str) else None
+
+    def queued_pending(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
+        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+        return self.queued_rollup(e) in ("PENDING", "EXPECTED")
+
+    def queued_red(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is FAILURE or ERROR: not near merging either (it
+        waits for a new head or a rerun, and both move the probe's fingerprint: head, rollup state or counts), so a
+        probe stands in for a full read up to PR_FULL_PENDING_EVERY as for a pending one. Only a moved fingerprint is
+        read in full (no counts-only confirm: which check is red is what its judgment reads). The land host, 2026-11-26
+        09:03-09:35Z: 39 of 172 batched land rows went to a full read as full-due, and a 50-row batch's full reads
+        (about 11 s a PR) ran out its LAND_REFRESH_BATCH_BUDGET with 15-24 rows unread."""
+        return self.queued_rollup(e) in ("FAILURE", "ERROR")
 
     def pending_counts_only(self, e: dict, node: dict | None) -> bool:
         """Whether E, a queued_pending PR, differs from its cached answer only in the counts of its running checks:
@@ -14942,6 +14955,9 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 log({"event": "land-probe-split", "n": len(entries), "probed": len(probe), "confirmed": confirmed,
                      "pending": sum(1 for e in entries if daemon.queued_pending(e)),
                      "refused": dict(Counter(r for r in refused.values() if r)),
+                     # the rollup of each full-due row: which kind of row the age bound still sends to a full read
+                     "fullDue": dict(Counter(str(daemon.queued_rollup(e)) for e in entries
+                                             if refused[e["key"]] == "full-due")),
                      "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
@@ -14949,6 +14965,12 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")
+                # A row batched() deferred (the GraphQL pace, the tick's share or budget, a split limit) waits for a
+                # next tick this throwaway Daemon never has: name the limit that held it. The land host, 2026-11-26
+                # 08:41-09:03Z: 69 batched rows ended "no data stored", about half of each 50-row batch, with no reason.
+                miss = getattr(daemon, "miss_why", None) or {}
+                for k in daemon.deferred:
+                    errors.setdefault(k, "not read: deferred, " + (miss.get(k) or "no reason kept"))
         except OutOfTime as stop:
             why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
             errors.update({k: why for k in todo if k not in errors})
@@ -17284,8 +17306,17 @@ def land_checks_running(data: dict, head: str) -> bool:
     a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
     if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
         return False
-    return (any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
-            or pending_on_every_page(data) > 0)
+    if pending_on_every_page(data) > 0:
+        return True
+    # LAND_GATE_ONLY: a check whose own description says a label starts it (land_gate_labels) is not running, it is
+    # waiting for the label. cmux#58041, 2026-11-26: its only unfinished checks were clippy and cmux/land-tier, both
+    # "Cheap tier: ... runs when ready-to-land ... is added"; the queue read them as running, so land_judge (which adds
+    # the label: land_tier_pending) was never asked, and the row slept a LAND_WAIT_DEFAULT wake after wake with the label
+    # never on. A head whose every unfinished check is label-gated is judged now. Detector: test-glaeda-gh.py
+    # test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on.
+    return any(str(c.get("status") or "").upper() not in ("COMPLETED", "")
+               and not (isinstance(c.get("description"), str) and LAND_GATE_SAID.search(c["description"]))
+               for c in data.get("checks") or [])
 
 
 def land_pending_status(data: dict) -> bool:
@@ -22483,8 +22514,13 @@ class LandQueue:
             if (e.get("oldPinWait") or {}).get("head") == head:
                 ancestor = True  # a pin it followed away from (old_pin_wait's own case): an older commit, no read
             kept = str(((e.get("headAncestry") or {}).get(f"{head}...{pin}") or {}).get("why") or "")
-        why = "" if gh and base else "no gh-quota shim or base branch to read it with"
+        why = "" if gh else "no gh-quota shim to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
+        if gh and not base and not kept:
+            # LAND_BASE_REF_READ's comment: a copy with no base branch is a read not made yet, not an answer
+            base = self.base_ref_read(e)[0]
+            if not base:
+                why = "no base branch to read it with: the copy here names none and the read of its PR did not answer"
         parents: Any = None
         chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
         if kept:
@@ -22562,6 +22598,20 @@ class LandQueue:
                          **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def base_ref_read(self, e: dict) -> tuple[str, str]:
+        """On a worker, from base_merge_check: (E's PR's base branch, "") from one REST read of the PR, for a head
+        whose cached copy names none (LAND_BASE_REF_READ's comment); ("", what the read said) when it did not
+        answer, and the head stops head_moved as it did before this read existed."""
+        gh = self.gh()
+        if not gh:
+            return "", ""
+        got = self.call([gh, "api", f"repos/{e['repo']}/pulls/{e['number']}", "--jq", LAND_BASE_REF_READ],
+                        LAND_GH_DEADLINE)
+        ref = (got.stdout or "").strip() if got.returncode == 0 else ""
+        if not ref or len(ref.split()) != 1:
+            return "", f"{got.stdout or ''}\n{got.stderr or ''}"
+        return ref, ""
 
     def base_merge_chain(self, e: dict, head: str, pin: str, base: str) -> tuple[str, str, bool, str, int]:
         """On a worker, from base_merge_check: whether HEAD is a run of base merges on PIN (land_base_merge_chain), from
@@ -26046,6 +26096,13 @@ def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
 # queue itself sent, "tools/perf_bug_land.py shows no patch", and each stop cost a hand re-pin and half an hour.
 LAND_BASE_MERGE_JQ = ("{mb: .merge_base_commit.sha, files: [.files[]? | {f: .filename, s: .status, "
                       "p: .previous_filename, d: .patch, b: .sha}]}")
+# The base branch base_merge_check compares against comes from the cache's copy of the PR, and a copy that has not
+# read the PR (a head land_judge's live read named first, a row re-armed or handed over by the broker before the
+# refresh reached it) names none. That was answered as a no: "no gh-quota shim or base branch to read it with", a
+# head_moved stop made with no read at all, on the host that has the shim. cmux-cp-1, 2026-11-25 22:30Z to
+# 2026-11-26 08:30Z: 73 stopped rows carry that reason (62 cmux, 6 leo-workspace, 5 hq), each a hand re-pin. One REST
+# read of the PR says its base; a read that fails stops as before, saying the read did not answer.
+LAND_BASE_REF_READ = ".base.ref"
 LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: a list that long may be cut short
 # base_merge_check's reads of one head that may fail before it stops head_moved, and the first wait between them
 # (doubled each time: 30 s to 16 min, about half an hour in all). A failed read stopped the land at once before.
@@ -30397,6 +30454,32 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
     with contextlib.suppress(OSError, TypeError, ValueError):
         write_json(path, chains)
     return timeout, ceiling, words
+
+
+# An agent's land wait never holds its turn (2026-11-25 Codex trial: one lane sat 137 min in a foreground
+# `cmux-gh land --wait 1800`; hq docs/findings/2026-11-25-codex-6.2-trial.md). The land is queued and the requester is
+# told on its merge or stop, so a long foreground wait only spends the session. A land an agent runs (any READER_KEYS
+# session variable, or CLAUDECODE=1) waits at most LAND_AGENT_WAIT_CAP, the helper cap leo-workspace#11193 set
+# (tools/tool_rewrites.py HELPER_WAIT_CAP_S: Claude Code backgrounds a foreground call at 180 s), and exits 2 with
+# the land still queued. A script that waits on purpose (leo-workspace tools/pinned_land.py) sets
+# GLAEDA_LAND_AGENT_WAIT_CAP=0. Only the wall-clock length changes: the queue entry, exit codes and verdicts are the same.
+LAND_AGENT_WAIT_CAP = 150.0
+
+
+def land_agent_wait_cap(target: str, wait: float, ceiling: float | None) -> tuple[float, float | None, str]:
+    """WAIT and CEILING for a land an agent runs, held to LAND_AGENT_WAIT_CAP, and the line saying so ("" when nothing
+    changed). See LAND_AGENT_WAIT_CAP."""
+    if os.environ.get("GLAEDA_LAND_AGENT_WAIT_CAP", "1") == "0":
+        return wait, ceiling, ""
+    if os.environ.get("CLAUDECODE") != "1" and not any(os.environ.get(k) for k in READER_KEYS):
+        return wait, ceiling, ""
+    whole = max(float(wait), default_wait_max(wait) if ceiling is None else float(ceiling))
+    if wait <= 0 or whole <= LAND_AGENT_WAIT_CAP:
+        return wait, ceiling, ""
+    words = (f"glaeda-gh land: an agent's foreground wait ends by {LAND_AGENT_WAIT_CAP:g}s (asked {whole:g}s); the land "
+             f"stays queued and your session is told on its merge or stop. End the turn, or run one background "
+             f"`cmux-gh wait pr {target} --until merged --timeout 1800`")
+    return min(float(wait), LAND_AGENT_WAIT_CAP), min(whole, LAND_AGENT_WAIT_CAP), words
 
 
 def default_wait_max(timeout: float) -> float:
@@ -42171,6 +42254,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
+            args.wait, args.max_wait, capped = land_agent_wait_cap(words[0], args.wait, args.max_wait)
+            if capped:
+                say_waiting(capped)
             override = land_override(*land_override_given(args.override_reason, args.override_receipt))
             nominated = land_nominated_given(args.nominated_path, args.nominated_evidence)
             return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,
