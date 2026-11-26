@@ -18010,6 +18010,38 @@ def land_checks_running(data: dict, head: str) -> bool:
                for c in data.get("checks") or [])
 
 
+# A refusal whose only step is a new head defers that head's base merge only on a run still queued or in progress,
+# never on a commit status. The deferral exists so an update does not restart CI that is running; a status context
+# is no run at the head (no workflow, no check-run id): the one an update could cancel is a run, and a pending status
+# may wait on nothing at the head at all. manaflow-ai/cmux#58277 at 241a6bde, 2026-11-26: its pr-router run ended
+# startup_failure with 0 jobs (land_judge's startup_failure, whose only step is the base merge), every check run at
+# the head had finished (96 skipped, 14 success, 3 neutral, 1 cancelled), and the one unfinished context was the
+# commit status "next-autoland / verdict" ("did not judge this head within 60m; queued for next pass"): another
+# lander's own queue, waiting for this one. land_checks_running read it as running, so every judgment deferred the
+# named update ("checks still running at the head") for 90+ min, while the broker's own update-branch was refused
+# no-base-sync-unlanded: the two waited on each other. Detector: test-glaeda-gh.py
+# test_a_startup_failure_base_merge_is_not_deferred_on_a_pending_status_with_no_run_in_progress.
+LAND_NEW_HEAD_ONLY = frozenset({"startup_failure"})
+
+
+def land_runs_running(data: dict, head: str) -> bool:
+    """Whether the cache shows a check run (not a commit status) still queued or in progress at HEAD:
+    land_checks_running less the status contexts (LAND_NEW_HEAD_ONLY's comment); a truncated rollup counts its runs'
+    pending past page one."""
+    if not data or data.get("state") != "OPEN" or not head or data.get("headRefOid") != head:
+        return False
+    counts = data.get("checkCounts")
+    if data.get("checksTruncated") and isinstance(counts, dict):
+        superseded = sum(1 for c in data.get("superseded") or []
+                         if not c.get("conclusion") and not c.get("lastRealAttempt"))
+        if sum(n for state, n in (counts.get("runs") or {}).items() if state in COUNT_PENDING) - superseded > 0:
+            return True
+    return any(str(c.get("status") or "").upper() not in ("COMPLETED", "")
+               and (c.get("workflow") or "id" in c)
+               and not (isinstance(c.get("description"), str) and LAND_GATE_SAID.search(c["description"]))
+               for c in data.get("checks") or [])
+
+
 def land_pending_status(data: dict) -> bool:
     """Whether the cache shows a commit status (not a check run) still pending at its head. The controller's feed
     carries workflow runs, check suites and comments, and no `status` delivery: a status going green moves no feed
@@ -24913,7 +24945,7 @@ class LandQueue:
             needs = act.get("needs_newer_base")
             force = act.get("force") if answer.get("code") == "base_update" else ""
             self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [],
-                               force if isinstance(force, str) else "")
+                               force if isinstance(force, str) else "", code=str(answer.get("code") or ""))
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -26317,7 +26349,7 @@ class LandQueue:
         return not (tried.get("head") == head and tried.get("tried"))
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "",
-                      named: bool = False) -> None:
+                      named: bool = False, code: str = "") -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -26385,8 +26417,10 @@ class LandQueue:
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         held = e.get("updateDeferred") or {}
         stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
-        if land_checks_running(data, head) and not stuck:
-            # Deferred once per head. A check still running after the whole wait never finishes (stuck, no runner):
+        running = land_runs_running if code in LAND_NEW_HEAD_ONLY else land_checks_running
+        if running(data, head) and not stuck:
+            # Deferred once per head; a refusal whose only step is a new head only on a run (LAND_NEW_HEAD_ONLY). A
+            # check still running after the whole wait never finishes (stuck, no runner):
             # deferring again only re-judges it into the identical-refusal stop with the named update never sent
             # (cmux#44800 stale_green, cmux#45380 tip_merge, 2026-11-17: both stopped, a person updated them).
             with self.lock:

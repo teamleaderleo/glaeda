@@ -33218,6 +33218,56 @@ class LandTest(Base):
         self.assertEqual((len(self.w.gh_calls("api")), e["wait"]["kind"]), (2, "pr"))
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_a_startup_failure_base_merge_is_not_deferred_on_a_pending_status_with_no_run_in_progress(self):
+        # LAND_NEW_HEAD_ONLY: manaflow-ai/cmux#58277 at 241a6bde (2026-11-26). Its pr-router run 45842608194 ended
+        # startup_failure with 0 jobs, so the rollup lists no check of it; every check run at the head had finished,
+        # and the one unfinished context was next-autoland's own verdict status. The named base merge was deferred
+        # "checks still running at the head" for 90+ min while the broker refused a manual one. The rollup as read
+        # (the real rows' shapes: an Actions job, an app's check run, the status):
+        real = {"headRefOid": LA, "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "UNSTABLE",
+                "isDraft": False, "checksTruncated": False, "checkCounts": None,
+                "checks": [{"name": "CI fast guards", "workflow": "CI", "id": "CR_kwDORDHQWM8AAAAgm6lOpA",
+                            "runId": 45860637006, "status": "COMPLETED", "conclusion": "SKIPPED"},
+                           {"name": "pr router", "workflow": "pr router", "id": "CR_kwDORDHQWM8AAAAgl2_1",
+                            "runId": 45840237094, "status": "COMPLETED", "conclusion": "SUCCESS"},
+                           {"name": "Cancel runs on older heads", "workflow": "CI PR superseded cancel",
+                            "id": "CR_kwDORDHQWM8AAAAgl2__Ag", "runId": 45840235714, "status": "COMPLETED",
+                            "conclusion": "CANCELLED"},
+                           {"name": "cubic · AI code reviewer", "workflow": None, "id": "CR_kwDORDHQWM8AAAAgl3D9Hg",
+                            "runId": None, "status": "COMPLETED", "conclusion": "NEUTRAL"},
+                           {"name": "next-autoland / verdict", "workflow": None, "status": "PENDING",
+                            "conclusion": None, "url": None,
+                            "description": "next-autoland did not judge this head within 60m; queued for next pass"}]}
+        self.assertTrue(gg.land_checks_running(real, LA))  # a merge still waits on the status, as before
+        self.assertFalse(gg.land_runs_running(real, LA))  # but no run is queued or in progress at the head
+        startup = refusal("startup_failure", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                  "needs_newer_base": [".github/workflows/pr-router.yml"]},
+                          reason="land-judge: refused: CI runs ended in startup_failure, which GitHub never re-runs")
+        self.w.set_pr(self.KEY, real, self.t)
+        self.land()
+        self.tick()  # queued: a pending context waits before the first judgment, as before
+        e = self.q.entries[self.KEY]
+        self.w.answers.append(startup)  # the row's judgment (its wait ran out): the startup_failure refusal
+        self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1, "the named base merge is sent at once")
+        self.assertNotIn("update_deferred", [h["event"] for h in e["history"]])
+        # a run still in progress at the head still defers it: the update would restart that run
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        running = {**real, "checks": [*real["checks"], {"name": "build", "workflow": "CI", "id": "CR_x",
+                                                        "status": "IN_PROGRESS", "conclusion": None}]}
+        self.assertTrue(gg.land_runs_running(running, LA))
+        self.w.set_pr(self.KEY, running, self.t)
+        self.land()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        self.w.answers.append(startup)
+        self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+        self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
+        self.assertIn("update_deferred", [h["event"] for h in e["history"]])
+
     def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
         # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
         # at the head never finished, and every timed-out wait judged again and deferred again: "3 identical refusals
