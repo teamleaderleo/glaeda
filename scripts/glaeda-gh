@@ -17244,6 +17244,8 @@ class LandQueue:
         self.queue_quota_at = (float(quota.get("at")) if isinstance(quota, dict)
                                and isinstance(quota.get("at"), (int, float))
                                and not isinstance(quota.get("at"), bool) else 0.0)
+        # the owner of the row whose refusal wrote the park (park_queue_quota): its App pools may void it
+        self.queue_quota_owner = str(quota.get("owner") or "").lower() if isinstance(quota, dict) else ""
         self.queue_park_voided: tuple[float, str] | None = None  # (until, why) of a park a reading voided, logged once
         self.load()
 
@@ -18967,6 +18969,9 @@ class LandQueue:
         nothing. One host, 2026-11-21 12:08Z: one row's classifier read (cmux#48940 at 93ecc731b278) was refused for
         the GraphQL limit and parked the queue until 12:40:59Z; /rate_limit at 12:07:37Z read 3873 REST and 4969
         GraphQL left, and 18 rows of 4 repos and 3 lanes sat "held: the land queue is parked" behind it."""
+        if self.queue_quota_owner and self.owner_free_kept(self.queue_quota_owner):
+            return (f"{self.queue_quota_owner}'s reads have a GitHub App pool here the login's latch does not hold "
+                    "(latch_free)")
         if self.reading is None or not self.queue_quota_at:
             return None
         seen = self.reading("rest")
@@ -18982,13 +18987,17 @@ class LandQueue:
         self.queue_quota_until = 0.0
         self.queue_quota_reason = ""
         self.queue_quota_at = 0.0
+        self.queue_quota_owner = ""
         (land_dir() / LAND_QUOTA_FILE).unlink(missing_ok=True)
 
     def queue_quota_parked(self) -> bool:
         """Whether a quota refusal has paused this host's whole land queue until its reset: only while GitHub's own
         count of the login agrees it is spent (queue_park_voided_by), which is logged once per park
         (land-queue-park-overridden), so its before and after are measurable. The refused row keeps its own park and
-        its own reason (park_quota) either way."""
+        its own reason (park_quota) either way. The park's owner's latch-free check is asked again here (at most once
+        per LAND_LATCH_FREE_EVERY, bounded by LAND_LATCH_FREE_DEADLINE): parked, no pass reaches latch_free."""
+        if self.queue_quota_until > self.now and self.queue_quota_owner:
+            self.owner_latch_free(self.queue_quota_owner, quiet=True)
         with self.lock:
             if self.queue_quota_until > self.now:
                 why = self.queue_park_voided_by()
@@ -19005,8 +19014,15 @@ class LandQueue:
                 self.clear_queue_park()
             return False
 
-    def park_queue_quota(self, until: float, text: str) -> None:
-        """Pause every queued land until UNTIL, retaining a later existing hold across restarts."""
+    def owner_free_kept(self, owner: str) -> bool:
+        """Whether OWNER's last latch-free answer (owner_latch_free), at most LAND_LATCH_FREE_EVERY * 3 old, said its
+        reads have a source the login's latch does not hold. No call: safe under the lock."""
+        seen = self.latch_free_seen.get(owner.lower())
+        return bool(seen and seen[1] and self.now - seen[0] < LAND_LATCH_FREE_EVERY * 3)
+
+    def park_queue_quota(self, until: float, text: str, owner: str = "") -> None:
+        """Pause every queued land until UNTIL, retaining a later existing hold across restarts. OWNER is the refused
+        row's: while its reads have an App pool here (latch_free) the park is void (queue_park_voided_by)."""
         if not isinstance(until, (int, float)) or isinstance(until, bool):
             return
         until = float(until)
@@ -19019,9 +19035,11 @@ class LandQueue:
             self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
             self.queue_quota_reason = land_reason(land_redact(text), 300)
             self.queue_quota_at = self.now
+            self.queue_quota_owner = owner.lower()
             self.queue_park_voided = None
             write_json(land_dir() / LAND_QUOTA_FILE,
-                       {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
+                       {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason,
+                        "owner": self.queue_quota_owner})
 
     def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
@@ -19043,12 +19061,18 @@ class LandQueue:
             w = {"kind": "quota", "until": wake, "said": False}
         if own:
             w["own"] = True  # its PR's CI job's limit: this row alone waits for it
-        if said is not None and not own:
+        owner = str(e.get("repo") or "").split("/")[0].lower()
+        if said is not None and not own and self.owner_free_kept(owner):
+            # The row's owner reads on the App pools here (latch_free): the login's reset parks this row alone, never
+            # the queue. cmux-cp-1, 2026-11-25 23:40Z: one base_red_excuse read refused on the login parked 23 lands
+            # until 00:40:59Z while 19 manaflow-ai App installations had 10,000+ REST left each.
+            log({"event": "land-queue-park-skipped", "key": e["key"], "owner": owner, "until": utc_clock(said)})
+        elif said is not None and not own:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
             # until 08:44Z though the limit it hit ended about 07:52Z -- 40 lands "every worker busy" for an hour.
-            self.park_queue_quota(said, text)
+            self.park_queue_quota(said, text, owner)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)

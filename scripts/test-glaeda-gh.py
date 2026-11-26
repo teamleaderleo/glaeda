@@ -34131,6 +34131,42 @@ class LandTest(Base):
         e = self.q.entries[self.KEY]  # the row that was refused parks itself, with its own reason
         self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "quota", said))
 
+    def test_a_login_refusal_of_a_latch_free_owner_parks_its_row_never_the_queue(self):
+        """cmux-cp-1, 2026-11-25 23:40Z: one base_red_excuse read refused on the login parked the whole queue (23
+        lands) until 00:40:59Z, while 19 App installations serving the owner had 10,000+ REST left each. An owner whose
+        reads have an App pool here (latch_free) parks the refused row alone; a park already written for such an
+        owner is void."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        self.q.latch_free_seen["o"] = (self.t, True, "")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M:%S", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: base_red_excuse.py exit 1")))
+        self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual(self.q.queue_quota_until, 0.0)  # before: parked until the reset
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "quota", said))
+        self.assertTrue([r for r in logs if r.get("event") == "land-queue-park-skipped"])
+        # A park written for that owner (by a daemon before this, or while its pools rested) is void once they serve it.
+        self.q.park_queue_quota(reset, "quota: spent", "o")
+        self.assertTrue((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        with mock.patch.object(self.q, "owner_latch_free", return_value=(True, "")):
+            self.assertFalse(self.q.queue_quota_parked())
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.q.latch_free_seen["o"] = (self.t, False, "every ready pool rests")
+        self.q.park_queue_quota(reset, "quota: spent", "o")
+        with mock.patch.object(self.q, "owner_latch_free", return_value=(False, "rests")):
+            self.assertTrue(self.q.queue_quota_parked())  # no App serves it: the park holds as written
+
     def test_a_reading_at_or_under_the_reserve_keeps_the_whole_queue_parked(self):
         """At or under the hard reserve GitHub's count agrees with the refusal: the park holds as written, and a
         stale or missing reading never ends it either."""
