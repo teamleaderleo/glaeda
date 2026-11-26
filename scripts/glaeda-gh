@@ -15656,6 +15656,43 @@ LAND_NOTIFY_BUSY_RETRY_S = 30.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
+# LAND_OWNER_REMIND_IDLE: a stop's reminder goes as an inbox fyi, and acpmux's inbox flush turns an fyi into a turn of
+# an idle session, so a "still stopped after N h" reminder woke lanes that had finished days before. Fleet count,
+# 2026-11-26 10:00Z (cmuxterm-hq#28514): 406 live Claude sessions against fanout_cap.claude_live_max 180, 53 of them
+# woken by these reminders, 40 on gcp-agent-lane-10, 38 of those idle 24 to 101 h before the notice. Leo, 2026-11-26
+# (ask-4c83752d35): "honestly if some sessions are well and truly done why dont we close/clean them up?" A dead
+# lane's PR is anyone's (orphan_sweep and the stall doctor adopt it from the PR's own idle clock), so nothing should
+# prompt the lane back. Before a reminder is sent, its requester is read once (`acpmux session info --json`, off the
+# tick, in the send thread): a session between turns (not running, nothing queued, no permission or input waiting)
+# whose last turn ended LAND_OWNER_REMIND_IDLE or longer ago is told nothing (log land-remind-lane-idle). The bound is
+# the session reaper's own idle_hours (leo-workspace machines/worktree-reclaim.json acpmux_idle_sessions), the age past
+# which it stops a session naming an open PR whose owner is gone. An unreadable or unparsable answer sends as before:
+# unsure tells. The stop's own notice is not gated: a lane that just asked for the land is live. No PR comment is
+# left either: a comment resets orphan_sweep's "nobody but the sweep has commented" idle clock. Cost: one acpmux read
+# per due reminder (LAND_OWNER_REMIND_MAX a row). Detector: test-glaeda-gh.py
+# test_a_reminder_to_a_lane_idle_past_the_reaper_bound_wakes_nobody.
+LAND_OWNER_REMIND_IDLE = 12 * 3600.0
+LAND_OWNER_REMIND_IDLE_FIELDS = "lastTurn,status,inputSince,pendingPermissions,queued,createdAt,turnCount"
+
+
+def land_requester_idle_s(out: str, now: float) -> float | None:
+    """Seconds the session `acpmux session info --json --fields LAND_OWNER_REMIND_IDLE_FIELDS` printed in OUT has sat
+    between turns at NOW, or None when it is busy or OUT says nothing certain (LAND_OWNER_REMIND_IDLE)."""
+    try:
+        doc = json.loads(out or "")
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or str(doc.get("status") or "") not in ("ready", "idle", "waiting"):
+        return None  # running, or no status at all: unsure tells
+    if doc.get("inputSince") or doc.get("pendingPermissions") or doc.get("queued"):
+        return None  # waiting on someone: not finished
+    last = doc.get("lastTurn")
+    ended = last.get("endedAt") if isinstance(last, dict) else None
+    if not _finite(ended) and not last and not doc.get("turnCount"):
+        ended = doc.get("createdAt")  # never ran a turn: idle since it was made (the reaper's _last_turn)
+    if not _finite(ended):
+        return None
+    return max(0.0, now - float(ended) / 1000.0)
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -20377,7 +20414,8 @@ class LandQueue:
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
              "hours": round(hours, 1), "moved": moved})
         self.save(e)
-        self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS)  # told at the stop; a repeat is an inbox fyi
+        # told at the stop; a repeat is an inbox fyi, and none to a lane idle past the reaper's bound
+        self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS, unless_idle=LAND_OWNER_REMIND_IDLE)
         return True
 
     def remind_ended(self, e: dict) -> bool:
@@ -25520,7 +25558,8 @@ class LandQueue:
         self.notify(e, e.get("requester") or "", msg, wake=not infra and tell != "quiet",
                     cls=LAND_FORWARD_FYI_CLASS if tell == "fyi" else None)
 
-    def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None) -> None:
+    def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None,
+               unless_idle: float | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -25530,7 +25569,10 @@ class LandQueue:
         broker host, still waiting behind a stopped land, held by the login's latch) is a line in the log and the
         entry's history, read with `land status`, and sends nothing: each was a turn of an idle lane that read it
         and said "nothing to do". gcp-agent-lane-10, 2026-11-21 11Z-2026-11-22 07Z: 87 idle wakes carried only
-        land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone."""
+        land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone.
+
+        UNLESS_IDLE: send nothing when the receiver has sat between turns that many seconds or longer, read once
+        before the send (LAND_OWNER_REMIND_IDLE)."""
         to = land_notify_target(e, to)
         if not wake:
             log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
@@ -25552,7 +25594,17 @@ class LandQueue:
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
                 "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
 
+        now = self.now
+
         def send() -> None:
+            if unless_idle is not None:
+                info = self.call([os.fspath(acpmux), "session", "info", to, "--json", "--fields",
+                                  LAND_OWNER_REMIND_IDLE_FIELDS], LAND_NOTIFY_DEADLINE)
+                idle = land_requester_idle_s(info.stdout, now) if info.returncode == 0 else None
+                if idle is not None and idle >= unless_idle:
+                    log({"event": "land-remind-lane-idle", "key": e["key"], "to": to, "idleHours": round(idle / 3600, 1),
+                         "message": land_trim(message, 160)})
+                    return
             whys: list[str] = []
             for tried in range(1, LAND_NOTIFY_TRIES + 1):
                 got = self.call(argv, LAND_NOTIFY_DEADLINE)

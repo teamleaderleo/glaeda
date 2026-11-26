@@ -26928,6 +26928,7 @@ class LandWorld:
         self.refreshed: list[str] = []
         self.watched: list[str] = []
         self.notices: list[tuple] = []
+        self.session_info: dict | None = None  # what `acpmux session info --json` answers (None: nothing printed)
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
@@ -26979,6 +26980,9 @@ class LandWorld:
                 doc = {**doc, "cacheOnly": True,
                        "cacheMiss": doc.get("cacheMiss", doc.get("code") in ("quota", "unreadable", "regen_retry"))}
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
+        if argv[0] == "/fake/acpmux" and argv[1:3] == ["session", "info"]:
+            # the requester as a due reminder reads it (LAND_OWNER_REMIND_IDLE); unset, nothing certain: it is told
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.session_info) if self.session_info else "", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
@@ -27063,7 +27067,7 @@ class LandWorld:
         return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
 
     def sent(self) -> list[list[str]]:
-        return [c for c in self.calls if c[0] == "/fake/acpmux"]
+        return [c for c in self.calls if c[0] == "/fake/acpmux" and c[1:3] != ["session", "info"]]
 
 
 class LandCrash(BaseException):
@@ -30496,6 +30500,32 @@ class LandTest(Base):
         self.assertIn("reminder 4 of 4, the last", self.w.sent()[-1][-1])
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 16)  # past LAND_OWNER_REMIND_MAX: silent, still listed
         self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
+
+    def test_a_reminder_to_a_lane_idle_past_the_reaper_bound_wakes_nobody(self):
+        # LAND_OWNER_REMIND_IDLE: 2026-11-26, 53 of 406 live Claude sessions were finished lanes woken by "still
+        # stopped after N h" reminders, 38 of gcp-agent-lane-10's 40 idle 24 to 101 h before it (cmuxterm-hq#28514).
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        infos = lambda: [c for c in self.w.calls if c[0] == "/fake/acpmux" and c[1:3] == ["session", "info"]]  # noqa
+        idle_since = lambda h: {"status": "ready", "inputSince": None, "pendingPermissions": 0,  # noqa: E731
+                                "queued": 0, "lastTurn": {"endedAt": (self.t - h * 3600) * 1000}}
+        self.w.session_info = idle_since(30)  # finished 30 h ago: past the reaper's 12 h
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["n"]), ("stopped", 1))  # due, and spent
+        self.assertEqual(len(self.w.sent()), sent)  # but nobody was woken
+        self.assertEqual(len(infos()), 1)  # one read of the requester per due reminder
+        self.assertEqual(infos()[-1][3], self.w.sent()[-1][self.w.sent()[-1].index("--no-wait") + 1])  # the same one
+        # a lane that is still at work (ran a turn an hour ago) is told, as before
+        self.w.session_info = idle_since(1 - 2 * gg.LAND_OWNER_REMIND_EVERY / 3600)  # 1 h before the tick's time
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 1))
+        self.assertIn("still stopped after", self.w.sent()[-1][-1])
+        # a running one, or an answer with nothing certain in it, is told too: unsure tells
+        for info in ({**idle_since(30), "status": "running"}, {**idle_since(30), "queued": 1}, None):
+            self.assertIsNone(gg.land_requester_idle_s(json.dumps(info) if info else "", self.t), info)
+        self.assertGreater(gg.land_requester_idle_s(json.dumps(idle_since(30)), self.t), gg.LAND_OWNER_REMIND_IDLE)
+        self.assertEqual(gg.land_requester_idle_s(json.dumps({"status": "ready", "createdAt": (self.t - 60) * 1000}),
+                                                  self.t), 60.0)  # never ran a turn: idle since it was made
 
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
