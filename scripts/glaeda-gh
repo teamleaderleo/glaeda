@@ -11093,8 +11093,10 @@ class Daemon:
                     explained = None
                 cached = read_cache(req["key"])
                 starved = None if explained else wait_starved(req, cached, now)
-                if starved is not None and self.wait_feed_quiet(req, cached, now):
+                if starved is not None and wait_sha_behind(req, cached) is None \
+                        and self.wait_feed_quiet(req, cached, now):
                     starved = None  # nothing reached the PR since its copy: a direct read reads the same
+                    # (not for a copy showing another head than the wait's --sha: the feed missed that push)
                 if starved is not None:
                     # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
                     # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
@@ -32941,6 +32943,28 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
 # what keeps the hard reserve (the calls kept back for lands) out of it however many waits block at once.
 WAIT_DIAGNOSE_AFTER = 120
 
+# A `wait pr --sha FULL` whose copy shows another head is starved at SHA_BEHIND_DIRECT_AFTER, whatever the copy's age
+# and whatever the feed vouches for (cmuxterm-hq#16522, cmuxterm-hq#27501): the caller named a head it pushed, which
+# is better evidence than a probe's "confirmed unchanged" or a quiet feed. glaeda#2290, 2026-11-21 07:52-08:32Z: a
+# wait --sha afcb5dde spent its whole 2400 s on head 986d77e1 ("data 52m ago, confirmed unchanged over GraphQL") while
+# one `gh pr view` showed the new head at once; cmux#56457, 2026-11-26: `gh api` showed 87a1452 for an hour, the real
+# head 733f1f3. One direct read per gap (direct_gap doubles it while the head stays the same, to DIRECT_QUIET_MAX).
+SHA_BEHIND_DIRECT_AFTER = 90
+
+
+def wait_sha_behind(req: dict, entry: dict | None) -> float | None:
+    """When an open PR wait pinned to a full --sha began, while its copy names another head, or None: no pin, a
+    prefix, a merged or closed PR, no head in the copy, or the copy shows the pin. Timed from the wait's start, not
+    from the first sight of the other head (unseenSince): a probe keeps a stale copy fresh, so it is seen at once."""
+    sha = str(req.get("sha") or "").lower()
+    data = (entry or {}).get("data")
+    if req.get("kind") != "pr" or not sha or not req.get("exact", True) or not isinstance(data, dict):
+        return None
+    head = str(data.get("headRefOid") or "").lower()
+    if not head or head.startswith(sha) or str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+        return None
+    return float(req["began"])
+
 
 def direct_gap(req: dict, bound: float) -> float:
     """How long after its last direct read (directAt) a wait may read its target directly again: BOUND, doubled for
@@ -32966,6 +32990,15 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
     in that long. None otherwise. Only for an undecided wait: wait_step rules first."""
     began = float(req["began"])
+    behind = wait_sha_behind(req, entry)
+    if behind is not None:
+        # SHA_BEHIND_DIRECT_AFTER's comment: the copy is known stale, so neither its age nor the feed rules
+        if now - behind < SHA_BEHIND_DIRECT_AFTER \
+                or now - float(req.get("directAt") or float("-inf")) < direct_gap(req, SHA_BEHIND_DIRECT_AFTER):
+            return None
+        seen = (entry or {}).get("dataAt")
+        return max(now - behind, now - float(seen) if isinstance(seen, (int, float)) and not isinstance(seen, bool)
+                   else 0.0)
     # An upstream host that reads one target itself through the broker: UPSTREAM_DIRECT_AFTER (the broker host keeps
     # waited keys fresher than that), else STALE_DATA_AFTER.
     bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
