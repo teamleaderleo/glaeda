@@ -10706,6 +10706,86 @@ class SparkleAppcastTest(unittest.TestCase):
         self.assertTrue(path.exists(), "live appcast generation keeps its extraction")
 
 
+class BenchCachesTest(unittest.TestCase):
+    """cmux20 (2026-11-26): perf-bench app copies, rival copies, CEF runtimes and vphone IPSWs held 38 GiB no family reached."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        for root in ("Library/Caches/cmux-perf-bench/apps", "Library/Caches/cmux-perf-bench/rivals-copies",
+                     "Library/Caches/cmux/cef", ".vphone/ipsws"):
+            (self.home / root).mkdir(parents=True)
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            self.families = {f.id: f for f in gd.default_families()}
+
+    def age(self, path: Path, hours: float) -> Path:
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_declared_and_library_caches_leaves_the_bench_root_to_them(self) -> None:
+        for fid in (gd.PERF_BENCH_APPS, gd.PERF_BENCH_COPIES, gd.CMUX_CEF_RUNTIMES, gd.VPHONE_IPSWS):
+            self.assertIn(fid, self.families)
+            self.assertIn(fid, gd.OUT_OF_BAND_FAMILY_IDS)
+        self.assertIn("cmux-perf-bench", self.families["library-caches"].skip)
+
+    def test_app_versions_go_idle_and_a_used_one_stays(self) -> None:
+        fam = self.families[gd.PERF_BENCH_APPS]
+        old, new = fam.root / "chrome/2026-10-20", fam.root / "chrome/2026-11-24"
+        make(old / "Google Chrome.app/Contents/Frameworks/X.framework/Versions/A")
+        make(new / "Google Chrome.app/Contents/MacOS")
+        self.age(old, 100)
+        self.age(new, 5)
+        for path in (old, new):
+            os.chmod(path / "Google Chrome.app", 0o555)  # fetch_browsers makes the copy read-only
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {i.path: i for i in gd.survey([fam], 24, 0)}
+            self.assertEqual(items[str(old)].verdict, "reclaimable", items[str(old)].reasons)
+            self.assertEqual(items[str(new)].verdict, "recent")
+            gd.apply(list(items.values()), {fam.id: fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+
+    def test_rival_copies_go_after_their_session(self) -> None:
+        fam = self.families[gd.PERF_BENCH_COPIES]
+        done, live = fam.root / "cmux-r1-3861", fam.root / "cmux-r1-99"
+        make(done / "cmux.app/Contents/MacOS")
+        make(live / "cmux.app/Contents/MacOS")
+        self.age(done, 5)
+        self.age(live, 0.5)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {i.path: i for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(items[str(done)].verdict, "reclaimable", items[str(done)].reasons)
+        self.assertEqual(items[str(live)].verdict, "recent")
+
+    def test_only_cef_runtimes_and_ipsw_files_are_candidates(self) -> None:
+        cef, ipsw = self.families[gd.CMUX_CEF_RUNTIMES], self.families[gd.VPHONE_IPSWS]
+        old, shim = cef.root / "cef-154.0.28-cmux.28", cef.root / "shim"
+        make(old / "Frameworks")
+        make(shim / "bin")
+        self.age(old, 24 * 8)
+        self.age(shim, 24 * 8)
+        image = ipsw.root / "iPhone.ipsw"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"x" * 4096)
+        stamp = time.time() - 24 * 15 * 3600
+        os.utime(image, (stamp, stamp))
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            cef_items = {i.path: i for i in gd.survey([cef], 24, 0)}
+            ipsw_items = {i.path: i for i in gd.survey([ipsw], 24, 0)}
+        self.assertEqual(cef_items[str(old)].verdict, "reclaimable", cef_items[str(old)].reasons)
+        self.assertNotIn(str(shim), cef_items)
+        self.assertEqual(ipsw_items[str(image)].verdict, "reclaimable", ipsw_items[str(image)].reasons)
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
