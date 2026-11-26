@@ -24082,6 +24082,36 @@ class SubmoduleShimTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.log(), ["mirror"])
 
+    def test_a_dead_proxy_after_the_mirror_failed_goes_direct(self) -> None:
+        # cmux-next media run 45837430593: the mirror served ghostty but the update failed on a pin it lacked; the
+        # shim asked github.com once through the mini's loopback proxy, got "Failed to connect to 127.0.0.1 port
+        # 18434", and exited without going direct or trying again
+        self.warm_mirror()
+        with self.gitconfig.open("a") as f:
+            f.write('[http "https://github.com/"]\n\tproxy = http://127.0.0.1:18434\n')
+        argv = self.dir / "argv"
+        fake = self.dir / "fake-git"
+        fake.write_text(
+            "#!/bin/bash\n"
+            f"if [[ \" $* \" == *' submodule '* ]]; then echo \"$*\" >> {argv}\n"
+            "  if [[ \" $* \" != *' http.https://github.com/.proxy= '* ]]; then\n"
+            "    echo \"fatal: unable to access 'https://github.com/manaflow-ai/ghostty-next.git/': Failed to connect"
+            " to 127.0.0.1 port 18434 after 0 ms: Couldn't connect to server\" >&2; exit 1; fi; fi\n"
+            'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        (bindir / "curl").write_text("#!/bin/bash\nexit 7\n")
+        (bindir / "curl").chmod(0o755)
+        allow = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+        done = self.shim("-C", os.fspath(self.ws), "submodule", "update", "--init", "--recursive",
+                         env={"PATH": f"{bindir}:/usr/bin:/bin", **allow})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("going direct to github.com", done.stderr)
+        self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", argv.read_text().splitlines()[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
