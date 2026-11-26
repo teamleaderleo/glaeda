@@ -23762,6 +23762,27 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.gitconfig.read_bytes(), original)
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
 
+    def test_hq_lazy_blob_fetch_from_another_command_goes_direct_after_a_dead_probe(self) -> None:
+        # cmuxterm-hq run 45860743368 (2026-11-26): fetch and checkout went direct, then checkout's
+        # "Removing auth" `git submodule foreach` read a blob outside the sparse set through the dead tunnel.
+        env, receipt = self.hq_checkout_fixture(refused_socket=True)
+        ref = "refs/remotes/origin/main"
+        late = ["cat-file", "-p", f"{ref}:b.txt"]
+        fetch = subprocess.run(["git", "fetch", "--no-tags", "--filter=blob:none", "--depth=1", "origin",
+                                f"+{self.pr_sha}:{ref}"], cwd=self.ws, env=env, capture_output=True, text=True,
+                               timeout=15)
+        self.assertEqual(fetch.returncode, 0, fetch.stderr)
+        self.assertTrue((Path(env["RUNNER_TEMP"]) / hook.HQ_GIT_SHIM_DEAD).exists())
+        receipt.write_text("")
+        result = subprocess.run(["git", *late], cwd=self.ws, env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "b\n")
+        self.assertEqual(receipt.read_text().splitlines(), [""])
+        env.pop("GITHUB_ACTION_REPOSITORY")  # a later step's git keeps the configured proxy
+        self.assertEqual(subprocess.run(["git", "config", "--get-urlmatch", "http.proxy", "https://github.com/"],
+                                        cwd=self.ws, env=env, capture_output=True, text=True).stdout.strip()[:17],
+                         "http://127.0.0.1:")
+
     def test_hq_keeps_configured_proxy_on_connect_response_or_override(self) -> None:
         env, receipt = self.hq_checkout_fixture()
         fleet = "http://127.0.0.1:18434"
