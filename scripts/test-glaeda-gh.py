@@ -31512,11 +31512,14 @@ class LandTest(Base):
                               "Actions run (its only PR runs are pull_request_target: Test integrity), while PRs into "
                               "main run Polling guard, Skills tests")
 
-    def updated_to(self, new_head: str, refused: bool = False) -> dict:
+    def updated_to(self, new_head: str, refused: bool = False, branch_read: bool = True) -> dict:
         """A land whose own update-branch at LA made NEW_HEAD, judged there. REFUSED: GitHub's own update had made it
         first, so the pinned send came back "expected head sha didn't match current head ref" (hq#16382's shape)."""
         self.pr(LA)
         self.land()
+        if refused and branch_read:
+            self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+            self.w.api["repos/o/r/git/ref/heads/lane/x"] = new_head  # the branch is already at GitHub's own merge
         if refused:
             self.w.gh_rc["update"] = 1
             self.w.gh_err["update"] = ('{"message":"expected head sha didn\u2019t match current head ref.",'
@@ -31533,17 +31536,18 @@ class LandTest(Base):
         # efficiency-standing-lane, 2026-11-21 08:39Z (LAND_CI_START's comment): `glaeda-gh land
         # manaflow-ai/cmuxterm-hq#16382 --wait 2700` ran its own update-branch, judged the merge head it made 70 s
         # later, and stopped ci_never_ran with ~45 min of the caller's wait unspent, for a PR that went green.
-        for refused in (False, True):
-            with self.subTest(refused=refused):
+        for refused, branch_read in ((False, True), (True, True), (True, False)):
+            with self.subTest(refused=refused, branch_read=branch_read):
                 shutil.rmtree(gg.land_dir(), ignore_errors=True)
                 self.w = LandWorld(self.tmp.name)
                 self.q = self.queue()
-                e = self.updated_to(LB, refused=refused)
+                e = self.updated_to(LB, refused=refused, branch_read=branch_read)
                 self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB),
                                  e.get("stop"))
                 # Waited from the moment that head is known to be this land's: the read that found it (updatedHeadAt)
-                # when the send went through, the refused send's own step 60 s earlier when it did not.
-                self.assertAlmostEqual(e["wakeAt"] - self.t, gg.LAND_CI_START - (60 if refused else 0), delta=5)
+                # when the send went through or the refused send's branch read showed the new head (branch_ahead's
+                # head_change wait), the refused send's own step 60 s earlier when nothing read the branch.
+                self.assertAlmostEqual(e["wakeAt"] - self.t, gg.LAND_CI_START - (0 if branch_read else 60), delta=5)
                 self.assertEqual([h["event"] for h in e["history"]][-1], "ci_start_wait")
                 # The refusal's own step is an empty commit, which would move this head and orphan the runs being
                 # created at it: nothing names it to the caller while the wait stands.
