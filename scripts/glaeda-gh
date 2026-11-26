@@ -16046,6 +16046,13 @@ LAND_OWNER_REMIND_MAX = 4
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_MAX a row in all. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_OWNER_REMIND_UNREAD_ONCE: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
+# repeats a copy from before the stop. cmux16, 2026-11-26 09:30Z: one requester got 20 "still stopped after 46-88 h"
+# reminders in an hour; 16 of those 20 PRs had merged or closed days before, but cmux16's reads of them never landed, so
+# each was told on its old OPEN copy. A stop now gets at most one reminder on a copy no read refreshed (the head moving
+# since the stop is new evidence and starts it again); past it, the row stays stopped and says nothing until a read
+# lands (history remind_held). LAND_OWNER_REMIND_MAX stays the one bound on how many in all. Detector:
+# test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_told_once_per_stop.
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -20305,6 +20312,20 @@ class LandQueue:
         head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
         was = str(st.get("head") or "").lower()
         moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
+        life = e.get("remindLife") or {}
+        if life.get("stopAt") != at or (moved and life.get("head") != head):
+            life = {"stopAt": at, "unread": 0, **({"head": head} if moved else {})}
+        if not head and int(life.get("unread") or 0) >= 1:  # LAND_OWNER_REMIND_UNREAD_ONCE
+            # its next due pass asks a fresh read first (remind_read_pending), so a merge, a close or a push still ends
+            # or restarts it; the reminder itself stays quiet and spends none of LAND_OWNER_REMIND_MAX
+            e["reminds"] = {**r, "n": n, "at": self.now, "code": code}
+            if e.get("remindHeld") != [at, "unread"]:
+                e["remindHeld"] = [at, "unread"]
+                self.history(e, "remind_held", code=code, why="unread", n=n)
+                log({"event": "land-remind-held", "key": e["key"], "code": code, "why": "unread"})
+            self.save(e)
+            return False
+        e["remindLife"] = {**life, "unread": int(life.get("unread") or 0) + (0 if head else 1)}
         e["reminds"] = {"n": n + 1, "at": self.now, "code": code,
                         **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
         hours = (self.now - at) / 3600.0
@@ -25348,7 +25369,12 @@ class LandQueue:
             self.merged(e, merge_sha or e.get("mergeSha") or "", f"{how} merged")
             return True
         if state == "CLOSED":
-            self.stop(e, "closed", f"closed unmerged ({how} closed)", "")
+            # LAND_CLOSED_FYI: someone closed it on purpose, so its requester has nothing to act on: an inbox fyi, not
+            # a WARN blocker. gcp-agent-lane-2, 2026-11-26 09:40Z: after glaeda#2862 re-armed old handoff_refused rows,
+            # each one whose PR had closed days before woke its requester with "stopped: closed: closed unmerged"
+            # (cmux#44639, #49288, #46842, #50262, #47264, #44490, hq#14780, #14909, #14242). Detector:
+            # test-glaeda-gh.py test_a_row_whose_pr_was_closed_ends_with_an_fyi_not_a_blocker.
+            self.stop(e, "closed", f"closed unmerged ({how} closed)", "", tell="fyi")
             return True
         return False
 
