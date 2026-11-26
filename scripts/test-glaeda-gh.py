@@ -31653,6 +31653,9 @@ class LandTest(Base):
         self.assertEqual((e["stop"]["code"], len(self.unlabels())), ("closed", 1))
 
     def test_unlabel_a_rearming_stop_waits_for_its_rearms_and_a_refusal_retries_then_gives_up(self):
+        # 2026-11-26: the five ticks below cover ~10 h, so from about 14:00Z on the wall clock they crossed midnight,
+        # the day's re-arm count reset and the entry re-armed instead of unlabeling (2 != 3). Start just after midnight.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
         self.stopped_on("own_red")
         self.tick(gg.LAND_UNLABEL_AFTER + 1)  # re-armed, not unlabeled
         self.assertEqual(self.unlabels(), [])
