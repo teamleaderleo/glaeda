@@ -3617,7 +3617,11 @@ APP_POOL_ROLE = "ci-watch"
 # names the primary (APP_POOL_ROLE) is the whole chain in its order (app_pool_chain); one that does not is the roles
 # after the primary, as before, so GLAEDA_GH_APP_SPARES=quota-goblin is the chain before this change. A role whose
 # token this host does not hold is passed over (held_here), as a spare always was.
-APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin"
+# Then yap-goblin-9000 and yap-goblin-9001 (Leo, 2026-11-26: "maybe it's time for quota goblin"): huge-blue,
+# 12:44:51-12:45:26Z, the four Apps above each answered a pr-pages GraphQL read with a secondary rate limit, every
+# one rested about 300 s, and 185 of the daemon's GraphQL reads in 12:4x-12:5x went on the shared login
+# (graphqlLoginWhy "pool-resting") while both yaps, pushed to every host, sat at 9,431 and 12,488 of 12,500.
+APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
 
 
@@ -8669,7 +8673,7 @@ class Daemon:
         elif not actor and self.rest_out(status, h, text):
             write_json(path, item)  # nothing was written: GraphQL posts it if it can, else it waits for REST's reset
         elif item["kind"] == "update-branch" and status in (404, 422) and not THROTTLED.search(text) \
-                and (retired := update_branch_retired(status, text)):
+                and (retired := update_branch_retired(status, text, lambda: self.update_branch_pr(item))):
             if retired[0] == "done":
                 self.post_finish(path, item, note=retired[1])  # the branch needs nothing: done, never retried
             else:
@@ -8688,6 +8692,14 @@ class Daemon:
                              error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
+
+    def update_branch_pr(self, item: dict) -> dict | None:
+        """The queued update-branch's PR as GitHub answers it now (update_branch_retired's state), None unread."""
+        try:
+            status, _, doc = self.request("GET", f"/repos/{item['repo']}/pulls/{item['number']}")
+        except (WatchError, OutOfTime):
+            return None
+        return doc if status == 200 and isinstance(doc, dict) else None
 
     def post_through_broker(self, path: Path, item: dict) -> None:
         """A lane VM's queued write, made with the lane-gh broker's own tool (broker_write), the route this host's
@@ -8741,7 +8753,10 @@ class Daemon:
                 item["notBefore"] = max(float(item.get("notBefore") or 0), self.now + BROKER_POST_DEADLINE)
                 write_json(path, item)
         else:
-            ended = update_branch_retired(422, str(value)) if item["kind"] == "update-branch" else None
+            # A pin read that failed sent nothing: no second read of the PR it could not read (update_branch_retired)
+            unpinned = str(value).startswith(UPDATE_BRANCH_PIN_UNREAD)
+            ended = update_branch_retired(422, str(value), None if unpinned else lambda: broker_read_pr(item)) \
+                if item["kind"] == "update-branch" else None
             if ended and ended[0] == "done":
                 self.post_finish(path, item, note=ended[1])
             elif ended:
@@ -24311,8 +24326,9 @@ class LandQueue:
                 e.pop("overrideWait", None)
             self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
-        if kind in LAND_OVERRIDE_PIN_KINDS and land_override_pinned(e, head):
-            # LAND_OVERRIDE_PIN_KINDS' comment: the pinned merge carrying the override, once per head
+        if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
+            # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
+            # head
             if (e.get("overridePinMerge") or {}).get("head") == head:
                 with self.lock:
                     self.stop(e, "pinned_override_refused",
@@ -26579,29 +26595,35 @@ def land_request_path(rid: str) -> Path:
     return _land_written[rid]
 
 
-LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason and receipt, one line each
-LAND_OVERRIDE_RECEIPT_MAX = 240
+# lane-gh land's own "override" limits (cmuxterm-hq lane-gh-broker OVERRIDE_REASON_MAX / OVERRIDE_RECEIPT_MAX): reason and
+# receipt, one line each. The broker judges every red or running check at the head by whether this text names it, so
+# the text goes whole: before 2026-11-26 both were cut here (and again at the broker, silently) at 200 and 240, and a
+# lane's override naming its reds past character 200 was refused "checks failed ... that the override does not name"
+# four times until it split the names across both fields. A text past these is refused by its length, never cut.
+LAND_OVERRIDE_REASON_MAX = 4000
+LAND_OVERRIDE_RECEIPT_MAX = 4000
 
 
 def fit_one_line(flag: str, text: str, most: int, *, stream=None) -> str:
-    """TEXT as one line of at most MOST characters, said on STREAM when it had to change. A reason and a receipt are
-    prose an agent writes for the record, so a newline or 2 characters too many is not worth a refused land and a
-    second call: both are things this function can do itself (tools/guard_refusal.py fit, the same contract for a
-    guard's own refusal text). What is left is what no guess can fix: an empty one, or only one of the pair."""
+    """TEXT as one line (its whitespace runs one space), said on STREAM when that changed it. A reason and a receipt
+    are prose an agent writes for the record, so a newline or padding is not worth a refused land and a second call
+    (tools/guard_refusal.py fit, the same contract for a guard's own refusal text). Never cut: the broker matches the
+    checks an override goes past against the whole text, so one past MOST is refused (WatchError) naming its length."""
     fitted = " ".join(text.split())
     if len(fitted) > most:
-        fitted = fitted[:most - 1].rstrip() + "\u2026"  # the head: a reason names its cause first
+        raise WatchError(f"{flag} is {len(fitted)} chars, limit {most}: name each check it goes past and its "
+                         "evidence in fewer words (nothing is cut: a check named past a cut would read as not named)")
     if fitted != text:
-        print(f"glaeda-gh land: {flag} fitted to one line of {most}: {fitted}",
+        print(f"glaeda-gh land: {flag} fitted to one line: {fitted}",
               file=sys.stderr if stream is None else stream)
     return fitted
 
 
 def land_override(reason: str | None, receipt: str | None) -> dict | None:
     """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
-    neither. A newline, padding or a text past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters is
-    fitted (fit_one_line), not refused: on 2026-11-21 a 202-character reason cost a refusal and a second land call
-    for 2 characters. Refused (WatchError) only for what no guess fixes: one of the two alone, or an empty one. Each
+    neither. A newline or padding is fitted (fit_one_line), not refused. Refused (WatchError) only for what no guess
+    fixes: one of the two alone, an empty one, or one past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX
+    characters (by its length: never cut, since the broker matches check names against the whole text). Each
     merge try then runs with LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's
     "override")."""
     if reason is None and receipt is None:
@@ -26641,8 +26663,9 @@ def land_override_given(reason: str | None, receipt: str | None,
 
 
 def land_request_override(req: dict) -> dict | None:
-    """A request's override as land_override takes it (fitted to the limits, not dropped for them), or None when it
-    names none or one no guess fixes (an older sender's, an empty one): never a merge override no queue checked."""
+    """A request's override as land_override takes it (fitted to one line, never cut), or None when it names none or
+    one no guess fixes (an older sender's, an empty one, one past the limits): never a merge override no queue
+    checked."""
     o = req.get("override")
     if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
         return None
@@ -26784,6 +26807,20 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
 # A hold, BLOCK, conflict or other LAND_STOP_CLASSES stop still stops; an unpinned override still waits on a running
 # check (land_override_carries), and a head off the pin is judged as before.
 LAND_OVERRIDE_PIN_KINDS = LAND_WAIT_KINDS | {"rerun_failed"}
+
+
+# land_judge's merge train (leo-workspace tools/land_judge/merge_train.py) replaces the update_branch step of a
+# manaflow-ai/cmux PR into feat-cmux-next with a timed retry that carries "board_train" (boarding) or "train" (boarded,
+# waiting on the train's status). A pinned override row is merged at its pin when land_judge names an update_branch
+# (update_branch's own comment), but the train's stand-in for that same step fell to the plain retry backoff, so the
+# override never reached a merge. manaflow-ai/cmux#58296, 2026-11-26: queued at 30061064 with --override-reason and
+# --override-receipt at 12:11:43Z (a base red on 'pr pipeline / linux' it does not touch), judged red_not_excused
+# step=retry (train=boarded) at 12:16:04Z and woken for another 5-minute retry, while the gh shim's own train hold had
+# already lapsed at 11:29:16Z. Now that retry is taken as the update_branch it replaces: the pinned merge carrying the
+# override, once per head. Any other retry (unreadable, quota, host_cap, explain_failed) waits as before.
+def land_train_retry(act: dict) -> bool:
+    """True when ACT is the merge train's retry standing in for an update_branch step (the comment above)."""
+    return act.get("kind") == "retry" and bool(act.get("train") or act.get("board_train"))
 
 
 def land_override_pinned(e: dict, head: str) -> bool:
@@ -40093,11 +40130,16 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     raise WatchError(f"unknown write kind {item['kind']!r}")
 
 
-def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
+def update_branch_retired(status: int, text: str, read_pr: Callable[[], Any] | None = None) -> tuple[str, str] | None:
     """How a queued update-branch ends on a 404/422 that is no limit: ("done", why) when the branch needs nothing,
     ("retired", why) when the write can no longer mean anything (the PR is gone or closed, or its head moved past the
     pinned sha), None for a refusal worth reading (a merge conflict): that one fails with GitHub's own words. Never
-    retried (cmuxterm-hq docs/handbook/outbox-drains-slower-than-it-fills.md)."""
+    retried (cmuxterm-hq docs/handbook/outbox-drains-slower-than-it-fills.md).
+
+    Closed or merged is the PR's own state (read_pr: the PR's JSON, read only when no word above explains the refusal),
+    never a word in the answer: `\\b(closed|merged)\\b` retired OPEN manaflow-ai/cmux#57082 and #57087 on 2026-11-26
+    as "closed or merged", since GitHub's and the broker's refusals say "merge conflict" or "closed or its head is not
+    a branch" of open PRs too. An unread state retires nothing: the post fails with the refusal's own text."""
     low = text.lower()
     if status == 404:
         return "retired", "the pull request or repository was not found (HTTP 404)"
@@ -40105,8 +40147,12 @@ def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
         return "done", "the branch was already up to date with its base"
     if re.search(r"expected head sha|head sha didn.?t match|head branch was modified", low):
         return "retired", "the pull request head moved past the pinned sha; the pin no longer describes it"
-    if re.search(r"\b(closed|merged)\b", low):
-        return "retired", "the pull request is closed or merged"
+    pr = read_pr() if read_pr is not None else None
+    if isinstance(pr, dict):
+        if pr.get("merged") or pr.get("merged_at"):
+            return "retired", "the pull request is merged (its state, read after the refusal)"
+        if str(pr.get("state") or "").lower() == "closed":
+            return "retired", "the pull request is closed (its state, read after the refusal)"
     return None
 
 
@@ -40494,6 +40540,9 @@ def post_lane_env(item: dict) -> dict[str, str] | None:
 # An unpinned update-branch means "whatever the head is now", so the daemon reads the PR's head through the broker's
 # own get and pins the call to it. Detector: test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_
 # broker_call.
+UPDATE_BRANCH_PIN_UNREAD = "could not read"  # broker_pin_update_branch's refusal: its own read failed, nothing was sent
+
+
 def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
     """CHOSEN with update_branch's expected_head_sha read from the PR when it has none: ("pinned", chosen), or the
     read's outcome as broker_write gives it ("limited", seconds; "refused", why: nothing was written either way)."""
@@ -40507,7 +40556,7 @@ def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: floa
         if outcome == "made" and isinstance(data, dict) else ""
     if not SHA40.fullmatch(head):
         why = data if outcome != "made" else "its answer named no 40-character head"
-        return "refused", f"could not read {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
+        return "refused", f"{UPDATE_BRANCH_PIN_UNREAD} {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
     return "pinned", (tool, {**call_args, "expected_head_sha": head})
 
 
@@ -40572,6 +40621,12 @@ def broker_find(item: dict, timeout: float) -> tuple[dict | None, bool]:
         if isinstance(found, dict) and found.get("html_url") and (kind == "pr" or (found.get("body") or "") == item["body"]):
             return found, True
     return None, True
+
+
+def broker_read_pr(item: dict) -> dict | None:
+    """The queued update-branch's PR read through the lane-gh broker's `get` (update_branch_retired's state)."""
+    outcome, data = broker_write(item, ("get", {"path": f"pulls/{item['number']}"}), BROKER_OUTBOX_DEADLINE, pin=False)
+    return data if outcome == "made" and isinstance(data, dict) else None
 
 
 def broker_made_where(data: Any) -> tuple[str | None, Any]:
@@ -42265,10 +42320,10 @@ def parser() -> argparse.ArgumentParser:
                          "and --pin (what the rulebook calls it) are the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
                     help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
-                         "line, at most 200 characters; needs --override-receipt. Neither flag: the caller's own "
+                         "line, at most 4000 characters, never cut; needs --override-receipt. Neither flag: the caller's own "
                          "LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) is taken")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
-                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 4000")
     ld.add_argument("--nominated-path", dest="nominated_path", metavar="PATH",
                     help="the merge path that nominated this head (next-autoland, repo-autoland): every judgment and "
                          f"merge try runs with {LAND_NOMINATED_ENV}, wherever the queue runs it (executor, overflow, "
