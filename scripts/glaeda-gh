@@ -20330,7 +20330,7 @@ class LandQueue:
         every = LAND_OWNER_REMIND_EVERY * (2 ** n)
         if self.now - last < every:
             return False
-        if self.remind_read_pending(e, last, every):
+        if self.remind_read_pending(e, last):
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
@@ -20396,18 +20396,20 @@ class LandQueue:
             return True
         return False
 
-    def remind_read_pending(self, e: dict, last: float, every: float = LAND_OWNER_REMIND_EVERY) -> bool:
+    def remind_read_pending(self, e: dict, last: float) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
         (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
-        LAND_OWNER_REMIND_READ_WAIT past due (EVERY after LAST, LAND_OWNER_REMIND_BACKOFF)."""
+        LAND_OWNER_REMIND_READ_WAIT after asking it. The wait counts from the ask, not from due: a pass that comes
+        late (a held reminder moves LAST to its pass) still asks, so an unread stop whose PR merged ends on a read."""
         def read_since() -> list[float]:
             c = self.cache_of(e["key"]) or {}
             return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
         reads = read_since()
-        if (reads and max(reads) > last) or self.now - (last + every) >= LAND_OWNER_REMIND_READ_WAIT:
+        if reads and max(reads) > last:
             return False
-        if float(e.get("remindReadAt") or 0) > last:
-            return True  # asked since the last word: told on the pass after it lands
+        asked = float(e.get("remindReadAt") or 0)
+        if asked > last:
+            return self.now - asked < LAND_OWNER_REMIND_READ_WAIT  # told (or held) on the pass after it lands
         if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
             return True  # asked on a later pass
         e["remindReadAt"] = self.now
