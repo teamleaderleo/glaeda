@@ -3611,7 +3611,11 @@ APP_POOL_ROLE = "ci-watch"
 # names the primary (APP_POOL_ROLE) is the whole chain in its order (app_pool_chain); one that does not is the roles
 # after the primary, as before, so GLAEDA_GH_APP_SPARES=quota-goblin is the chain before this change. A role whose
 # token this host does not hold is passed over (held_here), as a spare always was.
-APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin"
+# Then yap-goblin-9000 and yap-goblin-9001 (Leo, 2026-11-26: "maybe it's time for quota goblin"): huge-blue,
+# 12:44:51-12:45:26Z, the four Apps above each answered a pr-pages GraphQL read with a secondary rate limit, every
+# one rested about 300 s, and 185 of the daemon's GraphQL reads in 12:4x-12:5x went on the shared login
+# (graphqlLoginWhy "pool-resting") while both yaps, pushed to every host, sat at 9,431 and 12,488 of 12,500.
+APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
 
 

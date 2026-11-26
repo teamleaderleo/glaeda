@@ -44875,13 +44875,12 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen.role, "ci-watch")
         self.assertEqual(chosen.token("manaflow-ai"), APP_TOKEN)
-        self.assertEqual([p.role for p in [pool, *pool.spares]], ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+        self.assertEqual([p.role for p in [pool, *pool.spares]], CHAIN)
         (self.creds / "ci-watch-token.json").unlink()
         chosen.tokens.clear()
         chosen.rest_until.clear()
         self.assertIsNone(pool.pick("manaflow-ai", scope))
-        self.assertEqual(pool.passed_over("manaflow-ai", scope),
-                         ("no-token", dict.fromkeys(["land-judge", "glaeda", "ci-watch", "quota-goblin"], "no-token")))
+        self.assertEqual(pool.passed_over("manaflow-ai", scope), ("no-token", dict.fromkeys(CHAIN, "no-token")))
 
     def test_a_pushed_only_host_reads_an_owner_only_a_later_role_holds(self) -> None:
         """A host with pushed tokens and no helper or config: land-judge, first in the chain, holds none for
@@ -44905,13 +44904,31 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertEqual(pool.owner_why("GET", "/repos/nobody/x/pulls/1"), (None, "owner-without-app"))
 
 
+CHAIN = ["land-judge", "glaeda", "ci-watch", "quota-goblin", "yap-goblin-9000", "yap-goblin-9001"]
+
+
 class AppPoolChainTest(unittest.TestCase):
     """The order a read asks the Apps in (app_pool_chain) and its off switch, GLAEDA_GH_APP_SPARES."""
 
-    def test_the_default_chain_is_land_judge_glaeda_ci_watch_quota_goblin(self) -> None:
-        self.assertEqual(gg.APP_POOL_CHAIN, "land-judge,glaeda,ci-watch,quota-goblin")
-        self.assertEqual(gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(","))),
-                         ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+    def test_the_default_chain_ends_with_the_yap_goblins(self) -> None:
+        self.assertEqual(gg.APP_POOL_CHAIN, ",".join(CHAIN))
+        self.assertEqual(gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(","))), CHAIN)
+
+    def test_four_apps_on_a_secondary_limit_send_graphql_to_a_yap_not_the_login(self) -> None:
+        """huge-blue, 2026-11-26 12:45Z: land-judge, glaeda, ci-watch and quota-goblin each rested on a secondary
+        rate limit and 185 GraphQL reads went on the login. A yap holding a token answers instead."""
+        pool = gg.AppPool(role=CHAIN[0], mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"],
+                          ready=lambda: True).with_spares(CHAIN[1:])
+        for p in pool.spares:
+            p.mint_fn, p.owners_fn, p.ready_fn = (lambda owner: APP_TOKEN), (lambda: ["manaflow-ai"]), (lambda: True)
+        later = time.time() + 300
+        for p in [pool, *pool.spares][:4]:
+            p.rest_until["manaflow-ai"], p.rest_why["manaflow-ai"] = later, "secondary rate limit"
+        body = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
+        scope = pool.scope("manaflow-ai", "POST", "/graphql", body)
+        chosen = pool.pick("manaflow-ai", scope, body)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.role, "yap-goblin-9000")
 
     def test_a_list_without_the_primary_is_the_spares_after_it_as_before(self) -> None:
         self.assertEqual(gg.app_pool_chain(("quota-goblin",)), ["ci-watch", "quota-goblin"], "the chain before")
@@ -44924,7 +44941,7 @@ class AppPoolChainTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         gg.BASE = Path(tmp.name)
         try:
-            for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), ["land-judge", "glaeda", "ci-watch", "quota-goblin"]),
+            for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), CHAIN),
                                  (("quota-goblin",), ["ci-watch", "quota-goblin"])):
                 gg.APP_POOL_SPARES = spares
                 daemon = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
