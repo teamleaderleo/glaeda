@@ -30157,7 +30157,7 @@ class LandTest(Base):
         # told once, at the stop, and then nothing asked again: one lane's 89 stopped rows had a median age of 31.8 h
         # and a p90 of 108.1 h, 42 of 43 measured conflict heads carrying work that is not in the base.
         e = self.conflict_stop()
-        sent, judged = len(self.w.sent()), len(self.w.explains())
+        sent, judged, reads = len(self.w.sent()), len(self.w.explains()), self.remind_reads()
         gen = e.get("gen")
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
         self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
@@ -30167,17 +30167,110 @@ class LandTest(Base):
         said = self.w.sent()[-1][-1]
         self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
         self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
+        self.assertIn("reminder 1 of 4; the next in 12 h", said)
+        # backoff: each reminder waits twice as long as the one before it (6, 12, 24, 48 h), then they stop
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (2, sent + 2, gen))
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
-        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # 6 h after the first: not yet
+        for n, wait in ((2, 1), (3, 4), (4, 8)):
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY * wait - 10)
+            self.assertEqual(e["reminds"]["n"], n - 1)
+            e = self.tick(20)
+            self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (n, sent + n, gen))
+        self.assertIn("reminder 4 of 4, the last", self.w.sent()[-1][-1])
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 16)  # past LAND_OWNER_REMIND_MAX: silent, still listed
+        self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
+        # every reminder read the PR's state first, once
+        self.assertEqual(self.remind_reads(), reads + 4)
 
-    def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
+    def test_a_stopped_row_whose_cached_pr_is_over_ends_with_one_notice_and_no_read(self):
         self.conflict_stop()
-        sent = len(self.w.sent())
+        sent, reads = len(self.w.sent()), self.remind_reads()
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "e" * 40}
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        self.assertEqual((e["state"], e["mergeSha"], e.get("reminds")), ("merged", "e" * 40, None))
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        self.assertIn("merged at " + "e" * 40, self.w.sent()[-1][-1])
+        self.assertEqual(self.remind_reads(), reads)
+        self.tick(gg.LAND_OWNER_REMIND_EVERY * 40)
+        self.assertEqual(len(self.w.sent()), sent + 1)  # the final notice, once
+
+    def remind_reads(self) -> int:
+        return len([c for c in self.w.gh_calls("pr", "view") if "state,mergeCommit" in c])
+
+    def uncached_stop(self) -> tuple[dict, int]:
+        """A conflict stop whose PR then leaves this host's cache: nothing watches a stopped row, so nothing reads it
+        (gcp-codex-lane-11, 2026-11-26: cmux#44897, #52747 and #47363 had no copy at all)."""
+        self.conflict_stop()
+        del self.w.cache[self.KEY]
+        return self.q.entries[self.KEY], len(self.w.sent())
+
+    def test_a_reminder_reads_the_pr_first_and_an_ended_one_gets_one_final_notice(self):
+        # gcp-codex-lane-11, 2026-11-26 04:43Z: cmux#44897 and cmux#52747, merged 33-34 h before, were reminded
+        # "still stopped after 33 h: update_branch_conflict / compile_missing"; the cache had no copy to skip them on.
+        _, sent = self.uncached_stop()
+        reads = self.remind_reads()
+        self.w.view_state = "MERGED"
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        said = self.w.sent()[-1][-1]
+        self.assertIn("merged at " + "f" * 40, said)
+        self.assertNotIn("still stopped", said)
+        for _ in range(3):  # 6 days, inside LAND_KEEP
+            self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
+        self.assertEqual(len(self.w.sent()), sent + 1)  # terminal: nothing after it
+        self.assertEqual(self.remind_reads(), reads + 1)
+
+    def test_a_reminder_that_reads_the_pr_closed_ends_the_row_closed_once(self):
+        # cmux#47363, closed and superseded, was reminded after 152 h
+        _, sent = self.uncached_stop()
+        self.w.view_state = "CLOSED"
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        self.assertIn("closed unmerged", self.w.sent()[-1][-1])
+        for _ in range(3):  # 6 days, inside LAND_KEEP
+            self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
+        self.assertEqual(len(self.w.sent()), sent + 1)
+
+    def test_a_reminder_whose_read_fails_is_sent_once_and_says_so(self):
+        _, sent = self.uncached_stop()
+        self.w.view_err = "HTTP 502"
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 1, sent + 1))
+        self.assertIn("its state could not be read before this reminder: HTTP 502", self.w.sent()[-1][-1])
+        self.tick()
+        self.tick(60)
+        self.assertEqual(len(self.w.sent()), sent + 1)  # the slot was spent: no resend every pass
+
+    def test_a_machine_checkpoint_hold_is_said_once_and_never_reminded(self):
+        # hq#18246: a wip_checkpoint PR whose body says "HOLD: machine-made checkpoint, not reviewed and not for
+        # landing" sat stopped `hold` 90 h and was reminded as if someone could clear it.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("held", LA, {"kind": "stop", "stop": "hold"},  # as land_judge answers it
+                                      nxt="pr-owner --repo o/r who 1",
+                                      reason="land-judge: refused o/r 1: its body holds it: "
+                                             f"{gg.CHECKPOINT_MARK}, not reviewed and not for landing"))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "machine_hold"))
+        sent = len(self.w.sent())
+        self.assertIn("machine_hold", self.w.sent()[-1][-1])
+        self.assertIn("a machine-made checkpoint never lands", self.w.sent()[-1][-1])
+        judged = len(self.w.explains())
+        for _ in range(3):  # 6 days, inside LAND_KEEP
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
+        self.assertEqual((e["state"], e.get("reminds"), e.get("rearms")), ("stopped", None, None))
+        self.assertEqual((len(self.w.sent()), len(self.w.explains())), (sent, judged))
+
+    def test_a_hold_on_a_checkpoint_title_is_a_machine_hold_and_a_person_hold_is_not(self):
+        self.assertTrue(gg.land_machine_hold("land-judge: refused: its body holds it: HOLD", {
+            "title": "WIP (machine checkpoint of a gone session, do not land): lane/x"}))
+        self.assertTrue(gg.land_machine_hold(f"its body holds it: {gg.CHECKPOINT_MARK}", {}))
+        self.assertFalse(gg.land_machine_hold("its body holds it: HOLD until Lucas approves", {"title": "fix x"}))
+        self.assertFalse(gg.land_machine_hold("", {}))
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,

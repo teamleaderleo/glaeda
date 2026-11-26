@@ -14476,6 +14476,19 @@ LAND_REPLACED_HEAD_WAIT = 300.0
 LAND_MOVED_NEXT = re.compile(r"--(?:sha|match-head-commit) ([0-9a-f]{40})\b")
 
 
+# leo-workspace tools/wip_checkpoint.py's own words for the PRs it opens: the body line and the title's start (today's
+# CHECKPOINT_TITLE and the earlier "... of a gone session, do not land"). Copied, since this file imports nothing of it.
+CHECKPOINT_MARK = "HOLD: machine-made checkpoint"
+CHECKPOINT_TITLE_PREFIX = "WIP (machine checkpoint"
+
+
+def land_machine_hold(reason: str, data: dict) -> bool:
+    """Whether a `hold` stop is a machine-made checkpoint's (LAND_OWNER_REMIND's comment): land_judge quotes the body's
+    CHECKPOINT_MARK in its reason, or the cached PR's title is a checkpoint's (CHECKPOINT_TITLE_PREFIX)."""
+    title = str(data.get("title") or "") if isinstance(data, dict) else ""
+    return CHECKPOINT_MARK in (reason or "") or title.startswith(CHECKPOINT_TITLE_PREFIX)
+
+
 def land_replaced_head(e: dict, head: str, now: float) -> bool:
     """True when HEAD is the pin E's last head_moved stop said GitHub had replaced, E is now pinned at the head that stop
     read, and the re-pin is younger than LAND_REPLACED_HEAD_WAIT: a copy older than the stop's own read."""
@@ -15613,9 +15626,21 @@ LAND_REARM_CAP = 3
 # equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
 # the requester's to act on. Detector: test-glaeda-gh.py
 # test_a_stop_that_never_rearms_still_reaches_its_owner.
-LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
+# Its first night (gcp-codex-lane-11, 2026-11-26 04:43Z) it reminded four rows that could never land: cmux#44897 and
+# cmux#52747, merged a day and a half before; cmux#47363, closed (152 h); and hq#18246, a wip_checkpoint PR whose body
+# holds it as a machine-made checkpoint (90 h). None of the three ended PRs had a cache copy at all (a stopped row is
+# watched by nothing), so the cached-state skip had nothing to read. Three rules hold for the whole class now:
+# - a reminder reads the PR's state first, once, off the lock (remind_job): MERGED or CLOSED ends the row (ended) with
+#   its one final notice, merged at SHA or closed, and nothing after; a copy the cache already has that shows it ended
+#   (MERGED at any age, CLOSED read since the stop) ends it with no read at all (stopped_ended);
+# - a reminder backs off: the n-th comes LAND_OWNER_REMIND_EVERY * 2**(n-1) after the one before it (6, 12, 24, 48 h),
+#   LAND_OWNER_REMIND_MAX in all, so a row nobody acts on stops speaking within a week (LAND_KEEP);
+# - a `hold` whose reason or title is a machine-made checkpoint (CHECKPOINT_MARK, CHECKPOINT_TITLE_PREFIX) stops
+#   `machine_hold`, said once and never reminded: nobody is meant to clear it.
+# Detector: test-glaeda-gh.py test_a_reminder_reads_the_pr_first_and_an_ended_one_gets_one_final_notice and siblings.
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate|machine_hold)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
-LAND_OWNER_REMIND_CAP = 2
+LAND_OWNER_REMIND_MAX = 4
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19655,44 +19680,90 @@ class LandQueue:
         self.save(e)
         return True
 
+    def stopped_ended(self, e: dict) -> bool:
+        """Under the lock. End a stopped E whose PR this host's cache already shows over (LAND_OWNER_REMIND's comment):
+        MERGED at any age (a merge never reverts), CLOSED in a copy read since the stop (an older one may predate a
+        reopen). A cache file read, no GitHub call. True when it ended, with its one final notice."""
+        st = e.get("stop") or {}
+        if e.get("state") != "stopped" or LAND_OWNER_REMIND_SKIP.match(str(st.get("code") or "")):
+            return False
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state == "CLOSED":
+            at = c.get("dataAt")
+            if not _finite(at) or float(at) < float(st.get("at") or 0):
+                return False
+        elif state != "MERGED":
+            return False
+        merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "") \
+            if isinstance(data.get("mergeCommit"), dict) else ""
+        return self.ended(e, state, merge_sha, "while stopped: the cache shows it")
+
     def remind(self, e: dict) -> bool:
         """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
-        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen. A
+        reminder that is due reads the PR's state first (remind_job), so an ended PR gets its final notice instead."""
         if e.get("state") != "stopped":
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
         if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
-        to = str(e.get("requester") or "")
-        if not to:
+        if self.stopped_ended(e):
+            return True
+        if not str(e.get("requester") or ""):
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
-            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
-        day = land_day(self.now)
         r = e.get("reminds") or {}
-        n = int(r.get("n") or 0) if r.get("day") == day else 0
-        if n >= LAND_OWNER_REMIND_CAP:
+        n = int(r.get("n") or 0)
+        if n >= LAND_OWNER_REMIND_MAX:
             return False
         at = float(st.get("at") or 0)
-        last = float(r.get("at") or 0) or at
-        if self.now - last < LAND_OWNER_REMIND_EVERY:
+        last = float(r.get("at") or 0) if n else at
+        if self.now - last < LAND_OWNER_REMIND_EVERY * (2 ** n):
             return False
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
-        hours = (self.now - at) / 3600.0
-        msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
-               f"{land_reason(st.get('reason') or '', 300)}")
-        if st.get("next"):
-            msg += f" next: {land_trim(str(st['next']), 300)}"
-        if st.get("detail"):
-            msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
-        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
-        log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1)})
+        # Due. The slot is taken now, so a read that fails or runs long is never sent again on the next pass.
+        e["reminds"] = {"n": n + 1, "at": self.now}
         self.save(e)
-        self.notify(e, to, msg)
+        self.submit(e["key"], self.remind_job, e["key"], int(e.get("gen") or 0))
         return True
+
+    def remind_job(self, key: str, gen: int) -> None:
+        """One read of the PR's state (read_state, off the lock), then under it: an ended PR ends its row (ended: merged
+        at SHA, or closed) and is never reminded again; an open one, or one that could not be read, is reminded."""
+        e = self.entries.get(key)
+        if e is None:
+            return
+        state, merge_sha, why = self.read_state(e)
+        with self.lock:
+            if self.entries.get(key) is not e or e.get("state") != "stopped" or int(e.get("gen") or 0) != gen:
+                return  # re-landed, cancelled or ended meanwhile: whatever it is now says the rest
+            if self.ended(e, state, merge_sha, "while stopped: a reminder's read shows it"):
+                log({"event": "land-owner-remind-ended", "key": key, "state": state, "sha": merge_sha})
+                return
+            st = e.get("stop") or {}
+            code = str(st.get("code") or "")
+            n = int((e.get("reminds") or {}).get("n") or 0)
+            hours = (self.now - float(st.get("at") or 0)) / 3600.0
+            msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
+                   f"{land_reason(st.get('reason') or '', 300)}")
+            if st.get("next"):
+                msg += f" next: {land_trim(str(st['next']), 300)}"
+            if why:
+                msg += f" (its state could not be read before this reminder: {land_trim(why, 200)})"
+            if st.get("detail"):
+                msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
+            if n < LAND_OWNER_REMIND_MAX:
+                nxt_in = LAND_OWNER_REMIND_EVERY * (2 ** n) / 3600.0
+                msg += f"\n(reminder {n} of {LAND_OWNER_REMIND_MAX}; the next in {nxt_in:.0f} h if it still sits)"
+            else:
+                msg += f"\n(reminder {n} of {LAND_OWNER_REMIND_MAX}, the last; `glaeda-gh land status` still lists it)"
+            to = str(e.get("requester") or "")
+            self.history(e, "reminded", code=code, n=n, hours=round(hours, 1), **({"unread": why[:160]} if why else {}))
+            log({"event": "land-owner-reminded", "key": key, "code": code, "to": to, "n": n,
+                 "hours": round(hours, 1), **({"unread": land_trim(why, 160)} if why else {})})
+            self.save(e)
+            self.notify(e, to, msg)
 
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
@@ -24566,6 +24637,12 @@ class LandQueue:
         TELL "quiet" not at all (a line in the log and E's history only). DETAIL (a conflict's hunks) follows the
         message's `next:` and is kept on the stop, so `land status` shows it too."""
         self.check(e)
+        if code == "hold" and land_machine_hold(reason, (self.cache_of(e["key"]) or {}).get("data") or {}):
+            # LAND_OWNER_REMIND's comment: a machine-made checkpoint's HOLD is nobody's to clear, so the row is
+            # dropped: said once here, never re-armed or reminded.
+            code = "machine_hold"
+            nxt = ("none: a machine-made checkpoint never lands; land the PR that finishes its work instead"
+                   + (f" ({land_trim(nxt, 120)})" if nxt else ""))
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
             return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
