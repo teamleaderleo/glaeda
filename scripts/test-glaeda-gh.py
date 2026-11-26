@@ -32937,6 +32937,44 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
         self.assertIn("update_again", [h["event"] for h in e["history"]])
 
+    WEBVIEWS_ONLY = "land-judge: base update needed {h}: main (aaaaaaaaaaaa) changed webviews files since its checks (x)"
+    OWN_FILES = ("land-judge: base update needed {h}: main (aaaaaaaaaaaa) changed files the PR changes too "
+                 "(src/a.rs)")
+
+    def forced_base_update_twice(self, reason: str) -> dict:
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB)
+        self.w.answers.append(refusal("base_update", LB, {
+            "kind": "update_branch", "expected_head_sha": LB, "force": "land-judge: stale CI",
+            "needs_newer_base": ["land-judge base update (the base changed files the PR changes since its checks)"]},
+            reason=reason.format(h=LB)))
+        return self.tick()
+
+    def test_a_second_forced_base_update_at_this_lands_own_head_stops_by_name(self):
+        # land_base_update_unnamed: a base_update's stock force and need name no check, so a second base merge at the
+        # head the first made, for a change outside the PR's files, stops like any unnamed update
+        e = self.forced_base_update_twice(self.WEBVIEWS_ONLY)
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}"])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_again_unnamed"))
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
+    def test_a_second_base_update_for_the_prs_own_files_is_still_sent(self):
+        e = self.forced_base_update_twice(self.OWN_FILES)
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 2, updates)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
+    @mock.patch.dict(os.environ, {"GLAEDA_LAND_BASE_UPDATE_ONCE": "0"})  # the undo: force lifts the rule, as before
+    def test_the_base_update_switch_restores_the_forced_send(self):
+        e = self.forced_base_update_twice(self.WEBVIEWS_ONLY)
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 2, updates)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
     def test_an_update_interrupted_by_a_restart_is_not_sent_again_at_that_head(self):
         self.pr(LA)
         self.land()
