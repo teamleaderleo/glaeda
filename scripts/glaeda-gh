@@ -951,6 +951,12 @@ DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may 
 RECENT_ERRORS_KEEP = 3600  # daemon.json's recentErrors: the distinct errors of this long, newest first
 COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
 HEAD_PENDING_FED_TTL = 180  # a running head on such a repository: its check events re-read it sooner
+# ... and one the feed has said nothing about since its last read: the feed answered without a gap from before that
+# read (feed_live_since) and delivered no run, suite or status for the commit since (feed_marks). Its next check event
+# nudges it and it is read at once (nudge, NUDGE_MIN), so the 180 s poll only re-read an unchanged rollup. The glaeda
+# land host, 2026-11-26: the read loop spent 581 of each 600 s reading, 274 of them on heads, and waited PR copies aged
+# a median 2,538 s behind them. A quiet head is re-read at the settled TTL, the bound for a lost delivery.
+HEAD_QUIET_FED_TTL = 600
 HEAD_ALIGN = 30  # a head read also takes the heads due within this long, so they share one query
 CONTROLLER_FRESH = 60  # the controller's feed answered this recently: its webhooks are flowing
 FED_REPO_KEEP = 3600  # a repository the feed delivered an event for this recently is one the controller covers
@@ -6197,6 +6203,13 @@ def consumer_policy() -> dict:
     return policy
 
 
+def token_fingerprint(token: Any) -> str | None:
+    """The first 8 hex of sha256(TOKEN): which credential a quota reading came from, never the token itself. GitHub
+    answers a credential from more than one hourly counter, and a reading that names no credential cannot tell
+    another token's counter from the login's (2026-11-26: two overlapping GraphQL windows, one at 0, one at 4832)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:8] if isinstance(token, str) and token else None
+
+
 def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     """counters with one reading folded in. A reading whose reset is within RESET_JITTER of a known counter's is
     that counter (GitHub's reset for one window can differ by a second between answers), and within one window a
@@ -6204,11 +6217,15 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     later reset are kept."""
     out, merged = [], False
     for c in counters:
-        if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
+        # a counter is (credential, window): another token's reading with the same reset is another counter
+        same_token = not c.get("token") or not seen.get("token") or c["token"] == seen["token"]
+        if not merged and same_token and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
             c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
                  "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
             if "spent" in c or "spent" in seen:  # GraphQL: the points this daemon's queries drew from it
                 c["spent"] = int(c.get("spent") or 0) + int(seen.get("spent") or 0)
+            if seen.get("token") or c.get("token"):
+                c["token"] = seen.get("token") or c.get("token")
             tags = sorted(set(c.get("counters") or []) | set(seen.get("counters") or []))
             if tags:
                 c["counters"] = tags  # a counter keeps the tag any of its readings gave it (ACTIONS_COUNTER_PATH)
@@ -6229,7 +6246,8 @@ def graphql_drawn(budget: dict, live: list[dict], now: float) -> dict | None:
         return None
     if d["reset"] <= now:
         return d
-    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER), None)
+    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER
+                 and (not c.get("token") or not d.get("token") or c["token"] == d["token"])), None)
 
 
 def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
@@ -7621,13 +7639,18 @@ class Daemon:
         return current
 
     def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "",
-                    cost: int | None = None) -> None:
+                    cost: int | None = None, token: str | None = None) -> None:
         """One reading of BUCKET. COST (GraphQL only) marks it as the rateLimit of a query this daemon sent on the
         login: the counter that query drew COST points from, which settle_counters reads as the GraphQL reading."""
         try:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
             return
+        # Which credential answered (token_fingerprint): every caller records the login's answers only (an App's
+        # return before this), so the default is the login token this daemon sends.
+        fingerprint = token_fingerprint(token if token is not None else self.token)
+        if fingerprint:
+            seen["token"] = fingerprint
         if bucket == "graphql":
             # GraphQL too answers one token from two counters with their own hourly windows: on 2026-11-04 the one
             # /graphql requests spend reset at :26:29 while /rate_limit and some answers reported one resetting at
@@ -7646,7 +7669,8 @@ class Daemon:
                 return
             if cost is not None:
                 seen["spent"] = max(0, int(cost))
-                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt")}
+                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt", "token")
+                                               if k in seen}
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
@@ -7669,7 +7693,8 @@ class Daemon:
     def graphql_counters_view(self) -> list[dict]:
         """budget.json's live GraphQL counters as daemon.json carries them: left, limit, reset, drawn, spent."""
         return [{"remaining": c["remaining"], "limit": c.get("limit"), "reset": c["reset"],
-                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {})}
+                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {}),
+                 **({"token": c["token"]} if isinstance(c.get("token"), str) else {})}
                 for c in rest_counters(self.budget, "graphqlCounters") if c["reset"] > self.now]
 
     def settle_rest(self) -> None:
@@ -9830,7 +9855,22 @@ class Daemon:
         data = (e["cache"] or {}).get("data") or {}
         if data.get("settled"):
             return HEAD_SETTLED_TTL
-        return HEAD_PENDING_FED_TTL if self.fed(e["key"]) else HEAD_PENDING_TTL
+        if not self.fed(e["key"]):
+            return HEAD_PENDING_TTL
+        return HEAD_QUIET_FED_TTL if self.head_feed_quiet(e) else HEAD_PENDING_FED_TTL
+
+    def head_feed_quiet(self, e: dict) -> bool:
+        """Whether the feed has followed this head's repository without a gap since before its last read and delivered
+        no run, suite or status for the commit since then (HEAD_QUIET_FED_TTL)."""
+        at = (e["cache"] or {}).get("dataAt")
+        since = getattr(self, "feed_live_since", None)
+        if not isinstance(at, (int, float)) or since is None or since > at:
+            return False
+        try:
+            _, owner, repo, sha = split_key(e["key"])
+        except ValueError:
+            return False
+        return getattr(self, "feed_marks", {}).get(f"sha:{owner}/{repo}@{sha}".lower(), float("-inf")) < at
 
     def write_consumers(self) -> None:
         policy = consumer_policy()
@@ -21795,7 +21835,14 @@ class LandQueue:
                     e["updatedHead"], e["updatedHeadAt"] = head, self.now
                     if self.pin_follow(e, head, data):
                         return  # the new head's first parent is not read yet: not judged on it
-                self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="head_moved")
+                # A head the pin does not cover is judged now, running checks or not: the judgment's worker reads its
+                # parents (base_merge_check) and follows the pin to it or stops. Waiting on its checks first kept the
+                # pin behind: cmux#53433, 2026-11-26, pin_parent_unread at 11:45:55Z for the queue's own update
+                # 7fc4fa9bf428 (pin b62052934d4f), then checks_running at the new head under the old pin for 80 min.
+                if running and not land_head_moved(str(e.get("pinSha") or ""), head):
+                    self.wait_running(e, head, fp)
+                else:
+                    self.judge(e, head, fp, why="head_moved")
             elif woke:
                 if self.judge(e, "", fp, why="head_timeout"):  # land_judge reads the head itself: the cache never showed the new one
                     self.history(e, "head_timeout", before=w.get("before"))
@@ -23081,11 +23128,27 @@ class LandQueue:
                 why = "no base branch to read it with: the copy here names none and the read of its PR did not answer"
         parents: Any = None
         chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        if gh and not parent and sent and not land_head_moved(pin, sent) and sent != head:
+            # The queue's own update_branch was sent at the pin and no read said HEAD's first parent in time
+            # (pin_follow's pin_parent_unread, glaeda#2364): one read of HEAD's commit says whether it is that update's
+            # merge (follow_own_update), before any base or compare read. A missed read never leaves the pin behind
+            # the queue's own update (cmux#53433, 2026-11-26: 80 min on a stale pin until a person re-queued it).
+            parents = self.head_parents_read(e, head, data)
+            if isinstance(parents, list):
+                with self.lock:
+                    self.check(e)
+                    if self.follow_own_update(e, head, parents) is None \
+                            and not land_head_moved(str(e.get("pinSha") or ""), head):
+                        e.pop("baseMergeUnread", None)
+                        return True
         if kept:
             why = kept  # read before, for this head and pin (ancestry_record): not read again
         elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
-            if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+            if isinstance(parents, list):
+                pass  # read above, for the queue's own update: not read twice
+            elif str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
                 parents = data["headParents"]  # the cache read them: no call
             else:
                 got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
@@ -23158,6 +23221,22 @@ class LandQueue:
                          **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def head_parents_read(self, e: dict, head: str, data: dict) -> list | None:
+        """On a worker: HEAD's parents, lower-case, from the cache when its read of HEAD carried them, else from one
+        read of repos/OWNER/REPO/commits/HEAD (repin_parents' read). None when the read did not answer."""
+        if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+            return [str(p).lower() for p in data["headParents"]]
+        gh = self.gh()
+        if not gh:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{head}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def base_ref_read(self, e: dict) -> tuple[str, str]:
         """On a worker, from base_merge_check: (E's PR's base branch, "") from one REST read of the PR, for a head
@@ -25416,6 +25495,25 @@ class LandQueue:
             self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
             return True
 
+    def override_outside_diff(self, e: dict) -> str:
+        """Off the lock: why E's override still holds after a base merge (its reason names files, and none is one
+        the PR changes), or "" (the reason names no file, the PR's file list is unread, or a named file is in it)."""
+        named = land_override_files(str((e.get("override") or {}).get("reason") or ""))
+        if not named:
+            return ""
+        gh = self.gh()
+        if gh is None:
+            return ""
+        got = self.call([gh, "api", f"repos/{e['repo']}/pulls/{e['number']}/files?per_page=100", "--paginate",
+                         "--jq", ".[].filename | @json"], LAND_GH_DEADLINE)
+        files = land_file_names(got.stdout or "")
+        if got.returncode != 0 or not files or len(files) >= LAND_FILES_MAX:
+            return ""
+        stems = {Path(f).name.lower() for f in files} | {Path(f).stem.lower() for f in files}
+        if any(n in stems for n in named):
+            return ""
+        return f"its override names {', '.join(sorted(named)[:6])}, none of the PR's {len(files)} changed files"
+
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
         tried = e.get("unionMerge") or {}
@@ -25436,7 +25534,18 @@ class LandQueue:
             # "pin_parent_wait head=0795cbb055ec pin=4c3d0ca43fef", never merged; a direct merge at the new head
             # worked. It merges at its pin, once per head; a merge GitHub refuses there stops the row by name.
             tried = e.get("overridePinMerge") or {}
-            if land_head_moved(pin, head) or tried.get("head") == head:
+            follow = "" if land_head_moved(pin, head) or tried.get("head") != head else \
+                self.override_outside_diff(e)
+            if follow:
+                # The merge at the pin was refused (behind its base) and the override's reason names only files
+                # outside the PR's diff: a base merge leaves what the override excused untouched, so the update is
+                # sent; follow_own_update moves the pin to the base merge it makes, land_judge judges that head in
+                # full, and the override still names it. lw#11929, 2026-11-26 12:0xZ: overridden for base reds in
+                # test_reach and friends, behind main, stopped here, and a person merged main and re-queued.
+                with self.lock:
+                    self.history(e, "override_update_outside_diff", head=head[:12], why=land_trim(follow, 200))
+                    self.save(e)
+            elif land_head_moved(pin, head) or tried.get("head") == head:
                 with self.lock:
                     self.stop(e, "pinned_override_update",
                               f"land_judge named an update-branch at {head[:12] or '?'} for a row pinned at {pin[:12]} "
@@ -25446,13 +25555,14 @@ class LandQueue:
                               f"merge it by hand at the pin (gh pr merge {number} -R {repo} --squash "
                               f"--match-head-commit {pin}), or update it and re-queue at the new head")
                 return
-            with self.lock:
-                e["overridePinMerge"] = {"head": head, "at": self.now}
-                self.history(e, "override_pin_merge", head=head[:12],
-                             why="a pinned override row is merged at its pin, never base-updated")
-                self.save(e)
-            self.do_merge(e, head, {"pinned": True})
-            return
+            else:
+                with self.lock:
+                    e["overridePinMerge"] = {"head": head, "at": self.now}
+                    self.history(e, "override_pin_merge", head=head[:12],
+                                 why="a pinned override row is merged at its pin, never base-updated")
+                    self.save(e)
+                self.do_merge(e, head, {"pinned": True})
+                return
         sent = e.get("updateSent") or {}
         if head and sent.get("head") == head:
             # Once per head (LAND_UPDATE_ONCE's comment): never a second update at this head. Wait for the new head
@@ -26783,6 +26893,21 @@ def land_full_pin(e: dict) -> str:
     """E's --sha when it names a whole commit (40 hex), which a judgement and a merge may pin as given, else ""."""
     pin = str(e.get("pinSha") or "").lower()
     return pin if re.fullmatch(r"[0-9a-f]{40}", pin) else ""
+
+
+LAND_OVERRIDE_WORD = re.compile(r"[\w./-]+")
+LAND_OVERRIDE_FILEISH = re.compile(r"^(?:test_\w+|[\w-]+\.[a-z][a-z0-9]{0,5})$")
+
+
+def land_override_files(reason: str) -> set[str]:
+    """The file names an override REASON names (a basename with an extension, or a test_ module stem, which matches
+    its file by stem: test_reach names tools/test_reach.py), lowercased."""
+    out = set()
+    for word in LAND_OVERRIDE_WORD.findall(reason or ""):
+        base = word.strip("./-").rsplit("/", 1)[-1].lower()
+        if LAND_OVERRIDE_FILEISH.match(base):
+            out.add(base)
+    return out
 
 
 def land_head_moved(pin: str, head: str) -> bool:
@@ -34945,7 +35070,8 @@ def view_lines(view: dict) -> list[str]:
             continue
         counters = [c for c in p.get("counters") or [] if isinstance(c, dict)]
         left = "; ".join(f"{c.get('remaining')}/{c.get('limit')} left in {c.get('window')} "
-                         f"(read {c.get('reading_age_s', '?')} s ago{', ' + ','.join(c['tags']) if c.get('tags') else ''})"
+                         f"(token {c.get('token') or '?'}, read {c.get('reading_age_s', '?')} s ago"
+                         f"{', ' + ','.join(c['tags']) if c.get('tags') else ''})"
                          for c in counters) or "no reading of GitHub's count"
         used = p.get("used")
         acct = (f"GitHub counted {used}, the hosts' logs hold {p.get('attributed')} ({p.get('accounted_pct')}%), "
@@ -35200,6 +35326,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 print(f"         {label} counters ({head}): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
                     f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}"
+                    f" (token {c.get('token') or '?'})"
                     + (" (drawn from" + (f", {c['spent']} points spent" if isinstance(c.get("spent"), int) else "")
                        + ")" if c.get("drawn") else "") for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
@@ -38381,6 +38508,17 @@ GH_SWEEP_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({N
                          r"(?:runs/(\d+)(?:/attempts/\d+)?/jobs|jobs/(\d+))/?(?:\?.*)?$")
 GH_SWEEP_MAX = 30
 GH_SWEEP_WINDOW = 600.0
+# Named budgets: a caller whose question the runner list cannot answer ("which jobs wait, on what label, since when":
+# a queued job has no runner) names one in GLAEDA_GH_SWEEP_BUDGET. Its targets count against one host-wide bucket
+# (`budget:NAME`, every caller naming it together), not the caller's own GH_SWEEP_MAX, so a coordinator's session
+# reads and its queue-why pass no longer share 30 between them, and the bucket's ceiling is the most that purpose
+# can spend on this host however many sessions run it. An unknown name counts as the caller's own, as before.
+# queue-why (cmuxterm-hq tools/fleet-reconcilers ci_queue_why.py and queue_why_auto.py): its REST fallback, read
+# only while the controller's feed is down, is one listing per status and the jobs of at most 20 runs a pass
+# (queue_why_auto.REST_MAX_RUNS), each answer shared through this cache. 2026-11-26 12:15Z: session
+# interim-coord-2 held 27 of its 30 and the pass was refused on its first jobs read while the feed answered 503,
+# exactly when the verdict was needed.
+GH_SWEEP_BUDGETS = {"queue-why": 60}
 GH_SWEEP_EXIT = 2
 
 
@@ -38401,7 +38539,10 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
     target = gh_sweep_target(words, method)
     if target is None or os.environ.get("GLAEDA_GH_SWEEP_OK") == "1":
         return None
-    caller = broker_caller()
+    budget = os.environ.get("GLAEDA_GH_SWEEP_BUDGET") or ""
+    cap = GH_SWEEP_BUDGETS.get(budget)
+    caller = f"budget:{budget}" if cap else broker_caller()
+    cap = cap or GH_SWEEP_MAX
     path = BASE / "broker-sweeps.json"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with bounded_lock(BASE / ".broker-sweeps.lock") as held:
@@ -38416,8 +38557,12 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
                 if kept:
                     callers[str(who)] = kept
         mine = callers.setdefault(caller, {})
-        if target not in mine and len(mine) >= GH_SWEEP_MAX:
+        if target not in mine and len(mine) >= cap:
             owner = target.split("/")[0]
+            if caller.startswith("budget:"):
+                return (f"glaeda-gh: refused: the host's {budget} budget read the jobs of {len(mine)} different runs "
+                        f"or jobs in the last {int(GH_SWEEP_WINDOW // 60)} minutes (GH_SWEEP_BUDGETS); answers read "
+                        f"already come from the cache, and the bucket frees as the window passes.")
             return (f"glaeda-gh: refused: this caller read the jobs of {len(mine)} different runs or jobs in the last "
                     f"{int(GH_SWEEP_WINDOW // 60)} minutes, which is a runner-occupancy sweep and spends a REST request "
                     f"each from the quota every session shares. `glaeda-gh runners {owner}` answers which runners are "

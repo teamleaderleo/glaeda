@@ -2564,6 +2564,48 @@ class GraphqlDietTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 2)  # its check event re-read it at once
         self.assertTrue(gg.read_cache(key)["data"]["settled"])
 
+    @mock.patch.object(gg, "HEAD_QUIET_FED_TTL", 400)  # under HEAD_INTEREST: register() stamps the wall clock
+    def test_a_running_head_the_feed_is_quiet_about_is_read_at_the_quiet_ttl(self) -> None:
+        # HEAD_QUIET_FED_TTL: the glaeda land host, 2026-11-26, spent 274 of each 600 s reading heads.
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        read_at = gg.read_cache(key)["dataAt"]
+        t = NOW + gg.TICK
+        while t < read_at + gg.HEAD_QUIET_FED_TTL - gg.HEAD_ALIGN - gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertGreater(t - read_at, gg.HEAD_PENDING_FED_TTL)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # quiet past the fed TTL: not polled
+        while t < read_at + gg.HEAD_QUIET_FED_TTL + gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # the quiet TTL: read once more (a lost delivery's bound)
+
+    def test_a_running_head_read_before_the_feed_went_live_keeps_the_fed_ttl(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        e = {"key": key, "cache": gg.read_cache(key)}
+        self.assertTrue(self.daemon.head_feed_quiet(e))
+        self.daemon.feed_live_since = e["cache"]["dataAt"] + 1  # a gap after the read: what came in it is unknown
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+        self.assertEqual(self.daemon.head_ttl(e), gg.HEAD_PENDING_FED_TTL)
+        self.daemon.feed_live_since = e["cache"]["dataAt"] - 1
+        self.daemon.feed_marks[f"sha:o/r@{sha}"] = e["cache"]["dataAt"] + 1  # an event on the commit since its read
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+
     def test_a_check_event_inside_the_retry_gate_is_kept_until_the_head_is_read(self) -> None:
         sha = "a" * 40
         self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
@@ -4910,6 +4952,33 @@ class BalanceTest(Base):
         self.daemon.settle_counters("graphql")
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
         self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
+
+    def test_counter_readings_carry_the_token_fingerprint(self) -> None:
+        """2026-11-26: `budget` showed GraphQL 0/5000 in 10:41-11:41Z and 4832/5000 in 11:12-12:12Z and nothing said
+        which credential each came from. Every reading carries sha256(token)[:8] (never the token), and another
+        token's reading with the same reset is another counter, not folded into the login's."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.token = "ghp_logintoken"
+        self.daemon.note_budget("graphql", 5000, 4832, NOW + 1800, cost=1)
+        self.daemon.note_budget("rest", 5000, 4000, NOW + 900)
+        login = gg.token_fingerprint("ghp_logintoken")
+        self.assertEqual(len(login), 8)
+        self.assertNotIn("ghp_logintoken", json.dumps(self.daemon.budget))
+        self.assertEqual({c["token"] for c in self.daemon.budget["graphqlCounters"]}, {login})
+        self.assertEqual(self.daemon.budget["graphqlDrawn"]["token"], login)
+        self.assertEqual(self.daemon.budget["rest"]["token"], login)
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 1800, token="ghs_othertoken")
+        self.assertEqual(sorted(c["token"] for c in self.daemon.budget["graphqlCounters"]),
+                         sorted([login, gg.token_fingerprint("ghs_othertoken")]))
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4832)  # the drawn one, the login's
+        self.assertEqual({c["token"] for c in self.daemon.graphql_counters_view()},
+                         {login, gg.token_fingerprint("ghs_othertoken")})
+        lines = gg.view_lines({"pools": [{"pool": "graphql", "used": 168, "attributed": 160, "unaccounted": 8,
+                                          "accounted_pct": 95, "counters": [
+                                              {"remaining": 4832, "limit": 5000, "window": "11:12:25Z .. 12:12:25Z",
+                                               "token": login, "reading_age_s": 5}]}]})
+        self.assertIn(f"token {login}", lines[1])
 
     def test_graphql_reading_is_the_counter_its_own_queries_draw_from(self) -> None:
         """2026-11-25 22:40Z: a daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0 left
@@ -13895,9 +13964,10 @@ class BudgetRefreshTest(Base):
         self.daemon.tick(NOW)
         self.gh.rest_remaining = 1057
         self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
-        self.assertEqual(self.daemon.budget["rest"], {"limit": 5000, "remaining": 1057,
-                                                      "reset": int(NOW + 1800),
-                                                      "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
+        rest = dict(self.daemon.budget["rest"])
+        self.assertRegex(rest.pop("token", ""), r"^[0-9a-f]{8}$", "the reading names the token it counts")
+        self.assertEqual(rest, {"limit": 5000, "remaining": 1057, "reset": int(NOW + 1800),
+                                "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
         self.assertEqual(self.daemon.status["lastHour"]["rest"], 0, "the refresh spends no REST")
 
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
@@ -22713,6 +22783,21 @@ class BrokerSweepTest(BrokerBase):
             later = time.time() + gg.GH_SWEEP_WINDOW + 1
             self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/jobs/4"], "GET", later))
 
+    def test_a_named_budget_is_one_host_bucket_apart_from_the_callers_own(self) -> None:
+        # 2026-11-26: a coordinator session's own reads filled its 30, and its queue-why pass was refused while the
+        # controller feed was down.
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 1), mock.patch.dict(gg.GH_SWEEP_BUDGETS, {"queue-why": 2}):
+            self.run_gh(["api", "repos/o/r/actions/jobs/1"])
+            self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/2"])[3])
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "queue-why"}):
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/10/jobs"])[3])
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/11/jobs"])[3])
+                code, _out, err, passed = self.run_gh(["api", "repos/o/r/actions/runs/12/jobs"])
+            self.assertEqual((code, passed), (gg.GH_SWEEP_EXIT, None))
+            self.assertIn("queue-why budget", err)
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "no-such-budget"}):
+                self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/3"])[3])
+
     def test_what_is_a_sweep_target(self) -> None:
         for path, want in (("repos/O/R/actions/runs/5/jobs?per_page=100", "o/r run 5"),
                            ("/repos/o/r/actions/runs/5/attempts/2/jobs", "o/r run 5"),
@@ -29112,6 +29197,43 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertIn("pin_parent_unread", [h["event"] for h in e["history"]])
 
+    def test_a_pin_follows_its_own_update_after_the_parent_wait_ran_out_while_checks_run(self):
+        # cmux#53433, 2026-11-26: the queue's update_branch at the pin b62052934d4f made 7fc4fa9bf428; no read said its
+        # first parent within LAND_PIN_PARENT_WAIT (pin_parent_unread at 11:45:55Z), its checks were running, so the
+        # row waited checks_running at the new head under the old pin for 80 minutes, and follow_own_update refused
+        # (glaeda#2364) until a person re-queued it. Past the wait it is judged now, and the judgment's worker reads
+        # the head's commit and follows the pin to the queue's own update.
+        running = [("ci", "IN_PROGRESS", None)]
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=running)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"], e["pinFollow"]["head"]), ("waiting", LA, LB))
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, "d" * 40])
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "timeout_s": 1800}))
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        events = [h["event"] for h in e["history"]]
+        self.assertIn("pin_parent_unread", events)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB), events)
+        self.assertEqual([(h["pin"], h["head"]) for h in e["history"] if h["event"] == "repin_own_update"],
+                         [(LA[:12], LB[:12])])
+        self.assertIn(["--sha", LB], [c[i:i + 2] for c in self.w.explains() for i in range(len(c))])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_push_after_the_parent_wait_ran_out_still_stops_head_moved(self):
+        # The same wait running out on a head whose parents are not the pin's update: someone's push still stops.
+        self.update_branch_moved_the_head()
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick()
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC])
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        for _ in range(4):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertNotIn("repin_own_update", [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_a_first_parent_read_within_the_wait_is_followed(self):
         self.update_branch_moved_the_head()
         self.pr(LB)
@@ -32838,6 +32960,41 @@ class LandTest(Base):
         self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
         self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
+
+    def test_land_override_naming_only_files_outside_the_diff_updates_when_its_pin_merge_is_refused(self):
+        # lw#11929, 2026-11-26: overridden for base reds in test_reach and others, its pin merge refused behind main,
+        # stopped pinned_override_update and a person merged main by hand. Those files are not the PR's: update.
+        self.pr(LA)
+        self.w.files = ["tools/fanout_cap.py", "tools/test_fanout_cap.py"]
+        reason = "ws-check reds are base reds in files this PR does not touch (test_reach, tools/test_ws_check.py)"
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override={"reason": reason, "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertNotEqual(e.get("state"), "stopped", e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "override_update_outside_diff"],
+                         ["override_update_outside_diff"])
+        self.assertTrue(e.get("updateSent") or self.w.gh_calls("api", "-X", "PUT"), e["history"][-4:])
+
+    def test_land_override_naming_a_file_of_the_diff_still_stops_when_its_pin_merge_is_refused(self):
+        self.pr(LA)
+        self.w.files = ["tools/test_reach.py"]
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                        override={"reason": "test_reach red is flaky", "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
+
+    def test_land_override_files(self):
+        self.assertEqual(gg.land_override_files("base reds (test_reach, tools/test_ws_check.py; a/b.rs) on main 45810787066"),
+                         {"test_reach", "test_ws_check.py", "b.rs"})
+        self.assertEqual(gg.land_override_files("base red: ci fails the same way on main"), set())
 
     def test_land_override_pinned_row_merges_at_its_pin_past_running_or_red_checks(self):
         # cmux#52546 parked until 04:30Z and cmux#53958 (override recorded 03:30:35Z, judged checks_running 24 s later),

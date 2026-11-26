@@ -1665,7 +1665,7 @@ def check_disk_pass(mini: Mini, now: float) -> list[dict[str, Any]]:
         agent += f", last exit {facts['last_exit']}"
     return [finding("disk_pass_stale", "warn", f"{'; '.join(stale)} (limit {DISK_PASS_STALE_S // 3600} h); "
                     f"disk pass job {agent}", "impossible",
-                    "glaeda-disk --pressure --idle --apply --top 0 shows why a pass does not finish; "
+                    "cmux-disk --pressure --idle --apply --top 0 shows why a pass does not finish; "
                     "~/Library/Logs/glaeda-disk.err; glaeda-mini-setup reloads the agent")]
 
 
@@ -1714,7 +1714,7 @@ def pressure_blocked_findings(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return [finding("disk_pressure_blocked", "warn",
                     f"under pressure on {mounts}: reclaimable {reclaimable / 1024**3:.1f} GiB, blocked "
                     f"{blocked / 1024**3:.1f} GiB", "pending",
-                    "run `glaeda-disk --pressure --json` and fix the verdict that keeps the biggest build/cache items "
+                    "run `cmux-disk --pressure --json` and fix the verdict that keeps the biggest build/cache items "
                     "(handbook: build-caches-classified-keep)")]
 
 
