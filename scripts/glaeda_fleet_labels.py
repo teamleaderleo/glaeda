@@ -826,7 +826,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay", "user"})
+                                       "yieldToFleetBuild", "lanRelay", "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -902,6 +902,10 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        # YIELD_TO_FLEET_BUILD: the runner's jobs wait while the mini's fleet build (the CAS writer's fill) holds it
+        fleet_yields = entry.get("yieldToFleetBuild", False)
+        if not isinstance(fleet_yields, bool):
+            return [], f"{where}.yieldToFleetBuild must be boolean"
         relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None,
                                runner.get("dedicatedOnly") is True)
         if why:
@@ -923,7 +927,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "lanRelay": relay, "user": user})
+                    "yieldToFleetBuild": fleet_yields, "lanRelay": relay, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
