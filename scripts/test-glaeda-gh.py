@@ -4911,6 +4911,33 @@ class BalanceTest(Base):
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 900)
         self.assertEqual(len(self.daemon.budget["graphqlCounters"]), 1)
 
+    def test_counter_readings_carry_the_token_fingerprint(self) -> None:
+        """2026-11-26: `budget` showed GraphQL 0/5000 in 10:41-11:41Z and 4832/5000 in 11:12-12:12Z and nothing said
+        which credential each came from. Every reading carries sha256(token)[:8] (never the token), and another
+        token's reading with the same reset is another counter, not folded into the login's."""
+        self.daemon.now = NOW
+        self.daemon.budget = {}
+        self.daemon.token = "ghp_logintoken"
+        self.daemon.note_budget("graphql", 5000, 4832, NOW + 1800, cost=1)
+        self.daemon.note_budget("rest", 5000, 4000, NOW + 900)
+        login = gg.token_fingerprint("ghp_logintoken")
+        self.assertEqual(len(login), 8)
+        self.assertNotIn("ghp_logintoken", json.dumps(self.daemon.budget))
+        self.assertEqual({c["token"] for c in self.daemon.budget["graphqlCounters"]}, {login})
+        self.assertEqual(self.daemon.budget["graphqlDrawn"]["token"], login)
+        self.assertEqual(self.daemon.budget["rest"]["token"], login)
+        self.daemon.note_budget("graphql", 5000, 0, NOW + 1800, token="ghs_othertoken")
+        self.assertEqual(sorted(c["token"] for c in self.daemon.budget["graphqlCounters"]),
+                         sorted([login, gg.token_fingerprint("ghs_othertoken")]))
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4832)  # the drawn one, the login's
+        self.assertEqual({c["token"] for c in self.daemon.graphql_counters_view()},
+                         {login, gg.token_fingerprint("ghs_othertoken")})
+        lines = gg.view_lines({"pools": [{"pool": "graphql", "used": 168, "attributed": 160, "unaccounted": 8,
+                                          "accounted_pct": 95, "counters": [
+                                              {"remaining": 4832, "limit": 5000, "window": "11:12:25Z .. 12:12:25Z",
+                                               "token": login, "reading_age_s": 5}]}]})
+        self.assertIn(f"token {login}", lines[1])
+
     def test_graphql_reading_is_the_counter_its_own_queries_draw_from(self) -> None:
         """2026-11-25 22:40Z: a daemon held its GraphQL reads (and NOW paged ci-quota) on a counter with 0 left
         resetting at 22:41:25Z while the counter the login's queries spent had 4459 left until 23:11:10Z. The reading

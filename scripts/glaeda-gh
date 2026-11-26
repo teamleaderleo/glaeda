@@ -6197,6 +6197,13 @@ def consumer_policy() -> dict:
     return policy
 
 
+def token_fingerprint(token: Any) -> str | None:
+    """The first 8 hex of sha256(TOKEN): which credential a quota reading came from, never the token itself. GitHub
+    answers a credential from more than one hourly counter, and a reading that names no credential cannot tell
+    another token's counter from the login's (2026-11-26: two overlapping GraphQL windows, one at 0, one at 4832)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:8] if isinstance(token, str) and token else None
+
+
 def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     """counters with one reading folded in. A reading whose reset is within RESET_JITTER of a known counter's is
     that counter (GitHub's reset for one window can differ by a second between answers), and within one window a
@@ -6204,11 +6211,15 @@ def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
     later reset are kept."""
     out, merged = [], False
     for c in counters:
-        if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
+        # a counter is (credential, window): another token's reading with the same reset is another counter
+        same_token = not c.get("token") or not seen.get("token") or c["token"] == seen["token"]
+        if not merged and same_token and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
             c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
                  "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
             if "spent" in c or "spent" in seen:  # GraphQL: the points this daemon's queries drew from it
                 c["spent"] = int(c.get("spent") or 0) + int(seen.get("spent") or 0)
+            if seen.get("token") or c.get("token"):
+                c["token"] = seen.get("token") or c.get("token")
             tags = sorted(set(c.get("counters") or []) | set(seen.get("counters") or []))
             if tags:
                 c["counters"] = tags  # a counter keeps the tag any of its readings gave it (ACTIONS_COUNTER_PATH)
@@ -6229,7 +6240,8 @@ def graphql_drawn(budget: dict, live: list[dict], now: float) -> dict | None:
         return None
     if d["reset"] <= now:
         return d
-    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER), None)
+    return next((c for c in live if abs(c["reset"] - d["reset"]) <= RESET_JITTER
+                 and (not c.get("token") or not d.get("token") or c["token"] == d["token"])), None)
 
 
 def rest_counters(budget: dict, key: str = "restCounters") -> list[dict]:
@@ -7621,13 +7633,18 @@ class Daemon:
         return current
 
     def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None, path: str = "",
-                    cost: int | None = None) -> None:
+                    cost: int | None = None, token: str | None = None) -> None:
         """One reading of BUCKET. COST (GraphQL only) marks it as the rateLimit of a query this daemon sent on the
         login: the counter that query drew COST points from, which settle_counters reads as the GraphQL reading."""
         try:
             seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
             return
+        # Which credential answered (token_fingerprint): every caller records the login's answers only (an App's
+        # return before this), so the default is the login token this daemon sends.
+        fingerprint = token_fingerprint(token if token is not None else self.token)
+        if fingerprint:
+            seen["token"] = fingerprint
         if bucket == "graphql":
             # GraphQL too answers one token from two counters with their own hourly windows: on 2026-11-04 the one
             # /graphql requests spend reset at :26:29 while /rate_limit and some answers reported one resetting at
@@ -7646,7 +7663,8 @@ class Daemon:
                 return
             if cost is not None:
                 seen["spent"] = max(0, int(cost))
-                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt")}
+                self.budget["graphqlDrawn"] = {k: seen[k] for k in ("limit", "remaining", "reset", "seenAt", "token")
+                                               if k in seen}
             self.budget["graphqlCounters"] = merge_counter(rest_counters(self.budget, "graphqlCounters"), seen)
             self.settle_counters("graphql")
             return
@@ -7669,7 +7687,8 @@ class Daemon:
     def graphql_counters_view(self) -> list[dict]:
         """budget.json's live GraphQL counters as daemon.json carries them: left, limit, reset, drawn, spent."""
         return [{"remaining": c["remaining"], "limit": c.get("limit"), "reset": c["reset"],
-                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {})}
+                 "drawn": bool(c.get("drawn")), **({"spent": c["spent"]} if isinstance(c.get("spent"), int) else {}),
+                 **({"token": c["token"]} if isinstance(c.get("token"), str) else {})}
                 for c in rest_counters(self.budget, "graphqlCounters") if c["reset"] > self.now]
 
     def settle_rest(self) -> None:
@@ -34228,7 +34247,8 @@ def view_lines(view: dict) -> list[str]:
             continue
         counters = [c for c in p.get("counters") or [] if isinstance(c, dict)]
         left = "; ".join(f"{c.get('remaining')}/{c.get('limit')} left in {c.get('window')} "
-                         f"(read {c.get('reading_age_s', '?')} s ago{', ' + ','.join(c['tags']) if c.get('tags') else ''})"
+                         f"(token {c.get('token') or '?'}, read {c.get('reading_age_s', '?')} s ago"
+                         f"{', ' + ','.join(c['tags']) if c.get('tags') else ''})"
                          for c in counters) or "no reading of GitHub's count"
         used = p.get("used")
         acct = (f"GitHub counted {used}, the hosts' logs hold {p.get('attributed')} ({p.get('accounted_pct')}%), "
@@ -34483,6 +34503,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 print(f"         {label} counters ({head}): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
                     f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}"
+                    f" (token {c.get('token') or '?'})"
                     + (" (drawn from" + (f", {c['spent']} points spent" if isinstance(c.get("spent"), int) else "")
                        + ")" if c.get("drawn") else "") for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
