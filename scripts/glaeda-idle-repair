@@ -291,6 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
         health_path = os.environ.get("GLAEDA_HEALTH", str(HOME / ".local/bin/glaeda-mini-health"))
         actions: list[dict[str, Any]] = []
+        # run it as cmux-disk, its primary name, when the shim sits beside it: glaeda-disk counts uses of its old name
+        # (cmuxterm-hq docs/design/glaeda-into-cmux.md, Rename map). GLAEDA_DISK stays the program's own path, the one
+        # load_disk_module imports (the shim is not a module: it runs the program).
+        primary = Path(disk_path).with_name("cmux-disk")
+        if Path(disk_path).name == "glaeda-disk" and primary.is_file():
+            disk_path = os.fspath(primary)
         disk_command = [python, disk_path]
         if role := os.environ.get("GLAEDA_ROLE"):
             disk_command.extend(["--role", role])

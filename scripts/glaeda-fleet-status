@@ -584,9 +584,11 @@ def collect_lima(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
 # line cut at the front fails to parse and is skipped.
 DISK_SCRIPT = (
     "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; "
-    "echo @disk; if [ ! -x ~/.local/bin/glaeda-disk ]; then echo '{\"no_glaeda_disk\":true}'; "
+    # cmux-disk is glaeda-disk's primary name (the old one counts its uses); a host without the shim runs the old name
+    "echo @disk; d=~/.local/bin/cmux-disk; [ -x $d ] || d=~/.local/bin/glaeda-disk; "
+    "if [ ! -x $d ]; then echo '{\"no_glaeda_disk\":true}'; "
     "elif [ ! -e ~/.cache/glaeda-disk/sizes.json ]; then echo '{\"no_snapshot\":true}'; else "
-    "~/.local/bin/glaeda-disk --json --top 0 --max-age 1000000 2>/dev/null | head -c 4194304; fi; echo; "
+    "$d --json --top 0 --max-age 1000000 2>/dev/null | head -c 4194304; fi; echo; "
     "echo @sizes_at; stat -f %m ~/.cache/glaeda-disk/sizes.json 2>/dev/null; "
     "echo @prune; tail -n 48 ~/Library/Logs/glaeda-fleet-cas-prune.jsonl 2>/dev/null | tail -c 131072; echo; "
     "echo @prune_job_at; stat -f %m ~/Library/LaunchAgents/" + PRUNE_LABEL + ".plist 2>/dev/null; "
@@ -1174,7 +1176,7 @@ class Builder:
                 act = self.action(member, "restore_reach", "person", None,
                                   note="check the host is up, on the tailnet, and the SSH key is loaded")
             elif area == "disk":
-                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/cmux-disk",
                                   note="reports where the space went; it also refreshes its own snapshot")
             else:
                 command = as_command(fix)
@@ -1285,7 +1287,7 @@ class Builder:
             if kind == "none":
                 act = self.action(member, kind, who, None, note=note)
             elif kind == "free_disk":
-                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/cmux-disk",
                                   note="reports where the space went; delete stale build output only after "
                                        "checking nothing builds")
             else:
@@ -1500,7 +1502,7 @@ class Builder:
                              member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
                                                      safe=True, on_member=False))
                 continue
-            report = self.action(member, "report_disk", "agent", "~/.local/bin/glaeda-disk",
+            report = self.action(member, "report_disk", "agent", "~/.local/bin/cmux-disk",
                                  note="reports where the space went and what is reclaimable; it may refresh "
                                       "its own size snapshot")
             warned = False

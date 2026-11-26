@@ -85,6 +85,14 @@ What `--apply` does:
      event payload is missing or unreadable. Admitted jobs then run
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
+   - For an HQ checkout, the admitted job gets a job-local Git wrapper through `GITHUB_PATH`.
+     During `actions/checkout`, before a fetch or checkout from the HQ HTTPS origin configured for the fleet loopback proxy,
+     it tests the tunnel with a CONNECT bounded at five seconds. A transport failure before any
+     CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
+     An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
+     `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
+     disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
      so a PR job never lands on a mini that is busy with other work. It is refused, so
      cmux's rescue re-runs it on Blacksmith, when the host is reserved
