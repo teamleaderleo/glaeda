@@ -6217,6 +6217,15 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # ls-remote of cmux is a line in $RUNNER_TEMP/glaeda-git-fetches.log; job-completed prints the count. Opt-in by
 # repository: only manaflow-ai/cmux jobs get the shim. Kill switch: GLAEDA_GIT_SHIM=0 in the runner's environment
 # (no shim) or in a step's env (that step's git is the real one).
+# A mini reaches github.com through the loopback CONNECT proxy mini-rollout.sh sets (http.https://github.com/.proxy,
+# 127.0.0.1:18434: an ssh -R tunnel to a fleet VM's github-egress-proxy). When that tunnel's path is congested or
+# half-dead the proxy accepts and never answers, and curl waits its whole 300 s connect timeout per fetch (release
+# runs 45811016977 and 45805086277, 2026-11-26: "Proxy CONNECT aborted due to timeout" twice, then "Recv failure:
+# Connection reset by peer", while github.com answered the same mini directly in 0.5 s). So before each github.com
+# attempt the shim sends one CONNECT through the configured proxy, bounded at GIT_SHIM_PROXY_PROBE_S; when it gets no
+# answer, or an attempt fails with a proxy-shaped error, that attempt and the rest go direct (an empty
+# http.<url>.proxy for this command: actions/checkout's fetch carries the job's token, so it is no anonymous fetch),
+# and so do the job's later github.com git calls (a mark beside GIT_SHIM_LOG).
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6227,9 +6236,8 @@ GIT_SHIM_TRIES = 3
 GIT_SHIM_STALL_S = 60
 GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
 GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
-GIT_SHIM_BODY = r'''
-say() { echo "glaeda git shim: $*" >&2; }
-[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+GIT_SHIM_PROXY_PROBE_S = 10  # one CONNECT to github.com through the configured proxy; no answer in this long: go direct
+GIT_SHIM_COMMAND = r'''
 orig=("$@")
 globals=()
 while [ $# -gt 0 ]; do
@@ -6240,6 +6248,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 sub=$1
+'''
+GIT_SHIM_BODY = r'''
+say() { echo "glaeda git shim: $*" >&2; }
+[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
 normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
 sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
   for d in "$submodules"/*.git; do
@@ -6394,9 +6407,29 @@ fi
 tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
 budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
 stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
+probe_s=${GLAEDA_GIT_SHIM_PROXY_PROBE_S:-$proxy_probe_s}
+# the proxy git would use for github.com: http.<url>.proxy or http.proxy (urlmatch), else curl's environment
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy https://github.com/ 2>/dev/null)
+[ -n "$proxy" ] || proxy=${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}
+route=()
+go_direct() {  # $1: why. This attempt, the rest and the job's later git calls skip the proxy (an empty proxy also
+  # overrides curl's env); the mark in RUNNER_TEMP spares actions/checkout's own retry another probe of a dead path
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$log.direct" 2>/dev/null
+  say "the github.com proxy $proxy $1; going direct to github.com"
+}
+if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
+fi
+probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works
+  [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -o /dev/null --head -m "$probe_s" -x "$proxy" https://github.com/ 2>/dev/null && return 0
+  go_direct "did not answer a CONNECT in $probe_s s"
+}
 bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
   # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
-  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" "${orig[@]}" <&0 2>"$errf" &
+  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" ${route[@]+"${route[@]}"} "${orig[@]}" <&0 2>"$errf" &
   gp=$!
   stopped=
   end=$((SECONDS + $1))
@@ -6428,6 +6461,7 @@ while :; do
   else
     bound=86400; limit=
   fi
+  probe_proxy
   note github
   errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
   say "asking github.com (try $try of $tries; ${limit}no bytes for $stall s ends it)"
@@ -6440,6 +6474,12 @@ while :; do
   fi
   refused=
   grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect|too slow|timed out' "$errf" && refused=1
+  # curl's words for a proxy or tunnel that failed (case-sensitive: "unexpected disconnect" is GitHub's, not these)
+  if [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] &&
+     grep -Eq '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf"; then
+    go_direct "failed this attempt ($(grep -E '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf" | head -1 | sed -E "s/^.*'[^']*': //; s/^[a-z]+: //"))"
+    refused=1
+  fi
   rm -f "$errf"
   if [ -n "$stopped" ]; then
     say "github.com did not finish within $bound s; stopped it (exit $rc)"
@@ -6471,36 +6511,70 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
             f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
             f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
-            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\n")
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n")
     return head + GIT_SHIM_BODY
 
 
+# The HQ checkout can also fetch blobs during checkout after a filtered fetch. Test the
+# fleet tunnel for each of those commands. A CONNECT response (including a denial) is
+# authoritative. Only a transport failure before a response selects direct HTTPS.
+HQ_GIT_SHIM_BODY = r'''
+[ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
+passthrough() { exec "$real" "${orig[@]}"; }
+case "$sub" in fetch|checkout) ;; *) passthrough ;; esac
+url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
+case "$url" in
+  https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
+  *) passthrough ;;
+esac
+"$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
+[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
+          --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
+case "$?:$connect" in
+  7:000|28:000|52:000|55:000|56:000)
+    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
+    exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
+esac
+passthrough
+'''
+
+
 def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None) -> str:
-    """job-started: put the git shim first on a cmux job's PATH when the mirror is usable. Returns a note, or "".
-    Never raises."""
+    """Install the repository's job-local git wrapper and return a diagnostic note. Never raises."""
     env = os.environ if environ is None else environ
     try:
-        if (repo or "").lower() != GIT_SHIM_REPO or env.get("GLAEDA_GIT_SHIM") == "0":
+        repository = (repo or "").lower()
+        if repository not in (GIT_SHIM_REPO, HQ_DISPATCH_REPO) or env.get("GLAEDA_GIT_SHIM") == "0":
             return ""
         temp, path_file = env.get("RUNNER_TEMP"), env.get("GITHUB_PATH")
         if not temp or not path_file:
             return ""
-        if mirror_identity(mirror) is None:
+        if repository == GIT_SHIM_REPO and mirror_identity(mirror) is None:
             return f"git shim: off, the mirror at {mirror} is not verified or has a repair pending"
-        shim_dir = Path(temp) / GIT_SHIM_DIR
+        shim_dir = Path(temp) / (GIT_SHIM_DIR if repository == GIT_SHIM_REPO else "glaeda-hq-git-shim")
         search = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p) != shim_dir)
         real = shutil.which("git", path=search)
         if not real:
             return "git shim: off, no git on PATH"
         shim_dir.mkdir(parents=True, exist_ok=True)
-        log = Path(temp) / GIT_SHIM_LOG
+        real = os.path.realpath(real)
+        if repository == HQ_DISPATCH_REPO:
+            script = f"#!/bin/bash\nreal={shlex.quote(real)}\n" + HQ_GIT_SHIM_BODY
+            note = "git shim: HQ checkout checks the fleet Git proxy"
+        else:
+            log = Path(temp) / GIT_SHIM_LOG
+            script = git_shim_script(real, mirror, log)
+            note = f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
         tmp = shim_dir / f".git.{os.getpid()}"
-        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log), encoding="utf-8")
+        tmp.write_text(script, encoding="utf-8")
         tmp.chmod(0o755)
         os.replace(tmp, shim_dir / "git")
         with open(path_file, "a", encoding="utf-8") as fh:
             fh.write(f"{shim_dir}\n")
-        return f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
+        return note
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"git shim: {type(error).__name__}"
 

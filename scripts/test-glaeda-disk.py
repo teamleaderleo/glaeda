@@ -11728,6 +11728,41 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
         self.assertEqual(files[0].read_bytes(), b"changed since")
 
+    def test_a_killed_writers_leftovers_are_reclaimed_and_a_live_ones_kept(self) -> None:
+        # cmux22, 2026-11-26: 3.7 GB of `.<archive>.<pid>.tmp` from passes killed mid-write, which no expiry reached
+        unit, _, _ = self.dirty_mirror()
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        archive = self.home / "archive/glaeda-disk"
+        archives = sorted(p.name for p in archive.iterdir())
+        listed = next(n for n in archives if n != "manifest.jsonl")
+        dead = 2 ** 22 + 7  # no such process
+        stale = archive / f".20261107T112734-{dead}-ab-x.expires-2026-12-07.tar.gz.{dead}.tmp"
+        stale.write_bytes(b"half a tar")
+        live = archive / f".20261126T112734-{os.getpid()}-ab-y.expires-2026-12-26.bundle.{os.getpid()}.tmp"
+        live.write_bytes(b"being written")
+        old_live = archive / f".20261101T000000-{os.getpid()}-ab-z.expires-2026-12-01.bundle.{os.getpid()}.tmp"
+        old_live.write_bytes(b"pid reused")
+        os.utime(old_live, (time.time() - gd.ARCHIVE_LEFTOVER_STALE_S - 60,) * 2)
+        open_one = archive / f".held.{dead}.tmp"
+        open_one.write_bytes(b"open")
+        (archive / listed).rename(aside := archive / f".{listed}.{dead}.expiring")
+        link = archive / f".elsewhere.{dead}.tmp"
+        link.symlink_to(self.home / "elsewhere")
+        other = archive / ".note.txt"
+        other.write_text("someone's")
+        done = gd.prune_archive_leftovers(in_use=lambda p: p == open_one)
+        self.assertEqual(sorted(done), sorted([stale.name, old_live.name, aside.name]))
+        self.assertFalse(stale.exists())
+        self.assertFalse(old_live.exists())
+        self.assertFalse(aside.exists())
+        self.assertTrue((archive / listed).is_file())  # back under its name; the manifest still lists it
+        self.assertTrue(open_one.exists() and other.exists() and link.is_symlink())
+        self.assertEqual(sorted(p.name for p in archive.iterdir() if p.name in archives), archives)
+        # a live writer is kept while it writes
+        self.assertTrue(live.exists())
+        self.assertEqual(gd.prune_archive_leftovers(in_use=lambda p: False), [open_one.name])
+        self.assertTrue(live.exists())
+
     def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
         unit, clone, env = self.mirror_unit()
         with (clone / ".git/info/exclude").open("a") as f:

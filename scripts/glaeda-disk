@@ -1393,6 +1393,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "2839c8e6956ffc6776f3553b4e2a4774459075b568437957a3a10f1eeef735e2",
     "63aba53442d623bb33e68927897a84cdda307baffd294383123bfc73a9d5bbe3",
     "f349a345e89a2cc7e2984b50cd7c05c8ed4be5470124f21e4f418db42e04a8ef",
+    "2ed5b420a0f3d5259e7174c26a4a458febc6d158b2eb9d89a01df80477c6d780",
+    "4b1ac78a53b20a3a3a1419579f25a9edbb9e012eb58fba86bfd27423824e4211",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9909,6 +9911,57 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
     return gone
 
 
+# What a writer of ~/archive/glaeda-disk leaves when it is killed before its `finally` (a pass past its bound, a
+# reboot): `.<archive name>.<pid>.tmp` (a bundle, patch or tar being written or checked, _write_bundle,
+# archive_work_tree, archive_git_dir; `.manifest.<pid>.tmp` too) and `.<archive name>.<pid>.expiring` (an expired
+# archive renamed aside by prune_mirror_archive before its hash). cmux22, 2026-11-26: seven `.tmp` files from
+# 2026-11-07..24, 3.7 GB, none open and their writers long gone, which no pass ever took: the manifest lists only
+# finished archives, so prune_mirror_archive never saw them, and they sat on a mini whose 18 runners waited on the
+# disk floor. A leftover is stale once its writer's pid is gone, or once nothing wrote it for
+# ARCHIVE_LEFTOVER_STALE_S (a writer's git and tar steps are bounded at 600 s each; a reused pid keeps one no longer).
+ARCHIVE_LEFTOVER_RE = re.compile(r"\.(?P<name>.+)\.(?P<pid>\d+)\.(?P<kind>tmp|expiring)")
+ARCHIVE_LEFTOVER_STALE_S = 24 * 3600
+
+
+def prune_archive_leftovers(now: float | None = None, in_use=lambda p: False) -> list[str]:
+    """Reclaim the stale leftovers of killed archive writers in ~/archive/glaeda-disk (ARCHIVE_LEFTOVER_RE): a
+    `.tmp` is deleted (it never became an archive; an archive linked from it keeps its own name), an `.expiring`
+    goes back to its archive name, which the manifest still lists, so the next prune hashes it as usual (never
+    over a file there). Kept: a writer still alive and writing, anything in_use, a symlink or anything not a plain
+    file, and anything else in the directory. The names reclaimed or restored."""
+    now, root, done = time.time() if now is None else now, mirror_archive(), []
+    if root.is_symlink() or not root.is_dir():
+        return done
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return done
+    for e in entries:
+        if not (m := ARCHIVE_LEFTOVER_RE.fullmatch(e.name)):
+            continue
+        p = Path(e.path)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        idle = now - st.st_mtime  # a writer's bytes move mtime; a pid reused since keeps it no longer than this
+        if pid_alive(int(m["pid"])) and idle < ARCHIVE_LEFTOVER_STALE_S:
+            continue  # its writer may still be at it
+        if in_use(p):
+            continue
+        try:
+            if m["kind"] == "tmp":
+                p.unlink()
+            else:
+                rename_noreplace(p, root / m["name"])
+        except OSError:
+            continue
+        done.append(e.name)
+    return done
+
+
 def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> list[str]:
     """The rest of ~/archive (an archive a person or another tool wrote, ~/archive/<name>-<date>/) under the
     same expiry: each entry of ~/archive but glaeda-disk goes once nothing in it changed for MIRROR_ARCHIVE_DAYS,
@@ -15843,14 +15896,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
     cwds = open_index(cwds)
+
+    def archive_in_use(q: Path) -> bool:
+        try:
+            o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
+        except NoEvidence as error:
+            RUN["apply_incomplete"] = f"archive pruning: {error}"
+            return True
+        return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
+    # Every pass, mirror items or not: a killed writer's leftovers are no archive any expiry reaches (cmux22,
+    # 2026-11-26, 3.7 GB; prune_archive_leftovers).
+    if not archive_root_why() and (left := prune_archive_leftovers(in_use=archive_in_use)):
+        RUN.setdefault("archive_leftovers", []).extend(left)
     if any(f.mirror_idle_hours is not None for f in every):
-        def archive_in_use(q: Path) -> bool:
-            try:
-                o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
-            except NoEvidence as error:
-                RUN["apply_incomplete"] = f"archive pruning: {error}"
-                return True
-            return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
         if not archive_root_why():
             prune_mirror_archive(in_use=archive_in_use)
         if (expired := prune_foreign_archives(in_use=archive_in_use)):
