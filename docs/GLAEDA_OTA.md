@@ -111,6 +111,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    backed-off hours), as an error when the reason is one retrying cannot clear (a quarantined or
    refused release, a hook `--refresh-hooks` keeps), and `ota_stale` when no run has finished for
    three hours. ci-dash shows both in Health, from the report the probe forwards.
+   A new release restarts the host's `since`, but each stale runner row in `running.hooks` keeps its
+   own `staleSince` while its hook bytes stay the same, and `alertAfter` counts from the oldest of
+   them: a runner left on one hook through several releases pages two hours after it fell behind,
+   not two hours after the latest release (before, a ring that released every half hour never let
+   a stuck runner reach `alertAfter`).
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are
@@ -213,6 +218,8 @@ repository.
 **The fork's `main` takes no merges.** Its ruleset 26619652 ("main: deploy keys only") blocks
 every update to `main` except a push made with a deploy key. A pull request opened in the fork
 still runs Verify but cannot merge ("Cannot update this protected ref."): merge it here instead.
+`glaeda-gh land manaflow-ai/glaeda#N` does that: it carries the head to `carry/manaflow-ai-glaeda-N` here, opens one
+PR naming the original and lands it pinned (CONTRIBUTING.md, "How to land a glaeda PR").
 On 11-04 two pull requests merged straight into the fork's `main` and stalled the sync for about
 20 hours on a conflict. A ruleset cannot name one deploy key, so the bypass covers both of the
 fork's write keys: the sync's (`SYNC_MIRROR_DEPLOY_KEY`, kept here) and `mirror.yml`'s tag key

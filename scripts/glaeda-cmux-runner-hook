@@ -46,7 +46,8 @@ re-runs it elsewhere) when:
     drifted from its class receipt, or gh is not on the job PATH. Eligibility is the node status that glaeda-mini-enroll reads, from the
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
-    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly. First,
+    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly (a probe that
+    reads nothing is a failed probe that warns, never drift: PROBE_EMPTY_WARNS). First,
     rustup, rustc or cargo that cannot run at all (missing, or a link that dangles) refuses by path
     or is not on the job PATH, which is the runner's own (toolchain_missing); the gate then holds every such runner at once, and ci-step fits
     advertises nothing.
@@ -789,6 +790,11 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-ios-kit.yml's link-ffi-fleet submits the CmuxMobileLinkFFI xcframework build (cmux-ci ios-build --what ffi)
 # for kit-tests, reads the FFI key from a blobless sparse checkout of scripts/ci and moves the result into the Actions
 # cache and an artifact; it waits at most 40 min. Its first run, 45528332604 on cmux#55285, was refused here.
+# cmux-next-iphone-clips.yml's record (the What's New clips, on each nightly-next push), cmux-next-ios-energy-nightly.yml's
+# bench (the nightly iPhone energy bench), cmux-next-stress-bench.yml's measure and chief-evals.yml's fleet-ab each
+# submit fleet steps with cmux-ci and wait, with no build here, on the same vars.CI_EVAL_STEP_GATEWAY label. The first
+# two were refused here and sat red on base: runs 45640200901 (job 139296705888) and 45640201089 (job 139296423266).
+# The other two run on that label and were missing as well.
 # GATEWAY_FLEET_SUFFIX: that was the fourth client refused on its first run (gallery, try-ahead, gestures, this), each
 # fixed by one more pair here after a red. A home-repository job id that ends in -fleet is the client contract
 # cmux already names its thin clients by (app-compile-fleet, fast-tier-fleet, swift-test-fleet ...; the bare job that
@@ -815,7 +821,9 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                           ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
-                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")})
+                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                          ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                          ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab")})
 GATEWAY_FLEET_SUFFIX = "-fleet"
 
 
@@ -3459,6 +3467,14 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
                                             "signing job push or dispatch" if trusted_next_signing else ""))))
+    if trusted_next_signing and rc_nightly_push(event_name, ref, repository, event, workflow_ref):
+        # RC_NIGHTLY: an rc/* push of cmux's nightly.yml (Classic RC and the cmux-next RC). rc/* branches are
+        # admin-only on manaflow-ai/cmux (ruleset "rc branches: admin only"), so their nightly.yml is reviewed code
+        # like main's; the signing runner takes only nightly.yml's own signing jobs from it. Without this every rc/*
+        # run stopped at runner-preflight once the nightly left Blacksmith (cmux run 45582463917, 2026-11-25).
+        if ("nightly.yml", job) in SIGNING_JOBS:
+            return None
+        return "untrusted: an rc/* run takes this runner only for nightly.yml's signing jobs"
     if hq_dispatch:
         workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
         if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
@@ -3561,6 +3577,21 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
 # where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
+# RC_NIGHTLY: cmux's release-candidate branches (rc/<name>), admin-only on manaflow-ai/cmux.
+RC_NIGHTLY_REF = re.compile(r"refs/heads/rc/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+
+
+def rc_nightly_push(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None) -> bool:
+    """Whether this is a push to an rc/* branch of manaflow-ai/cmux running that same ref's own nightly.yml. Pure."""
+    if event_name != "push" or not isinstance(ref, str) or not RC_NIGHTLY_REF.fullmatch(ref) or ".." in ref:
+        return False
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return False
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    return repos == {"manaflow-ai/cmux"} and event.get("ref") == ref and workflow_ref == f"{NIGHTLY_WORKFLOW}@{ref}"
+
+
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
@@ -3789,22 +3820,30 @@ DRAIN_TTL_S = 3600.0
 DRAIN_MAX_BYTES = 4096
 
 
-def runner_drain(runner_dir: Path, now: float) -> str | None:
-    """Why this runner is draining (RUNNER_DRAIN), or None: no marker, an expired one, or one that cannot be read."""
-    doc = runner_drain_doc(runner_dir, now)
+def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
+    """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
+    no marker, an expired one, or one that cannot be read."""
+    doc = runner_drain_doc(runner_dir, now) or host_runner_pause_for(runner_dir, now, fleet_dir)
     return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
 def runner_drain_doc(runner_dir: Path, now: float) -> dict[str, Any] | None:
     """The live RUNNER_DRAIN marker of this runner, or None: no marker, an expired one, or one that cannot be read."""
+    return drain_doc_at(runner_dir / RUNNER_DRAIN_FILE, now)
+
+
+def drain_doc_at(path: Path, now: float, owner_uid: int | None = None) -> dict[str, Any] | None:
+    """The live drain marker at path, or None: no marker, an expired one, one that cannot be read, or (owner_uid)
+    one some other user owns."""
     # a job runs as this user in this tree, so the read is bounded: no symlink, no FIFO or device, at most
     # DRAIN_MAX_BYTES, and nothing in it can raise past here; a marker that is not a small regular file holds nothing
     try:
-        fd = os.open(runner_dir / RUNNER_DRAIN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (owner_uid is not None and st.st_uid != owner_uid):
             return None
         data = os.read(fd, DRAIN_MAX_BYTES + 1)
     except OSError:
@@ -3850,6 +3889,71 @@ def host_drain(home: Path, now: float) -> str | None:
             return None
         first = first or str(doc.get("reason") or "a hand drain")[:200]
     return f"host draining: all {len(runners)} runners are draining for {first}" if first else None
+
+
+# MEASURE_DRAIN_SLOT: cmux-ci's lend drain empties a lent mini for an exclusive measurement. Its worker writes this
+# RUNNER_DRAIN marker (by CMUX_CI_DRAIN_BY) in every runner directory but the nightly slot, so nightly, DEV and
+# promote jobs still start there. The slot also admits a stack-blocker PR job (STACK_SLOT), and that one started on
+# the drained mini as on any undrained one: on 2026-11-26 new PR jobs started through the nightly slot on 5 drained
+# minis while their measurements waited (cmuxterm-hq forum 250). While another runner on the mini carries a live
+# cmux-ci drain marker, the slot refuses a stack-tier job at once, as it does past STACK_SLOT_WAIT, and cmux's
+# owned-pool rescue places it again as an ordinary PR job. Nightly-tier jobs are untouched: the slot's own listener
+# carries no marker and keeps listening, and nothing here cancels or delays a nightly, DEV or promote build.
+CMUX_CI_DRAIN_BY = "cmux-ci lend drain"
+
+
+def measurement_drain(home: Path, now: float, fleet_dir: str | None = None) -> str | None:
+    """Why the mini drains for a cmux-ci measurement (MEASURE_DRAIN_SLOT), or None: no runner under home carries a
+    live RUNNER_DRAIN marker written by CMUX_CI_DRAIN_BY and no HOST_RUNNER_PAUSE stands. A directory that cannot be
+    listed drains nothing."""
+    try:
+        runners = sorted(p for p in home.glob("actions-runner-glaeda*")
+                         if HOST_DRAIN_RUNNER_DIR.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
+    except OSError:
+        return None
+    for runner in runners:
+        doc = runner_drain_doc(runner, now)
+        if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY:
+            return f"{runner.name} is draining for {str(doc.get('reason') or 'a cmux-ci measurement')[:200]}"
+    if (doc := host_runner_pause(now, fleet_dir)) is not None:
+        return f"the host's runner pause is draining for {str(doc.get('reason') or 'a cmux-ci measurement')[:200]}"
+    return None
+
+
+# HOST_RUNNER_PAUSE: cmux-ci's worker pauses a mini's PR runners with the RUNNER_DRAIN marker in each runner directory
+# (MEASURE_DRAIN_SLOT), which needs the worker to write in the runner account's home. On the AWS Macs the worker runs
+# as the operator (ec2-user) and the PR runners as the pool account (cmux-pr-runner, home 0700), so the worker found no
+# runner directory and paused nothing: 2026-11-26 aws-m4pro-7 reported runner_pause runners:0 home /Users/ec2-user,
+# and aws-m4pro-4, claim-paused for Aziz's pinned simulator steps, started a new PR job at 09:05Z. The worker writes
+# one host-level marker instead, FLEET_DIR/runner-pause.json (the RUNNER_DRAIN document, by CMUX_CI_DRAIN_BY), in the
+# operator-owned fleet directory the pool account can read but not write. A live one (a regular file owned by
+# FLEET_DIR's owner, no symlink, the same expiry and DRAIN_TTL_S cap) drains every runner but the nightly slot, as if
+# each carried cmux-ci's marker; any other writer or owner holds nothing.
+HOST_RUNNER_PAUSE_FILE = "runner-pause.json"
+
+
+def host_runner_pause(now: float, fleet_dir: str | None = None) -> dict[str, Any] | None:
+    """The live HOST_RUNNER_PAUSE marker, or None."""
+    fleet = Path(fleet_dir or FLEET_DIR)
+    try:
+        owner = os.stat(fleet).st_uid
+    except OSError:
+        return None
+    doc = drain_doc_at(fleet / HOST_RUNNER_PAUSE_FILE, now, owner_uid=owner)
+    return doc if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY else None
+
+
+def host_runner_pause_for(runner_dir: Path, now: float, fleet_dir: str | None = None) -> dict[str, Any] | None:
+    """HOST_RUNNER_PAUSE as it applies to this runner: None on the nightly slot (its hook passes --nightly-runner, or
+    the hook cannot be read: the worker's own per-runner pause leaves such a runner alone too)."""
+    doc = host_runner_pause(now, fleet_dir)
+    if doc is None:
+        return None
+    try:
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None if re.search(r"\s--nightly-runner(?:\s|$)", text) else doc
 
 
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
@@ -4301,10 +4405,28 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     if diff and want.get("diffRustcVersion"):  # the DiffSidecar pin, run the way cmux runs it
         have["diffRustcVersion"] = _probe(["rustup", "run", diff, "rustc", "--version"], env, home, deadline)
         fields.append("diffRustcVersion")
+    # PROBE_EMPTY_WARNS: only a probe that answered with another string is drift. One that printed nothing (exited
+    # non-zero, timed out, or the tool is gone) is a probe that failed: it warns in the note and never refuses (Leo:
+    # "disk floors and probes warn, never refuse"). 2026-11-22: cruft-sweep reclaimed ~/.rustup/toolchains/1.88.0-*
+    # on m6-16 minis, `rustup run 1.88.0 rustc --version` exited 1 ("toolchain ... is not installed") and every
+    # fast-tier job was refused as "diffRustcVersion '' != 'rustc 1.88.0 ...'" (cmuxterm-hq#19552 fault 2), though
+    # cmux's install-rust-ci.sh installs the DiffSidecar toolchain itself.
+    failed = [field for field in fields if not have.get(field)]
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields
-             if have.get(field) != str(want[field])]
-    drifted = out_of_time(f"node not eligible (toolchain drifted from the {fleet_class} class receipt: "
-                          f"{'; '.join(drift)})", any(not have.get(field) for field in fields)) if drift else None
+             if have.get(field) and have[field] != str(want[field])]
+    if failed:
+        why = ""
+        if "diffRustcVersion" in failed:
+            names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home,
+                                                        max(deadline, time.monotonic() + 5)).splitlines()
+                     if line.strip()]
+            if names and not any(name == diff or name.startswith(diff + "-") for name in names):
+                why = f" (rust toolchain {diff} is not installed; cmux's install-rust-ci.sh installs it)"
+        note = "; ".join(x for x in (note, f"warning: toolchain probe failed, not drift: "
+                                           f"{', '.join(f'{field} read nothing (receipt {str(want[field])!r})' for field in failed)}"
+                                           f"{why}") if x)
+    drifted = (f"node not eligible (toolchain drifted from the {fleet_class} class receipt: "
+               f"{'; '.join(drift)})") if drift else None
     # judged before the Xcode probe, which runs on its own budget after the deadline
     if xcode_app:
         # after the receipt probes and on its own budget, so slow Xcode probes never starve them into a '' drift;
@@ -6073,6 +6195,417 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
         return "; ".join(notes)
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"mirror borrow: {type(error).__name__}"
+
+
+# GIT_SHIM: every git fetch of cmux on a mini reads the mini's mirror first. Run 45744507889 (the NEXT nightly,
+# 2026-11-26) failed at checkout: github.com answered the shared App token's git fetches with 429 four times, then
+# 403. glaeda-git-mirror is the one GitHub reader on a mini (a fetch a minute) and is forced to match GitHub, so a
+# commit it holds is the commit GitHub has. At job-started of a cmux job, the hook puts a `git` shim first on the
+# job's PATH ($GITHUB_PATH), so every actions/checkout and every `git fetch` in every step goes through it with no
+# workflow change. A fetch of https://github.com/manaflow-ai/cmux whose refspecs are all object ids the mirror holds
+# is served from the mirror (url.<mirror>.insteadOf for that one command). Anything else (a pull request's merge
+# commit, a branch or tag pattern, --all, --tags, a shallow-history change) goes to github.com as before, with bounded
+# backoff on a refusal (429, 403, 5xx) during which the mirror is asked again. A fetch of a run's own commit
+# ($GITHUB_SHA) on a branch the mirror keeps waits up to GIT_SHIM_WAIT_S for the mirror's next pass before asking
+# github.com; any other id (a lane-gh ci merge snapshot, minutes old) goes to github.com at once, since no pass of
+# the mirror's branches brings it. Every github.com attempt is bounded: git's low-speed limit ends one that moves
+# no bytes, not even keepalives, for GIT_SHIM_STALL_S; a watchdog stops a shallow fetch of ids (actions/checkout's,
+# small) past GIT_SHIM_ATTEMPT_S; and no retry starts past GIT_SHIM_BUDGET_S, so actions/checkout's own retry and
+# its step timeout still have room (cmux jobs 139823571654
+# and 139837960264, 2026-11-26: one unbounded github.com fetch, its stderr held until exit, ran silent into the
+# checkout step's 10 min timeout after the 90 s mirror wait). Each github.com fetch or
+# ls-remote of cmux is a line in $RUNNER_TEMP/glaeda-git-fetches.log; job-completed prints the count. Opt-in by
+# repository: only manaflow-ai/cmux jobs get the shim. Kill switch: GLAEDA_GIT_SHIM=0 in the runner's environment
+# (no shim) or in a step's env (that step's git is the real one).
+# A mini reaches github.com through the loopback CONNECT proxy mini-rollout.sh sets (http.https://github.com/.proxy,
+# 127.0.0.1:18434: an ssh -R tunnel to a fleet VM's github-egress-proxy). When that tunnel's path is congested or
+# half-dead the proxy accepts and never answers, and curl waits its whole 300 s connect timeout per fetch (release
+# runs 45811016977 and 45805086277, 2026-11-26: "Proxy CONNECT aborted due to timeout" twice, then "Recv failure:
+# Connection reset by peer", while github.com answered the same mini directly in 0.5 s). So before each github.com
+# attempt the shim sends one CONNECT through the configured proxy, bounded at GIT_SHIM_PROXY_PROBE_S; when it gets no
+# answer, or an attempt fails with a proxy-shaped error, that attempt and the rest go direct (an empty
+# http.<url>.proxy for this command: actions/checkout's fetch carries the job's token, so it is no anonymous fetch),
+# and so do the job's later github.com git calls (a mark beside GIT_SHIM_LOG).
+GIT_SHIM_REPO = "manaflow-ai/cmux"
+GIT_SHIM_DIR = "glaeda-git-shim"
+GIT_SHIM_LOG = "glaeda-git-fetches.log"
+GIT_SHIM_WAIT_S = 90
+GIT_SHIM_TRIES = 3
+# git's http.lowSpeedTime at http.lowSpeedLimit 1 B/s: a stream with no bytes for this long ends. Not 1000: GitHub
+# sends only keepalives while it builds a pack (cmuxterm-hq handbook network-transfer-stalls-the-whole-job).
+GIT_SHIM_STALL_S = 60
+GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
+GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
+GIT_SHIM_PROXY_PROBE_S = 10  # one CONNECT to github.com through the configured proxy; no answer in this long: go direct
+GIT_SHIM_COMMAND = r'''
+orig=("$@")
+globals=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -C|-c|--git-dir|--work-tree|--namespace|--config-env) [ $# -ge 2 ] || break; globals+=("$1" "$2"); shift 2 ;;
+    -*) globals+=("$1"); shift ;;
+    *) break ;;
+  esac
+done
+sub=$1
+'''
+GIT_SHIM_BODY = r'''
+say() { echo "glaeda git shim: $*" >&2; }
+[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
+normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
+sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
+  for d in "$submodules"/*.git; do
+    [ -f "$d/HEAD" ] || continue
+    u=$("$real" --git-dir="$d" config --get glaeda.url 2>/dev/null) || continue
+    [ "$(normurl "$u")" = "$1" ] && { printf '%s' "$d"; return 0; }
+  done
+  return 1
+}
+# Any other command can fetch a missing blob in a partial clone (checkout, submodule foreach, cat-file): once
+# this job's proxy failed, it goes direct too, as fetches do (cmuxterm-hq run 45860743368: the HQ shim's twin gap).
+case $sub in fetch|ls-remote|submodule) ;; *)
+  [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
+  exec "$real" "${orig[@]}" ;; esac
+shift
+args=("$@")
+kind=cmux
+if [ "$sub" = submodule ]; then
+  # `git submodule update` (actions/checkout's submodules: true, scripts/ci/init-submodule.sh): every submodule
+  # whose pin the mirror pass holds is cloned from file://<its mirror> (-c reaches git's own submodule clone and
+  # fetch, which never run this shim); a pin it lacks goes to github.com and is counted.
+  case " $* " in *" update "*) ;; *) exec "$real" "${orig[@]}" ;; esac
+  top=$("$real" "${globals[@]}" rev-parse --show-toplevel 2>/dev/null) || exec "$real" "${orig[@]}"
+  gd=$("$real" "${globals[@]}" rev-parse --absolute-git-dir 2>/dev/null) || exec "$real" "${orig[@]}"
+  targets=(); dd=; skip=; seen=
+  for a in "$@"; do
+    if [ -n "$skip" ]; then skip=; continue; fi
+    if [ -z "$seen" ]; then [ "$a" = update ] && seen=1; continue; fi
+    if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then targets+=("${a%/}"); continue; fi
+    case $a in --) dd=1 ;; --reference|--depth|--jobs|-j|--filter) skip=1 ;; esac
+  done
+  rules=(); served=(); misses=()
+  while read -r key path; do
+    [ -n "$path" ] || continue
+    name=${key#submodule.}; name=${name%.path}
+    if [ ${#targets[@]} -gt 0 ]; then
+      want=; for t in "${targets[@]}"; do [ "$t" = "$path" ] && want=1; done
+      [ -n "$want" ] || continue
+    fi
+    pin=$("$real" -C "$top" ls-tree HEAD -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3 }')
+    [ -n "$pin" ] || continue
+    "$real" --git-dir="$gd/modules/$name" cat-file -e "$pin^{commit}" 2>/dev/null && continue  # here already
+    url=$("$real" -C "$top" config -f .gitmodules --get "submodule.$name.url" 2>/dev/null)
+    case $url in https://github.com/*) ;; *) continue ;; esac
+    d=$(sm_for "$(normurl "$url")")
+    if [ -n "$d" ] && "$real" --git-dir="$d" cat-file -e "$pin^{commit}" 2>/dev/null; then
+      for u in "$url" "$("$real" "${globals[@]}" config --get "submodule.$name.url" 2>/dev/null)"; do
+        [ -n "$u" ] && rules+=(-c "url.file://$d.insteadOf=$u")
+      done
+      served+=("$name")
+    else
+      misses+=("$name")
+    fi
+  done < <("$real" -C "$top" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+  [ ${#served[@]} -gt 0 ] || [ ${#misses[@]} -gt 0 ] || exec "$real" "${orig[@]}"
+  log_line() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git submodule $2" >> "$log" 2>/dev/null; }
+  count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
+  if [ ${#served[@]} -gt 0 ]; then
+    if "$real" "${globals[@]}" -c protocol.file.allow=always "${rules[@]}" "${orig[@]:${#globals[@]}}"; then
+      for n in "${served[@]}"; do log_line mirror "$n"; done
+      for n in ${misses[@]+"${misses[@]}"}; do log_line github "$n"; done
+      say "submodules ${served[*]} from the mirror${misses[*]:+, ${misses[*]} from github.com}; github.com git fetches this job: $(count)"
+      exit 0
+    fi
+    say "the mirror submodule update failed; asking github.com"
+    misses=("${served[@]}" ${misses[@]+"${misses[@]}"})
+  fi
+  kind=submodule; remote=submodule; refspecs=("${misses[@]}")
+fi
+[ "$kind" = submodule ] || { remote=; have_remote=; dd=; plain=1; refspecs=(); }
+shallow=
+n=$#
+i=0
+[ "$kind" = submodule ] && n=0
+while [ $i -lt $n ]; do
+  a=${args[$i]}
+  if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then
+    if [ -z "$have_remote" ]; then remote=$a; have_remote=1; else refspecs+=("$a"); fi
+  else
+    case $a in
+      --) dd=1 ;;
+      --all|--multiple|--stdin|--tags|-t|--unshallow|--refetch|--update-shallow|--negotiate-only|--dry-run) plain= ;;
+      --deepen|--shallow-since|--shallow-exclude) plain=; i=$((i + 1)) ;;
+      --deepen=*|--shallow-since=*|--shallow-exclude=*) plain= ;;
+      --depth=*) shallow=1 ;;
+      --depth) shallow=1; i=$((i + 1)) ;;
+      --negotiation-tip|--server-option|-o|--upload-pack|--recurse-submodules-default|--refmap|--filter|-j|--jobs|--submodule-prefix) i=$((i + 1)) ;;
+    esac
+  fi
+  i=$((i + 1))
+done
+if [ "$kind" != submodule ]; then
+  [ -n "$have_remote" ] || remote=origin
+  case $remote in
+    */*|*:*) url=$remote ;;
+    *) url=$("$real" "${globals[@]}" config --get "remote.$remote.url" 2>/dev/null) ;;
+  esac
+  norm=$(normurl "$url")
+  if [ "$norm" != "https://github.com/manaflow-ai/cmux" ]; then
+    # a fetch inside a submodule (a retry, or a pin the clone did not bring) reads that submodule's mirror
+    case $norm in https://github.com/*) ;; *) exec "$real" "${orig[@]}" ;; esac
+    mirror=$(sm_for "$norm") || exec "$real" "${orig[@]}"
+    kind=pins
+  fi
+fi
+note() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git $sub ${remote} ${refspecs[*]}" >> "$log" 2>/dev/null; }
+count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
+mirror_ok() {
+  if [ "$kind" = pins ]; then [ -f "$mirror/HEAD" ]; return; fi
+  [ -f "$mirror/glaeda-verified" ] && [ ! -e "$mirror/glaeda-repair-pending" ] && [ ! -e "$mirror/shallow" ]
+}
+ids_only=
+if [ "$kind" != submodule ] && [ "$sub" = fetch ] && [ -n "$plain" ] && [ ${#refspecs[@]} -gt 0 ]; then
+  ids_only=1
+  for r in "${refspecs[@]}"; do
+    printf '%s\n' "$r" | grep -Eq '^\+?([0-9a-f]{40}|[0-9a-f]{64})(:refs/[^:*]+)?$' || { ids_only=; break; }
+  done
+fi
+run_sha_only() {  # every refspec is the run's own commit, the one the mirror's next pass of a kept branch brings
+  [ -n "${GITHUB_SHA:-}" ] || return 1
+  for r in "${refspecs[@]}"; do
+    id=${r#+}; id=${id%%:*}
+    [ "$id" = "$GITHUB_SHA" ] || return 1
+  done
+}
+has_all() {
+  mirror_ok || return 1
+  for r in "${refspecs[@]}"; do
+    id=${r#+}; id=${id%%:*}
+    "$real" --git-dir="$mirror" cat-file -e "$id" 2>/dev/null || return 1
+  done
+}
+from_mirror() {
+  if "$real" "${globals[@]}" -c protocol.file.allow=always -c "url.file://$mirror.insteadOf=$url" fetch "${args[@]}"; then
+    note mirror
+    say "served from the mirror ($mirror); github.com git fetches this job: $(count)"
+    exit 0
+  fi
+  say "the mirror fetch failed; asking github.com"
+}
+if [ -n "$ids_only" ]; then
+  if has_all; then from_mirror; fi
+  case "$kind:${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+    pins:*|*:pull_request*|*:merge_group*) ;;
+    *:refs/heads/main|*:refs/heads/feat-cmux-next|*:refs/heads/nightly-next)
+      if run_sha_only && mirror_ok; then
+        until=$((SECONDS + ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s}))
+        say "waiting up to ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s} s for the mirror's next pass to bring ${refspecs[*]}"
+        while [ "$SECONDS" -lt "$until" ]; do
+          sleep "${GLAEDA_GIT_SHIM_POLL_S:-5}"
+          if has_all; then from_mirror; break; fi
+        done
+      fi ;;
+  esac
+fi
+tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
+budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
+stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
+probe_s=${GLAEDA_GIT_SHIM_PROXY_PROBE_S:-$proxy_probe_s}
+# the proxy git would use for github.com: http.<url>.proxy or http.proxy (urlmatch), else curl's environment
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy https://github.com/ 2>/dev/null)
+[ -n "$proxy" ] || proxy=${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}
+route=()
+go_direct() {  # $1: why. This attempt, the rest and the job's later git calls skip the proxy (an empty proxy also
+  # overrides curl's env); the mark in RUNNER_TEMP spares actions/checkout's own retry another probe of a dead path
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$log.direct" 2>/dev/null
+  say "the github.com proxy $proxy $1; going direct to github.com"
+}
+if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
+fi
+probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works
+  [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -o /dev/null --head -m "$probe_s" -x "$proxy" https://github.com/ 2>/dev/null && return 0
+  go_direct "did not answer a CONNECT in $probe_s s"
+}
+bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
+  # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
+  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" ${route[@]+"${route[@]}"} "${orig[@]}" <&0 2>"$errf" &
+  gp=$!
+  stopped=
+  end=$((SECONDS + $1))
+  while kill -0 "$gp" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$end" ]; then
+      stopped=1
+      kids=$(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$gp" '$2 == p { print $1 }')
+      kill -TERM $kids "$gp" 2>/dev/null
+      end=$((SECONDS + 5))
+      while kill -0 "$gp" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
+      kill -KILL $kids "$gp" 2>/dev/null
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$gp" 2>/dev/null
+  rc=$?
+}
+try=1
+while :; do
+  # A shallow fetch of commit ids (actions/checkout's) is small, so a slow one is a stuck one: the watchdog
+  # stops it within the budget. Anything else (a full history, a pattern, a submodule clone) may be large and
+  # slow while healthy, so only the low-speed limit ends it.
+  if [ -n "$ids_only" ] && [ -n "$shallow" ]; then
+    bound=$((budget - SECONDS))
+    [ "$bound" -gt "${GLAEDA_GIT_SHIM_ATTEMPT_S:-$attempt_s}" ] && bound=${GLAEDA_GIT_SHIM_ATTEMPT_S:-$attempt_s}
+    [ "$bound" -ge 1 ] || bound=1
+    limit="at most $bound s; "
+  else
+    bound=86400; limit=
+  fi
+  probe_proxy
+  note github
+  errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
+  say "asking github.com (try $try of $tries; ${limit}no bytes for $stall s ends it)"
+  bounded_git "$bound"
+  cat "$errf" >&2
+  if [ $rc -eq 0 ]; then
+    rm -f "$errf"
+    say "github.com git fetches this job: $(count)"
+    exit 0
+  fi
+  refused=
+  grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect|too slow|timed out' "$errf" && refused=1
+  # curl's words for a proxy or tunnel that failed (case-sensitive: "unexpected disconnect" is GitHub's, not these)
+  if [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] &&
+     grep -Eq '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf"; then
+    go_direct "failed this attempt ($(grep -E '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf" | head -1 | sed -E "s/^.*'[^']*': //; s/^[a-z]+: //"))"
+    refused=1
+  fi
+  rm -f "$errf"
+  if [ -n "$stopped" ]; then
+    say "github.com did not finish within $bound s; stopped it (exit $rc)"
+    refused=1
+  fi
+  if [ -z "$refused" ] || [ "$try" -ge "$tries" ]; then
+    say "github.com git fetches this job: $(count); this one failed (exit $rc)"
+    exit $rc
+  fi
+  delay=$((${GLAEDA_GIT_SHIM_BACKOFF_S:-15} * try * try))
+  if [ $((SECONDS + delay + 30)) -gt "$budget" ]; then
+    say "github.com git fetches this job: $(count); this one failed (exit $rc); no try left in the shim's $budget s budget (GLAEDA_GIT_SHIM_BUDGET_S) after $SECONDS s, so the caller's own retry gets the time"
+    exit $rc
+  fi
+  say "github.com refused (exit $rc); again in $delay s (try $try of $tries), asking the mirror meanwhile"
+  until=$((SECONDS + delay))
+  while [ "$SECONDS" -lt "$until" ]; do
+    sleep "${GLAEDA_GIT_SHIM_POLL_S:-5}"
+    if [ -n "$ids_only" ] && has_all; then from_mirror; break; fi
+  done
+  try=$((try + 1))
+done
+'''
+
+
+def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
+    """The shim's text: the values the hook resolved, then GIT_SHIM_BODY. /bin/bash, so 3.2 on a mini."""
+    head = (f"#!/bin/bash\n# glaeda-cmux-runner-hook GIT_SHIM: written at job-started; see the hook.\n"
+            f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
+            f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
+            f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n")
+    return head + GIT_SHIM_BODY
+
+
+# The HQ checkout can also fetch blobs during checkout after a filtered fetch. Test the
+# fleet tunnel for each of those commands. A CONNECT response (including a denial) is
+# authoritative. Only a transport failure before a response selects direct HTTPS.
+# Any other git command checkout runs can fetch a missing blob too: its "Removing auth" step's
+# `git submodule foreach --recursive` reads .gitmodules, outside the sparse set of a blob:none
+# clone, through the dead tunnel ("Failed to connect to 127.0.0.1 port 18434", "could not fetch
+# 84f6a850... from promisor remote": cmuxterm-hq run 45860743368, 2026-11-26, after its
+# fetch and checkout had both gone direct). So a dead probe leaves a mark in RUNNER_TEMP, and every
+# later HQ command in the step goes direct too, with no second probe.
+HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
+HQ_GIT_SHIM_BODY = r'''
+[ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
+passthrough() { exec "$real" "${orig[@]}"; }
+mark=${RUNNER_TEMP:+$RUNNER_TEMP/$dead}
+case "$sub" in fetch|checkout) ;; *) [ -n "$mark" ] && [ -e "$mark" ] || passthrough ;; esac
+url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
+case "$url" in
+  https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
+  *) passthrough ;;
+esac
+"$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
+[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
+connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
+          --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
+case "$?:$connect" in
+  7:000|28:000|52:000|55:000|56:000)
+    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
+    [ -z "$mark" ] || : > "$mark" 2>/dev/null || :
+    exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
+esac
+passthrough
+'''
+
+
+def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None) -> str:
+    """Install the repository's job-local git wrapper and return a diagnostic note. Never raises."""
+    env = os.environ if environ is None else environ
+    try:
+        repository = (repo or "").lower()
+        if repository not in (GIT_SHIM_REPO, HQ_DISPATCH_REPO) or env.get("GLAEDA_GIT_SHIM") == "0":
+            return ""
+        temp, path_file = env.get("RUNNER_TEMP"), env.get("GITHUB_PATH")
+        if not temp or not path_file:
+            return ""
+        if repository == GIT_SHIM_REPO and mirror_identity(mirror) is None:
+            return f"git shim: off, the mirror at {mirror} is not verified or has a repair pending"
+        shim_dir = Path(temp) / (GIT_SHIM_DIR if repository == GIT_SHIM_REPO else "glaeda-hq-git-shim")
+        search = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p) != shim_dir)
+        real = shutil.which("git", path=search)
+        if not real:
+            return "git shim: off, no git on PATH"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        real = os.path.realpath(real)
+        if repository == HQ_DISPATCH_REPO:
+            script = f"#!/bin/bash\nreal={shlex.quote(real)}\ndead={HQ_GIT_SHIM_DEAD}\n" + HQ_GIT_SHIM_BODY
+            note = "git shim: HQ checkout checks the fleet Git proxy"
+        else:
+            log = Path(temp) / GIT_SHIM_LOG
+            script = git_shim_script(real, mirror, log)
+            note = f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
+        tmp = shim_dir / f".git.{os.getpid()}"
+        tmp.write_text(script, encoding="utf-8")
+        tmp.chmod(0o755)
+        os.replace(tmp, shim_dir / "git")
+        with open(path_file, "a", encoding="utf-8") as fh:
+            fh.write(f"{shim_dir}\n")
+        return note
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"git shim: {type(error).__name__}"
+
+
+def git_fetch_summary(environ: Mapping[str, str] | None = None) -> str:
+    """job-completed: how many cmux git fetches this job sent to github.com and how many the mirror served, or ""."""
+    env = os.environ if environ is None else environ
+    temp = env.get("RUNNER_TEMP")
+    if not temp or not (Path(temp) / GIT_SHIM_DIR / "git").exists():
+        return ""
+    try:
+        lines = (Path(temp) / GIT_SHIM_LOG).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    github = sum(1 for line in lines if line.startswith("github "))
+    mirror = sum(1 for line in lines if line.startswith("mirror "))
+    return f"github.com git fetches: {github} (the mirror served {mirror})"
 
 
 def workspace_damage(ws: Path) -> str:
@@ -8419,6 +8952,195 @@ LISTEN_CLAIM_HANDOFF_S = 30.0
 # next job about 2 s after the last ended, before the gate's next look (24% of 10-27's admission wait, 39% after the
 # side fit in #1715: a fast tier cancelled at 05:38:29Z, the next one taken at 05:38:31Z waited 23 minutes).
 JOB_ENDING = ".job-ending"
+
+# DRAIN_FREEZE_AT_END (2026-11-25): under RUNNER_DRAIN, job-completed itself freezes (SIGSTOP) the listener, while the
+# job's Runner.Worker still runs, so the listener cannot take the next job in the moment its Worker exits. The gate's
+# JOB_END_FREEZE wakes at that exit and freezes the listener then, which is a race with the listener's own reaction to
+# the same exit: glaeda#2809 moved the freeze ahead of the gate's /bin/ps look, but on a lent mini at load 100+ the
+# gate process can still be scheduled after the listener (a lent mini, 2026-11-25 19:59-20:03Z: runners took new
+# PR jobs 1-3 s after the last one ended under cmux-ci's RUNNER_DRAIN marker; 36 holds in 24 h started 0 steps).
+# job-completed runs inside the job, before the Worker's exit, so its freeze comes first by construction. Only the
+# Worker's own parent is frozen, and only when its command is this runner's Runner.Listener. The hook leaves
+# JOB_END_FROZEN (the listener, the Worker and its request) for the gate, which takes the frozen listener over once the
+# Worker has exited (Gate.adopt_job_end_freeze: the same state its own JOB_END_FREEZE leaves, so it stops the listener
+# or thaws it on that poll). A detached backstop (JOB_END_THAW) thaws a listener no gate took over within
+# JOB_END_THAW_ADOPT_S of the Worker's exit, and any listener still frozen JOB_END_THAW_WAIT_S after the hook, so the
+# listener never stays frozen past the job lock's renewal (a frozen listener renews nothing).
+JOB_END_FROZEN = ".job-end-frozen"
+JOB_END_THAW_WAIT_S = 240.0
+JOB_END_THAW_ADOPT_S = 30.0
+JOB_END_FROZEN_MAX_BYTES = 4096
+# The backstop, run detached with RUNNER_TRACKING_ID dropped (the runner's orphan cleanup must not end it): argv is
+# marker, listener pid, Worker pid, the wait for the Worker, the wait for the gate. It thaws only a listener the marker
+# still names, so it never signals a listener the gate took over (the gate removes the marker as it does).
+JOB_END_THAW = r"""
+import json, os, select, signal, subprocess, sys, time
+marker, listener, worker = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+wait_s, adopt_s = float(sys.argv[4]), float(sys.argv[5])
+def ours():
+    try:
+        with open(marker) as file:
+            return json.loads(file.read(4096)).get("listener") == listener
+    except Exception:
+        return False
+def ended():
+    try:
+        os.kill(worker, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except Exception:
+        return False
+    return stat == "" or stat.startswith("Z")
+deadline = time.monotonic() + wait_s
+kq = None
+try:
+    kq = select.kqueue()
+    kq.control([select.kevent(worker, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)], 0, 0)
+except Exception:
+    kq = None
+while ours() and not ended() and time.monotonic() < deadline:
+    if kq is not None:
+        try:
+            kq.control(None, 1, min(5.0, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            time.sleep(2)
+    else:
+        time.sleep(2)
+deadline = time.monotonic() + adopt_s
+while ours() and time.monotonic() < deadline:
+    time.sleep(0.5)
+if ours():
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    try:
+        os.kill(listener, signal.SIGCONT)
+    except OSError:
+        pass
+"""
+
+
+def job_end_frozen_doc(marker: Path) -> dict[str, Any] | None:
+    """JOB_END_FROZEN's record ({listener, worker, request, at}), or None: none, unreadable, or not that shape. A
+    job runs as this user, so the read is bounded the way runner_drain_doc's is. Never raises."""
+    try:
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, JOB_END_FROZEN_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data) if len(data) <= JOB_END_FROZEN_MAX_BYTES else None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    listener, worker = doc.get("listener"), doc.get("worker")
+    if not (type(listener) is int and type(worker) is int and listener > 1 and worker > 1):
+        return None
+    return doc
+
+
+def runner_listener_of(runner_dir: Path, worker: int) -> int | None:
+    """The Runner.Listener of runner_dir that is the Worker's parent, or None. Two /bin/ps reads, never the job's
+    PATH; a failed read is None (nothing is frozen)."""
+    try:
+        ppid = int(subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=5, check=False).stdout.strip())
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(ppid)], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return ppid if ppid > 1 and runner_worker(runner_dir, command, "Listener") else None
+
+
+def freeze_listener_at_job_end(hook_dir: Path, worker: int | None, now: float | None = None) -> str | None:
+    """job-completed, last (DRAIN_FREEZE_AT_END): when this runner carries a live RUNNER_DRAIN, freeze its listener
+    before the Worker exits, record it for the gate (JOB_END_FROZEN) and start the backstop thaw. A note, or None
+    when nothing was frozen. Never raises: a freeze that cannot be made leaves the gate's own JOB_END_FREEZE."""
+    try:
+        runner_dir = hook_dir.parent
+        if worker is None or runner_drain(runner_dir, time.time() if now is None else now) is None:
+            return None
+        listener = runner_listener_of(runner_dir, worker)
+        if listener is None:
+            return None
+        request = None
+        with contextlib.suppress(OSError, ValueError):
+            request = listener_request(runner_dir)
+        marker = hook_dir / JOB_END_FROZEN
+        tmp = hook_dir / f"{JOB_END_FROZEN}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"listener": listener, "worker": worker, "request": request,
+                                   "at": round(time.time(), 3)}, separators=(",", ":")))
+        os.replace(tmp, marker)  # the record first: a gate never meets a frozen listener it has no record of
+        try:
+            os.kill(listener, signal.SIGSTOP)
+        except OSError as error:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            return f"could not freeze the listener (pid {listener}) at the job's end: {type(error).__name__}"
+        backstop = job_end_thaw_detached(marker, listener, worker)
+        return (f"froze the listener (pid {listener}) before its Worker exits: the runner is draining, so it takes "
+                f"no next job; the listener gate stops it ({backstop})")
+    except Exception as error:  # noqa: BLE001  (never fail the job on the drain's freeze)
+        return f"no freeze at the job's end: {type(error).__name__}"
+
+
+def job_end_thaw_detached(marker: Path, listener: int, worker: int) -> str:
+    """Start JOB_END_THAW detached (out of the runner's session, RUNNER_TRACKING_ID dropped, every inherited fd
+    closed), as disk_pressure_detached starts its pass. On a failed start, thaws the listener at once and removes the
+    marker: a frozen listener with no backstop would rely on the gate alone. Returns a note."""
+    env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+    argv = [sys.executable, "-c", JOB_END_THAW, os.fspath(marker), str(listener), str(worker),
+            f"{JOB_END_THAW_WAIT_S:g}", f"{JOB_END_THAW_ADOPT_S:g}"]
+    try:
+        child = os.fork()
+    except OSError:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        with contextlib.suppress(OSError):
+            os.kill(listener, signal.SIGCONT)
+        return "no backstop could start, so the listener was thawed at once"
+    if child == 0:
+        try:
+            os.setsid()
+            with contextlib.suppress(OSError):
+                os.chdir("/")
+            # the middle process exits only once the backstop has exec'd (the close-on-exec end reads EOF), so no
+            # process with this job's RUNNER_TRACKING_ID is left for the runner's orphan cleanup
+            execd, execing = os.pipe()  # both close-on-exec
+            if os.fork():
+                os.close(execing)
+                with contextlib.suppress(OSError):
+                    select.select([execd], [], [], 10)
+                os._exit(0)
+            os.close(execd)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            limit = os.sysconf("SC_OPEN_MAX")
+            limit = limit if limit > 0 else 65536
+            os.closerange(3, execing)
+            os.closerange(execing + 1, limit)
+            os.execve(sys.executable, argv, env)
+        finally:
+            os._exit(0)
+    with contextlib.suppress(OSError):
+        os.waitpid(child, 0)
+    return f"a backstop thaws it if no gate does within {JOB_END_THAW_ADOPT_S:g} s of the Worker's exit"
 
 
 def claims_room(scope: RunnerScope) -> bool:
@@ -11433,7 +12155,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def host_claim(self) -> str | None:
@@ -11462,6 +12184,21 @@ class Gate:
             return exclusive_claim(self.capacity_dir)
         except Exception:  # noqa: BLE001
             return None
+
+    def signer_yield(self) -> str | None:
+        """SIGNER_SIBLING_YIELD: why an idle trusted signing listener takes no job now, or None. While a signing job
+        (the exclusive class) holds this Mac or waits for it to drain, a job handed to this Mac's other signing
+        listener waits in job-started for the whole signing; held off, GitHub hands it to the other signing Mac's
+        idle listener instead. cmux nightly-next, 2026-11-25: keep-published-dsyms waited 37.8 min in "Set up runner"
+        behind nightly-next-one on the same Mac while the other signer sat idle from the start (run 45567575338),
+        sign-live-code-variant 16.7 min (run 45562645699). A ledger that cannot be read holds nothing."""
+        if self.capacity_dir is None or not runner_scope(self.runner_dir).trusted_signing:
+            return None
+        try:
+            why = exclusive_claim(self.capacity_dir)
+        except Exception:  # noqa: BLE001
+            return None
+        return f"{why}; the next signing job goes to the other signing Mac" if why else None
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -12034,7 +12771,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
@@ -13038,10 +13775,40 @@ class Gate:
         """One poll. Returns an exit code when the gate itself should exit. A listener frozen at its Worker's exit
         (JOB_END_FREEZE) is thawed when the poll returns, whatever it decided, a failed poll too."""
         try:
+            self.adopt_job_end_freeze()
             return self.poll()
         finally:
             self.thaw()
             self.publish()
+
+    def adopt_job_end_freeze(self) -> None:
+        """DRAIN_FREEZE_AT_END: take over the listener job-completed froze (JOB_END_FROZEN) once its Worker has
+        exited, as if nap() had frozen it at that exit (JOB_END_FREEZE): poll() then stops it if the runner still
+        drains, and step() thaws it either way. While the Worker still runs, the listener stays frozen and the record
+        stays. A record naming no listener of this gate's own tree and process group is left to its backstop. Never
+        raises."""
+        marker = self.runner_dir / "glaeda-hooks" / JOB_END_FROZEN
+        doc = job_end_frozen_doc(marker)
+        if doc is None:
+            return
+        listener, worker = doc["listener"], doc["worker"]
+        try:
+            if pid_alive(worker) and not self._zombie(worker):
+                return
+            if os.getpgid(listener) != os.getpgrp() or listener not in self.listener_list():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        self.frozen = self.frozen if listener in self.frozen else (*self.frozen, listener)
+        self.done = self.done if worker in self.done else (*self.done, worker)
+        self.listener_pids = self.listener_pids if listener in self.listener_pids else (*self.listener_pids, listener)
+        self.freeze_at_exit = True
+        request = doc.get("request")
+        if self.job_request is None and isinstance(request, str):
+            self.job_request = request
+        gate_log(f"the job's end froze the listener (pid {listener}) before its Worker exited: looking now")
 
     def live_line(self) -> str | None:
         """The gate line for what the gate does right now (gate_state_file), or None when it is between states (no
@@ -13279,9 +14046,16 @@ class Gate:
                     break
                 time.sleep(GATE_WATCH_S)
         if exited:
+            # Freeze first, then look (2026-11-25). The look below runs /bin/ps for each Worker still a zombie, which
+            # is every one its listener has not reaped yet; on a lent mini at load 100+ that spawn took longer than
+            # the listener's own reaction to the same exit, so the listener went Online and its poll took the next
+            # job before the freeze (cmuxs-mac-mini-6, 19:59-20:03Z: runners 1, 7, 10 and 13 each took a new PR
+            # job 1-3 s after the last one ended while every runner carried cmux-ci's RUNNER_DRAIN marker for an
+            # urgent simulator hold; no drain finished, so 36 holds in 24 h started 0 steps). Frozen, the listener
+            # cannot reap its Worker either, so the look still finds the zombie.
+            self.freeze()
             # the exited ones, so the next poll neither counts their zombies as a job nor waits on them again
             self.done = tuple(pid for pid in self.watching if not pid_alive(pid) or self._zombie(pid)) or self.watching
-            self.freeze()
 
     @staticmethod
     def _zombie(pid: int) -> bool:
@@ -13811,15 +14585,23 @@ def core_busy(before: list[tuple[int, ...]], after: list[tuple[int, ...]]) -> li
 
 
 def efficiency_cores() -> int | None:
-    """How many efficiency cores the mini has (hw.perflevel1.logicalcpu; on Apple silicon they are the
-    lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM) or when unreadable."""
+    """How many efficiency cores the mini has (the lowest perf level's logicalcpu when its name is Efficiency; on
+    Apple silicon they are the lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM),
+    with no efficiency level, or when unreadable. The M5 Pro has two levels and no efficiency cores (5 super, 10
+    performance: hw.perflevel1 is its performance cores), so a bare hw.perflevel1 read would call its performance
+    cores efficiency cores and the P-core stall check could hold and drain-reboot a healthy mini."""
     try:
-        out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels", "hw.perflevel1.logicalcpu"],
-                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split()
-        levels, ecores = int(out[0]), int(out[1])
+        levels = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=5).stdout.strip())
+        if levels < 2:
+            return None
+        low = f"hw.perflevel{levels - 1}"
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", f"{low}.name", f"{low}.logicalcpu"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split("\n")
+        name, ecores = out[0].strip(), int(out[1])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
-    return ecores if levels >= 2 and ecores > 0 else None
+    return ecores if name == "Efficiency" and ecores > 0 else None
 
 
 def boot_epoch() -> int | None:
@@ -15143,11 +15925,17 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return os.path.abspath(explicit) if os.path.isfile(explicit) else None
-    found = shutil.which("glaeda-disk")
-    if found:
-        return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
-    fallback = Path.home() / ".local/bin/glaeda-disk"
-    return os.fspath(fallback) if fallback.is_file() else None
+    # cmux-disk, glaeda-disk's primary name, first: glaeda-disk counts uses of its old name (cmuxterm-hq
+    # docs/design/glaeda-into-cmux.md, Rename map); a host that has only the old name still runs it
+    for name in ("cmux-disk", "glaeda-disk"):
+        found = shutil.which(name)
+        if found:
+            return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
+    for name in ("cmux-disk", "glaeda-disk"):
+        fallback = Path.home() / ".local/bin" / name
+        if fallback.is_file():
+            return os.fspath(fallback)
+    return None
 
 
 def hooks_floor_gib() -> float:
@@ -15890,6 +16678,10 @@ def main(argv: list[str] | None = None) -> int:
                                  os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
                 os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REPOSITORY"), event)
             why = nightly_slot_refusal(slot_tier)
+            if not why and slot_tier == TIER_STACK and (drain := measurement_drain(Path.home(), time.time())):
+                # MEASURE_DRAIN_SLOT: a stack-blocker PR job is the slot's only PR work; a drained mini takes none
+                why = (f"the mini drains for a measurement ({drain}): the nightly slot takes no stack-blocker PR job "
+                       "until it ends, and cmux's owned-pool rescue places this one again")
             if why:
                 return refused(why)
         if args.dev_compile_runner:
@@ -16274,6 +17066,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
             print(f"{PREFIX}: {guarded}", flush=True)
+        if shim := install_git_shim(repo):
+            print(f"{PREFIX}: {shim}", flush=True)
         unsparsed = ""
         with contextlib.suppress(Exception):  # must not fail an admitted job
             unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))
@@ -16329,6 +17123,8 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # JOB_SCRATCH: its processes are ended; drop its volume
             for note in job_scratch_end():
                 print(f"{PREFIX}: {note}", flush=True)
+        if fetches := git_fetch_summary():
+            print(f"{PREFIX}: {fetches}", flush=True)
         if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
             print(f"{PREFIX}: {borrowed}", flush=True)
         worker = args.watch_pid or current_worker
@@ -16348,6 +17144,10 @@ def main(argv: list[str] | None = None) -> int:
         note = install_staged_hook(Path(__file__).resolve().parent)
         if note:
             print(f"{PREFIX}: {note}", flush=True)
+        hook_dir = Path(__file__).resolve().parent
+        if hook_dir.name == "glaeda-hooks" and args.capture_lease is None:  # DRAIN_FREEZE_AT_END, a runner's install
+            if note := freeze_listener_at_job_end(hook_dir, args.watch_pid or runner_worker_pid()):
+                print(f"{PREFIX}: {note}", flush=True)
     return 0
 
 
