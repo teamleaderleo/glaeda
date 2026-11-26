@@ -86,7 +86,7 @@ What `--apply` does:
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
    - For an HQ checkout, the admitted job gets a job-local Git wrapper through `GITHUB_PATH`.
-     Before a fetch or checkout from the HQ HTTPS origin configured for the fleet loopback proxy,
+     During `actions/checkout`, before a fetch or checkout from the HQ HTTPS origin configured for the fleet loopback proxy,
      it tests the tunnel with a CONNECT bounded at five seconds. A transport failure before any
      CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
      An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic

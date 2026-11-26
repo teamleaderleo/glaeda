@@ -23742,7 +23742,7 @@ class GitShimTest(unittest.TestCase):
         helper.chmod(0o755)
         env = {**self.job_env, "PATH": f"{shim_dir}:/usr/bin:/bin", "GIT_EXEC_PATH": str(self.dir),
                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "test.checkout-header", "GIT_CONFIG_VALUE_0": "kept",
-               "TEST_CONNECT": "000", "TEST_CURL_EXIT": "7"}
+               "GITHUB_ACTION_REPOSITORY": "actions/checkout", "TEST_CONNECT": "000", "TEST_CURL_EXIT": "7"}
         return env, receipt
 
     def test_hq_actions_checkout_recovers_fetch_and_lazy_blobs_without_cmux_mirror(self) -> None:
@@ -23778,6 +23778,15 @@ class GitShimTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("using direct HTTPS", result.stderr)
                 self.assertEqual(receipt.read_text().splitlines(), [expected])
+
+    def test_hq_later_steps_use_git_without_checkout_recovery(self) -> None:
+        env, receipt = self.hq_checkout_fixture()
+        env.pop("GITHUB_ACTION_REPOSITORY")
+        result = subprocess.run(["git", "fetch", "origin", self.pr_sha], cwd=self.ws, env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("using direct HTTPS", result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(), ["http://127.0.0.1:18434"])
 
     def test_a_commit_the_mirror_holds_comes_from_the_mirror_with_no_github_fetch(self) -> None:
         self.install()
