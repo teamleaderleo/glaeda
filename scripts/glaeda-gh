@@ -16046,13 +16046,16 @@ LAND_OWNER_REMIND_MAX = 4
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_MAX a row in all. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
-# LAND_OWNER_REMIND_UNREAD_ONCE: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
+# LAND_OWNER_REMIND_UNREAD: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
 # repeats a copy from before the stop. cmux16, 2026-11-26 09:30Z: one requester got 20 "still stopped after 46-88 h"
 # reminders in an hour; 16 of those 20 PRs had merged or closed days before, but cmux16's reads of them never landed, so
-# each was told on its old OPEN copy. A stop now gets at most one reminder on a copy no read refreshed (the head moving
-# since the stop is new evidence and starts it again); past it, the row stays stopped and says nothing until a read
-# lands (history remind_held). LAND_OWNER_REMIND_MAX stays the one bound on how many in all. Detector:
-# test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_told_once_per_stop.
+# each was told on its old OPEN copy. One such reminder a stop (the rule this replaces, UNREAD_ONCE) still sent one
+# nag per merged or closed PR: cmux#50122 MERGED, #49693 and #47641 CLOSED, lw#7977 and #7724 MERGED were each told
+# "still stopped" 44-95 h on (sr2-coord, 2026-11-26). "Still stopped" is a claim about the PR now, so it is made only
+# on a read newer than the row's last word (the stop or the last reminder); with none, the row stays stopped and says
+# nothing (history remind_held, once a stop) until a read lands, and then it ends (merged, closed) or is told. The
+# requester was told at the stop with its one step, so holding costs nobody a step. LAND_OWNER_REMIND_MAX stays the
+# one bound on how many in all. Detector: test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_never_told.
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -20324,7 +20327,7 @@ class LandQueue:
         life = e.get("remindLife") or {}
         if life.get("stopAt") != at or (moved and life.get("head") != head):
             life = {"stopAt": at, "unread": 0, **({"head": head} if moved else {})}
-        if not head and int(life.get("unread") or 0) >= 1:  # LAND_OWNER_REMIND_UNREAD_ONCE
+        if not head:  # LAND_OWNER_REMIND_UNREAD: never told on a copy no read refreshed since its last word
             # its next due pass asks a fresh read first (remind_read_pending), so a merge, a close or a push still ends
             # or restarts it; the reminder itself stays quiet and spends none of LAND_OWNER_REMIND_MAX
             e["reminds"] = {**r, "n": n, "at": self.now, "code": code}
@@ -20347,8 +20350,6 @@ class LandQueue:
             # head: the re-queue at the head now comes first, and the stop's own sha is dated.
             msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
                     f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
-        elif not head and was:
-            msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
         if n + 1 < LAND_OWNER_REMIND_MAX:

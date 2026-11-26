@@ -30532,7 +30532,7 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e.get("reminds"), len(self.w.refreshed)), (None, 1))
 
-    def test_a_reminder_whose_read_never_comes_is_still_told(self):
+    def test_a_reminder_whose_read_never_comes_is_held_not_told(self):
         e = self.conflict_stop()
         sent = len(self.w.sent())
         self.fresh_head = None  # every read fails
@@ -30541,7 +30541,8 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT - 60)
         self.assertEqual((e.get("reminds"), len(self.w.refreshed)), (None, 1))  # asked once, not every pass
         e = self.tick(60)
-        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
+        # LAND_OWNER_REMIND_UNREAD: the wait ran out with no read, so nothing is claimed about the PR now
+        self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 0, sent))
 
     def test_a_machine_checkpoint_hold_is_said_once_and_never_reminded(self):
         # LAND_OWNER_REMIND_BACKOFF: hq#18246, a wip_checkpoint PR whose body says "HOLD: machine-made checkpoint, not
@@ -30587,35 +30588,36 @@ class LandTest(Base):
         reminded = [h for h in e["history"] if h.get("event") == "reminded"]
         self.assertEqual([h.get("moved") for h in reminded], [LB[:12]])
 
-    def test_a_reminder_on_an_unread_copy_dates_the_stop_instead_of_naming_a_head(self):
-        # The wait ran out with no read (LAND_OWNER_REMIND_READ_WAIT): the copy's head may be as old as the stop, so
-        # the reminder names no head now and says the stop's sha is dated.
-        self.conflict_stop()
-        self.fresh_head = None  # every read fails
-        self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
-        said = self.w.sent()[-1][-1]
-        self.assertEqual((e["reminds"]["n"], e["reminds"].get("head")), (1, None))
-        self.assertIn("could not be read just now", said)
-        self.assertNotIn("--pin", said)
-
-    def test_a_reminder_on_an_unread_copy_is_told_once_per_stop(self):
+    def test_a_reminder_on_an_unread_copy_is_never_told(self):
         # cmux16, 2026-11-26: 16 of 20 reminded PRs had merged or closed days before; its reads never landed, so every
-        # reminder repeated an OPEN copy from before the stop. One such reminder says so; later ones wait for a read.
+        # reminder repeated an OPEN copy from before the stop, and one a stop (UNREAD_ONCE) still nagged cmux#50122
+        # (MERGED) 44-95 h on. With no read the row holds, quietly; a read that lands ends it or tells it.
         self.conflict_stop()
         sent = len(self.w.sent())
         self.fresh_head = None  # every read fails
         self.tick(gg.LAND_OWNER_REMIND_EVERY)
         e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
-        self.assertEqual(len(self.w.sent()), sent + 1)
-        self.assertIn("could not be read just now", self.w.sent()[-1][-1])
         for _ in range(6):
             e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((len(self.w.sent()), e["state"]), (sent + 1, "stopped"))
-        self.assertIn("unread", [h.get("why") for h in e["history"] if h.get("event") == "remind_held"])
+        self.assertEqual((len(self.w.sent()), e["state"]), (sent, "stopped"))
+        held = [h for h in e["history"] if h.get("event") == "remind_held"]
+        self.assertEqual([h.get("why") for h in held], ["unread"])  # said once in history, not once a pass
         self.fresh_head = LA  # a read lands: the PR is unchanged and still stopped, told on the copy now
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
-        self.assertEqual(len(self.w.sent()), sent + 2)
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        self.assertNotIn("could not be read", self.w.sent()[-1][-1])
+
+    def test_an_unread_stop_whose_pr_merged_ends_when_a_read_lands(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None  # every read fails: the copy is the OPEN one from before the stop
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.q.refresh = lambda key: (self.w.refreshed.append(key),
+                                      self.w.set_pr(key, land_pr(LA, state="MERGED"), self.t))[1]
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+        self.assertEqual(e["state"], "merged")
+        self.assertTrue(all(c[c.index("--class") + 1] == "fyi" for c in self.w.sent()[sent:]))
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
