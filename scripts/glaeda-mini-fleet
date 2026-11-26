@@ -107,7 +107,8 @@ on it is left alone. Dry run by default.
 fix, share, sudo-plan --run, onboard, repair and upgrade skip a host another build holds (the fleet
 host lock /Users/Shared/cmux-build-fleet/host.lock) or a glaeda-reservation/v1 marker reserves, and
 exit 1; --wait waits up to 4 hours instead. fix still runs, on a host only the host lock holds, the
-repairs that drain that lock themselves (the iOS simulator runtime download), and skips the rest. Every changing step on a host checks again first.
+repairs that drain that lock themselves (the iOS simulator runtime download) and the Xcode copies that land
+beside a build on their own path, and skips the rest. Every changing step on a host checks again first.
 
 The manifest's `candidate` pins the reviewed Glaeda candidate the fleet runs (source, sha256, run,
 artifact, repo, expires). upgrade writes it; preflight, fix, onboard and repair read it.
@@ -3399,11 +3400,12 @@ def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
                               *options, "-l", user, name, remote_command(command)], log, stdin, timeout)
 
 
-def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str:
+def library_command(func: str, args: list[str], keep_stdin: bool = False, gate: str | None = None) -> str:
     """`/bin/bash -c` running one cmux_mini_fix.sh function, ready to hand to ssh as its command.
 
-    Every function that changes the host first takes its step lock."""
-    gate = LOCK_GATE.get(func, "")
+    Every function that changes the host first takes its step lock. gate: how much of the host gate the step
+    honors when not LOCK_GATE's (an Xcode copy honors reservations only: BESIDE_BUILD_REPAIRS)."""
+    gate = LOCK_GATE.get(func, "") if gate is None else gate
     call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else \
         f"lock{' ' + gate if gate else ''}; " + shlex.join([func, *args])
     script = (f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + ("KEEP_STDIN=1\n" if keep_stdin else "")
@@ -3432,6 +3434,10 @@ def routed_ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes
     return ssh_stream(name, user, command, log, stdin=stdin, timeout=timeout)
 
 
+# Agent forwarding for a peer-to-peer LAN step. ControlPath=none: an operator's ssh config that multiplexes
+# (ControlMaster auto) reuses a master opened without -A and silently forwards no agent, so the seed's ssh to the
+# peer failed "Permission denied (publickey)" (exit 255) on 2026-11-26 for every Xcode 27.0 copy.
+AGENT_FORWARD = ("-A", "-o", "ControlPath=none")
 HELD_EXIT = 20  # cmux_mini_fix.sh: the host is held by the fleet host lock or a reservation
 # host_held's reason when the fleet host lock alone holds the host: it checks the reservation first, so a host
 # held for this reason has no active reservation.
@@ -3439,6 +3445,12 @@ BUSY_HOST_LOCK = "held by another build (fleet host lock "
 # Repairs that wait for the fleet host lock themselves, with a host.lock.waiters entry holding new jobs off, so fix
 # runs them on a host a build or step holds instead of skipping it (a busy build worker is never free on its own).
 DRAINING_REPAIRS = frozenset({"ios_runtime"})
+# Repairs that run beside a build on a host the fleet host lock alone holds, without draining it: a missing Xcode is
+# copied to its own path (staged, then moved in whole), which no running job reads; jobs select the pin. A busy build
+# worker frees the lock only between jobs, so on 2026-11-26 `fix --wait` for Xcode 27.0 on four busy fleet minis
+# copied nothing. Leo, 2026-11-26: "and also just have more xcode versions installed". Reservations still hold.
+BESIDE_BUILD_REPAIRS = frozenset({"xcode_share"})
+BUSY_HOST_REPAIRS = DRAINING_REPAIRS | BESIDE_BUILD_REPAIRS
 HOLD_WAIT_SECONDS = 4 * 3600
 HOLD_POLL_SECONDS = 60
 
@@ -3809,7 +3821,7 @@ def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | No
         else:
             lan = lan_settings(manifest)
             args = [f"ssh://{user}@{address}/opt/homebrew", *([lan["identity"]] if lan["identity"] else [])]
-            options = ("-A",) if lan["agent"] else ()
+            options = AGENT_FORWARD if lan["agent"] else ()
     code = routed_ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
                              timeout=FIX_TIMEOUTS["homebrew_fetch"],
                              options=(*host_ssh_options(manifest, name), *options))
@@ -3917,7 +3929,8 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
     targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != seed])
     held = gate_hosts(manifest, targets, wait and yes)
     # A host held only by the fleet host lock (a busy build worker, never a reservation) still gets the repairs
-    # that drain the lock themselves (DRAINING_REPAIRS); the rest wait, as on any held host.
+    # that drain the lock themselves (DRAINING_REPAIRS) or run beside a build (BESIDE_BUILD_REPAIRS); the rest
+    # wait, as on any held host.
     busy = {h: why for h, why in held.items() if why.startswith(BUSY_HOST_LOCK)}
     held = {h: why for h, why in held.items() if h not in busy}
     skipped.update({h: f"held: {why}" for h, why in held.items()})
@@ -3925,7 +3938,7 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
     results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)}
     for name, why in busy.items():
         if "reach" in results[name]["checks"] or \
-                not any(a["kind"] in DRAINING_REPAIRS for a in planned_actions(results[name])[0]):
+                not any(a["kind"] in BUSY_HOST_REPAIRS for a in planned_actions(results[name])[0]):
             skipped[name] = f"held: {why}"
             held[name] = why
     targets = [h for h in targets if h not in held]
@@ -3933,7 +3946,7 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
     reachable = [h for h in targets if "reach" not in results[h]["checks"]]
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         done = dict(zip(reachable, pool.map(lambda h: fix_host(manifest, h, results[h], yes, directory, seed,
-                                                                 DRAINING_REPAIRS if h in busy else None), reachable)))
+                                                                 BUSY_HOST_REPAIRS if h in busy else None), reachable)))
     outcomes = []
     for name in [h for h in hosts if h != seed]:
         if name in skipped:
@@ -4243,9 +4256,11 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
     route = f"{source} -> {address} ({'ssh -A from this Mac' if lan['agent'] else 'fleet key ' + lan['identity']})"
     if not yes:
         return True, f"would copy over {route}"
+    # An Xcode lands on its own path beside a build (BESIDE_BUILD_REPAIRS): its steps honor reservations only.
+    gate = "reservation" if thing == "xcode" else None
     inner = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
              *(["-i", lan["identity"]] if lan["identity"] else []), "-l", user, address,
-             library_command("share_recv", [thing, *args], keep_stdin=True)]
+             library_command("share_recv", [thing, *args], keep_stdin=True, gate=gate)]
     send = library_command("share_send", [thing, *args])[len("/bin/bash -c "):]
     pipeline = f"set -o pipefail; /bin/bash -c {send} | {shlex.join(inner)}"
     note(log, f"== share {thing}: {route}")
@@ -4253,10 +4268,10 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
         streams = SEED_STREAMS.setdefault(source, threading.Semaphore(SEED_STREAMS_PER_SOURCE))
     with streams:  # fix and onboard run many peers at once; one source serves a few at a time
         code = routed_ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
-                                 options=(*source_route, *( ("-A",) if lan["agent"] else () )))
+                                 options=(*source_route, *(AGENT_FORWARD if lan["agent"] else ())))
     if code:
         return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
-    if routed_ssh_stream(name, user, library_command("share_finish", [thing, *args]), log, timeout=3600,
+    if routed_ssh_stream(name, user, library_command("share_finish", [thing, *args], gate=gate), log, timeout=3600,
                          options=target_route):
         return False, "the copy did not finish or verify on the peer (see the log)"
     return True, f"copied over {route}"
@@ -4314,7 +4329,9 @@ def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, ye
     with SEED_LOCK:
         key = (source, thing, yes, tuple(args))
         if key not in SEEDS_READY:
-            func = "share_prepare" if yes else ("share_have" if thing == "metal" else "share_source")
+            # Only metal prepares (an export, under the step lock); everything else is a read-only check, so a seed
+            # a build holds still seeds (share_send reads lock-free too).
+            func = ("share_prepare" if yes else "share_have") if thing == "metal" else "share_source"
             code = routed_ssh_stream(source, host_ssh_user(manifest, source),
                                      library_command(func, [thing, *args]), log,
                                      timeout=SHARE_TIMEOUT, options=host_ssh_options(manifest, source))
