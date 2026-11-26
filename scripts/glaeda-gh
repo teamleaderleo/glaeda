@@ -16310,8 +16310,8 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 # stop named no step. efficiency-standing-lane, 2026-11-21: leo-workspace#7087 was pushed as a draft by the
 # PreCompact checkpoint hook (tools/wip_checkpoint.py opens one), and `land` reported merge_refused after six identical
 # refusals with the GraphQL pool at its floor. Stopping at the first one names `gh pr ready`, the step that clears it.
-# Nothing here marks a PR ready: that is a state change on someone's PR (a teammate's included), so it stays the
-# requester's call.
+# The merge step's draft refusal now marks it ready first, once per head (LAND_READY_ONCE's comment), and stops here
+# only when that was refused or the PR went back to a draft after it.
 LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request is in draft state\b"
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
 # The other half of the same answer: *when* it is given. Stopping at the first merge refusal still spends the whole
@@ -16328,9 +16328,18 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
 #   that is not an answer anything may refuse on, and a write that could have marked the PR ready (gh_cache_writes,
 #   stamped by the brokered `gh pr ready` itself) after the read drops it too.
 # - the merge-time check above stays: a PR can be converted back to a draft after its request, and this one answers
-#   only the rows where the cache already knew. Nothing here marks a PR ready either -- `gh pr ready` is the
-#   requester's call, as it is above, and [hold-own-pr] exists so a draft can be a deliberate hold.
+#   only the rows where the cache already knew. A draft the request knows of is marked ready there instead
+#   (land_ready_at_request, LAND_READY_ONCE's comment); only a refused `gh pr ready` is still refused.
 LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cycle is 60 s)
+# A land is its requester's intent to merge, so a draft is no longer a stop of its own (2026-11-26: cmux#58227 and
+# cmuxterm-hq#28522 each stopped merge_draft after a passing judgment, and their requesters had to `gh pr ready` and
+# re-queue, one wasted land cycle each, with two more queued drafts waiting to stop the same way). The queue now marks
+# it ready itself: at the request when this host's cache already knows it is a draft (land_ready_at_request), and at
+# the merge's draft refusal otherwise (LandQueue.mark_ready), which covers lands queued by any tool. Once per head:
+# a PR converted back to a draft after that is someone's deliberate hold, and stops merge_draft as before; so does a
+# `gh pr ready` that is itself refused. A hold is not a draft's job here: [hold-own-pr] is a HOLD: line or a hold
+# label, which land_judge refuses before any merge is sent.
+LAND_READY_ONCE = "readySent"
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
 # push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
@@ -16339,9 +16348,9 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
 # names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases a conflict away or
-# force-pushes over one: that is a write on someone's branch, so it stays the requester's call, as the draft case
-# stays theirs. The pushes are LAND_UNION's (the base merge update-branch would have made, when git merges the base
-# into the head cleanly) and LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
+# force-pushes over one: that is a write on someone's branch, so it stays the requester's call. The pushes are
+# LAND_UNION's (the base merge update-branch would have made, when git merges the base into the head cleanly) and
+# LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
 # which changes no line of the PR's own diff).
 # A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
 # update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
@@ -24927,6 +24936,8 @@ class LandQueue:
         if LAND_STEP_DRAFT.search(out):
             # Permanent until someone marks it ready (LAND_STEP_DRAFT's comment): one refusal, one named step.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="draft", n=1)
+            if kind == "merge" and (e.get(LAND_READY_ONCE) or {}).get("head") != head:
+                return "ready"  # the queue marks it ready itself, once per head (LAND_READY_ONCE's comment)
             name = key_name(e["key"])
             repo, _, number = name.partition("#")
             self.stop(e, f"{kind}_draft", f"the {kind} at {head[:12]} was refused while the PR is a draft: "
@@ -25322,6 +25333,37 @@ class LandQueue:
             self.update_branch(e, sha)
         elif named == "union_merge":
             self.union_merge(e, sha)
+        elif named == "ready":
+            self.mark_ready(e, sha)
+
+    def mark_ready(self, e: dict, head: str) -> None:
+        """The merge at HEAD was refused because the PR is a draft: mark it ready (LAND_READY_ONCE's comment), once per
+        head, and judge it again soon. A refused `gh pr ready` stops the entry merge_draft, as every draft did before.
+        e[LAND_READY_ONCE] is written before the send, so a restart mid-send counts it as sent."""
+        gh = self.gh()
+        repo, number = e["repo"], str(e["number"])
+        name = key_name(e["key"])
+        with self.lock:
+            self.claim(e, "ready", sha=head)
+            e[LAND_READY_ONCE] = {"head": head, "at": self.now}
+            self.history(e, "ready_sent", head=head[:12])
+            self.save(e)
+        got = self.call([gh, "pr", "ready", number, "-R", repo], LAND_GH_DEADLINE, e) if gh is not None else \
+            subprocess.CompletedProcess([], 1, "", f"no gh-quota shim at {self.path('gh', LAND_GH)}")
+        with self.lock:
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.history(e, "readied", head=head[:12])
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"{name} was a draft at the merge; marked it ready (gh pr "
+                              "ready): the merge is taken next"}, float(NUDGE_MIN))
+                return
+            said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+            self.stop(e, "merge_draft", f"the merge at {head[:12]} was refused while the PR is a draft, and marking "
+                      f"it ready was refused too: {said}",
+                      f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
         """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
@@ -27167,8 +27209,26 @@ def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple
     pinned = f" --match-head-commit {pin}" if pin else ""
     return (f"{name} is a draft ({int(now - at)} s ago, by this host's last read of it): GitHub refuses every merge "
             f'on a draft ("Pull Request is still a draft"), so the land would wait out its checks, judge them, and '
-            f"stop at the merge. Nothing here marks a PR ready: a draft can be a deliberate hold, so it stays yours",
+            f"stop at the merge",
             f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}{pinned}")
+
+
+def land_ready_at_request(key: str, repo: str, number: int, pin: str = "") -> tuple[str, tuple[str, str] | None]:
+    """(a note, a refusal) for a land request on a PR this host already knows is a draft (land_draft_refusal): the
+    request is the intent to merge it, so it is marked ready here (LAND_READY_ONCE's comment) and queued, with a note
+    saying so. ("", None) when the cache knows no draft; a refusal, as before, only when `gh pr ready` is refused."""
+    draft = land_draft_refusal(key, repo, number, pin)
+    if draft is None:
+        return "", None
+    try:
+        got = run_bounded(["gh", "pr", "ready", str(number), "-R", repo], timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as err:
+        got = subprocess.CompletedProcess([], 1, "", str(err) or type(err).__name__)
+    if got.returncode == 0:
+        return (f"{repo}#{number} was a draft; marked it ready (gh pr ready {number} -R {repo}): a land is the "
+                "intent to merge it, and GitHub refuses every merge on a draft"), None
+    said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+    return "", (f"{draft[0]}; marking it ready here was refused: {said}", draft[1])
 
 
 def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool) -> int:
@@ -27304,11 +27364,14 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         # First of the pin answers, before the draft read and before check_land_pin's two git calls: no head, cache
         # or checkout is needed to know this sha names no commit, so the refusal costs nothing at all.
         return land_request_refused(key, "land_pin_null", *null, as_json=as_json)
-    draft = land_draft_refusal(key, repo, number, sha)
+    readied, draft = land_ready_at_request(key, repo, number, sha)
     if draft is not None:
         # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
-        # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment).
+        # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment). Only a
+        # refused `gh pr ready` gets here: a draft this host knows of is marked ready (LAND_READY_ONCE's comment).
         return land_request_refused(key, "land_draft", *draft, as_json=as_json)
+    if readied and not as_json:
+        say_waiting(f"glaeda-gh land: {readied}")
     # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
@@ -27395,6 +27458,8 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         out["laneWarning"] = no_lane
     if unchecked:
         out["pinUnchecked"] = unchecked
+    if readied:
+        out["draftReadied"] = readied
     if replaced:
         out["pinReplaced"] = replaced
     if not running:
@@ -27601,7 +27666,7 @@ def cmd_land_serve(text: str) -> int:
         except (WatchError, TypeError):
             key = repo = pin = ""  # land_serve_one below answers a target or pin this host cannot read
             number = 0
-        draft = land_draft_refusal(key, repo, number, pin) if key else None
+        draft = land_ready_at_request(key, repo, number, pin)[1] if key else None
         if draft is not None:
             print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": draft[0], "next": draft[1],
                               "host": policy_host()}, sort_keys=True))
