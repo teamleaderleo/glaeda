@@ -1088,6 +1088,15 @@ ADD_COMMENT = """mutation($s: ID!, $b: String!) { addComment(input: {subjectId: 
 commentEdge { node { id databaseId url authorAssociation author { __typename login } } } } }"""
 EDIT_COMMENT = """mutation($c: ID!, $b: String!) { updateIssueComment(input: {id: $c, body: $b}) {
 issueComment { id databaseId url authorAssociation author { __typename login } } } }"""
+# The draft PR a lane/ branch's first push opens (leo-workspace tools/lane_gh_auto_draft.py MARK). The broker's pr_create
+# and the gh shim fill it in and mark it ready when the agent's own create finds it; the outbox's `post pr` now does
+# the same (Daemon.post_fill_auto_draft). Before, its create got GitHub's 422 "already exists", recorded the draft's
+# URL as posted, and left the push's title, auto-draft body and draft flag on it: 2026-11-26 cmux#59774 and
+# cmuxterm-hq#30522, both opened by `cmux-gh post pr ... --body-file` as wt push suggests, kept the auto-draft body,
+# and each land then stopped merge_draft when its `gh pr ready` met a spent GraphQL limit.
+AUTO_DRAFT_MARK = "<!-- auto-draft: opened by git push at the branch's first push -->"
+READY_PR = """mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+pullRequest { number isDraft } } }"""
 # Match cmux's base-owned risk classifier. This only wakes that classifier; it never grants SHIP authority.
 RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*(ship|block|fix|not ship|hold)(?![\w-])",
                           re.I)
@@ -8924,11 +8933,59 @@ class Daemon:
             self.post_retry(path, item, f"HTTP {status}")
         elif item["kind"] == "pr" and status == 422 and "already exists" in text:
             found, _ = self.post_find(item, actor)
+            note = "a pull request for this head is already open"
+            if found and AUTO_DRAFT_MARK in str(found.get("body") or ""):
+                note = self.post_fill_auto_draft(item, found, body, actor)
             self.post_finish(path, item, url=found.get("html_url") if found else None,
-                             note="a pull request for this head is already open",
+                             number=found.get("number") if found else None, note=note,
                              error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
+
+    def post_fill_auto_draft(self, item: dict, found: dict, body: dict, actor: dict | None) -> str:
+        """The create found the draft a lane/ branch's first push opened (AUTO_DRAFT_MARK): put this create's title
+        and body on it (REST PATCH) and mark it ready (markPullRequestReadyForReview, by the App that made the create
+        when there is one, so the login's GraphQL hour is not what it spends), as the broker's pr_create does. A
+        refused fill or ready is a note, never a failed create: the PR exists, and a queued land readies a draft
+        itself, waiting out a GraphQL limit (LandQueue.mark_ready). Returns the note for the posted record."""
+        n = found.get("number")
+        notes = [f"#{n} was the auto-draft the branch's first push opened"]
+        try:
+            status, _, doc = self.outbox_request("PATCH", f"/repos/{item['repo']}/pulls/{n}",
+                                                 {"title": body["title"], "body": body["body"]}, actor)
+        except (WatchError, OutOfTime) as error:
+            status, doc = 0, {"message": describe(error) if isinstance(error, WatchError) else "out of time"}
+        if 200 <= status < 300:
+            notes.append("filled in with this title and body")
+        else:
+            said = gh_said((doc or {}).get("message"), limit=None) if isinstance(doc, dict) else ""
+            notes.append(f"filling it in was refused (HTTP {status} {said}".rstrip() + "): it keeps the auto-draft "
+                         f"body; `gh pr edit {n} -R {item['repo']} --body-file F` fills it")
+        if not found.get("draft"):
+            return "; ".join(notes)
+        node = found.get("node_id")
+        query = {"query": READY_PR, "variables": {"id": node}}
+        try:
+            if not node:
+                raise WatchError("the PR read has no node_id")
+            if actor:
+                status, h, doc = self.outbox_request("POST", "/graphql", query, actor)
+            else:
+                status, h, doc = self.post_gql(READY_PR, {"id": node}, "outbox-ready")
+        except (WatchError, OutOfTime) as error:
+            status, doc = 0, {"message": describe(error) if isinstance(error, WatchError) else "out of time"}
+        got = (((doc or {}).get("data") or {}).get("markPullRequestReadyForReview") or {}).get("pullRequest") \
+            if isinstance(doc, dict) else None
+        if status == 200 and isinstance(got, dict) and got.get("isDraft") is False:
+            notes.append("marked ready")
+        else:
+            errors = (doc or {}).get("errors") if isinstance(doc, dict) else None
+            said = gh_said(((errors or [{}])[0] or {}).get("message") if errors else (doc or {}).get("message"),
+                           limit=200) if isinstance(doc, dict) else ""
+            notes.append(f"marking it ready was refused (HTTP {status} {said}".rstrip() + "): it is STILL A DRAFT; "
+                         f"a queued land readies it (and waits out a GraphQL limit), or `gh pr ready {n} -R "
+                         f"{item['repo']}`")
+        return "; ".join(notes)
 
     def update_branch_pr(self, item: dict) -> dict | None:
         """The queued update-branch's PR as GitHub answers it now (update_branch_retired's state), None unread."""
@@ -16848,9 +16905,12 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # can quote a red job's log). Before, only land_judge's words parked a step: cmux#42244's update-branch was refused
 # "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
 # stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
+# GitHub's own sentence counts too ("API rate limit already exceeded for user ID N", "API rate limit exceeded for
+# ..."), as gh prints it when no shim word is in front: cmux#59774's `gh pr ready` at the merge, 2026-11-26 22:3xZ,
+# was refused that way and stopped merge_draft instead of parking.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
                              r"|rate limit is spent|secondary rate limit|content-creation cooldown"
-                             r"|content writes are paced", re.I)
+                             r"|content writes are paced|\bAPI rate limit (?:already )?exceeded\b", re.I)
 # The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
 # next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
 # paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
@@ -27020,6 +27080,8 @@ class LandQueue:
             return False
         if (e.get(LAND_READY_ONCE) or {}).get("head") == head:
             return False  # readied once at this head: a draft again is someone's hold, the merge step stops it
+        if (e.get("wait") or {}).get("kind") == "quota" and _finite(e.get("wakeAt")) and float(e["wakeAt"]) > self.now:
+            return False  # a ready the login's limit refused waits out its reset (mark_ready's park), as any step does
         at = c.get("dataAt")
         since = max(float(e["requestedAt"]) if _finite(e.get("requestedAt")) else 0.0,
                     float(e["created"]) if _finite(e.get("created")) else 0.0)
@@ -27054,7 +27116,19 @@ class LandQueue:
                 self.wait(e, {"kind": "retry", "why": f"{name} was a draft {where}; marked it ready (gh pr "
                               "ready): it is judged next"}, float(NUDGE_MIN))
                 return
-            said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+            out = f"{got.stderr or ''}\n{got.stdout or ''}"
+            if LAND_STEP_QUOTA.search(out):
+                # The login's limit, not a refusal of the ready: parked until the reset it names, and the next
+                # judgment's draft refusal (or first read) sends `gh pr ready` again, since LAND_READY_ONCE is unset.
+                # 2026-11-26: cmux#59774 ("API rate limit already exceeded for user ...") and cmuxterm-hq#30522
+                # ("GraphQL rate limit is spent for login until 22:41Z") each stopped merge_draft here, and their
+                # requesters re-queued after the reset by hand.
+                self.history(e, "ready_parked", head=head[:12])
+                self.park_quota(e, out)
+                e["stepQuotaParked"] = True
+                self.save(e)
+                return
+            said = land_trim(land_tail(out), 200)
             what = (f"the merge at {head[:12]} was refused while the PR is a draft" if where == "at the merge" else
                     f"the PR was a draft at {head[:12]} {where}")
             self.stop(e, "merge_draft", f"{what}, and marking it ready was refused too: {said}",
@@ -29067,6 +29141,11 @@ def land_ready_at_request(key: str, repo: str, number: int, pin: str = "",
         return (f"{repo}#{number} was a draft; marked it ready (gh pr ready {number} -R {repo}): a land is the "
                 "intent to merge it, and GitHub refuses every merge on a draft"), None
     said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+    if LAND_STEP_QUOTA.search(f"{got.stderr or ''}\n{got.stdout or ''}"):
+        # The login's limit, not a refusal of the ready: queued, and the queue's own mark_ready sends it again once
+        # the limit has reset (it parks on the same words).
+        return (f"{repo}#{number} is a draft; `gh pr ready` met a rate limit here ({said}), so it is queued and the "
+                "queue marks it ready after the reset"), None
     return "", (f"{draft[0]}; marking it ready here was refused: {said}", draft[1])
 
 

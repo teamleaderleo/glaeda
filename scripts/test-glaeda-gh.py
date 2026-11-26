@@ -19278,6 +19278,45 @@ class PostTest(unittest.TestCase):
         state = gg.post_state(item["id"])
         self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/3"))
 
+    def test_an_open_auto_draft_for_the_head_is_filled_in_and_marked_ready(self) -> None:
+        """2026-11-26: cmux#59774 and cmuxterm-hq#30522 were opened by `cmux-gh post pr ... --body-file` (wt push's
+        suggested command) after the branch's first push had opened its auto-draft. The create's 422 "already exists"
+        was recorded as posted and the PR kept the push's title, the auto-draft body and its draft flag, so each land
+        then spent its own `gh pr ready` and stopped merge_draft on a spent GraphQL limit. The create now fills the
+        draft in (REST) and marks it ready (one GraphQL call at the create), as the broker's pr_create does."""
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "mine")
+        exists = (422, {}, {"message": "Validation Failed",
+                            "errors": [{"message": "A pull request already exists for o:lane/x."}]})
+        draft = {"html_url": "https://github.com/o/r/pull/3", "number": 3, "node_id": "PR_3", "draft": True,
+                 "body": gg.AUTO_DRAFT_MARK + "\nDraft opened automatically"}
+        ready = (200, {}, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"number": 3, "isDraft": False}}}})
+        d, t = self.daemon(exists, (200, {}, [draft]), (200, {}, {"number": 3}), ready)
+        self.step(d, NOW)
+        self.assertEqual(t.calls[2], ("PATCH", "/repos/o/r/pulls/3", {"title": "T", "body": "mine"}))
+        self.assertEqual(t.calls[3][1], "/graphql")
+        self.assertIn("markPullRequestReadyForReview", t.calls[3][2]["query"])
+        self.assertEqual(t.calls[3][2]["variables"], {"id": "PR_3"})
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"], state["number"]), ("posted", "https://github.com/o/r/pull/3", 3))
+        self.assertIn("filled in with this title and body", state["note"])
+        self.assertIn("marked ready", state["note"])
+        # A spent GraphQL hour refuses only the ready: the create is still posted, filled in, and says it is a draft
+        # that a queued land readies.
+        item = self.queue("pr", "o/r", "--head", "lane/y", "--base", "main", "--title", "T", "--body", "mine")
+        spent = (200, {}, {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit already exceeded for user ID 1."}]})
+        d, t = self.daemon(exists, (200, {}, [draft]), (200, {}, {"number": 3}), spent)
+        self.step(d, NOW + 3600)
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["error"]), ("posted", None))
+        self.assertIn("STILL A DRAFT; a queued land readies it", state["note"])
+        self.assertIn("API rate limit already exceeded", state["note"])
+        # A PR for the head that is not the auto-draft is someone's own: never edited, never readied.
+        item = self.queue("pr", "o/r", "--head", "lane/z", "--base", "main", "--title", "T", "--body", "mine")
+        d, t = self.daemon(exists, (200, {}, [{**draft, "body": "a real body"}]))
+        self.step(d, NOW + 7200)
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET"])
+        self.assertEqual(gg.post_state(item["id"])["note"], "a pull request for this head is already open")
+
     def test_a_refusal_fails_and_transient_errors_give_up(self) -> None:
         bad = self.queue("comment", "o/r#404", "--body", "x")
         forbidden = self.queue("comment", "o/r#403", "--body", "x")
@@ -34376,6 +34415,44 @@ class LandTest(Base):
         self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
         self.assertIn("still a draft", e["stop"]["reason"])
+
+    def test_a_ready_refused_by_the_logins_rate_limit_parks_until_the_reset_and_then_merges(self):
+        """2026-11-26: cmux#59774's `gh pr ready` at the merge was refused "API rate limit already exceeded for user"
+        and cmuxterm-hq#30522's "GraphQL rate limit is spent for login until 22:41Z"; each stopped merge_draft and its
+        requester re-queued by hand after the reset. A limit is the login's state, not a refusal of the ready: the
+        entry parks until the reset and the queue sends `gh pr ready` again itself."""
+        for said in ("gh-quota: refused: GitHub's GraphQL rate limit is spent for login until 22:41Z",
+                     "GraphQL: API rate limit already exceeded for user ID 1. (markPullRequestReadyForReview)",
+                     "HTTP 403: API rate limit exceeded for user ID 1."):
+            self.assertTrue(gg.LAND_STEP_QUOTA.search(said), said)
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.gh_rc["ready"] = 1
+        self.w.gh_err["ready"] = "GraphQL: API rate limit already exceeded for user ID 1. (markPullRequestReadyForReview)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), e.get("stop"))
+        self.assertNotIn(gg.LAND_READY_ONCE, e)
+        self.assertIn("ready_parked", [h["event"] for h in e["history"]])
+        self.assertFalse(any("stopped" in str(m) for m in self.w.sent()), self.w.sent())
+        # Parked: its first-read ready does not fire again before the reset.
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.q.now)
+        self.assertFalse(self.q.ready_due(e, self.w.cache[self.KEY], self.w.cache[self.KEY]["data"], LA))
+        # After the reset the ready goes through and the PR merges, with no re-queue by anyone.
+        self.w.gh_rc["ready"] = 0
+        e = self.tick(gg.LAND_QUOTA_BACKOFF_MAX + gg.LAND_QUOTA_JITTER + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 2)
+        self.w.set_pr(self.KEY, land_pr(LA), self.q.now)
+        self.w.gh_rc["merge"] = 0
+        for _ in range(3):
+            if e["state"] == "merged":
+                break
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(e["state"], "merged", e.get("stop"))
 
     def test_land_marks_a_draft_it_knows_of_ready_at_the_request_and_queues_it(self):
         """The request-time half: when this host's cache already knows the PR is a draft, `land` marks it ready
