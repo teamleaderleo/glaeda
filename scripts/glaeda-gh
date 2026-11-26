@@ -16450,7 +16450,28 @@ LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
-LAND_HANDOFF_DEADLINE = 60.0
+LAND_HANDOFF_DEADLINE = 120.0
+# LAND_HANDOFF_TRANSIENT: a hand-off the broker did not take because it could not answer -- the call cut at
+# LAND_HANDOFF_DEADLINE (exit 124), a 5xx or a dropped connection (LAND_STEP_TRANSIENT), the broker's own "busy:
+# admission queue full" past lane-gh's retry window, or its login's rate-limit latch ("... is spent for login until
+# HH:MMZ (reset); not sent, retry after ...") -- is not a refusal of this PR: nothing was judged, and the same call
+# is taken once the broker answers again. It used to count toward LAND_STEP_STOP like a real refusal and stop the row
+# handoff_refused, a code nothing re-arms. gcp-agent-lane-2, 2026-11-22 05Z-11-23 08Z, with the broker CPU-bound
+# ("busy: admission queue full (the broker is CPU-bound)"): 336 of the 411 handoff_refused events in its land store
+# were "timed out after 60s", and 59 rows (cmux#49887, cmux#50116, leo-workspace#6140, ...) sat stopped 75-123 h
+# though the same host's hand-offs were taken again from 11-23 03Z on. A transient refusal now backs off on its own
+# count (e["handoffTransient"], per head), never counts toward LAND_STEP_STOP, and after LAND_RETRY_STREAK_STOP in a
+# row stops "handoff_transient", which LAND_REARM_CODES re-arms (hourly, LAND_REARM_CAP a day), as a step's timeout
+# does. A legacy handoff_refused stop whose last refusal was transient is re-armed the same way (rearm). The deadline
+# is LAND_HANDOFF_DEADLINE = 120 s, lane-gh's own STEP_BUSY_S: a 60 s cut ended the call inside lane-gh's busy retry.
+# Detector: test-glaeda-gh.py test_a_hand_off_the_broker_could_not_answer_backs_off_and_is_rearmed_not_stopped.
+LAND_HANDOFF_TRANSIENT = re.compile(r"\bbusy: admission queue full\b|\bconnection reset by peer\b"
+                                    r"|\bis spent for login until \S+ \(reset\); not sent, retry after\b", re.I)
+
+
+def land_handoff_transient(rc: int, said: str) -> bool:
+    """A hand-off refusal the broker gave without judging anything (LAND_HANDOFF_TRANSIENT's comment)."""
+    return rc == 124 or bool(LAND_STEP_TRANSIENT.search(said) or LAND_HANDOFF_TRANSIENT.search(said))
 # A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
 # read its PR again, so it never learned that the far host merged it, closed it or lost it. Finding hq#19725
 # (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
@@ -19630,7 +19651,7 @@ class LandQueue:
         """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not LAND_REARM_CODES.match(code):
+        if not LAND_REARM_CODES.match(code) and not self.handoff_stop_transient(e):
             return False
         # A PR that merged or closed since the stop is over: it ends its entry (merged, or stopped "closed"), never a
         # re-arm. gcp-codex-swarm-06, 2026-11-20/21: hq#14618, merged long before, re-armed retry_deadline hour after
@@ -19665,6 +19686,16 @@ class LandQueue:
         self.save(e)
         return True
 
+    @staticmethod
+    def handoff_stop_transient(e: dict) -> bool:
+        """E is stopped handoff_refused and its last refusal was one the broker gave without judging anything: a
+        stop from before LAND_HANDOFF_TRANSIENT, re-armed as a handoff_transient stop is."""
+        st = e.get("stop") or {}
+        if st.get("code") != "handoff_refused":
+            return False
+        why = str((e.get("handoffFail") or {}).get("why") or st.get("reason") or "")
+        return land_handoff_transient(0, why)
+
     def remind(self, e: dict) -> bool:
         """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
         (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
@@ -19672,7 +19703,8 @@ class LandQueue:
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
-        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code) \
+                or self.handoff_stop_transient(e):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
         to = str(e.get("requester") or "")
         if not to:
@@ -24221,6 +24253,7 @@ class LandQueue:
                 host = str(doc.get("host") or "the broker host")
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
+                e.pop("handoffTransient", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
                                   "request": str(doc.get("request") or ""),
                                   "kind": "judgment" if due.get("kind") == "judgment" else "ownership"}
@@ -24239,6 +24272,20 @@ class LandQueue:
             self.hand_off(e, live, repinned=True)  # off the lock, as the first call was
             return
         with self.lock:
+            if land_handoff_transient(got.returncode, said):
+                last = e.get("handoffTransient") or {}
+                n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+                e["handoffTransient"] = {"head": head, "count": n, "at": self.now, "why": said}
+                self.history(e, "handoff_refused", head=head[:12], why=land_trim(said, 160), n=0, transient=n)
+                if n >= LAND_RETRY_STREAK_STOP:
+                    self.stop(e, "handoff_transient", f"{what}, and the broker host's land queue could not answer "
+                              f"the hand-off {n} times in a row: {said}",
+                              f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+                    return
+                after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+                self.wait(e, {"kind": "retry", "why": f"the broker host's land queue could not answer the hand-off "
+                              f"({land_trim(said, 80)}): backoff {after:.0f} s"}, after)
+                return
             last = e.get("handoffFail") or {}
             n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}

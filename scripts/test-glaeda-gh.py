@@ -33600,6 +33600,59 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
         self.assertIn("unknown tool", e["stop"]["reason"])
 
+    def test_a_hand_off_the_broker_could_not_answer_backs_off_and_is_rearmed_not_stopped(self):
+        # gcp-agent-lane-2, 2026-11-22: with the broker CPU-bound, 336 of 411 hand-off refusals were "timed out after
+        # 60s", and 59 rows stopped handoff_refused (a code nothing re-arms) for 75-123 h. A refusal the broker gave
+        # without judging anything never counts toward LAND_STEP_STOP: it stops handoff_transient only after
+        # LAND_RETRY_STREAK_STOP in a row, which re-arms, and the re-armed row is handed off once the broker answers.
+        busy = "lane-gh call land_handoff: refused: busy: admission queue full (the broker is CPU-bound); nothing was started"
+        latch = ("lane-gh call land_handoff: refused: the REST limit is spent for login until 01:36Z (reset); not sent, "
+                 "retry after 01:36Z")
+        for said in ("timed out after 120s", busy, "[Errno 104] Connection reset by peer", latch):
+            with self.subTest(said=said[:30]):
+                self.assertTrue(gg.land_handoff_transient(1, said))
+        self.assertFalse(gg.land_handoff_transient(1, "refused: unknown tool 'land_handoff'"))
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        ok = self.w.handoff
+        self.w.handoff = (124, "", "timed out after 120s")
+        e = {}
+        for _ in range(gg.LAND_RETRY_STREAK_STOP):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+        self.assertEqual(len(self.handoffs()), gg.LAND_RETRY_STREAK_STOP)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_transient"))
+        self.assertNotIn("handoffFail", e)
+        self.w.handoff = ok
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER + 1)
+        self.assertIn("rearmed", [h.get("event") for h in e["history"]])
+        for _ in range(3):
+            if e["state"] == "forwarded":
+                break
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertNotIn("handoffTransient", e)
+
+    def test_a_legacy_handoff_refused_stop_on_a_timeout_is_rearmed_and_a_real_refusal_is_not(self):
+        # The 59 rows stopped before LAND_HANDOFF_TRANSIENT: their last refusal was a timeout, so they re-arm as a
+        # handoff_transient stop does. A stop whose refusals were the broker's real answer stays stopped.
+        for why, rearmed in (("timed out after 60s", True), ("refused: unknown tool 'land_handoff'", False)):
+            with self.subTest(why=why):
+                e = {"key": self.KEY, "state": "stopped", "handoffFail": {"head": LA, "count": 6, "why": why},
+                     "stop": {"code": "handoff_refused", "at": self.t - gg.LAND_REARM_AFTER - 1, "head": LA,
+                              "reason": f"x, and handing it to the broker host's land queue was refused 6 times: {why}"},
+                     "history": []}
+                self.assertEqual(gg.LandQueue.handoff_stop_transient(e), rearmed)
+                self.q.now = self.t
+                with self.q.lock:
+                    self.assertEqual(self.q.rearm(e), rearmed)
+                self.assertEqual(e["state"], "queued" if rearmed else "stopped")
+
     STALE = "PR 1's head is " + LB + ", not " + LA + ": nothing was queued. The hand-off is for the PR's head now"
 
     def stale_handoff(self) -> tuple[int, str, str]:
