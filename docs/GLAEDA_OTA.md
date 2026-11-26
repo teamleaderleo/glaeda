@@ -111,6 +111,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    backed-off hours), as an error when the reason is one retrying cannot clear (a quarantined or
    refused release, a hook `--refresh-hooks` keeps), and `ota_stale` when no run has finished for
    three hours. ci-dash shows both in Health, from the report the probe forwards.
+   A new release restarts the host's `since`, but each stale runner row in `running.hooks` keeps its
+   own `staleSince` while its hook bytes stay the same, and `alertAfter` counts from the oldest of
+   them: a runner left on one hook through several releases pages two hours after it fell behind,
+   not two hours after the latest release (before, a ring that released every half hour never let
+   a stuck runner reach `alertAfter`).
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are
