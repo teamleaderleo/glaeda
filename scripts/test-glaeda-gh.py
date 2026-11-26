@@ -31067,6 +31067,24 @@ class LandTest(Base):
         self.assertIn("the ready-to-land label starts", reason)
         self.assertIn("ready-to-land", self.w.sent()[-1][-1])
 
+    def test_a_head_whose_only_unfinished_checks_wait_for_a_label_is_judged_not_waited_on(self):
+        # LAND_GATE_ONLY: cmux#58041 (2026-11-26) waited 1.5 h on clippy and cmux/land-tier, both saying the
+        # ready-to-land label starts them; land_judge, which adds that label, was never asked.
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        gated = {"headRefOid": LA, "state": "OPEN",
+                 "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {"name": "clippy", "status": "PENDING", "description": said}]}
+        self.assertFalse(gg.land_checks_running(gated, LA))
+        gated["checks"].append({"name": "ws-check", "status": "PENDING", "description": "Queued on a Linux runner"})
+        self.assertTrue(gg.land_checks_running(gated, LA))  # an ordinary pending check still waits
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        self.w.answers.append(ok_answer(LA))  # land_judge is asked: the answer it gives is its own (land_tier_pending)
+        e = self.tick()
+        self.assertEqual(self.w.answers, [])
+        self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
+
     def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
         # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
         # stop that invented a label would send its reader to add one no workflow reads.
