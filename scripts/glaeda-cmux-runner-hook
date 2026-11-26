@@ -3820,22 +3820,30 @@ DRAIN_TTL_S = 3600.0
 DRAIN_MAX_BYTES = 4096
 
 
-def runner_drain(runner_dir: Path, now: float) -> str | None:
-    """Why this runner is draining (RUNNER_DRAIN), or None: no marker, an expired one, or one that cannot be read."""
-    doc = runner_drain_doc(runner_dir, now)
+def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
+    """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
+    no marker, an expired one, or one that cannot be read."""
+    doc = runner_drain_doc(runner_dir, now) or host_runner_pause_for(runner_dir, now, fleet_dir)
     return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
 def runner_drain_doc(runner_dir: Path, now: float) -> dict[str, Any] | None:
     """The live RUNNER_DRAIN marker of this runner, or None: no marker, an expired one, or one that cannot be read."""
+    return drain_doc_at(runner_dir / RUNNER_DRAIN_FILE, now)
+
+
+def drain_doc_at(path: Path, now: float, owner_uid: int | None = None) -> dict[str, Any] | None:
+    """The live drain marker at path, or None: no marker, an expired one, one that cannot be read, or (owner_uid)
+    one some other user owns."""
     # a job runs as this user in this tree, so the read is bounded: no symlink, no FIFO or device, at most
     # DRAIN_MAX_BYTES, and nothing in it can raise past here; a marker that is not a small regular file holds nothing
     try:
-        fd = os.open(runner_dir / RUNNER_DRAIN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (owner_uid is not None and st.st_uid != owner_uid):
             return None
         data = os.read(fd, DRAIN_MAX_BYTES + 1)
     except OSError:
@@ -3894,9 +3902,10 @@ def host_drain(home: Path, now: float) -> str | None:
 CMUX_CI_DRAIN_BY = "cmux-ci lend drain"
 
 
-def measurement_drain(home: Path, now: float) -> str | None:
+def measurement_drain(home: Path, now: float, fleet_dir: str | None = None) -> str | None:
     """Why the mini drains for a cmux-ci measurement (MEASURE_DRAIN_SLOT), or None: no runner under home carries a
-    live RUNNER_DRAIN marker written by CMUX_CI_DRAIN_BY. A directory that cannot be listed drains nothing."""
+    live RUNNER_DRAIN marker written by CMUX_CI_DRAIN_BY and no HOST_RUNNER_PAUSE stands. A directory that cannot be
+    listed drains nothing."""
     try:
         runners = sorted(p for p in home.glob("actions-runner-glaeda*")
                          if HOST_DRAIN_RUNNER_DIR.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
@@ -3906,7 +3915,45 @@ def measurement_drain(home: Path, now: float) -> str | None:
         doc = runner_drain_doc(runner, now)
         if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY:
             return f"{runner.name} is draining for {str(doc.get('reason') or 'a cmux-ci measurement')[:200]}"
+    if (doc := host_runner_pause(now, fleet_dir)) is not None:
+        return f"the host's runner pause is draining for {str(doc.get('reason') or 'a cmux-ci measurement')[:200]}"
     return None
+
+
+# HOST_RUNNER_PAUSE: cmux-ci's worker pauses a mini's PR runners with the RUNNER_DRAIN marker in each runner directory
+# (MEASURE_DRAIN_SLOT), which needs the worker to write in the runner account's home. On the AWS Macs the worker runs
+# as the operator (ec2-user) and the PR runners as the pool account (cmux-pr-runner, home 0700), so the worker found no
+# runner directory and paused nothing: 2026-11-26 aws-m4pro-7 reported runner_pause runners:0 home /Users/ec2-user,
+# and aws-m4pro-4, claim-paused for Aziz's pinned simulator steps, started a new PR job at 09:05Z. The worker writes
+# one host-level marker instead, FLEET_DIR/runner-pause.json (the RUNNER_DRAIN document, by CMUX_CI_DRAIN_BY), in the
+# operator-owned fleet directory the pool account can read but not write. A live one (a regular file owned by
+# FLEET_DIR's owner, no symlink, the same expiry and DRAIN_TTL_S cap) drains every runner but the nightly slot, as if
+# each carried cmux-ci's marker; any other writer or owner holds nothing.
+HOST_RUNNER_PAUSE_FILE = "runner-pause.json"
+
+
+def host_runner_pause(now: float, fleet_dir: str | None = None) -> dict[str, Any] | None:
+    """The live HOST_RUNNER_PAUSE marker, or None."""
+    fleet = Path(fleet_dir or FLEET_DIR)
+    try:
+        owner = os.stat(fleet).st_uid
+    except OSError:
+        return None
+    doc = drain_doc_at(fleet / HOST_RUNNER_PAUSE_FILE, now, owner_uid=owner)
+    return doc if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY else None
+
+
+def host_runner_pause_for(runner_dir: Path, now: float, fleet_dir: str | None = None) -> dict[str, Any] | None:
+    """HOST_RUNNER_PAUSE as it applies to this runner: None on the nightly slot (its hook passes --nightly-runner, or
+    the hook cannot be read: the worker's own per-runner pause leaves such a runner alone too)."""
+    doc = host_runner_pause(now, fleet_dir)
+    if doc is None:
+        return None
+    try:
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None if re.search(r"\s--nightly-runner(?:\s|$)", text) else doc
 
 
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
