@@ -779,6 +779,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             scope += " --yield-to-exclusive"
         if dedicated.get("yieldToFleetBuild"):  # the hook's YIELD_TO_FLEET_BUILD
             scope += " --yield-to-fleet-build"
+        if dedicated.get("yieldToWaiters"):  # the hook's YIELD_TO_WAITERS (its listener gate reads it)
+            scope += " --yield-to-waiters"
     # DEDICATED_USER: the account's own ledger directory (dedicated_context), for every phase and the gate
     own_ledger = f" --capacity-dir {shlex.quote(os.fspath(capacity_dir))}" if (dedicated or {}).get("user") else ""
     scope += own_ledger
@@ -3156,7 +3158,8 @@ def preflight(ctx: Context) -> dict[str, Any]:
                   blocking=not ctx.allow_stale)
         else:
             check("scriptCopy", None, f"differs from release {copy['release']} ({what})", "not older; used as is")
-    disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
+    disk = (which("cmux-disk", (os.fspath(ctx.home / ".local/bin/cmux-disk"),))
+            or which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),)))
     check("glaedaDisk", disk is not None or None, disk or "not installed",
           "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
     return {"checks": checks, "blocking": sorted(n for n, c in checks.items() if c["level"] == "block")}

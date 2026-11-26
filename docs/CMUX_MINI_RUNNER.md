@@ -85,6 +85,14 @@ What `--apply` does:
      event payload is missing or unreadable. Admitted jobs then run
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
+   - For an HQ checkout, the admitted job gets a job-local Git wrapper through `GITHUB_PATH`.
+     During `actions/checkout`, before a fetch or checkout from the HQ HTTPS origin configured for the fleet loopback proxy,
+     it tests the tunnel with a CONNECT bounded at five seconds. A transport failure before any
+     CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
+     An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
+     `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
+     disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
      so a PR job never lands on a mini that is busy with other work. It is refused, so
      cmux's rescue re-runs it on Blacksmith, when the host is reserved
@@ -637,7 +645,12 @@ What `--apply` does:
      its listener (`holding the listener off: disk full ... (DISK_FULL_NO_LISTEN)`, logged once per hold), and a
      full disk seen during a job stops the listener at that job's end, as a reservation does; the job runs on. It
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk
-     holds nothing. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
+     holds nothing. job-started applies the same line to the job it was handed (`DISK_FULL_REFUSES`, 2026-11-22: a listener
+     already online kept taking jobs on cmux17 at 9 GiB beside 8 more, 160 of 646 jobs in a day saw under 1 GiB, and
+     the runners' `_diag` ENOSPC dropped every runner on the mini): after its disk phase and again once capacity is
+     held, under the line or with free disk unreadable it refuses the job before any step (`disk full: ...
+     (DISK_FULL_REFUSES)`) and lets the host lock go, so the rescue re-runs it on a runner with room. The same runners
+     are exempt as from the hold, and nightly jobs keep their own reserve. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
      wrote it down to 1.8 GiB while the lent fleet worker sat at `claim_paused disk` with suites queued 4-5 h.
      **A fleet suite step goes first on a lent mini's disk, for at most 15 minutes per wait (`SUITE_FIRST_HOLD`).**
      The PR jobs on a lent mini took every GiB a job's end freed, so a fleet suite step (20 GiB growth plus the
@@ -1379,6 +1392,13 @@ dispatch as the others. It holds the Developer ID key for its whole run, so it i
 build included: one claim and one drain per nightly, where the two-run pipeline drained the mini once per signing
 job. No other runner class admits it, and main's `nightly.yml` has no such job (a dispatch of it stays refused).
 
+NIGHTLY_DELTA_ADMISSION (cmux#57000) admits `nightly-next-deltas`, the post-feed delta job, on that same exact
+nightly-next workflow and signing runner. Splitting work from a signing job must carry its admission and exclusive
+capacity class with it: this job still holds the nightly signing key. Detectors in `scripts/test-glaeda-cmux-runner.py`:
+`test_nightly_next_deltas_requires_exact_signing_provenance` covers push, dispatch, re-runs and refused provenance;
+`test_nightly_next_deltas_holds_the_whole_mini_before_credentials` checks draining, the exclusive claim and exclusion
+of concurrent jobs. Merge and deploy this admission before enabling the companion workflow job.
+
 AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
 whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
 copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a
@@ -1619,6 +1639,18 @@ own 20 min bound ends the wait; `YIELD_TO_FLEET_BUILD_WAIT_S` (30 min) is the ba
 admitted, never refused. Its listener gate reads the same hold (`Gate.fleet_build_yield`) and stops listening through
 it, so a job of a shared label goes to another runner instead of waiting here. Without the key nothing changes.
 
+### Yielding to a build waiting for the host lock (`yieldToWaiters`)
+
+A pool runner's listener gate stops while a build waits for `host.lock` (a fleet build, a lend drain, cmux15's
+catch-up fill in its slot), bounded by `GATE_WAITER_MAX_HOLD_S` (10 min) and then waived for `GATE_WAITER_WAIVE_S`.
+A dedicated runner's gate never read those waiters, so a builder beside a waiter kept starting jobs. A
+runner.dedicated entry with `"yieldToWaiters": true` gets the hook's `--yield-to-waiters`, and its gate reads the
+waiters exactly as a pool gate does: it stops an idle listener and freezes a busy one as its job ends
+(`JOB_END_FREEZE`). `job-started` does not change: a job already handed to it runs. cmux15's `trusted-main` declares
+it. Its Seed DerivedData jobs build from the same local CAS as the catch-up fill, the compiler CAS store's only
+writer, and the label's other servers (cmux7s-mac-mini, ultra1) take the job meanwhile. Without the key nothing
+changes. A `user` entry cannot declare it (the waiter spans are the member user's state).
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and
@@ -1665,7 +1697,8 @@ account's session and a token (cmuxterm-hq#13863): a PR job on the same Mac then
 - Allowed only on a trusted entry (`trustedRef` and `trustedRepo`, registered at that repository even when the
   member's pools are org-scoped), so only merged code of that branch runs in the account (push and schedule jobs).
   Refused: root, the member's own `ssh_user`, a name outside `[a-z_][a-z0-9_-]{0,31}`, and `user` together with
-  `lanRelay` or `yieldToExclusive` (both are the member user's: its relay socket, its capacity ledger).
+  `lanRelay`, `yieldToExclusive` or `yieldToWaiters` (each is the member user's: its relay socket, its capacity
+  ledger, its waiter spans).
 - `glaeda-cmux-runner-fleet --apply` stages the scripts into that account's home and runs
   `glaeda-cmux-runner --dedicated NAME --apply` over `ssh -l USER MEMBER` (the same options; the token on stdin). The
   plan names the user per entry. When ssh as that user fails, that entry alone fails, reported `missing: user-ssh`.

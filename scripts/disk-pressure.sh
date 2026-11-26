@@ -16,6 +16,9 @@ fi
 home="${HOME:?HOME is required}"
 python="${GLAEDA_PYTHON:-/opt/homebrew/bin/python3}"
 disk="${GLAEDA_DISK:-$home/.local/bin/glaeda-disk}"
+# run it by its primary name, cmux-disk, when the shim sits beside it (GLAEDA_DISK stays the program's own path,
+# which other tools load as a module); glaeda-disk counts every use of its old name (glaeda-into-cmux, Rename map)
+if [ "${disk##*/}" = glaeda-disk ] && [ -f "${disk%/*}/cmux-disk" ]; then disk="${disk%/*}/cmux-disk"; fi
 export GLAEDA_DISK_CALLER="${GLAEDA_DISK_CALLER:-disk-pressure LaunchAgent}"
 # Each pass ends before the next one starts (the agent runs every 15 minutes): glaeda-disk stops starting walks and
 # deletes 60 s before HYGIENE_RUN_DEADLINE and the next pass goes on, so no pass waits behind a long one.
