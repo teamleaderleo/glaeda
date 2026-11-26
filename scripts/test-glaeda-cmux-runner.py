@@ -355,7 +355,22 @@ class HookTest(unittest.TestCase):
         self.dir = Path(self.tmp.name)
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        # job-started and job-completed leave a detached disk pass (disk_pressure_detached) that outlives the hook and
+        # writes its trigger, lock and log under HOME/.cache/glaeda-disk: a cleanup that races it fails with
+        # "Directory not empty: 'glaeda-disk'" (runner-tests shard 2, glaeda#2876, 2026-11-26). Wait, bounded, for the
+        # pass lock to be let go, then retry the removal of what the pass wrote meanwhile.
+        lock = self.dir / ".cache" / "glaeda-disk" / hook.DISK_PASS_LOCK
+        deadline = time.monotonic() + 10
+        while lock.exists() and hook.disk_pass_running(lock) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for attempt in range(20):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.ENOENT) or attempt == 19:
+                    raise
+                time.sleep(0.1)
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -1664,6 +1679,54 @@ class HookTest(unittest.TestCase):
             self.finish("")
         finally:
             self.finish("")
+
+    def test_the_host_runner_pause_drains_every_runner_but_the_nightly_slot(self) -> None:
+        """HOST_RUNNER_PAUSE: on the AWS Macs the worker runs as ec2-user and the PR runners as cmux-pr-runner (home
+        0700), so its per-runner markers paused nothing (2026-11-26 aws-m4pro-7: runner_pause runners:0; aws-m4pro-4
+        started a PR job at 09:05Z while claim-paused for pinned simulator steps). A live FLEET_DIR/runner-pause.json
+        by cmux-ci, owned by FLEET_DIR's owner, drains every runner but the nightly slot; an expired one, one past
+        DRAIN_TTL_S, another writer's, a symlink or one another user owns holds nothing. Before: no runner drained."""
+        fleet = self.dir / "fleet-pause"
+        fleet.mkdir()
+        pr, nightly, unreadable = (self.dir / name for name in (
+            "actions-runner-glaeda-2", "actions-runner-glaeda-nightly", "actions-runner-glaeda-5"))
+        for runner, flags in ((pr, "--capacity-units 14"), (nightly, "--nightly-runner")):
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / hook.RUNNER_HOOK_SCRIPT).write_text(f"#!/bin/sh\nexec hook job-started {flags}\n")
+        unreadable.mkdir()
+        marker = fleet / hook.HOST_RUNNER_PAUSE_FILE
+        now = time.time()
+
+        def mark(by: str, until: float) -> None:
+            marker.unlink(missing_ok=True)
+            marker.write_text(json.dumps({"until": until, "by": by,
+                                          "reason": "cmux-ci lend drain: a measurement waits for this mini"}))
+
+        self.assertIsNone(hook.runner_drain(pr, now, os.fspath(fleet)), "no marker")
+        self.assertIsNone(hook.measurement_drain(self.dir, now, os.fspath(fleet)))
+        mark(hook.CMUX_CI_DRAIN_BY, now + 600)
+        self.assertIn("draining for cmux-ci lend drain", hook.runner_drain(pr, now, os.fspath(fleet)))
+        self.assertIsNone(hook.runner_drain(nightly, now, os.fspath(fleet)), "the nightly slot keeps listening")
+        self.assertIsNone(hook.runner_drain(unreadable, now, os.fspath(fleet)), "a hook that cannot be read: no pause")
+        self.assertIn("the host's runner pause", hook.measurement_drain(self.dir, now, os.fspath(fleet)))
+        self.assertIsNone(hook.host_drain(self.dir, now), "a measurement's pause is no hand drain of the host")
+        other = os.stat(fleet).st_uid + 1
+        real_stat = hook.os.stat
+        with mock.patch.object(hook.os, "stat", lambda p, *a, **k: os.stat_result(
+                (*real_stat(p, *a, **k)[:4], other, *real_stat(p, *a, **k)[5:]))):
+            self.assertIsNone(hook.runner_drain(pr, now, os.fspath(fleet)), "a marker the fleet's owner did not write")
+        for name, by, until in (("expired", hook.CMUX_CI_DRAIN_BY, now - 1),
+                                ("past DRAIN_TTL_S", hook.CMUX_CI_DRAIN_BY, now + hook.DRAIN_TTL_S + 3600),
+                                ("another writer", hook.APPLY_DRAIN_BY, now + 600)):
+            with self.subTest(name):
+                mark(by, until)
+                self.assertIsNone(hook.runner_drain(pr, now, os.fspath(fleet)))
+                self.assertIsNone(hook.measurement_drain(self.dir, now, os.fspath(fleet)))
+        target = self.dir / "elsewhere.json"
+        target.write_text(json.dumps({"until": now + 600, "by": hook.CMUX_CI_DRAIN_BY}))
+        marker.unlink()
+        marker.symlink_to(target)
+        self.assertIsNone(hook.runner_drain(pr, now, os.fspath(fleet)), "a symlink holds nothing")
 
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
@@ -6320,13 +6383,15 @@ time.sleep(60)
         for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
                      "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
             self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
-        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+        uid = 501
+        daemon, root = (4242, uid, "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
 
         def recycle(*tables, error=None):
             """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
             seq = list(tables)
             ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
             with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook.os, "getpid", return_value=4241), mock.patch.object(hook.os, "getuid", return_value=uid), \
                     mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
                 return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
 
@@ -6335,12 +6400,12 @@ time.sleep(60)
         self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
         self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
         # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "Z", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242")
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "SE", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
         # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
-        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        note, kills = recycle([daemon], [daemon, (7, uid, "S", "/x/usr/bin/xctest /x/a.xctest")])
         self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
         self.assertEqual(kills, [(4242, term)])
         self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
@@ -7919,7 +7984,11 @@ elif args[:1] == ["default"] and args[1] in installed:
     open(state + "/rustup-default", "w").write(args[1])
     print("info: default toolchain set to " + args[1])
 elif args[:1] == ["run"]:
-    print(json.load(open(state + "/rustc-by-toolchain.json")).get(args[1] + "-aarch64-apple-darwin", ""))
+    name = args[1] if args[1] in installed else args[1] + "-aarch64-apple-darwin"
+    if name not in installed:  # as rustup 1.29: "error: toolchain '...' is not installed", exit 1
+        print("error: toolchain '" + name + "' is not installed", file=sys.stderr)
+        sys.exit(1)
+    print(json.load(open(state + "/rustc-by-toolchain.json")).get(name, ""))
 else:
     sys.exit(1)
 """)
@@ -8023,7 +8092,6 @@ else:
             "other-receipt": (dict(enrolled_sha="sha256:bb"), "does not reference the m4pro-48 class receipt"),
             "rustc-drift": (dict(tools={"rustcVersion": "rustc 1.99.0"}), "rustcVersion 'rustc 1.99.0'"),
             "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
-            "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
             "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
             "receipt-invalid": (dict(valid=False), "class receipt does not validate"),
             "wrong-role": (dict(role="some_other_role"), "some_other_role: ok"),
@@ -8106,6 +8174,36 @@ else:
         self.assertIn("diffRustcVersion", result.stdout)
         self.assertTrue(self.lock_free())
 
+    def test_an_empty_toolchain_probe_warns_and_never_reads_as_drift(self) -> None:
+        """PROBE_EMPTY_WARNS. 2026-11-22: cruft-sweep reclaimed the DiffSidecar toolchain (1.88.0) on m6-16 minis,
+        `rustup run 1.88.0 rustc --version` exited 1, and every fast-tier job was refused as
+        "diffRustcVersion '' != 'rustc 1.88.0 ...'" (cmuxterm-hq#19552 fault 2). A probe that read nothing is a
+        failed probe: it warns and admits; only a different answer is drift."""
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.node(receipt_toolchain=receipt, installed=("1.98.1-aarch64-apple-darwin",))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: diffRustcVersion read nothing", result.stdout)
+        self.assertIn("rust toolchain 1.88.0 is not installed", result.stdout)
+        self.done()
+        import shutil as _sh
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None})  # zig prints nothing: a failed probe, not drift
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("zigVersion read nothing (receipt '0.16.0')", result.stdout)
+        self.done()
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None, "rustcVersion": "rustc 1.99.0"})  # one real answer still refuses
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("rustcVersion 'rustc 1.99.0'", result.stdout)
+        self.assertNotIn("zigVersion ''", result.stdout)
+        self.assertTrue(self.lock_free())
+
     def test_a_timed_out_eligibility_probe_is_named_as_a_timeout_not_an_invalid_receipt(self) -> None:
         """On a mini too loaded to start Python within ELIGIBILITY_BUDGET_S the validator or node status gives no
         answer. node_answer flags it, so the health agent raises no node_ineligible; the refusal names the timeout."""
@@ -8144,14 +8242,17 @@ else:
                                   env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                        "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"})
         self.assertLess(time.monotonic() - start, 30)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        # PROBE_EMPTY_WARNS: the hung tool's empty reading warns, never reads as drift
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("xcodeVersion read nothing", result.stdout)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.done()
         # the same hung tool on a busy host admits: the job is slower, never failed
         result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
                               env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                    "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"})
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("admitted on no answer", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: xcodeVersion read nothing", result.stdout)
 
     def test_no_enrollment_refuses(self) -> None:
         self.fleet()
@@ -9189,9 +9290,9 @@ class XcodeToolchainTest(unittest.TestCase):
                 self.assertIn("timed out after 0 s; no answer, not a missing or drifted tool", why)
                 self.assertIn("gh is not on the job PATH", why)
                 answers.update(gh="gh version 2", zig="")
-                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
-                self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
-                self.assertIn("zigVersion '' != '0.16.0'", why)
+                why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIsNone(why, "an empty reading is a failed probe, never drift (PROBE_EMPTY_WARNS)")
+                self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
                 answers.update(zig="0.15.0")
                 why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
                 self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
@@ -9230,7 +9331,7 @@ class XcodeToolchainTest(unittest.TestCase):
             answers.update(gh="gh version 2", zig="")
             why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertIsNone(why, "an empty drift past the budget admits too")
-            self.assertIn("zigVersion '' != '0.16.0'", note)
+            self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
             answers.update(zig="0.15.0")
             why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
@@ -15542,6 +15643,20 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.core_busy(before, after), [100.0, 0.0])
         self.assertIsNone(hook.core_busy(before, after[:1]))
 
+    def test_efficiency_cores_counts_only_an_efficiency_level(self) -> None:
+        """M4 Pro: perflevel1 is Efficiency. M5 Pro (5 super + 10 performance, no efficiency cores; Leo's
+        cmux25-34): perflevel1 is Performance, so the P-core stall check must not see efficiency cores there."""
+        def sysctl(levels: dict[str, str]):
+            def run(argv, **_kw):
+                return subprocess.CompletedProcess(argv, 0, stdout="\n".join(levels[k] for k in argv[2:]) + "\n")
+            return run
+        m4pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Efficiency", "hw.perflevel1.logicalcpu": "4"}
+        m5pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Performance", "hw.perflevel1.logicalcpu": "10"}
+        intel = {"hw.nperflevels": "1"}
+        for levels, want in ((m4pro, 4), (m5pro, None), (intel, None)):
+            with mock.patch.object(hook.subprocess, "run", side_effect=sysctl(levels)):
+                self.assertEqual(hook.efficiency_cores(), want, levels)
+
     def pcore_gate(self, busy: list[float], boot: int = 1794342904):
         totals: list[list[int]] = []
 
@@ -19709,6 +19824,10 @@ class DedicatedRunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
         self.assertEqual(self.by_kind(receipt)["private"]["state"], "create")
         self.assertTrue(self.by_kind(receipt)["private"]["applied"])
+        agents = [p for p in (self.home / "Library/LaunchAgents").glob("*.plist") if "hq-two-mac-a" in p.read_text()]
+        self.assertEqual(len(agents), 1, agents)
+        self.assertFalse(plistlib.loads(agents[0].read_bytes()).get("SessionCreate", False),
+                         "a user entry's runner runs in its account's GUI session, where /usr/bin/open reaches the app")
         self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
         self.assertEqual(runner.stat().st_mode & 0o777, 0o700)
         ledger = self.home / ".local/state/glaeda/cmux-runner" / cr.USER_CAPACITY_DIR
@@ -23649,11 +23768,49 @@ class GitShimTest(unittest.TestCase):
         try:
             result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "push",
                                                           "GITHUB_REF": "refs/heads/nightly-next",
+                                                          "GITHUB_SHA": self.pr_sha,
                                                           "GLAEDA_GIT_SHIM_WAIT_S": "30"})
         finally:
             fill.wait(timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_snapshot_that_is_not_the_runs_commit_goes_to_github_at_once(self) -> None:
+        # cmux job 139823571654: a lane-gh ci merge snapshot, minutes old, fetched by a workflow_dispatch run on
+        # feat-cmux-next. No mirror pass of a kept branch brings it, so the shim must not wait for one.
+        self.install()
+        started = time.monotonic()
+        result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "workflow_dispatch",
+                                                      "GITHUB_REF": "refs/heads/feat-cmux-next",
+                                                      "GITHUB_SHA": self.main_sha,
+                                                      "GLAEDA_GIT_SHIM_WAIT_S": "30"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting up to", result.stderr)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_stalled_github_fetch_is_stopped_and_the_budget_ends_the_retries(self) -> None:
+        # cmux job 139837960264: a github.com fetch hung with its stderr held, then a retry ran into the checkout
+        # step's 10 min timeout. Each attempt now has the low-speed limit and a watchdog, and the budget ends retries.
+        self.install()
+        argv = self.dir / "argv"
+        fake = self.dir / "fake-git"
+        fake.write_text("#!/bin/bash\n"
+                        f"if [[ \" $* \" == *' fetch '* ]]; then echo \"$*\" >> {argv}; sleep 300; fi\n"
+                        'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        started = time.monotonic()
+        result = self.checkout_fetch(self.pr_sha, env={"GLAEDA_GIT_SHIM_ATTEMPT_S": "2",
+                                                      "GLAEDA_GIT_SHIM_BUDGET_S": "4"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 20)  # the sleeping child was stopped too: the pipe closed
+        self.assertIn("asking github.com (try 1 of 3; at most 2 s;", result.stderr)
+        self.assertIn("github.com did not finish within 2 s; stopped it", result.stderr)
+        self.assertIn("no try left in the shim's 4 s budget", result.stderr)
+        self.assertIn("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60", argv.read_text())
+        self.assertEqual(self.log(), ["github"])
 
 
 class SubmoduleShimTest(unittest.TestCase):
