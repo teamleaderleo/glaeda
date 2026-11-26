@@ -6569,6 +6569,10 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 # 84f6a850... from promisor remote": cmuxterm-hq run 45860743368, 2026-11-26, after its
 # fetch and checkout had both gone direct). So a dead probe leaves a mark in RUNNER_TEMP, and every
 # later HQ command in the step goes direct too, with no second probe.
+# An HQ job checks out other repositories too: the phone probe's viewer checks out manaflow-ai/cmux's
+# feat-cmux-next after HQ, and that fetch passed straight to the dead tunnel ("Failed to connect to
+# 127.0.0.1 port 18434" three times, cmuxterm-hq job 140064510755, 2026-11-26 17:30Z). So any
+# github.com origin an actions/checkout step fetches in an HQ job takes the same probe and mark.
 HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
@@ -6578,7 +6582,7 @@ mark=${RUNNER_TEMP:+$RUNNER_TEMP/$dead}
 case "$sub" in fetch|checkout) ;; *) [ -n "$mark" ] && [ -e "$mark" ] || passthrough ;; esac
 url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
 case "$url" in
-  https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
+  https://github.com/*) ;;
   *) passthrough ;;
 esac
 "$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
@@ -6589,7 +6593,7 @@ connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --nop
           --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
 case "$?:$connect" in
   7:000|28:000|52:000|55:000|56:000)
-    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
+    echo "glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ job's checkout of ${url#https://github.com/}" >&2
     [ -z "$mark" ] || : > "$mark" 2>/dev/null || :
     exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
 esac

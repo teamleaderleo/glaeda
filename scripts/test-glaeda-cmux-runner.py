@@ -23839,10 +23839,10 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.path_file.read_text(), "")
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
 
-    def hq_checkout_fixture(self, *, refused_socket: bool = False) -> tuple[dict, Path]:
+    def hq_checkout_fixture(self, *, refused_socket: bool = False,
+                            url: str = "https://github.com/manaflow-ai/cmuxterm-hq") -> tuple[dict, Path]:
         # Replace only the network peers: curl reports the tunnel result, and git's
         # HTTPS helper records its effective config and serves a real local upstream.
-        url = "https://github.com/manaflow-ai/cmuxterm-hq"
         proxy = "http://127.0.0.1:18434"
         if refused_socket:
             sock = socket.socket()
@@ -23894,6 +23894,18 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(receipt.read_text().splitlines(), ["", ""])
         self.assertEqual(self.gitconfig.read_bytes(), original)
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
+
+    def test_hq_jobs_checkout_of_another_repository_goes_direct_too(self) -> None:
+        # cmuxterm-hq job 140064510755 (2026-11-26 17:30Z): the phone probe's viewer checked out
+        # manaflow-ai/cmux after HQ, and its fetch went to the dead tunnel three times.
+        env, receipt = self.hq_checkout_fixture(refused_socket=True, url="https://github.com/manaflow-ai/cmux")
+        result = subprocess.run(["git", "fetch", "--no-tags", "--filter=blob:none", "--depth=1", "origin",
+                                 f"+{self.pr_sha}:refs/remotes/origin/feat-cmux-next"], cwd=self.ws, env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("using direct HTTPS for this HQ job's checkout of manaflow-ai/cmux", result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(), [""])
+        self.assertTrue((Path(env["RUNNER_TEMP"]) / hook.HQ_GIT_SHIM_DEAD).exists())
 
     def test_hq_lazy_blob_fetch_from_another_command_goes_direct_after_a_dead_probe(self) -> None:
         # cmuxterm-hq run 45860743368 (2026-11-26): fetch and checkout went direct, then checkout's
