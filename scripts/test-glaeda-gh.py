@@ -28022,6 +28022,76 @@ class LandTest(Base):
         self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
         self.assertIn("already rerun once", json.dumps(e["history"]))
 
+    # cmuxterm-hq#26226 (2026-11-26, run 45727561330): job 139601136607 lost its runner ("completed with step 'Set up
+    # runner' still in_progress"); base_red_excuse.py infra() worded it "is infra, not a verdict", which no "not
+    # excused: 'NAME'" named, and land stopped own_red with no rerun. It takes the setup refusal's one rerun.
+    INFRA = ("land_judge: refused: base_red_excuse.py exit 1 at {head}: not excused: infra, not a verdict: "
+             "'Native/OptChat/optchat-chief' is infra, not a verdict (job 139601136607: it completed with step "
+             "'Set up runner' still in_progress); it is never this PR's own red and needs a re-run, like a cancelled job")
+
+    def infra(self, text: str | None = None) -> tuple[int, dict]:
+        why = (text or self.INFRA).format(head=LA)
+        return refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red",
+                                               "why": f"{why}; next: gh run view {self.RUN} -R o/r --log-failed"},
+                       reason=why)
+
+    def test_a_job_that_lost_its_runner_is_rerun_once_with_no_path_rule_then_merged(self):
+        self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]  # a path the workflow reads: still no PR red
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.infra())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"), e.get("history"))
+        self.assertIn("lost its runner", json.dumps(e["history"]))
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_job_that_lost_its_runner_again_after_its_rerun_stops_own_red(self):
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.infra())
+        self.tick()
+        self.pr_red(True, running=True)
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.infra())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
+
+    def test_an_infra_red_reruns_the_run_of_the_job_it_names(self):
+        # the same job name red in two runs at the head: the job id the classifier read picks the run
+        other = 44118660999
+        checks = [{"name": "Native/OptChat/optchat-chief", "workflow": "rust workspaces", "status": "COMPLETED",
+                   "conclusion": "FAILURE", "runId": run, "completedAt": "2026-11-17T10:00:00Z",
+                   "url": f"https://github.com/o/r/actions/runs/{run}/job/{job}"}
+                  for run, job in ((other, 139601130000), (self.RUN, 139601136607))]
+        self.w.set_pr(self.KEY, {**land_pr(LA), "checks": checks}, self.t)
+        answer = self.infra()[1]
+        self.assertEqual(gg.land_own_red(answer, answer["action"], checks, True), ("rust workspaces", self.RUN, ""))
+        self.land()
+        self.w.answers.append(self.infra())
+        self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+
+    def test_a_classifier_read_failure_worded_infra_is_no_rerun(self):
+        for text in ("land_judge: refused: base_red_excuse.py exit 1 at {head}: not excused: infra, not a verdict: "
+                     "ran past its 600 s deadline",
+                     "land_judge: refused: base_red_excuse.py exit 1 at {head}: not excused: infra, not a verdict: "
+                     "the classifier could not be read"):
+            with self.subTest(text=text[-40:]):
+                self.setUp()
+                self.pr_red(True)
+                self.land()
+                self.w.answers.append(self.infra(text))
+                e = self.tick()
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"))
+
     def test_another_signal_or_a_sigterm_in_a_later_job_is_no_rerun(self):
         for text in (self.SIGTERM.replace("signal 15", "signal 11"),
                      "merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: "
