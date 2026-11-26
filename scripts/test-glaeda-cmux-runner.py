@@ -23878,6 +23878,31 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", second)
         self.assertEqual(self.log(), ["github", "github"])
 
+    def test_another_github_repos_clone_and_fetch_get_the_probe_too(self) -> None:
+        # SwiftPM's package clones and another repo's fetch run the shim's git too, through the same proxy
+        argv, curl_argv, env = self.proxied(curl_exit=28)
+        other = self.dir / "github" / "someone" / "pkg.git"
+        other.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(self.github), os.fspath(other))
+        fake = self.dir / "fake-git"  # log every argv, not only fetches
+        fake.write_text(fake.read_text().replace("if [[ \" $* \" == *' fetch '* ]]; then echo", "if true; then echo"))
+        result = self.shim("clone", "-q", "https://github.com/someone/pkg.git", os.fspath(self.dir / "pkg"), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not answer a CONNECT", result.stderr)
+        self.assertIn("-c http.proxy= -c http.https://github.com/.proxy= clone", argv.read_text())
+        self.assertEqual(len(curl_argv.read_text().splitlines()), 1)
+        # a local command is passed through untouched: no probe, no note
+        status = self.shim("status", "--short", env=env)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(status.stderr, "")
+        self.assertEqual(self.log(), [])
+
+    def test_a_good_probe_holds_for_a_minute(self) -> None:
+        _, curl_argv, env = self.proxied(curl_exit=0)
+        for _ in range(3):
+            self.assertEqual(self.shim("ls-remote", "https://github.com/manaflow-ai/cmux", env=env).returncode, 0)
+        self.assertEqual(len(curl_argv.read_text().splitlines()), 1)
+
     def test_no_proxy_means_no_probe(self) -> None:
         self.install()
         bindir = self.dir / "bin"

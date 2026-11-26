@@ -6259,7 +6259,45 @@ sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.u
   done
   return 1
 }
-case $sub in fetch|ls-remote|submodule) ;; *) exec "$real" "${orig[@]}" ;; esac
+case $sub in fetch|ls-remote|submodule|clone|pull) ;; *) exec "$real" "${orig[@]}" ;; esac
+probe_s=${GLAEDA_GIT_SHIM_PROXY_PROBE_S:-$proxy_probe_s}
+# the proxy git would use for github.com: http.<url>.proxy or http.proxy (urlmatch), else curl's environment
+proxy=$("$real" ${globals[@]+"${globals[@]}"} config --get-urlmatch http.proxy https://github.com/ 2>/dev/null)
+[ -n "$proxy" ] || proxy=${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}
+route=()
+go_direct() {  # $1: why. This attempt, the rest and the job's later git calls skip the proxy (an empty proxy also
+  # overrides curl's env); the mark in RUNNER_TEMP spares actions/checkout's own retry another probe of a dead path
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$log.direct" 2>/dev/null
+  say "the github.com proxy $proxy $1; going direct to github.com"
+}
+if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
+fi
+probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works.
+  # A good answer holds for a minute ($log.proxy-ok), so a SwiftPM resolve's dozens of clones cost one probe.
+  [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
+  now=$(date +%s)
+  okat=$(cat "$log.proxy-ok" 2>/dev/null)
+  case $okat in ''|*[!0-9]*) ;; *) [ $((now - okat)) -lt "${GLAEDA_GIT_SHIM_PROXY_OK_S:-60}" ] && return 0 ;; esac
+  if curl -sS -o /dev/null --head -m "$probe_s" -x "$proxy" https://github.com/ 2>/dev/null; then
+    echo "$now" > "$log.proxy-ok" 2>/dev/null
+    return 0
+  fi
+  go_direct "did not answer a CONNECT in $probe_s s"
+}
+github_bound() {  # any argument names github.com (a clone URL, a fetch or ls-remote of a URL)
+  for a in "${orig[@]}"; do case $a in *github.com[/:]*) return 0 ;; esac; done
+  return 1
+}
+pass_github() {  # the real git, for a github.com command the shim does not serve: probed, maybe direct
+  probe_proxy
+  exec "$real" ${route[@]+"${route[@]}"} "${orig[@]}"
+}
+# Network commands of other github.com repositories (SwiftPM's package clones, a cargo git fetch through the git
+# CLI, another repo's ls-remote) go through the same proxy, so they get the same probe and direct fallback.
+case $sub in clone|pull) github_bound && pass_github; exec "$real" "${orig[@]}" ;; esac
 shift
 args=("$@")
 kind=cmux
@@ -6347,7 +6385,7 @@ if [ "$kind" != submodule ]; then
   if [ "$norm" != "https://github.com/manaflow-ai/cmux" ]; then
     # a fetch inside a submodule (a retry, or a pin the clone did not bring) reads that submodule's mirror
     case $norm in https://github.com/*) ;; *) exec "$real" "${orig[@]}" ;; esac
-    mirror=$(sm_for "$norm") || exec "$real" "${orig[@]}"
+    mirror=$(sm_for "$norm") || pass_github
     kind=pins
   fi
 fi
@@ -6404,26 +6442,6 @@ fi
 tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
 budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
 stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
-probe_s=${GLAEDA_GIT_SHIM_PROXY_PROBE_S:-$proxy_probe_s}
-# the proxy git would use for github.com: http.<url>.proxy or http.proxy (urlmatch), else curl's environment
-proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy https://github.com/ 2>/dev/null)
-[ -n "$proxy" ] || proxy=${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}
-route=()
-go_direct() {  # $1: why. This attempt, the rest and the job's later git calls skip the proxy (an empty proxy also
-  # overrides curl's env); the mark in RUNNER_TEMP spares actions/checkout's own retry another probe of a dead path
-  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$log.direct" 2>/dev/null
-  say "the github.com proxy $proxy $1; going direct to github.com"
-}
-if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
-  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
-  say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
-fi
-probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works
-  [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
-  curl -sS -o /dev/null --head -m "$probe_s" -x "$proxy" https://github.com/ 2>/dev/null && return 0
-  go_direct "did not answer a CONNECT in $probe_s s"
-}
 bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
   # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
   "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" ${route[@]+"${route[@]}"} "${orig[@]}" <&0 2>"$errf" &
