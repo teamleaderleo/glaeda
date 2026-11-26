@@ -614,7 +614,7 @@ class DiskTests(unittest.TestCase):
         doc = build(disk=disk(mini_a=disk_row()))
         [f] = by_id(doc, "disk.")
         self.assertEqual((f["id"], f["severity"]), ("disk.summary@mini-a", "info"))
-        self.assertEqual(f["action"]["command"], "ssh -- mini-a '~/.local/bin/glaeda-disk'")
+        self.assertEqual(f["action"]["command"], "ssh -- mini-a '~/.local/bin/cmux-disk'")
         self.assertFalse(f["action"]["safe_to_apply"])  # glaeda-disk may rewrite its snapshot
         d = self.member(doc)["disk"]
         self.assertEqual((d["free_bytes"], d["cache_bytes"], d["under_pressure"]), (200 * GIB, 12 * GIB, False))

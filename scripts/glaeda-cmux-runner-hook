@@ -21,9 +21,11 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * GITHUB_EVENT_NAME or GITHUB_EVENT_PATH is missing or unreadable (fail closed)
   * with --trusted-ref REF --trusted-repo OWNER/NAME (a mini that holds a secret): the job is not a push
     or schedule of exactly that repository on REF (GITHUB_REF, the payload's ref and default branch)
-A disk floor never refuses a job (a disk floor warns, never refuses): below --min-free-gib the hook runs one bounded
+A disk floor warns, never refuses: below --min-free-gib the hook runs one bounded
 glaeda-disk --pressure pass (evict; skipped with --no-disk) and admits the job with a warning if free disk is still
-short. A nightly job (or a dedicated builder's) first removes idle PR runners' work dirs and holds every new job off
+short. A full disk does refuse (DISK_FULL_REFUSES): under the listener's full line (the hard floor plus one runner
+job's p95, full_disk_line), or with free disk unreadable, after that pass and again once capacity is held, a pool job
+is refused before any step, so it is re-run on a runner with room instead of losing this one to ENOSPC. A nightly job (or a dedicated builder's) first removes idle PR runners' work dirs and holds every new job off
 the mini while it frees space (NIGHTLY_DISK_RESERVE). Above the floor but under the pre-job target (the floor plus
 PREJOB_MARGIN_GIB) it starts the queued pass before the job and waits up to PREJOB_WAIT_S for that target
 (prejob_evict), then admits it: the eviction happens before every job, not after it. Free disk under a 10 GiB margin
@@ -1524,6 +1526,45 @@ def full_disk_gib() -> float:
     plus one runner job's measured p95 (runner_job_disk), or the hard floor alone when that value is unreadable."""
     per, _source = runner_job_disk()
     return runner_jobs_need_gib(0, per) if per is not None else RUNNER_JOBS_FLOOR_GIB
+
+
+def full_disk_line(scope: "RunnerScope") -> float | None:
+    """The free disk under which no job of this runner fits (DISK_FULL_NO_LISTEN, DISK_FULL_REFUSES): full_disk_gib, cut
+    to the runner's own job peak (a small runner's jobs are measured to fit under it). None for a runner the full-disk
+    hold never covers: a dedicated builder, the nightly's own listeners, a gateway runner or one with no disk floor."""
+    nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+    if scope.dedicated or nightly_own or scope.gateway or scope.min_free_gib <= 0:
+        return None
+    return min(full_disk_gib(), listener_disk_peak(scope)[0])
+
+
+# DISK_FULL_REFUSES (2026-11-22: "a runner stops taking jobs when the disk is below the floor instead of continuing").
+# FLEET_PAUSE_FULL held only the idle listener; job-started still admitted every job it was handed, "a disk floor warns,
+# never refuses", whatever the disk read after its bounded eviction ("glaeda-disk timed out; continuing"). A listener
+# that was online when the disk fell, or that the gate had not looked at since, took jobs at a disk where none fits:
+# cmux17, 2026-11-21..22, 160 of 646 completed runner jobs saw under 1 GiB free, 17:09Z auth-refresh-tests admitted at
+# 9.0 GiB beside 8 jobs; the runner's own _diag then hit ENOSPC ("No space left on device" from JobDispatcher and
+# StepsRunner), the Worker crashed and every runner on the mini lost its connection mid-job with no verdict (cmux22
+# 08:08Z, cmux17 09:05Z and 17:10Z). Leo: "A busy machine makes things slower, never makes them fail": a job taken
+# there fails anyway, later, and takes its neighbours with it. So job-started now applies the listener's own full line
+# (full_disk_line, no new number) after its disk phase, and again once its capacity is held (the capacity wait has no
+# limit, and the running jobs write the disk down meanwhile): under it, or with free disk unreadable (fail closed), the
+# job is refused before any step runs, so cmux's rescue re-runs it on a runner with room, and the reclaim it started
+# goes on. The 30 GiB floor itself still only warns; no running job is ever touched.
+def full_disk_refusal(path: str, scope: "RunnerScope") -> str | None:
+    """Why job-started refuses a job for a full disk (DISK_FULL_REFUSES), or None."""
+    full = full_disk_line(scope)
+    if full is None:
+        return None
+    free = free_or_none(path)
+    if free is None:
+        return (f"disk: cannot read free disk at {path}, so this job is not known to fit; refused before any step "
+                "(DISK_FULL_REFUSES)")
+    if free >= full:
+        return None
+    return (f"disk full: {free:.1f} GiB free, under {full:g} GiB, where no job of this runner fits (the hard floor "
+            f"plus one runner job's p95, FLEET_PAUSE_FULL); refused before any step so it runs on a runner with room "
+            "while reclaim goes on here (DISK_FULL_REFUSES)")
 
 
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
@@ -6217,6 +6258,15 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # ls-remote of cmux is a line in $RUNNER_TEMP/glaeda-git-fetches.log; job-completed prints the count. Opt-in by
 # repository: only manaflow-ai/cmux jobs get the shim. Kill switch: GLAEDA_GIT_SHIM=0 in the runner's environment
 # (no shim) or in a step's env (that step's git is the real one).
+# A mini reaches github.com through the loopback CONNECT proxy mini-rollout.sh sets (http.https://github.com/.proxy,
+# 127.0.0.1:18434: an ssh -R tunnel to a fleet VM's github-egress-proxy). When that tunnel's path is congested or
+# half-dead the proxy accepts and never answers, and curl waits its whole 300 s connect timeout per fetch (release
+# runs 45811016977 and 45805086277, 2026-11-26: "Proxy CONNECT aborted due to timeout" twice, then "Recv failure:
+# Connection reset by peer", while github.com answered the same mini directly in 0.5 s). So before each github.com
+# attempt the shim sends one CONNECT through the configured proxy, bounded at GIT_SHIM_PROXY_PROBE_S; when it gets no
+# answer, or an attempt fails with a proxy-shaped error, that attempt and the rest go direct (an empty
+# http.<url>.proxy for this command: actions/checkout's fetch carries the job's token, so it is no anonymous fetch),
+# and so do the job's later github.com git calls (a mark beside GIT_SHIM_LOG).
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6227,9 +6277,8 @@ GIT_SHIM_TRIES = 3
 GIT_SHIM_STALL_S = 60
 GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
 GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
-GIT_SHIM_BODY = r'''
-say() { echo "glaeda git shim: $*" >&2; }
-[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+GIT_SHIM_PROXY_PROBE_S = 10  # one CONNECT to github.com through the configured proxy; no answer in this long: go direct
+GIT_SHIM_COMMAND = r'''
 orig=("$@")
 globals=()
 while [ $# -gt 0 ]; do
@@ -6240,6 +6289,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 sub=$1
+'''
+GIT_SHIM_BODY = r'''
+say() { echo "glaeda git shim: $*" >&2; }
+[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
 normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
 sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
   for d in "$submodules"/*.git; do
@@ -6249,7 +6303,11 @@ sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.u
   done
   return 1
 }
-case $sub in fetch|ls-remote|submodule) ;; *) exec "$real" "${orig[@]}" ;; esac
+# Any other command can fetch a missing blob in a partial clone (checkout, submodule foreach, cat-file): once
+# this job's proxy failed, it goes direct too, as fetches do (cmuxterm-hq run 45860743368: the HQ shim's twin gap).
+case $sub in fetch|ls-remote|submodule) ;; *)
+  [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
+  exec "$real" "${orig[@]}" ;; esac
 shift
 args=("$@")
 kind=cmux
@@ -6394,9 +6452,29 @@ fi
 tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
 budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
 stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
+probe_s=${GLAEDA_GIT_SHIM_PROXY_PROBE_S:-$proxy_probe_s}
+# the proxy git would use for github.com: http.<url>.proxy or http.proxy (urlmatch), else curl's environment
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy https://github.com/ 2>/dev/null)
+[ -n "$proxy" ] || proxy=${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}
+route=()
+go_direct() {  # $1: why. This attempt, the rest and the job's later git calls skip the proxy (an empty proxy also
+  # overrides curl's env); the mark in RUNNER_TEMP spares actions/checkout's own retry another probe of a dead path
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$log.direct" 2>/dev/null
+  say "the github.com proxy $proxy $1; going direct to github.com"
+}
+if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
+fi
+probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works
+  [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -o /dev/null --head -m "$probe_s" -x "$proxy" https://github.com/ 2>/dev/null && return 0
+  go_direct "did not answer a CONNECT in $probe_s s"
+}
 bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
   # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
-  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" "${orig[@]}" <&0 2>"$errf" &
+  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" ${route[@]+"${route[@]}"} "${orig[@]}" <&0 2>"$errf" &
   gp=$!
   stopped=
   end=$((SECONDS + $1))
@@ -6428,6 +6506,7 @@ while :; do
   else
     bound=86400; limit=
   fi
+  probe_proxy
   note github
   errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
   say "asking github.com (try $try of $tries; ${limit}no bytes for $stall s ends it)"
@@ -6440,6 +6519,12 @@ while :; do
   fi
   refused=
   grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect|too slow|timed out' "$errf" && refused=1
+  # curl's words for a proxy or tunnel that failed (case-sensitive: "unexpected disconnect" is GitHub's, not these)
+  if [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] &&
+     grep -Eq '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf"; then
+    go_direct "failed this attempt ($(grep -E '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf" | head -1 | sed -E "s/^.*'[^']*': //; s/^[a-z]+: //"))"
+    refused=1
+  fi
   rm -f "$errf"
   if [ -n "$stopped" ]; then
     say "github.com did not finish within $bound s; stopped it (exit $rc)"
@@ -6471,36 +6556,80 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
             f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
             f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
-            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\n")
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n")
     return head + GIT_SHIM_BODY
 
 
+# The HQ checkout can also fetch blobs during checkout after a filtered fetch. Test the
+# fleet tunnel for each of those commands. A CONNECT response (including a denial) is
+# authoritative. Only a transport failure before a response selects direct HTTPS.
+# Any other git command checkout runs can fetch a missing blob too: its "Removing auth" step's
+# `git submodule foreach --recursive` reads .gitmodules, outside the sparse set of a blob:none
+# clone, through the dead tunnel ("Failed to connect to 127.0.0.1 port 18434", "could not fetch
+# 84f6a850... from promisor remote": cmuxterm-hq run 45860743368, 2026-11-26, after its
+# fetch and checkout had both gone direct). So a dead probe leaves a mark in RUNNER_TEMP, and every
+# later HQ command in the step goes direct too, with no second probe.
+HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
+HQ_GIT_SHIM_BODY = r'''
+[ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
+passthrough() { exec "$real" "${orig[@]}"; }
+mark=${RUNNER_TEMP:+$RUNNER_TEMP/$dead}
+case "$sub" in fetch|checkout) ;; *) [ -n "$mark" ] && [ -e "$mark" ] || passthrough ;; esac
+url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
+case "$url" in
+  https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
+  *) passthrough ;;
+esac
+"$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
+[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
+connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
+          --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
+case "$?:$connect" in
+  7:000|28:000|52:000|55:000|56:000)
+    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
+    [ -z "$mark" ] || : > "$mark" 2>/dev/null || :
+    exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
+esac
+passthrough
+'''
+
+
 def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None) -> str:
-    """job-started: put the git shim first on a cmux job's PATH when the mirror is usable. Returns a note, or "".
-    Never raises."""
+    """Install the repository's job-local git wrapper and return a diagnostic note. Never raises."""
     env = os.environ if environ is None else environ
     try:
-        if (repo or "").lower() != GIT_SHIM_REPO or env.get("GLAEDA_GIT_SHIM") == "0":
+        repository = (repo or "").lower()
+        if repository not in (GIT_SHIM_REPO, HQ_DISPATCH_REPO) or env.get("GLAEDA_GIT_SHIM") == "0":
             return ""
         temp, path_file = env.get("RUNNER_TEMP"), env.get("GITHUB_PATH")
         if not temp or not path_file:
             return ""
-        if mirror_identity(mirror) is None:
+        if repository == GIT_SHIM_REPO and mirror_identity(mirror) is None:
             return f"git shim: off, the mirror at {mirror} is not verified or has a repair pending"
-        shim_dir = Path(temp) / GIT_SHIM_DIR
+        shim_dir = Path(temp) / (GIT_SHIM_DIR if repository == GIT_SHIM_REPO else "glaeda-hq-git-shim")
         search = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p) != shim_dir)
         real = shutil.which("git", path=search)
         if not real:
             return "git shim: off, no git on PATH"
         shim_dir.mkdir(parents=True, exist_ok=True)
-        log = Path(temp) / GIT_SHIM_LOG
+        real = os.path.realpath(real)
+        if repository == HQ_DISPATCH_REPO:
+            script = f"#!/bin/bash\nreal={shlex.quote(real)}\ndead={HQ_GIT_SHIM_DEAD}\n" + HQ_GIT_SHIM_BODY
+            note = "git shim: HQ checkout checks the fleet Git proxy"
+        else:
+            log = Path(temp) / GIT_SHIM_LOG
+            script = git_shim_script(real, mirror, log)
+            note = f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
         tmp = shim_dir / f".git.{os.getpid()}"
-        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log), encoding="utf-8")
+        tmp.write_text(script, encoding="utf-8")
         tmp.chmod(0o755)
         os.replace(tmp, shim_dir / "git")
         with open(path_file, "a", encoding="utf-8") as fh:
             fh.write(f"{shim_dir}\n")
-        return f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
+        return note
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"git shim: {type(error).__name__}"
 
@@ -12791,7 +12920,7 @@ class Gate:
             # Full is under the hard floor plus one runner job's measured p95 (full_disk_gib, FLEET_PAUSE_FULL: the
             # build fleet's own disk pause beside it) and under this runner's own job peak (a small runner's 8 GiB:
             # its jobs are measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none).
-            full_gib = min(full_disk_gib(), peak)
+            full_gib = full_disk_line(scope) or min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
                 self.runner_jobs_hold_edge(path, False, None)  # a hold in force ends here, logged, not left stale
@@ -15837,11 +15966,17 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return os.path.abspath(explicit) if os.path.isfile(explicit) else None
-    found = shutil.which("glaeda-disk")
-    if found:
-        return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
-    fallback = Path.home() / ".local/bin/glaeda-disk"
-    return os.fspath(fallback) if fallback.is_file() else None
+    # cmux-disk, glaeda-disk's primary name, first: glaeda-disk counts uses of its old name (cmuxterm-hq
+    # docs/design/glaeda-into-cmux.md, Rename map); a host that has only the old name still runs it
+    for name in ("cmux-disk", "glaeda-disk"):
+        found = shutil.which(name)
+        if found:
+            return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
+    for name in ("cmux-disk", "glaeda-disk"):
+        fallback = Path.home() / ".local/bin" / name
+        if fallback.is_file():
+            return os.fspath(fallback)
+    return None
 
 
 def hooks_floor_gib() -> float:
@@ -15906,7 +16041,8 @@ def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
         skipped = any(mark in out for mark in DISK_BUSY)
         return f"glaeda-disk exited {result.returncode}{' (busy)' if skipped else ''}", skipped
     except subprocess.TimeoutExpired:
-        return "glaeda-disk timed out; continuing", False
+        # the free disk is read again after this; under the full line the job is refused (DISK_FULL_REFUSES)
+        return f"glaeda-disk timed out after {timeout:g} s", False
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"glaeda-disk skipped: {type(error).__name__}", False
 
@@ -16717,6 +16853,13 @@ def main(argv: list[str] | None = None) -> int:
                 why = job_disk_own_refusal(disk_path, peak_key, args.job_log, args.state_dir)
                 if why:
                     return refused(why, disk=True)
+        # DISK_FULL_REFUSES: the listener's full line, read after every eviction and wait above; a nightly job keeps its
+        # own reserve (NIGHTLY_DISK_RESERVE) and is never refused for disk
+        full_scope = RunnerScope(min_free_gib=args.min_free_gib, dedicated=bool(args.dedicated_admit),
+                                 nightly=bool(args.nightly_runner), gateway=bool(args.gateway_runner),
+                                 trusted_signing=bool(args.trusted_next_signing), small=bool(args.small_runner))
+        if not nightly_disk and (why := full_disk_refusal(disk_path, full_scope)):
+            return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
         if args.gateway_runner:  # its thin client takes a gateway token, never a shared unit (GATEWAY)
@@ -16933,6 +17076,10 @@ def main(argv: list[str] | None = None) -> int:
             held, note = take_host_lock(args.host_lock, owner, args.state_dir)
         if not held:
             return refused(note)
+        if not nightly_disk and (why := full_disk_refusal(disk_path, full_scope)):
+            # DISK_FULL_REFUSES again: the capacity wait has no limit and the running jobs wrote the disk meanwhile
+            release_host_lock(args.state_dir)
+            return refused(why, disk=True)
         if args.require_eligible:
             # Under the lock no fleet build runs here, and every runner here aligns to the same receipt,
             # so the default set now holds for this job.

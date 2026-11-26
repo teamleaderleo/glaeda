@@ -1623,6 +1623,7 @@ def record_convergence(config: dict, result: dict, wants: dict | None, previous:
     if held:
         doc["signHold"] = held
     doc["staleAfter"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + STALE_AFTER_S))
+    stale_since = carry_stale_since(running, previous, stamp)
     if converged:
         doc.update(since=None, attempts=0, nextAttempt=None, alertAfter=None)
     else:
@@ -1630,14 +1631,44 @@ def record_convergence(config: dict, result: dict, wants: dict | None, previous:
                 and (previous.get("wants") or {}).get("tag") == (wants or {}).get("tag"))
         attempts = int(previous.get("attempts") or 0) + 1 if same else 1
         since = previous["since"] if same else stamp
+        # A new release restarts `since`, but not a runner's own clock: a hook that has not changed through
+        # several releases alerts from when it first fell behind (stale_since), not from the latest release.
+        alert_from = min([parse_utc(since), *(parse_utc(t) for t in stale_since)])
         doc.update(since=since, attempts=attempts,
                    nextAttempt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + backoff_s(attempts))),
-                   alertAfter=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(parse_utc(since) + ALERT_AFTER_S)))
+                   alertAfter=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(alert_from + ALERT_AFTER_S)))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, path)
     return doc
+
+
+def carry_stale_since(running: dict, previous: dict, stamp: str) -> list[str]:
+    """Give each stale runner row in `running` its staleSince: the previous run's, when that run saw the same runner
+    stale on the same hook bytes, else this run's stamp. Returns them. Before this, every new release reset `since`,
+    so on a ring that releases every half hour a runner left on one old hook never reached alertAfter: a runner on a
+    hook five hours and three releases old read "alert after 15:08" at 13:08 (2026-11-26)."""
+    before = {}
+    for row in (previous.get("running") or {}).get("hooks") or []:
+        if isinstance(row, dict) and row.get("runnerDir") and not row.get("current") and row.get("staleSince"):
+            before[row["runnerDir"]] = row
+    out = []
+    for row in running.get("hooks") or []:
+        if not isinstance(row, dict) or row.get("current") or not row.get("runnerDir"):
+            continue
+        prior = before.get(row["runnerDir"])
+        since = stamp
+        if prior and prior.get("glaeda-cmux-runner-hook") == row.get("glaeda-cmux-runner-hook") \
+                and prior.get("glaeda_reservation.py") == row.get("glaeda_reservation.py"):
+            try:
+                parse_utc(str(prior["staleSince"]))
+                since = str(prior["staleSince"])
+            except ValueError:
+                pass
+        row["staleSince"] = since
+        out.append(since)
+    return out
 
 
 def parse_utc(stamp: str) -> float:
