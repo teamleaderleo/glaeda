@@ -27090,7 +27090,8 @@ class LandWorld:
             kind = "merge" if words[:2] == ["pr", "merge"] or (words[:3] == ["api", "-X", "PUT"]
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] \
-                else "close" if words[:2] == ["pr", "close"] else "reopen" if words[:2] == ["pr", "reopen"] else "other"
+                else "close" if words[:2] == ["pr", "close"] else "reopen" if words[:2] == ["pr", "reopen"] \
+                else "ready" if words[:2] == ["pr", "ready"] else "other"
             rc = self.gh_rc.get(kind, 0)
             return subprocess.CompletedProcess(argv, rc, self.gh_out.get(kind, "") if rc == 0 else "",
                                                "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
@@ -29481,6 +29482,38 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertEqual(self.compares(), [])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    # LAND_BASE_REF_READ: a copy of the PR that names no base branch is a read not made yet, not "no base branch to
+    # read it with". cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 73 rows stopped head_moved on that reason.
+    def base_ref_reads(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if c[1] == "repos/o/r/pulls/1" and c[-1] == gg.LAND_BASE_REF_READ]
+
+    def test_a_base_merge_on_a_copy_with_no_base_branch_reads_the_base_and_is_followed(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = "main"
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual((len(self.base_ref_reads()), len(self.compares())), (1, 2))
+
+    def test_a_base_branch_read_that_fails_stops_saying_the_read_did_not_answer(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = None  # the read fails
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("the read of its PR did not answer", e["stop"]["reason"])
+        self.assertEqual((len(self.base_ref_reads()), self.compares(), self.w.gh_calls("pr", "merge")), (1, [], []))
+
+    def test_a_copy_that_names_its_base_branch_makes_no_base_branch_read(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], self.base_ref_reads()), ("merged", []))
 
     # A copy of the PR showing an older commit of the pin (one of its ancestors) is a stale read, not a moved head (the
     # host that executes forwarded lands, 2026-11-23 00:38-01:38Z: 11 of 26 head_moved stops in one hour were on a head
@@ -32849,18 +32882,18 @@ class LandTest(Base):
         self.assertEqual(gg.land_step_class("{}"), "no output")
         self.assertEqual(gg.land_step_class(""), "no output")
 
-    def test_a_draft_pr_stops_at_the_first_refusal_and_names_gh_pr_ready(self):
-        """A draft is permanent until someone marks it ready, so one refusal is the whole answer. 2026-11-21,
-        leo-workspace#7087 (opened as a draft by the PreCompact checkpoint hook): six identical "Pull Request is
-        still a draft" merge calls over ~31 min, with the GraphQL pool at its floor, and a stop naming no step."""
+    def test_a_draft_pr_at_the_merge_is_marked_ready_once_and_then_merges(self):
+        """A land is its requester's intent to merge, so a draft is marked ready by the queue, not stopped on.
+        2026-11-26: cmux#58227 and cmuxterm-hq#28522 each stopped merge_draft after a passing judgment, and their
+        requesters ran `gh pr ready` and re-queued, one wasted land cycle each (LAND_READY_ONCE's comment)."""
         for said in ("GraphQL: Pull Request is still a draft (mergePullRequest)",
                      "pull request is in draft state", "Draft pull requests cannot be merged"):
             self.assertTrue(gg.LAND_STEP_DRAFT.search(said), said)
         for said in ("GraphQL: Pull Request is not mergeable (mergePullRequest)", "the PR is a draft review"):
             self.assertIsNone(gg.LAND_STEP_DRAFT.search(said), said)
         self.pr(LA)
-        # Converted to a draft *after* its request, which is why this check cannot be replaced by the request-time
-        # one: at the request this host's read said the PR was ready, so land_draft_refusal has nothing to answer.
+        # Converted to a draft *after* its request: at the request this host's read said the PR was ready, so
+        # land_ready_at_request had nothing to answer, and the merge is where the draft is met.
         gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
                       {"key": self.KEY, "data": land_pr(LA), "dataAt": time.time()})
         self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1))
@@ -32869,40 +32902,140 @@ class LandTest(Base):
         self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
         self.w.answers.append(ok_answer(LA))
         e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "ready"), [["pr", "ready", "1", "-R", "o/r"]])
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"), e.get("stop"))
+        self.assertIn("marked it ready", e["wait"]["why"])
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)
+        self.assertNotIn("stepFail", e)
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("ready_sent", "readied")],
+                         ["ready_sent", "readied"])
+        # GitHub now takes the merge: the next judgment merges it, pinned, with no re-queue by anyone.
+        self.w.gh_rc["merge"] = 0
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(e["state"], "merged", e.get("stop"))
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
+
+    def test_a_draft_queued_on_a_cold_cache_is_marked_ready_at_the_queues_first_read(self):
+        """LAND_READY_AT_READ. gcp-agent-lane-2, 2026-11-26: leo-workspace#11870 was queued while this host held no
+        fresh read of it, so land_ready_at_request had nothing to answer from, and the draft was met only at the merge
+        after its CI wait. The queue's first read after the request takes the merge step's own mark_ready, once."""
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t - 3600)  # a copy from before the request
+        self.land()
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "ready"), [], "a copy read before the request readies nothing")
+        e = self.q.entries[self.KEY]
+        # A copy read after the request but shadowed by a write that could have readied it readies nothing.
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t)
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {"o/r pr 1": self.t + 1})
+        self.assertFalse(self.q.ready_due(e, self.w.cache[self.KEY], self.w.cache[self.KEY]["data"], LA))
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {})
+        self.assertTrue(self.q.ready_due(e, self.w.cache[self.KEY], self.w.cache[self.KEY]["data"], LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "ready"), [["pr", "ready", "1", "-R", "o/r"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])  # readied before any merge was sent
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"), e.get("stop"))
+        self.assertIn("first read after the request; marked it ready", e["wait"]["why"])
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)
+        # Once per head: the same (still stale) draft copy readies nothing again.
+        self.assertFalse(self.q.ready_due(e, self.w.cache[self.KEY], self.w.cache[self.KEY]["data"], LA))
+        # A ready PR's fresh copy readies nothing.
+        self.assertFalse(self.q.ready_due({**e, gg.LAND_READY_ONCE: None}, {"dataAt": self.t}, land_pr(LA), LA))
+
+    def test_a_cold_cache_draft_whose_ready_is_refused_stops_merge_draft(self):
+        """The one stop LAND_READY_AT_READ keeps: `gh pr ready` refused, as at the merge."""
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t - 3600)
+        self.land()
+        self.tick()
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t)
+        self.w.gh_rc["ready"] = 1
+        self.w.gh_err["ready"] = "GraphQL: Resource not accessible by integration (markPullRequestReadyForReview)"
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertIn("marking it ready was refused too", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_draft_stops_merge_draft_when_marking_it_ready_is_refused_or_it_is_a_draft_again(self):
+        """The stop stays for the two cases the queue cannot answer: `gh pr ready` itself refused, and a PR converted
+        back to a draft after the queue readied it at that head (someone's deliberate hold). One refusal each, and the
+        stop names the step that clears it."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.gh_rc["ready"] = 1
+        self.w.gh_err["ready"] = "GraphQL: Resource not accessible by integration (markPullRequestReadyForReview)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
         self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
-        self.assertIn("still a draft", e["stop"]["reason"])
-        self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
+        self.assertIn("marking it ready was refused too", e["stop"]["reason"])
+        self.assertIn("Resource not accessible", e["stop"]["reason"])
+        self.assertNotIn("stepFail", e)
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
+        # Readied once at this head, then a draft again at the merge: stopped, no second `gh pr ready`.
+        self.q.entries.clear()
+        for f in gg.LandQueue.entries_dir().glob("*.json"):
+            f.unlink()
+        self.w.calls.clear()
+        self.w.gh_rc["ready"] = 0
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"), e.get("stop"))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertIn("still a draft", e["stop"]["reason"])
 
-    def test_land_refuses_a_draft_pr_at_the_request_and_names_gh_pr_ready(self):
-        """The other half of the one above: *when* the answer comes. efficiency-standing-lane, 2026-11-21: one host's
-        queue stopped 7 rows merge_draft 139 min after their own land requests in total (median 13.6 min, worst
-        53.3 min: manaflow-ai/cmuxterm-hq#16729),
-        every refusal carrying "land-judge (pass): ok: ... may merge at <sha>" -- a full CI wait, a judgment and a
-        merge call spent on `isDraft`, which was already true when `land` was typed, and 65 more minutes sitting
-        stopped. A request this host can answer from its cache is answered at once, with the step that clears it."""
+    def test_land_marks_a_draft_it_knows_of_ready_at_the_request_and_queues_it(self):
+        """The request-time half: when this host's cache already knows the PR is a draft, `land` marks it ready
+        there (land_ready_at_request) and queues it, so its checks and the merge are never spent on a draft. Only a
+        refused `gh pr ready` is still a refusal (land_draft), with the step that clears it."""
         self.pr(LA, draft=True)
         self.store_pr(land_pr(LA, draft=True))
+        ready = subprocess.CompletedProcess(["gh"], 0, "", "")
         said: list[str] = []
         with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
                 mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "check_land_pin", return_value=None), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
                 mock.patch.object(gg, "say_waiting", side_effect=said.append), \
-                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
-                mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("no read, no judge, no step")):
+                mock.patch.object(gg, "run_bounded", return_value=ready) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(run.call_args_list[0].args[0], ["gh", "pr", "ready", "1", "-R", "o/r"])
+        self.assertEqual(rc, gg.EXIT_DOWN, said)  # queued (the daemon is down here), not refused
+        self.assertTrue(any("o/r#1 was a draft; marked it ready (gh pr ready 1 -R o/r)" in s for s in said), said)
+        self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 1)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
+                mock.patch.object(gg, "run_bounded", return_value=ready), contextlib.redirect_stdout(out):
+            gg.cmd_land("o/r#1", [], "host/lane", 0, True)
+        self.assertIn("marked it ready", json.loads(out.getvalue())["draftReadied"])
+        refused = subprocess.CompletedProcess(["gh"], 1, "", "GraphQL: Resource not accessible by integration")
+        said.clear()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "run_bounded", return_value=refused), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")):
             rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, "b" * 40)
         self.assertEqual(rc, gg.EXIT_FAIL)
         self.assertIn("o/r#1 is a draft", said[0])
-        self.assertIn("GitHub refuses every merge on a draft", said[0])
-        self.assertIn("stays yours", said[0])  # nothing here marks a PR ready: [hold-own-pr]
-        # The step, with the pin carried through, so the re-land is still pinned to the head the caller judged.
+        self.assertIn("marking it ready here was refused: GraphQL: Resource not accessible", said[0])
         self.assertIn(f"next: gh pr ready 1 -R o/r, then glaeda-gh land o/r#1 --match-head-commit {'b' * 40}",
                       said[0])
-        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json"))
-                         if gg.LandQueue.requests_dir().is_dir() else [], [])
         out = io.StringIO()
         with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
-                mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "run_bounded", return_value=refused), contextlib.redirect_stdout(out):
             rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True)
         doc = json.loads(out.getvalue())
         self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
