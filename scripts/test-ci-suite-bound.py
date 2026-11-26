@@ -76,8 +76,14 @@ class SuiteBound(unittest.TestCase):
         self.assertIn("FAILED=1", done.stdout, done.stdout)
 
     def test_a_passing_suite_is_timed_and_not_counted_failed(self) -> None:
+        # The timing is read from two whole-second clock reads, so a suite that takes no measurable time still
+        # reads 1s when it straddles a second tick: run 45770952054 red here on `true` with "took 1s". The claim
+        # is that a passing suite is timed at all and is not counted failed, so the test reads the number rather
+        # than an exact string.
         done = run_suites("suite true", bound="60")
-        self.assertIn("suite took 0s of its 60s bound: true", done.stdout, done.stdout)
+        took = re.search(r"suite took (\d+)s of its 60s bound: true", done.stdout)
+        self.assertIsNotNone(took, done.stdout)
+        self.assertLessEqual(int(took.group(1)), 2, done.stdout)
         self.assertIn("FAILED=0", done.stdout, done.stdout)
 
     def unittest_suite(self, body: str) -> str:
