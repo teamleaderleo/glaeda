@@ -15616,18 +15616,29 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
-# LAND_OWNER_REMIND_FRESH: a reminder is sent only on a copy of the PR read this recently. A stopped row is watched by
-# nothing, so the daemon deletes its copy after CACHE_KEEP (1 h), and the cadence (6 h) always found none: a missing
-# copy read as "not merged". gcp-agent-lane-9, 2026-11-26 04:43:54Z, the first pass after #2844 deployed: 100 reminders
-# in one second, 94 of them on rows with no copy at all, among them cmux#49814 (merged 11-24), #49840 and #48963
-# (merged 11-22), each woken as a block "still stopped after 42-98 h". A row due a reminder with no fresh copy is read
-# once (peek, at most once per LAND_PEEK_EVERY) and reminded or ended on the pass after the read lands: MERGED ends it
-# merged (one fyi, LAND_MERGED_ELSEWHERE_FYI), CLOSED stops it "closed" quietly. Detector: test-glaeda-gh.py
-# test_a_stopped_row_with_no_copy_is_read_before_any_reminder.
-# LAND_OWNER_REMIND_FYI: the reminder itself goes as an inbox fyi, never a block. The stop it repeats already woke its
-# requester once as a block; the same pass above woke 100 sessions (102 in 25 min) for repeats, the measured class Leo's
-# ask c-ec4bc6dc7d cuts ("simply clear th bullshit"). The fyi still reaches the owner's inbox with its one step.
-LAND_OWNER_REMIND_FRESH = 1800.0
+# LAND_OWNER_REMIND_READ: "a PR that is over owes nothing" was decided on whatever copy the cache held, and a stopped row
+# is unwatched, so that copy is the one from before the stop or none at all (a lane VM keeps no copy of an unwatched PR).
+# gcp-agent-lane-2, 2026-11-26 04:42Z: cmux#55358 stopped update_branch_refused at 03:08Z on 11-25, merged at 07:56Z by
+# another host's queue, and was reminded "still stopped after 26 h" -- this host's cache held no file for it. A due
+# reminder whose copy is missing or older than its last word (the stop, or the last reminder) first asks one direct
+# read (refresh_job, as after_blind_read does) and is decided on the pass after it lands. Bounded: past
+# LAND_OWNER_REMIND_READ_WAIT beyond due with no read (a hold, a full pool, a failed read) it is told on the copy there
+# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
+# test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
+LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_OWNER_REMIND_NO_BLIND: a reminder is never told on a copy older than its last word. #2849 told it "as before"
+# past LAND_OWNER_REMIND_READ_WAIT, and before was the bug: one lane host, 2026-11-26 04:43:54Z, the first pass after
+# #2844 deployed, sent 100 reminders in one second, 94 on rows with no copy at all, among them cmux#49814 (merged 11-24),
+# #49840 and #48963 (merged 11-22), "still stopped after 42-98 h". A read that has not come in the wait is asked again
+# (one per row per LAND_OWNER_REMIND_READ_WAIT while due), and the reminder waits for it.
+# LAND_OWNER_REMIND_ENDS: a copy that shows the PR over ends the row instead of only skipping the reminder: MERGED as
+# merged (one fyi, LAND_MERGED_ELSEWHERE_FYI), CLOSED on the fresh read as a quiet `closed` stop. A skipped row stayed
+# stopped, listed in `land status` and read again at every cadence for the rest of LAND_KEEP.
+# LAND_OWNER_REMIND_FYI: the reminder goes as an inbox fyi, never a block. The stop it repeats already woke its requester
+# as a block; that one pass woke 100 sessions (102 in 25 min) with repeats, the class Leo's ask c-ec4bc6dc7d cuts
+# ("simply clear th bullshit"). The fyi still puts the stop's one step in the owner's inbox.
+# Detectors: test-glaeda-gh.py test_a_stopped_row_with_no_copy_is_never_reminded_blind,
+# test_a_stopped_row_closed_unmerged_ends_quietly_instead_of_a_reminder.
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19679,6 +19690,8 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
+        if self.remind_over(e):
+            return False  # a PR that is over owes its requester nothing: the row ends (LAND_OWNER_REMIND_ENDS)
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0
@@ -19688,29 +19701,10 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
-        # LAND_OWNER_REMIND_FRESH: a stopped row is watched by nothing, so its copy is gone after CACHE_KEEP and a
-        # missing copy is not an open PR. Due a reminder, the PR is read once (peek) and the reminder waits for that
-        # copy; a copy that shows the PR over ends the row (one merged fyi, or a quiet closed stop), never a reminder.
-        c = self.cache_of(e["key"]) or {}
-        data = c.get("data") or {}
-        read = c.get("dataAt")
-        if not isinstance(read, (int, float)) or isinstance(read, bool) or self.now - read > LAND_OWNER_REMIND_FRESH:
-            if self.now - self.peeked.get(e["key"], float("-inf")) >= LAND_PEEK_EVERY:
-                self.peeked[e["key"]] = self.now
-                with contextlib.suppress(OSError, WatchError):
-                    self.peek(e["key"])
-                log({"event": "land-owner-remind-read", "key": e["key"], "code": code,
-                     "age": round(self.now - read) if isinstance(read, (int, float)) else None})
-            return False  # reminded, or ended, on the pass after the read lands
-        state = str(data.get("state") or "").upper()
-        if state == "MERGED":
-            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "") \
-                if isinstance(data.get("mergeCommit"), dict) else ""
-            self.merged(e, merge_sha, "remind: the PR's copy shows it")  # not this queue's merge: an fyi
+        if self.remind_read_pending(e, last):
             return False
-        if state == "CLOSED":
-            self.stop(e, "closed", "closed unmerged (remind: the PR's copy shows it closed)", "", tell="quiet")
-            return False
+        if self.remind_over(e):
+            return False  # the read it waited for shows the PR over: the row ended
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
@@ -19725,6 +19719,49 @@ class LandQueue:
         self.save(e)
         self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS)  # LAND_OWNER_REMIND_FYI: the stop itself woke it
         return True
+
+    def remind_over(self, e: dict) -> bool:
+        """Under the lock. End stopped E when its PR's copy shows it over (LAND_OWNER_REMIND_ENDS): MERGED (any copy: a
+        merge never reverts) as merged, an fyi since the merge was not this queue's; CLOSED on a copy read since E was
+        queued (retire_from_cache's rule: an older one may predate a reopen), as a quiet `closed` stop. True when the
+        PR is over, ended or not."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state == "MERGED":
+            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "") \
+                if isinstance(data.get("mergeCommit"), dict) else ""
+            self.merged(e, merge_sha or e.get("mergeSha") or "", "remind: the PR's copy shows it")
+            return True
+        if state == "CLOSED" and _finite(c.get("dataAt")) and float(c["dataAt"]) >= float(e.get("created") or 0):
+            self.stop(e, "closed", "closed unmerged (remind: the PR's copy shows it closed)", "", tell="quiet")
+            return True
+        return state == "CLOSED"
+
+    def remind_read_pending(self, e: dict, last: float) -> bool:
+        """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
+        (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
+        LAND_OWNER_REMIND_READ_WAIT past due."""
+        def read_since() -> list[float]:
+            c = self.cache_of(e["key"]) or {}
+            return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
+        reads = read_since()
+        if reads and max(reads) > last:
+            return False
+        asked = float(e.get("remindReadAt") or 0)
+        if asked > last and self.now - asked < LAND_OWNER_REMIND_READ_WAIT:
+            return True  # asked since the last word: told on the pass after it lands
+        # LAND_OWNER_REMIND_NO_BLIND: no read past the wait is asked again, never told on the copy there is
+        if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return True  # asked on a later pass
+        e["remindReadAt"] = self.now
+        age = round(self.now - max(reads)) if reads else None
+        self.history(e, "remind_read", age=age)
+        log({"event": "land-remind-read", "key": e["key"], "age": age})
+        self.save(e)
+        self.submit(e["key"], self.refresh_job, e["key"])
+        after = read_since()
+        return not (after and max(after) > last)  # a read that already landed (an inline pool) decides it now
 
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
@@ -25579,11 +25616,14 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
     of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}."""
+    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
+    clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
+    queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
     judged = 0
     for e in entries:
-        if e.get("state") in LAND_DONE:
+        if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
         x = e.get("explain") or {}
         data = (cache_of(e["key"]) or {}).get("data") or {}
