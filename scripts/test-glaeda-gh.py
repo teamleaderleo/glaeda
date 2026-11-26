@@ -32902,6 +32902,32 @@ class LandTest(Base):
         self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
 
+    def test_a_draft_queued_on_a_cold_cache_stops_at_the_daemons_first_read(self):
+        """LAND_DRAFT_AT_READ. gcp-agent-lane-2, 2026-11-26: leo-workspace#11870 was queued while this host held no
+        fresh read of it, so the request-time refusal had nothing to answer from, and the draft surfaced only as
+        merge_draft at the merge call. The daemon's own first read after the request answers it, with the same step."""
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t - 3600)  # a copy from before the request
+        self.land()
+        e = self.tick()
+        self.assertNotEqual((e.get("stop") or {}).get("code"), "draft", "a copy read before the request refuses nothing")
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        # A copy read after the request but shadowed by a write that could have marked it ready refuses nothing.
+        self.w.set_pr(self.KEY, land_pr(LA, draft=True), self.t)
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {"o/r pr 1": self.t + 1})
+        self.assertFalse(self.q.stop_draft_from_cache(self.q.entries[self.KEY], self.w.cache[self.KEY],
+                                                      self.w.cache[self.KEY]["data"]))
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {})
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "draft"), e.get("stop"))
+        self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+        self.assertIn("is a draft", e["stop"]["reason"])
+        self.assertIn("stays yours", e["stop"]["reason"])  # [hold-own-pr]: nothing marks it ready
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])  # never reached the merge
+        self.assertIn("stopped: draft", self.w.sent()[-1][-1])
+        # A ready PR's fresh copy stops nothing.
+        self.assertFalse(self.q.stop_draft_from_cache({**e, "state": "queued"}, {"dataAt": self.t},
+                                                      land_pr(LA)))
+
     def test_land_refuses_a_draft_pr_at_the_request_and_names_gh_pr_ready(self):
         """The other half of the one above: *when* the answer comes. efficiency-standing-lane, 2026-11-21: one host's
         queue stopped 7 rows merge_draft 139 min after their own land requests in total (median 13.6 min, worst

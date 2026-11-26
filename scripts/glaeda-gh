@@ -16330,6 +16330,15 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
 # - the merge-time check above stays: a PR can be converted back to a draft after its request, and this one answers
 #   only the rows where the cache already knew. Nothing here marks a PR ready either -- `gh pr ready` is the
 #   requester's call, as it is above, and [hold-own-pr] exists so a draft can be a deliberate hold.
+# LAND_DRAFT_AT_READ: the request-time refusal above answers only when this host's cache read the PR within 90 s,
+# so a request on a cold or stale copy is still queued, and the draft surfaces only at the merge call after a full CI
+# wait and a judgment. gcp-agent-lane-2, 2026-11-26: teamleaderleo/leo-workspace#11870 (an agent's own fix, opened as
+# a draft) was queued at e09b2017, judged pass, and stopped merge_draft at its merge; `gh pr ready` and a re-queue
+# merged it (595b56fb) on the first try, the same shape as the 2026-11-21 rows below. The second half: the daemon's
+# own first read of the row after the request (retire_from_cache, every look at the row, no GitHub call) stops it
+# `draft` with the same step, so no draft waits out its checks. Same bounds as the request-time check: a copy read
+# before the request, or shadowed by a later write (the brokered `gh pr ready`), refuses nothing; nothing marks a PR
+# ready ([hold-own-pr]). Detector: test-glaeda-gh.py test_a_draft_queued_on_a_cold_cache_stops_at_the_daemons_first_read.
 LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cycle is 60 s)
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
@@ -19138,7 +19147,34 @@ class LandQueue:
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
             return True
+        if self.stop_draft_from_cache(e, c, data):
+            return True
         return self.stop_moved_pin(e, c, data)
+
+    def stop_draft_from_cache(self, e: dict, c: dict, data: dict) -> bool:
+        """Under the lock. Stop E `draft` the first time the daemon's copy of its PR, read since E's last land request
+        with no write after it that could have marked it ready, reads an open draft (LAND_DRAFT_AT_READ's comment). A
+        cache file read, no GitHub call, so the stop comes on the row's first look after that read, not at the merge."""
+        if e.get("state") in LAND_DONE or data.get("isDraft") is not True or data.get("merged") \
+                or str(data.get("state") or "") != "OPEN":
+            return False
+        at = c.get("dataAt")
+        since = max(float(e["requestedAt"]) if _finite(e.get("requestedAt")) else 0.0,
+                    float(e["created"]) if _finite(e.get("created")) else 0.0)
+        if not _finite(at) or at < since or at > self.now + 60:
+            return False  # a copy from before the request may predate a `gh pr ready`; one from the future is no read
+        repo, number = str(e.get("repo") or ""), str(e.get("number") or "")
+        writes = gh_cache_writes()
+        if any(writes.get(stamp, 0.0) >= at for stamp in gh_cache_stamps(["pr", repo, number], repo) or []):
+            return False  # a write that could have marked it ready came after the read: read it again first
+        pin = str(e.get("pinSha") or "")
+        name = f"{repo}#{number}"
+        self.history(e, "draft_at_read", age=round(self.now - at))
+        self.stop(e, "draft", f"the PR is a draft (the daemon's read {max(0, round(self.now - at))} s ago, after "
+                  f"this land request): GitHub refuses every merge on a draft, so the land stops now instead of "
+                  f"waiting out its checks to be refused at the merge. Nothing here marks a PR ready: it stays yours",
+                  f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}" + (f" --sha {pin}" if pin else ""))
+        return True
 
     def closed_copy_stale(self, e: dict, c: dict) -> bool:
         """Under the lock. Whether a CLOSED copy of E's PR is too old to end E on: read before E was queued, or before
