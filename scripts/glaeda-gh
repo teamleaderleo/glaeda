@@ -2331,8 +2331,71 @@ def load_full_pr_secs(path: Path) -> dict[str, float]:
 
 
 def read_cache(key: str) -> dict | None:
-    doc = read_json(cache_dir() / file_name(key))
+    doc = read_json_stable(cache_dir() / file_name(key))
     return doc if isinstance(doc, dict) and doc.get("key") == key else None
+
+
+# `read` runs inside the lane-gh broker for every lane VM's upstream tick, and each call parsed every key's watch file
+# and cache file again (twice for a cache touched within INTEREST_QUIET): 60 keys cost about 180 opens, 120 to 160 json
+# decodes and 16 to 24 ms of CPU, measured, most of it on files nobody had changed since the last call. Inside
+# stable_reads() a file is parsed again only when its stat changes. The stamp includes the ctime, which every replace
+# (stable_replace renames a new inode in) and every utime moves and no writer can set back, so a write by any process
+# shows. A file is remembered only once its ctime is STABLE_RACY old when stat'ed, so a later write within the
+# filesystem's timestamp granularity (or an inode number reused by the next replace) can never carry the same stamp.
+# Only stable_reads() callers see shared docs, and they never change them; everywhere else read_json_stable is read_json.
+STABLE_RACY = 2.0
+STABLE_MAX = 4096  # files remembered, and their bytes on disk together; past either the oldest remembered go first
+STABLE_MAX_BYTES = 16 << 20
+_STABLE_DOCS: dict[str, tuple[tuple[int, ...], Any]] = {}
+_STABLE_BYTES = [0]
+_STABLE_LOCK = threading.Lock()
+_STABLE_ON = threading.local()
+
+
+def _stable_forget(name: str) -> None:
+    """Drop NAME from the memo (hold _STABLE_LOCK)."""
+    gone = _STABLE_DOCS.pop(name, None)
+    if gone is not None:
+        _STABLE_BYTES[0] -= gone[0][2]
+
+
+@contextlib.contextmanager
+def stable_reads():
+    """Within this block (this thread only), read_json_stable answers an unchanged file from its last parse."""
+    previous = getattr(_STABLE_ON, "on", False)
+    _STABLE_ON.on = True
+    try:
+        yield
+    finally:
+        _STABLE_ON.on = previous
+
+
+def read_json_stable(path: Path) -> Any:
+    """read_json(PATH), but inside stable_reads() a file whose stat is the one last parsed is not parsed again. The
+    answer is shared with later calls: read it, never change it."""
+    if not getattr(_STABLE_ON, "on", False):
+        return read_json(path)
+    name = os.fspath(path)
+    try:
+        st = os.stat(name)
+    except OSError:
+        with _STABLE_LOCK:
+            _stable_forget(name)
+        return None
+    stamp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    hit = _STABLE_DOCS.get(name)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    doc = read_json(path)  # stat'ed before the read: a replace in between leaves a newer doc under an older stamp
+    keep = doc is not None and time.time() - st.st_ctime_ns / 1e9 > STABLE_RACY and st.st_size <= STABLE_MAX_BYTES
+    with _STABLE_LOCK:
+        _stable_forget(name)
+        if keep:
+            while _STABLE_DOCS and (len(_STABLE_DOCS) >= STABLE_MAX or _STABLE_BYTES[0] + st.st_size > STABLE_MAX_BYTES):
+                _stable_forget(next(iter(_STABLE_DOCS)))
+            _STABLE_DOCS[name] = (stamp, doc)
+            _STABLE_BYTES[0] += st.st_size
+    return doc
 
 
 LOCK_WAIT = 2.0  # how long a read-modify-write waits for a sibling before giving up on the lock
@@ -2448,7 +2511,7 @@ def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, wai
                      began: float | None = None, reader: str | None = None, at: dict | None = None,
                      once: bool = False) -> None:
     at = at or {}
-    prior = read_json(path) or {}
+    prior = read_json_stable(path) or {}
     try:
         prior_mtime = path.stat().st_mtime if prior else None
     except OSError:
@@ -2489,6 +2552,8 @@ def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, wai
         touched = stamp_at(time.time(), at.get("touched"), prior_mtime)
         if doc != prior:
             write_json(path, doc)
+        elif prior_mtime is not None and abs(prior_mtime - touched) < 1e-6:
+            return  # the mtime is this time already: a utime would move only the ctime, which nothing reads
         try:
             os.utime(path, (touched, touched))
         except OSError:
@@ -4854,12 +4919,23 @@ def cmd_read(text: str) -> int:
     if broken is not None:
         print(json.dumps({"error": failing_message(broken)[:UPSTREAM_ERROR_MAX]}))
         return EXIT_DOWN
+    with stable_reads():
+        return _read_answer(items, readers, times)
+
+
+def _read_answer(items: list[tuple[str, bool, bool, str | None]], readers: dict[str, str],
+                 times: dict[tuple[str, str | None], dict[str, float]]) -> int:
     entries: dict[str, Any] = {}
     ledger = None
+    # A head is registered under its consumer, as `checks` does: the daemon reads it charged to that consumer's head
+    # budget (due_heads, head_allowed), or leaves it to the cache and marks the consumer denied. Every key is
+    # registered under one hold of the lock (as register_all does), not one open and flock of it per key.
+    watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with bounded_lock(watch_dir() / ".register.lock"):
+        for key, jobs, wait, consumer in items:
+            _register_locked(watch_dir() / file_name(key), key, jobs, consumer, waited=wait, reader=readers.get(key),
+                             at=times.get((key, consumer)) or {})
     for key, jobs, wait, consumer in items:
-        # A head is registered under its consumer, as `checks` does: the daemon reads it charged to that consumer's
-        # head budget (due_heads, head_allowed), or leaves it to the cache and marks the consumer denied.
-        register(key, jobs, consumer=consumer, waited=wait, reader=readers.get(key), at=times.get((key, consumer)))
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
