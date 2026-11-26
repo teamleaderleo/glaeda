@@ -32963,18 +32963,25 @@ class LandTest(Base):
         self.assertEqual([r.get("override") for r in reqs],
                          [{"reason": "the base's red is not this PR's", "receipt": gg.LAND_OVERRIDE_ENV_RECEIPT}])
 
-    def test_a_reason_two_characters_too_long_is_fitted_not_refused(self):
-        """2026-11-21: a 202-character reason cost a refusal and a second land call, for 2 characters."""
+    def test_a_reason_is_fitted_to_one_line_and_never_cut(self):
+        """2026-11-26 12:3xZ (a lane's win-wine-smoke land): reason and receipt were cut at 200 and 240, so the broker
+        refused a red named past the cut as "not named", four tries. Now a newline is fitted, the length never cut."""
+        reason = "base reds on the shared runners, each red on base at the same step; " * 4 + "wine smoke: run 1"
+        self.assertGreater(reason.index("wine smoke"), 200)
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            got = gg.land_override("r" * 202, "two\nlines  and   padding")
-        self.assertEqual(len(got["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
-        self.assertTrue(got["reason"].endswith("\u2026"), got["reason"][-8:])
-        self.assertTrue(got["reason"].startswith("r" * 199), "the head is what a reason names first")
-        self.assertEqual(got["receipt"], "two lines and padding")  # one line, no refusal
-        self.assertRegex(err.getvalue(), r"fitted to one line of (200|240)")
-        # a forwarded request past them is fitted too, so the queue still checks an override it can keep
-        kept = gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}})
-        self.assertEqual(len(kept["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
+            got = gg.land_override(reason, "two\nlines  and   padding " + "q" * 300)
+        self.assertEqual(got["reason"], reason)  # whole: the check named past character 200 is still in it
+        self.assertEqual(got["receipt"], "two lines and padding " + "q" * 300)  # one line, no refusal, no cut
+        self.assertIn("--override-receipt fitted to one line", err.getvalue())
+        self.assertNotIn("--override-reason fitted", err.getvalue())
+        kept = gg.land_request_override({"override": {"reason": reason, "receipt": "t"}})
+        self.assertEqual(kept["reason"], reason)  # a forwarded request is kept whole too
+        # past the limit: refused by its length, never cut
+        with self.assertRaises(gg.WatchError) as said:
+            gg.land_override("r" * (gg.LAND_OVERRIDE_REASON_MAX + 1), "t")
+        self.assertIn(f"--override-reason is {gg.LAND_OVERRIDE_REASON_MAX + 1} chars, limit "
+                      f"{gg.LAND_OVERRIDE_REASON_MAX}", str(said.exception))
+        self.assertIsNone(gg.land_request_override({"override": {"reason": "t", "receipt": "q" * 4001}}))
 
     def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
         self.broker = True

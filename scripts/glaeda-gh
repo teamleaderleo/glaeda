@@ -26098,29 +26098,35 @@ def land_request_path(rid: str) -> Path:
     return _land_written[rid]
 
 
-LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason and receipt, one line each
-LAND_OVERRIDE_RECEIPT_MAX = 240
+# lane-gh land's own "override" limits (cmuxterm-hq lane-gh-broker OVERRIDE_REASON_MAX / OVERRIDE_RECEIPT_MAX): reason and
+# receipt, one line each. The broker judges every red or running check at the head by whether this text names it, so
+# the text goes whole: before 2026-11-26 both were cut here (and again at the broker, silently) at 200 and 240, and a
+# lane's override naming its reds past character 200 was refused "checks failed ... that the override does not name"
+# four times until it split the names across both fields. A text past these is refused by its length, never cut.
+LAND_OVERRIDE_REASON_MAX = 4000
+LAND_OVERRIDE_RECEIPT_MAX = 4000
 
 
 def fit_one_line(flag: str, text: str, most: int, *, stream=None) -> str:
-    """TEXT as one line of at most MOST characters, said on STREAM when it had to change. A reason and a receipt are
-    prose an agent writes for the record, so a newline or 2 characters too many is not worth a refused land and a
-    second call: both are things this function can do itself (tools/guard_refusal.py fit, the same contract for a
-    guard's own refusal text). What is left is what no guess can fix: an empty one, or only one of the pair."""
+    """TEXT as one line (its whitespace runs one space), said on STREAM when that changed it. A reason and a receipt
+    are prose an agent writes for the record, so a newline or padding is not worth a refused land and a second call
+    (tools/guard_refusal.py fit, the same contract for a guard's own refusal text). Never cut: the broker matches the
+    checks an override goes past against the whole text, so one past MOST is refused (WatchError) naming its length."""
     fitted = " ".join(text.split())
     if len(fitted) > most:
-        fitted = fitted[:most - 1].rstrip() + "\u2026"  # the head: a reason names its cause first
+        raise WatchError(f"{flag} is {len(fitted)} chars, limit {most}: name each check it goes past and its "
+                         "evidence in fewer words (nothing is cut: a check named past a cut would read as not named)")
     if fitted != text:
-        print(f"glaeda-gh land: {flag} fitted to one line of {most}: {fitted}",
+        print(f"glaeda-gh land: {flag} fitted to one line: {fitted}",
               file=sys.stderr if stream is None else stream)
     return fitted
 
 
 def land_override(reason: str | None, receipt: str | None) -> dict | None:
     """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
-    neither. A newline, padding or a text past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters is
-    fitted (fit_one_line), not refused: on 2026-11-21 a 202-character reason cost a refusal and a second land call
-    for 2 characters. Refused (WatchError) only for what no guess fixes: one of the two alone, or an empty one. Each
+    neither. A newline or padding is fitted (fit_one_line), not refused. Refused (WatchError) only for what no guess
+    fixes: one of the two alone, an empty one, or one past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX
+    characters (by its length: never cut, since the broker matches check names against the whole text). Each
     merge try then runs with LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's
     "override")."""
     if reason is None and receipt is None:
@@ -26160,8 +26166,9 @@ def land_override_given(reason: str | None, receipt: str | None,
 
 
 def land_request_override(req: dict) -> dict | None:
-    """A request's override as land_override takes it (fitted to the limits, not dropped for them), or None when it
-    names none or one no guess fixes (an older sender's, an empty one): never a merge override no queue checked."""
+    """A request's override as land_override takes it (fitted to one line, never cut), or None when it names none or
+    one no guess fixes (an older sender's, an empty one, one past the limits): never a merge override no queue
+    checked."""
     o = req.get("override")
     if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
         return None
@@ -41718,10 +41725,10 @@ def parser() -> argparse.ArgumentParser:
                          "and --pin (what the rulebook calls it) are the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
                     help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
-                         "line, at most 200 characters; needs --override-receipt. Neither flag: the caller's own "
+                         "line, at most 4000 characters, never cut; needs --override-receipt. Neither flag: the caller's own "
                          "LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) is taken")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
-                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 4000")
     ld.add_argument("--nominated-path", dest="nominated_path", metavar="PATH",
                     help="the merge path that nominated this head (next-autoland, repo-autoland): every judgment and "
                          f"merge try runs with {LAND_NOMINATED_ENV}, wherever the queue runs it (executor, overflow, "
