@@ -18482,14 +18482,17 @@ class PostTest(unittest.TestCase):
         sha = "a" * 40
         pooled = (f"Review (claude claude-opus-5-5 medium, router-review): SHIP at {sha}\n\n<!-- review-run=run-1 -->\n",
                   f"<!-- review-running sha={sha} at=2026-11-26T01:57:40Z run=run-1 by=router-review -->\nReview running.",
-                  "<!-- review-run=run-1 --> Review finished at abc; its verdict is not posted again here.")
+                  "<!-- review-run=run-1 --> Review finished at abc; its verdict is not posted again here.",
+                  '<!-- pr-owner {"id": "aid-1", "at": "2026-11-26T17:46:04Z", "prev": ["aid-0"]} -->\n'
+                  "Owned by an agent session · took over from an earlier session")
         for body in pooled:
             item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
             self.assertEqual(d.poster_actor(item)["role"], "quota-goblin", body)
             with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "0"}):
                 self.assertTrue(gg.app_author_bound(body), body)  # the switch back to the login
-        kept = ('<!-- pr-owner {"id": "aid-1"} -->\nOwned by an agent session', "<!-- review-run=run-1 -->\n/land",
-                "<!-- review-running sha=x -->\n<!-- marker -->")
+        kept = ('<!-- pr-owner {"id": "aid-1"} -->\n<!-- marker -->', "<!-- review-run=run-1 -->\n/land",
+                "<!-- review-running sha=x -->\n<!-- marker -->", '<!-- pr-owner {"id": "aid-1"} -->\nowner: me',
+                "<!-- pr-owner aid-1 -->\nOwned")
         for body in kept:
             self.assertTrue(gg.app_author_bound(body), body)
 
@@ -18497,16 +18500,45 @@ class PostTest(unittest.TestCase):
         self.no_env_token()
         asked, _ = self.poster_pool()
         d, t = self.daemon()
-        for body in ("<!-- marker -->\nhi", "/land", "owner: me", '<!-- pr-owner {"id": "aid-1"} -->\nOwned'):
+        for body in ("<!-- marker -->\nhi", "/land", "owner: me", '<!-- pr-owner {"id": "aid-1"} -->\n/land'):
             item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
             self.assertIsNone(d.poster_actor(item), body)
-        status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
-        self.assertIsNone(d.poster_actor(status))
+        status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "<!-- marker -->", "--status-key", "k")
+        self.assertIsNone(d.poster_actor(status))  # a status key never frees an author-bound body
         self.assertEqual(asked, [])
+        d.now = NOW
+        d.note_status(status, "IC_1", 1, "u1")  # the login's own earlier status, editable in place
+        plain = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
         with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "1"}):
             receipt = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "/land")
             self.assertEqual(d.poster_actor(receipt)["role"], "quota-goblin")
-            self.assertIsNone(d.poster_actor(status))  # a status edit keeps the identity that posted it: the login
+            self.assertIsNone(d.poster_actor(plain))  # a status edit keeps the identity that posted it: the login
+
+    def test_a_status_key_comment_with_nothing_to_edit_goes_on_the_pool(self) -> None:
+        """router-review's review-running marker carries a status key: with no earlier status of the login's to edit,
+        it is a new comment and leaves on a poster App; the App's status is never edited as the login, so the next
+        status of that key is a new comment on the pool again. Leo, 2026-11-26: "we built the poster App for exactly
+        this (glaeda#2946, #12134), why are comments still going out on the login and getting throttled?" """
+        self.no_env_token()
+        asked, tokens = self.poster_pool()
+        sha = "a" * 40
+        running = self.queue("comment", "teamleaderleo/glaeda#1", "--body",
+                             f"<!-- review-running sha={sha} at=2026-11-26T17:45:36Z run=run-1 by=router-review -->\n"
+                             "Review running at aaaaaaaaaaaa (router-review).", "--status-key", "review-run=run-1")
+        made = {"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-5", "id": 5, "node_id": "IC_5"}
+        d, t = self.daemon((201, {}, made))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls], ["POST"])
+        self.assertEqual(seen, ["Bearer " + tokens["quota-goblin"]])  # the App's token, never the login's
+        self.assertEqual(gg.post_state(running["id"])["state"], "posted")
+        noted = gg.read_json(gg.BASE / gg.POST_STATUSES)["teamleaderleo/glaeda#1"]
+        self.assertEqual((noted["nodeId"], noted["appWriter"]), ("IC_5", "quota-goblin"))
+        verdict = self.queue("comment", "teamleaderleo/glaeda#1", "--body",
+                             "<!-- review-run=run-1 --> Review finished.", "--status-key", "review-run=run-1")
+        self.assertIsNone(d.status_editable(verdict))  # the App's comment is not the login's to edit
+        self.assertEqual(d.poster_actor(verdict)["role"], "quota-goblin")
 
     def test_an_uncertain_poster_comment_is_looked_up_not_sent_again_on_another_identity(self) -> None:
         self.no_env_token()

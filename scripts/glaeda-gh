@@ -3985,10 +3985,10 @@ APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reuse
 # App (gh-app-roles.json "posters") that is installed, has a token here and is not resting; ROLES are the posters this
 # daemon holds for their own throttle (app_create_hold). A throttle holds THAT App alone, for its Retry-After, and the
 # next turn picks the next one; the login makes the comment only when no poster is free. Stays on the login: reviews,
-# status-key comments, anything with GH_TOKEN set, and the comments a reader interprets by author (a risk receipt, a
-# `<!--` marker, a `/command`, an `owner:` claim) until GLAEDA_APP_POST_RECEIPTS=1 (set once every reader accepts the
-# App bots). GLAEDA_APP_POSTS=0 turns the pool off. A post that left an App and lost its answer is looked up (post_find),
-# never sent again on another identity before the look.
+# a status-key edit of its own earlier status, anything with GH_TOKEN set, and the comments a reader interprets by
+# author (a risk receipt, a `<!--` marker, a `/command`, an `owner:` claim) until GLAEDA_APP_POST_RECEIPTS=1 (set once
+# every reader accepts the App bots). GLAEDA_APP_POSTS=0 turns the pool off. A post that left an App and lost its answer
+# is looked up (post_find), never sent again on another identity before the look.
 APP_POSTS_ENV = "GLAEDA_APP_POSTS"
 APP_POST_RECEIPTS_ENV = "GLAEDA_APP_POST_RECEIPTS"
 APP_POST_REFUSED_HOLD = 600.0  # a poster App's refusal that is no throttle (its credential, its install) rests it this long
@@ -4002,11 +4002,17 @@ APP_AUTHOR_INTERPRETED = re.compile(r"<!--|^\s*(?:/|owner:)", re.M | re.I)
 # (`<!-- review-running ... -->`, `<!-- review-run=... -->`). These go on the poster pool by default. Until 2026-11-26
 # every `<!--` kept a comment on the login, and those were all of the land host's comments: a sample of 60 of that day's
 # 382 was 27 receipts, 20 review-running markers, 3 review-run lines and 10 pr-owner claims, 0 plain, and no comment left
-# on an App all day while the login's create pause held the outbox for up to 44 min. Every other marker (a pr-owner
-# claim, which pr-owner edits in place as the login), a `/command` and an `owner:` claim stay on the login unless
-# GLAEDA_APP_POST_RECEIPTS=1; GLAEDA_APP_POST_RECEIPTS=0 keeps these on the login too. Detector:
-# test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login.
-APP_POOL_READ_MARKER = re.compile(r"<!--\s*review-run(?:ning\s|=)(?:(?!-->).)*-->", re.S | re.I)
+# on an App all day while the login's create pause held the outbox for up to 44 min. A pr-owner claim
+# (`<!-- pr-owner {...} -->`) goes on the pool too: every reader of it takes our App bots as a claim's writer
+# (leo-workspace tools/pr_owner.py claim_comments: is_claim_writer over CLAIM_BOTS, which holds every App of
+# gh-app-roles.json; the lane-gh broker's land and push checks read the same raw_claim), while a marker from anyone else
+# still claims nothing. Until 2026-11-27 claims stayed on the login, and on the land host at 17:50Z 2026-11-26 the first
+# claims of four PRs (cmux#58752, #58419, #58073, #55022: no earlier marker to edit) waited 4 to 6 min behind the
+# login's create pause. pr-owner still edits its own earlier claim in place, which costs no create. Every other marker, a
+# `/command` and an `owner:` claim stay on the login unless GLAEDA_APP_POST_RECEIPTS=1; GLAEDA_APP_POST_RECEIPTS=0 keeps
+# these on the login too. Detector: test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login.
+APP_POOL_READ_MARKER = re.compile(r"<!--\s*review-run(?:ning\s|=)(?:(?!-->).)*-->|<!-- pr-owner \{[^\n]*?\} -->",
+                                  re.S | re.I)
 
 
 def app_author_bound(body: str, env: Any = None) -> bool:
@@ -8275,11 +8281,20 @@ class Daemon:
 
     def poster_due(self, item: dict) -> bool:
         """Whether ITEM is a comment that may go on the poster App pool (APP_POSTS_ENV): not a status-key edit, not
-        under a GH_TOKEN or an upstream, not a comment a reader interprets by its author (APP_POST_RECEIPTS_ENV)."""
-        if (item.get("kind") != "comment" or not app_posts_on() or item.get("appPosts") is False or item.get("status")
+        under a GH_TOKEN or an upstream, not a comment a reader interprets by its author (APP_POST_RECEIPTS_ENV).
+        A status-key comment with no earlier status of the login's to edit in place (status_editable) is a new comment
+        like any other, so it goes on the pool too. Until 2026-11-27 every status-key comment stayed on the login,
+        and router-review's `<!-- review-running -->` markers all carry one: on the land host, 2 h before 17:55Z
+        2026-11-26, 53 of 85 comments were review-run status comments on the login and 3 left on an App, while the
+        login's create pause held its writes (Leo: "we built the poster App for exactly this (glaeda#2946, #12134),
+        why are comments still going out on the login and getting throttled?"). Detector:
+        test_a_status_key_comment_with_nothing_to_edit_goes_on_the_pool."""
+        if (item.get("kind") != "comment" or not app_posts_on() or item.get("appPosts") is False
                 or item.get("delivered") or item.get("reviewers") or self.upstream() is not None
                 or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
             return False
+        if item.get("status") and self.status_editable(item) is not None:
+            return False  # the login edits its own earlier status in place (post_comment_graphql): no create at all
         body = str(item.get("body") or "")
         if app_author_bound(body):
             return False
@@ -9241,9 +9256,11 @@ class Daemon:
         statuses = read_json(BASE / POST_STATUSES)
         thread = f"{str(item['repo']).lower()}#{int(item['number'])}"
         prior = statuses.get(thread) if isinstance(statuses, dict) else None
+        # A status a poster App made is not the login's to edit (post_comment_graphql edits as the login): its next
+        # status is a new comment, on the pool again (poster_due).
         ok = (isinstance(prior, dict) and prior.get("key") == item["status"] and prior.get("by") == item.get("by")
               and isinstance(prior.get("nodeId"), str) and self.now - float(prior.get("at") or 0) < POST_STATUS_MAX
-              and not self.thread_watched(str(item["repo"]), item["number"]))
+              and not prior.get("appWriter") and not self.thread_watched(str(item["repo"]), item["number"]))
         return prior if ok else None
 
     def thread_watched(self, repo: str, number: Any) -> bool:
@@ -9258,6 +9275,8 @@ class Daemon:
         if item.get("status") and isinstance(node_id, str) and node_id:
             statuses[thread] = {"by": item.get("by"), "key": item["status"], "nodeId": node_id, "id": database_id,
                                 "url": url, "at": self.now}
+            if item.get("appWriter"):
+                statuses[thread]["appWriter"] = item["appWriter"]
         elif thread not in statuses:
             return
         else:
