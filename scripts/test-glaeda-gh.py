@@ -4134,6 +4134,31 @@ class DaemonTest(Base):
         with mock.patch.object(gg.subprocess, "run", side_effect=OSError("no git")):
             self.assertIsNone(gg.cwd_repo())
 
+    def test_cwd_repo_sees_through_a_fetch_rewrite(self) -> None:
+        """A lane VM's git cache rewrites `https://github.com/` (url.<base>.insteadOf), so `git remote get-url`
+        answers `http://127.0.0.1:47380/github.com/o/r.git`; the configured URL still names o/r, and so does
+        land_pin_local_head, which is what lets a pinned land there be checked instead of taken as given. Real git,
+        a throwaway global config shaped like /run/cmux/git-cache/gitconfig."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, cfg = Path(tmp) / "r", Path(tmp) / "gitconfig"
+            cfg.write_text('[url "http://127.0.0.1:47380/github.com/"]\n\tinsteadOf = https://github.com/\n'
+                           '[user]\n\tname = t\n\temail = t@t\n')
+            env = {"GIT_CONFIG_GLOBAL": os.fspath(cfg), "GIT_CONFIG_NOSYSTEM": "1"}
+            with mock.patch.dict(os.environ, env):
+                git = lambda *a: subprocess.run(["git", "-C", os.fspath(repo), *a], check=True,
+                                                capture_output=True, text=True).stdout.strip()
+                subprocess.run(["git", "init", "-q", os.fspath(repo)], check=True)
+                git("remote", "add", "origin", "https://github.com/o/r.git")
+                git("commit", "-q", "--allow-empty", "-m", "x")
+                self.assertEqual(git("remote", "get-url", "origin"), "http://127.0.0.1:47380/github.com/o/r.git")
+                self.assertEqual(gg.cwd_repo(os.fspath(repo)), "o/r")
+                head = git("rev-parse", "HEAD")
+                with contextlib.chdir(repo):
+                    self.assertEqual(gg.land_pin_local_head("o/r"), head)
+                    self.assertEqual(gg.land_pin_local_head("o/other"), "")
+                git("remote", "set-url", "origin", "https://gitlab.com/o/r.git")  # rewritten or not, not GitHub
+                self.assertIsNone(gg.cwd_repo(os.fspath(repo)))
+
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
             with self.assertRaises(gg.WatchError):
