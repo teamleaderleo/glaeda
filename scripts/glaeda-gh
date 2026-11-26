@@ -15249,6 +15249,17 @@ LAND_PIN_PARENT_WAIT = 300.0
 # (2026-11-25 17:12Z-19:59Z, manaflow-ai/cmux#53399, #55811, #53921, #53968: 3 update_head_unread stops asked for a
 # re-pin, and each re-pin stopped head_moved 300 s later, the PR still at the old head).
 LAND_PR_SYNC_MAX = 1800.0
+# How long that same wait goes before the daemon closes and reopens the PR itself (LandQueue.pr_reopen), once per
+# update: GitHub syncs a PR's head to its branch on reopen. 2026-11-25: manaflow-ai/cmux#57070 (3309 s) and #54988
+# (4896 s) stopped pr_head_unsynced within one hour; each time a person ran `gh pr close && gh pr reopen` and the PR
+# showed the update's commit within ~25 s. Only for the queue's own clean base merge (update_tip_clean), with the
+# branch ref read again just before the close; the pin then follows the new head only through pin_follow (its first
+# parent is the pin the update was sent at), so a foreign push is never carried and land_judge judges the new head.
+LAND_PR_REOPEN_AFTER = 600.0
+# A copy of the PR reading CLOSED that was read before a reopen of the daemon's own, or this soon after it (GitHub's
+# reads lag), is that close's, not a person's: it does not end the row (retire_from_cache).
+LAND_PR_REOPEN_LAG = 120.0
+LAND_PR_REOPEN_TRIES = 3  # a closed PR left closed by one failed reopen is worse than two more calls
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -18536,10 +18547,25 @@ class LandQueue:
             at = c.get("dataAt")
             if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
                 return False
+            if self.own_close_copy(e, c):
+                return False
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
             return True
         return self.stop_moved_pin(e, c, data)
+
+    def own_close_copy(self, e: dict, c: dict | None) -> bool:
+        """Under the lock. Whether C, a copy of E's PR, reads CLOSED from this queue's own close-and-reopen (pr_reopen):
+        read before that reopen or within LAND_PR_REOPEN_LAG after it. Such a copy ends nothing; the PR is read again."""
+        data = (c or {}).get("data") or {}
+        own = e.get("selfReopen") or {}
+        at = (c or {}).get("dataAt")
+        if str(data.get("state") or "") != "CLOSED" or not isinstance(own.get("at"), (int, float)):
+            return False
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and at >= float(own["at"]) + LAND_PR_REOPEN_LAG:
+            return False
+        self.nudge(e["key"])
+        return True
 
     def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
         """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
@@ -20484,6 +20510,8 @@ class LandQueue:
         if self.refresh_due(e, c):
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
+        if self.own_close_copy(e, c):
+            return  # the queue's own close (pr_reopen), not a person's: judged once a read shows it reopened
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
@@ -23783,6 +23811,8 @@ class LandQueue:
         if tip and tip != head:
             # Read on the second look only (the first waits, and most reads catch up by then).
             clean = (e.get("updateUnread") or {}).get("head") == head and self.update_tip_clean(e, head, tip, base)
+            if clean and self.pr_reopen_due(e, head) and self.pr_reopen(e, head, tip, data):
+                return True
             with self.lock:
                 if (e.get("updateUnread") or {}).get("head") != head:
                     e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
@@ -23806,10 +23836,21 @@ class LandQueue:
                               min(LAND_HEAD_TIMEOUT, LAND_PR_SYNC_MAX - (self.now - since)))
                     return True
                 if clean:
+                    tried = u.get("reopen") or {}
+                    if tried.get("reopened"):
+                        self.stop(e, "pr_head_unsynced",
+                                  f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with "
+                                  f"{base}, GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
+                                  f"{self.now - since:.0f} s, {self.now - float(tried.get('at') or self.now):.0f} s "
+                                  "after this queue closed and reopened it: GitHub has not synced the PR to its branch",
+                                  f"gh pr view {number} -R {repo} --json headRefOid (when it shows {tip[:12]}: "
+                                  f"glaeda-gh land {name} --sha {tip})")
+                        return True
                     self.stop(e, "pr_head_unsynced",
                               f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with {base}, "
                               f"GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
-                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch",
+                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch"
+                              + (f" (this queue's close-and-reopen failed: {tried['why']})" if tried.get("why") else ""),
                               f"gh pr close {number} -R {repo} && gh pr reopen {number} -R {repo} (GitHub syncs the "
                               f"PR's head on reopen), then glaeda-gh land {name} --sha {tip}")
                     return True
@@ -23843,6 +23884,66 @@ class LandQueue:
                 return True
         self.base_merge_first(e, head, LAND_UPDATE_LOCAL, reason, nxt)
         return True
+
+    def pr_reopen_due(self, e: dict, head: str) -> bool:
+        """Whether the queue closes and reopens E's PR now (LAND_PR_REOPEN_AFTER): its own update at HEAD made a clean
+        base merge GitHub's PR has not shown for that long, and no close-and-reopen was tried for this update yet."""
+        u = e.get("updateUnread") or {}
+        if u.get("head") != head or u.get("reopen"):
+            return False
+        return self.now - float(u.get("at") or self.now) >= LAND_PR_REOPEN_AFTER
+
+    def pr_reopen(self, e: dict, head: str, tip: str, data: dict) -> bool:
+        """Close and reopen E's PR so GitHub syncs its head to TIP, the branch ref this queue's own update-branch at
+        HEAD made (a checked clean base merge: update_tip_clean), once per update (LAND_PR_REOPEN_AFTER's comment).
+        The ref is read again just before the close: when it is no longer TIP (a push since), nothing is sent and
+        False goes back to the old wait-or-stop. True when this decided E: reopened (it waits for the new head, which
+        pin_follow carries the pin to only when its first parent is the pin, and land_judge judges, reviews included)
+        or left closed by a failed reopen (stopped pr_reopen_failed, naming the reopen). False when the close failed:
+        nothing changed, and the old wait goes on to its pr_head_unsynced stop, which names the failure."""
+        repo, number, name, gh = e["repo"], str(e["number"]), key_name(e["key"]), self.gh()
+        if gh is None:
+            return False
+        now_tip, branch = self.update_live_tip(e, data)
+        if now_tip != tip:
+            return False
+        closed = self.call([gh, "pr", "close", number, "-R", repo], LAND_GH_DEADLINE, e)
+        reopened: subprocess.CompletedProcess | None = None
+        if closed.returncode == 0:
+            for _ in range(LAND_PR_REOPEN_TRIES):
+                reopened = self.call([gh, "pr", "reopen", number, "-R", repo], LAND_GH_DEADLINE, e)
+                if reopened.returncode == 0:
+                    break
+        with self.lock:
+            u = e.setdefault("updateUnread", {"head": head, "tip": tip, "at": self.now})
+            if closed.returncode != 0:
+                why = land_trim(land_tail(f"{closed.stderr or ''} {closed.stdout or ''}".strip()
+                                          or f"exit {closed.returncode}"), 200)
+                u["reopen"] = {"at": self.now, "tip": tip, "why": f"the close: {why}"}
+                self.history(e, "pr_reopen_failed", head=head[:12], tip=tip[:12], why=f"the close: {why}")
+                self.save(e)
+                return False
+            e["selfReopen"] = {"at": self.now, "head": head, "tip": tip}
+            if reopened is None or reopened.returncode != 0:
+                got = reopened or closed
+                why = land_trim(land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip()
+                                          or f"exit {got.returncode}"), 200)
+                u["reopen"] = {"at": self.now, "tip": tip, "why": f"the reopen: {why}"}
+                self.history(e, "pr_reopen_failed", head=head[:12], tip=tip[:12], why=f"the reopen: {why}")
+                self.stop(e, "pr_reopen_failed",
+                          f"GitHub's PR still showed {head[:12]} {self.now - float(u.get('at') or self.now):.0f} s "
+                          f"after this queue's update-branch made {tip[:12]} (GitHub's {branch} ref); the queue "
+                          f"closed the PR to sync its head, and the reopen failed: {why}. The PR is closed",
+                          f"gh pr reopen {number} -R {repo}, then glaeda-gh land {name} --sha {tip}")
+                return True
+            u["reopen"] = {"at": self.now, "tip": tip, "reopened": True}
+            self.history(e, "pr_reopened", head=head[:12], tip=tip[:12],
+                         why=f"GitHub's PR still showed {head[:12]} {self.now - float(u.get('at') or self.now):.0f} s "
+                             f"after the update made {tip[:12]}: closed and reopened so GitHub syncs its head")
+            log({"event": "land-pr-reopened", "key": e["key"], "head": head, "tip": tip})
+            self.nudge(e["key"])
+            self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+            return True
 
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
