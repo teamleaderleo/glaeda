@@ -3906,6 +3906,28 @@ APP_POST_REFUSED_HOLD = 600.0  # a poster App's refusal that is no throttle (its
 APP_POST_NONE_TTL = 10.0  # seconds "no poster is free" is reused: a poster that rests ends it sooner than APP_ACTOR_TTL
 APP_POST_ROLE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 APP_AUTHOR_INTERPRETED = re.compile(r"<!--|^\s*(?:/|owner:)", re.M | re.I)
+# The author-interpreted comments whose every reader already reads our App bots as the login (leo-workspace
+# tools/our_identities.py; review_running.py and review_receipt.py take app_writer.is_trusted_bot; land_ready and
+# land_judge's receipt_trust are pinned by test_our_identities.py "A router-review verdict receipt our poster App posts
+# is the shared login's receipt"): a review verdict receipt (RISK_RECEIPT) and router-review's run markers
+# (`<!-- review-running ... -->`, `<!-- review-run=... -->`). These go on the poster pool by default. Until 2026-11-26
+# every `<!--` kept a comment on the login, and those were all of the land host's comments: a sample of 60 of that day's
+# 382 was 27 receipts, 20 review-running markers, 3 review-run lines and 10 pr-owner claims, 0 plain, and no comment left
+# on an App all day while the login's create pause held the outbox for up to 44 min. Every other marker (a pr-owner
+# claim, which pr-owner edits in place as the login), a `/command` and an `owner:` claim stay on the login unless
+# GLAEDA_APP_POST_RECEIPTS=1; GLAEDA_APP_POST_RECEIPTS=0 keeps these on the login too. Detector:
+# test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login.
+APP_POOL_READ_MARKER = re.compile(r"<!--\s*review-run(?:ning\s|=)(?:(?!-->).)*-->", re.S | re.I)
+
+
+def app_author_bound(body: str, env: Any = None) -> bool:
+    """Whether BODY is a comment a reader interprets by its author that must stay on the login (APP_POOL_READ_MARKER)."""
+    flag = str((os.environ if env is None else env).get(APP_POST_RECEIPTS_ENV, "")).strip()
+    if flag == "1":
+        return False
+    if flag == "0":
+        return bool(RISK_RECEIPT.search(body) or APP_AUTHOR_INTERPRETED.search(body))
+    return bool(APP_AUTHOR_INTERPRETED.search(APP_POOL_READ_MARKER.sub("", body)))
 
 
 APP_NON_POSTER_ROLES = frozenset(APP_CREATE_ROLE.values()) | {"review"}  # Apps of another purpose, never the pool's
@@ -3914,11 +3936,6 @@ APP_NON_POSTER_ROLES = frozenset(APP_CREATE_ROLE.values()) | {"review"}  # Apps 
 def app_posts_on(env: Any = None) -> bool:
     """Whether comments may go on the poster App pool here (APP_POSTS_ENV, on unless it is "0")."""
     return str((os.environ if env is None else env).get(APP_POSTS_ENV, "1")).strip() != "0"
-
-
-def app_post_receipts_on(env: Any = None) -> bool:
-    """Whether author-interpreted comments (receipts, markers, commands, claims) may go on the pool too."""
-    return str((os.environ if env is None else env).get(APP_POST_RECEIPTS_ENV, "0")).strip() == "1"
 
 
 def app_creates_on(env: Any = None) -> bool:
@@ -8164,7 +8181,7 @@ class Daemon:
                 or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
             return False
         body = str(item.get("body") or "")
-        if not app_post_receipts_on() and (RISK_RECEIPT.search(body) or APP_AUTHOR_INTERPRETED.search(body)):
+        if app_author_bound(body):
             return False
         saved = item.get("appWriter")
         if saved is None:

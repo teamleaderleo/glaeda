@@ -18321,11 +18321,29 @@ class PostTest(unittest.TestCase):
         self.assertEqual((seen, asked), (["Bearer " + TOKEN], []))
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login(self) -> None:
+        self.no_env_token()
+        asked, _ = self.poster_pool()
+        d, t = self.daemon()
+        sha = "a" * 40
+        pooled = (f"Review (claude claude-opus-5-5 medium, router-review): SHIP at {sha}\n\n<!-- review-run=run-1 -->\n",
+                  f"<!-- review-running sha={sha} at=2026-11-26T01:57:40Z run=run-1 by=router-review -->\nReview running.",
+                  "<!-- review-run=run-1 --> Review finished at abc; its verdict is not posted again here.")
+        for body in pooled:
+            item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
+            self.assertEqual(d.poster_actor(item)["role"], "quota-goblin", body)
+            with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "0"}):
+                self.assertTrue(gg.app_author_bound(body), body)  # the switch back to the login
+        kept = ('<!-- pr-owner {"id": "aid-1"} -->\nOwned by an agent session', "<!-- review-run=run-1 -->\n/land",
+                "<!-- review-running sha=x -->\n<!-- marker -->")
+        for body in kept:
+            self.assertTrue(gg.app_author_bound(body), body)
+
     def test_receipts_markers_status_keys_and_reviews_stay_on_the_login_unless_flagged(self) -> None:
         self.no_env_token()
         asked, _ = self.poster_pool()
         d, t = self.daemon()
-        for body in ("Review (codex): ship abc", "<!-- marker -->\nhi", "/land", "owner: me"):
+        for body in ("<!-- marker -->\nhi", "/land", "owner: me", '<!-- pr-owner {"id": "aid-1"} -->\nOwned'):
             item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
             self.assertIsNone(d.poster_actor(item), body)
         status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
