@@ -30161,16 +30161,49 @@ class LandTest(Base):
         gen = e.get("gen")
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
         self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
-        e = self.tick(20)
+        e = self.remind_tick(20)
         self.assertEqual((e["state"], e["reminds"]["n"], e.get("rearms")), ("stopped", 1, None))
         self.assertEqual((len(self.w.explains()), e.get("gen")), (judged, gen))  # reminded, never re-judged
         said = self.w.sent()[-1][-1]
         self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
         self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.remind_tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (2, sent + 2, gen))
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
+
+    def remind_tick(self, seconds: float) -> dict:
+        """A reminder's two passes (LAND_OWNER_REMIND_FRESH): the first asks one read of the PR and says nothing, the
+        daemon answers it (the cached copy read now), and the next pass reminds on it."""
+        sent, watched = len(self.w.sent()), len(self.w.watched)
+        e = self.tick(seconds)
+        self.assertEqual(len(self.w.sent()), sent)  # nothing said on the stop's old copy
+        self.assertEqual(self.w.watched[watched:], [self.KEY])  # one read asked
+        self.w.cache[self.KEY]["fetchedAt"] = self.t
+        return self.tick()
+
+    def test_a_stopped_row_merged_after_its_stop_reads_fresh_and_is_not_reminded(self):
+        # LAND_OWNER_REMIND_FRESH: cmuxterm-hq#16833 stopped ci_never_ran, merged later outside the queue, and its
+        # requester was reminded 105 h after the stop, on the copy read at the stop that still said OPEN.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent()), self.w.watched[-1]), (None, sent, self.KEY))
+        self.assertEqual(self.tick().get("reminds"), None)  # the read is asked, not yet in: still nothing
+        self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # the daemon's read: merged since the stop
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
+
+    def test_a_reminder_whose_read_never_comes_is_sent_on_the_old_copy(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT - 10)
+        self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))  # waits on its one read
+        e = self.tick(20)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # then says it, rather than never
 
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()

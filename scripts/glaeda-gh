@@ -15616,6 +15616,21 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_OWNER_REMIND_FRESH: the MERGED/CLOSED skip above read the cache, and a stopped row's PR is read by nothing, so
+# its copy is the one from the stop. gcp-codex-swarm-10, 2026-11-26: cmuxterm-hq#16833 stopped ci_never_ran at
+# 11-21 19:26Z, merged later outside the queue, and its requester was reminded 105 h after the stop that it "still"
+# needed a CI run. Now a reminder whose cached copy was read before the last word to the requester (the stop, or the
+# last reminder) first asks one unwaited read (peek) and sends nothing that pass; the next pass decides on that read,
+# so a PR that is over ends silently. A read that has not come in LAND_OWNER_REMIND_READ_WAIT sends the reminder on
+# the old copy, as before, rather than never. Detector: test-glaeda-gh.py
+# test_a_stopped_row_merged_after_its_stop_reads_fresh_and_is_not_reminded.
+LAND_OWNER_REMIND_READ_WAIT = 900.0
+
+
+def land_cache_read_at(cached: dict) -> float:
+    """When CACHED (a read_cache doc) was last read from GitHub: its newest stamp, 0 for none."""
+    stamps = [cached.get(k) for k in ("fetchedAt", "dataAt", "restAt")]
+    return max((float(s) for s in stamps if isinstance(s, (int, float)) and not isinstance(s, bool)), default=0.0)
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19667,7 +19682,8 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        cached = self.cache_of(e["key"]) or {}
+        data = cached.get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
             return False  # a PR that is over owes its requester nothing; `land status` still shows the row
         day = land_day(self.now)
@@ -19679,6 +19695,19 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
+        # LAND_OWNER_REMIND_FRESH: a stopped row reads nothing, so its cached state is as old as the stop.
+        read_at = land_cache_read_at(cached)
+        if read_at < last:
+            asked = float((e.get("remindRead") or {}).get("at") or 0)
+            if asked < last:
+                e["remindRead"] = {"at": self.now}
+                self.save(e)
+                with contextlib.suppress(OSError, WatchError):
+                    self.peek(e["key"])
+                return False  # the next pass decides on the read
+            if self.now - asked < LAND_OWNER_REMIND_READ_WAIT:
+                return False  # the one read is asked; wait for it
+            # the read never came: remind on the old copy, as before, rather than never
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
