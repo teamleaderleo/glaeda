@@ -14894,6 +14894,12 @@ class BrokerMergeGuardTest(BrokerBase):
         self.assertEqual(path, str(self.guard))
 
     def test_reads_and_other_writes_never_go_to_the_guard(self) -> None:
+        """Neither a merge nor a create: only the ordinary hand-off (BrokerQuotaGuardTest) sends these to the guard,
+        and this daemon's own reads (GLAEDA_GH_INTERNAL) skip that one, so they show the merge and create lists
+        leave them alone. Before 2026-11-26 the ordinary hand-off was also skipped here, because no broker shim sat
+        after the guard on this test's PATH."""
+        os.environ["GLAEDA_GH_INTERNAL"] = "1"
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_INTERNAL", None)
         for args in (["pr", "view", "7", "-R", "o/r", "--json", "state"],
                      ["api", "repos/o/r/pulls/7/merge"],  # GET: whether it merged
                      ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"],
@@ -16159,15 +16165,45 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.patch_env({gg.BROKER_MARK: f"1:{os.getpid()}"})
         self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
 
-    def test_the_guard_is_left_out_when_it_would_not_hand_the_call_back(self) -> None:
-        """The guard execs the next `gh` on PATH. Where that is not this broker's shim, this route would hand the
-        read to the real gh behind this broker's back -- losing the answer cache, the source refusal and the repeat
-        hold, a worse trade than the one quota route it would gain. A create still goes (it has a pause only the
-        guard can ask) and a merge is refused without the guard: neither changes here."""
-        self.chain(comes_back=False)
-        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+    def test_a_read_goes_to_the_guard_even_when_it_would_not_hand_the_call_back(self) -> None:
+        """A timer's, a LaunchAgent's or a systemd unit's `glaeda-gh gh` has no broker shim after the guard on PATH
+        (often no guard at all). Leaving the guard out there ran the real gh outside the gh-quota ledger: 2026-11-26,
+        2144 of 2379 GraphQL points in 22 minutes were untallied, and this broker started 238 of the unshimmed gh
+        processes measured in 240 s on seven hosts. With no shim installed the guard runs the real gh itself."""
+        os.environ.pop("GLAEDA_GH_SHIM_DIR", None)
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "no-shim-here")})
+        guard = self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"], os.pathsep.join([str(guard.parent), os.environ["PATH"]]),
+                         "no shim installed: the guard's directory, then PATH as it was")
         self.assertEqual(self.first_exec(["pr", "comment", "7", "-R", "o/r", "--body", "x"])[0],
-                         str(self.home / "quota" / "gh"), "a create goes to the guard either way")
+                         str(guard), "a create goes to the guard either way")
+
+    def test_the_installed_shim_is_put_after_the_guard_so_the_call_comes_back(self) -> None:
+        installed = self.home / "installed-shim"
+        installed.mkdir()
+        (installed / "gh").write_text(f"#!/bin/sh\n# {gg.BROKER_MARK} shim\nexit 9\n")
+        (installed / "gh").chmod(0o755)
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(installed)})
+        guard = self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[:2], [str(guard.parent), str(installed)],
+                         "the guard execs the next gh after its own directory: the broker's shim")
+
+    def test_a_guard_off_path_still_gets_the_read(self) -> None:
+        """A LaunchAgent's PATH names neither the guard nor the shim (cmux16, air-blue, cosmic-gray, 2026-11-26)."""
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "no-shim-here")})
+        guard = self.chain(comes_back=False)
+        self.patch_env({"PATH": str(self.home / "nothing")})
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[-1], str(Path(os.environ["GLAEDA_GH_REAL"]).parent),
+                         "no gh after the guard on PATH: the real gh this broker would have run is named last")
+
+    def test_a_shim_already_after_the_guard_is_not_added_twice(self) -> None:
+        guard = self.chain()
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "shim")})
+        self.first_exec()
+        self.assertEqual(self.exec_env["PATH"], os.pathsep.join([str(guard.parent), os.environ["PATH"]]))
 
     def test_a_host_with_no_guard_runs_the_read_as_before(self) -> None:
         self.chain(guard=False)

@@ -34662,12 +34662,47 @@ def path_gh_after(directory: Path) -> Path | None:
 
 def broker_guard_comes_back(guard: Path) -> bool:
     """Whether the gh-quota guard would hand the call back to this broker: the next `gh` after it on PATH is this
-    broker's own shim. A merge and a create go to the guard either way (one is refused without it, the other has a
-    pause only it can ask), but for every other call this is the condition that makes the hand-off free: without
-    it the guard runs the real gh behind this broker's back, and the call loses the answer cache, the source
-    refusal and the repeat hold -- a worse trade than the quota route it would gain."""
+    broker's own shim. When it is, the hand-off keeps the answer cache, the source refusal and the repeat hold."""
     following = path_gh_after(guard.parent)
     return following is not None and BROKER_MARK.encode() in file_head(following)
+
+
+# Where `glaeda-gh gh --install-shim` writes the broker's shim; GLAEDA_GH_SHIM_DIR names another (tests).
+BROKER_SHIM_DIR = Path(".local/lib/glaeda-gh/bin")
+
+
+def broker_installed_shim_dir() -> Path | None:
+    """The directory of this host's installed broker shim (a `gh` carrying BROKER_MARK), or None."""
+    directory = Path(os.environ.get("GLAEDA_GH_SHIM_DIR") or Path.home() / BROKER_SHIM_DIR)
+    shim = directory / "gh"
+    if shim.is_file() and os.access(shim, os.X_OK) and BROKER_MARK.encode() in file_head(shim):
+        return directory
+    return None
+
+
+def broker_handoff_path(guard: Path) -> str:
+    """The PATH the gh-quota guard is exec'd with: its own directory first, then -- when the next `gh` after it would
+    not be this broker -- the installed broker shim's directory, so the guard hands the call back here and the call
+    keeps the answer cache, the source refusal and the repeat hold. With no shim installed the guard runs the real
+    gh itself: the call is charged to the login's ledger either way, which is the point of the hand-off.
+
+    Before 2026-11-26 the hand-off was skipped whenever the guard would not come back, which is every `glaeda-gh gh`
+    run from a timer, a LaunchAgent or a systemd unit (their PATH has the guard after nothing, or not at all). Those
+    calls ran the real gh outside the gh-quota shim, so its ledger never saw them: measured 2026-11-26 03:40Z, 240 s
+    on seven login hosts, 238 `gh` processes started by this broker without GH_QUOTA_DEPTH (air-blue's leo-asks
+    tick alone 58 GraphQL searches), against a NOW quota-untallied red of 2144 of 2379 GraphQL points untallied."""
+    rest = os.environ.get("PATH", "")
+    parts = [str(guard.parent)]
+    if not broker_guard_comes_back(guard):
+        shim_dir = broker_installed_shim_dir()
+        if shim_dir is not None and shim_dir != guard.parent:
+            parts.append(str(shim_dir))
+        elif path_gh_after(guard.parent) is None:
+            # A LaunchAgent's PATH can hold no gh at all: the guard would fall back to a bare `gh` and fail where
+            # this broker finds one in the usual install paths. Name that one's directory last.
+            with contextlib.suppress(Exception):
+                rest = os.pathsep.join(entry for entry in (rest, str(Path(broker_real_gh()).parent)) if entry)
+    return os.pathsep.join([*parts, rest]) if rest else os.pathsep.join(parts)
 
 
 def broker_real_gh() -> str:
@@ -36955,8 +36990,9 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         # -- which is what this tool's own next-step lines print -- the call had one route and no ledger entry.
         # Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr edit 2358 -R
         # teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the
-        # identical bare `gh pr edit` answered over REST at once. Unlike a merge or a create, this hand-off is taken only when the guard would hand the
-        # call back here (broker_guard_comes_back) and not for this daemon's own reads, which keep their route.
+        # identical bare `gh pr edit` answered over REST at once. The hand-off is taken whether or not the guard would hand the
+        # call back here (broker_handoff_path puts the installed shim after it when it would not), and not for this
+        # daemon's own reads, which keep their route.
         # CMUX_GH_BROKER_DISABLE is honoured here, unlike for a merge or a create: a merge may never be sent
         # past land_judge and a create may never skip the login's pause, but for an ordinary call that switch is
         # a person asking for the real gh and the line they typed, and it is the escape hatch the loop message
@@ -36968,15 +37004,13 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         if create or other:
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-                if guard.is_file() and os.access(guard, os.X_OK) \
-                        and (create or broker_guard_comes_back(guard)):
+                if guard.is_file() and os.access(guard, os.X_OK):
                     # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
                     # to the process being started. Mutating this process first leaves the guard's directory on
                     # PATH and the hop mark set for every later call in the same process, which is wrong for
                     # every in-process caller (a test, the daemon) whenever the exec does not happen.
                     # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
-                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
-                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()), "PATH": broker_handoff_path(guard)}
                     os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
