@@ -16292,6 +16292,14 @@ UPSTREAM_FEED_SKEW = 5.0  # seconds of clock difference between hosts an event t
 LAND_NOT_JUDGED = frozenset({"quota", "unreadable", "host_cap", "explain_failed"})  # answers that judged nothing
 LAND_STREAK_STOP = 3 # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
+# LAND_CONFLICT_FETCH_STOP: a base merge whose fetch fails, at a head GitHub already reads as conflicting (the KINDS
+# below: land_judge's conflicts_base, a merge or update-branch GitHub refused for a conflict), stops as `conflict`
+# after this many tries, not LAND_RETRY_STREAK_STOP's. cmux#56666 and #56078, 2026-11-26: both conflicted with
+# feat-cmux-next for real, the broker fetch of feat-cmux-next ran past LAND_FETCH_DEADLINE every time, and each spent
+# 8 backoffs (~3 h) to stop as base_merge_transient "never for a conflict ... next: none", which no owner was told
+# to act on. One retry covers a blip; the conflict stop names the hand merge and reaches the owner.
+LAND_CONFLICT_FETCH_STOP = 2
+LAND_GITHUB_CONFLICT_KINDS = frozenset({"base", "merge", "update_branch"})
 # The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
 # failures step_refused counts on their own
 LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
@@ -25523,6 +25531,16 @@ class LandQueue:
         last = e.get("stepTransient") or {}
         n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
         e["stepTransient"] = {"head": head, "kind": "base_merge", "count": n, "at": self.now}
+        if kind in LAND_GITHUB_CONFLICT_KINDS and n >= LAND_CONFLICT_FETCH_STOP:
+            # LAND_CONFLICT_FETCH_STOP's comment: GitHub already reads a conflict and this host cannot fetch to try
+            # its own merge: the conflict stop, which reaches the owner (LAND_OWNER_REMIND), not "next: none".
+            self.stop(e, "conflict", f"GitHub reads {head[:12]} as conflicting with its base ({kind}: "
+                      f"{land_trim(said, 160)}), and the local base merge that settles .gitattributes-only "
+                      f"conflicts could not be tried here {n} times in a row: {land_trim(why, 200)}",
+                      f"merge the base into {key_name(e['key'])} by hand, resolve the conflicts and push "
+                      f"(gh pr checkout {key_name(e['key']).partition('#')[2]} -R {e['repo']}; git merge "
+                      f"origin/<its base>; git push), then re-land it pinned to the new head")
+            return
         if n >= LAND_RETRY_STREAK_STOP:
             self.stop(e, "base_merge_transient", f"the base merge at {head[:12]} (after {kind}: {land_trim(said, 160)}) "
                       f"could not be made {n} times in a row, never for a conflict: {land_trim(why, 200)}",

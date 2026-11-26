@@ -35224,7 +35224,28 @@ class LandTest(Base):
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
         self.assertEqual(len([h for h in e["history"] if h["event"] == "base_merge_try"]), 2)
 
+    def test_a_github_conflict_whose_base_merge_cannot_fetch_stops_conflict_on_the_second_try(self):
+        """cmux#56666 and #56078, 2026-11-26: GitHub read CONFLICTING (a real conflict with feat-cmux-next), the base
+        merge's fetch failed every time, and each spent 8 backoffs to stop base_merge_transient "never for a conflict"
+        with next: none. GitHub's conflict stands once the retry fails too: the conflict stop with a hand-merge next."""
+        head, _ = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.judge_conflict_tick(head)
+            self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+            self.judge_conflict_refusal(head)
+            e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"))
+        self.assertIn("GitHub reads", e["stop"]["reason"])
+        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertIn("merge the base into o/r#1 by hand", e["stop"]["next"])
+        self.assertNotIn("none", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
+
     def test_a_base_merge_that_keeps_failing_doubles_its_backoff_and_stops_transient_never_conflict(self):
+        """Where GitHub has read no conflict (LAND_CONFLICT_FETCH_STOP's KINDS), failures stay transient."""
+        patch = mock.patch.object(gg, "LAND_GITHUB_CONFLICT_KINDS", frozenset())
+        patch.start()
+        self.addCleanup(patch.stop)
         head, _ = self.union_origin()
         with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"), \
                 mock.patch.object(gg, "LAND_RETRY_STREAK_STOP", 3):

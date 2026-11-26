@@ -797,7 +797,7 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 19)
+        self.assertEqual(len(signing), 20)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
         # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
@@ -3773,6 +3773,42 @@ class HookTest(unittest.TestCase):
                                      "workflow": ".github/workflows/nightly.yml"}},
                           {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"},
                           {"event": {"ref": ref, "repository": repo, "pull_request": {}}}):
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+
+    def test_nightly_next_deltas_holds_the_whole_mini_before_credentials(self) -> None:
+        """The post-feed delta job signs with the nightly key and must drain the whole Mac."""
+        self._assert_nightly_job_holds_the_whole_mini("nightly-next-deltas")
+
+    def test_nightly_next_deltas_requires_exact_signing_provenance(self) -> None:
+        """NIGHTLY_DELTA_ADMISSION: splitting a signing job must preserve its admission and exclusivity."""
+        ref = "refs/heads/nightly-next"
+        repo = {**CMUX, "default_branch": "main"}
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux",
+                "event": {"ref": ref, "repository": repo}, "trusted_ref": "refs/heads/main",
+                "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True, "run_attempt": "1",
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}",
+                "job": "nightly-next-deltas"}
+        for event_name in ("push", "workflow_dispatch"):
+            for attempt in ("1", "2"):
+                with self.subTest(event=event_name, attempt=attempt):
+                    admitted = {**args, "event_name": event_name, "run_attempt": attempt}
+                    self.assertIsNone(hook.trusted_refusal(**admitted))
+                    self.assertEqual(hook.job_tier(**{k: admitted[k] for k in
+                                     ("event_name", "ref", "repository", "event", "workflow_ref", "job")}),
+                                     hook.TIER_NIGHTLY)
+        main = "refs/heads/main"
+        for overrides in ({"trusted_next_signing": False},
+                          {"trusted_next_signing": False, "trusted_next_nightly": True},
+                          {"repository": "outside/cmux"},
+                          {"event_name": "pull_request"},
+                          {"event": {"ref": ref, "repository": repo, "pull_request": {}}},
+                          {"event": {"ref": main, "repository": repo}},
+                          {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/other.yml@{ref}"},
+                          {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/other"},
+                          {"event_name": "workflow_dispatch", "ref": main,
+                           "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{main}",
+                           "event": {"ref": main, "repository": repo}}):
             with self.subTest(overrides=overrides):
                 self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
 
