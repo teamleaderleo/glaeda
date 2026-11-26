@@ -1588,6 +1588,114 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(checks["secrets"], {"state": "ok", "detail": "none readable by builder", "fix": "", "group": ""})
         self.assertEqual(list(checks)[-1], "secrets")
 
+    # POOL_USER (cmuxterm-hq#18007): PR pool runners run as runner.poolUser, so its reads decide the verdict.
+    POOL = "cmux-pr-runner"
+
+    def pool_text(self, *entries: str, done: str | None = POOL, home: str = "/Users/cmux-pr-runner",
+                  **kwargs: object) -> str:
+        lines = [f"pf_pool_user\t{self.POOL}", f"pf_pool_home\t{home}"]
+        lines += [f"pf_pool_secret\t{e}" for e in entries]
+        if done:
+            lines.append(f"pf_pool_secret_done\t{done}")
+        return preflight_text(**kwargs) + "pf_home\t/Users/builder\n" + "\n".join(lines) + "\n"
+
+    def set_pool(self) -> None:
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["runner"] = {"poolUser": self.POOL}
+
+    def test_pool_probe_lines_parse(self) -> None:
+        text = self.pool_text("/Users/builder/.ssh/id_ed25519|eacces", "/Users/Shared/a|b.token|readable",
+                              "/Users/builder/.netrc|errno-ENOENT")
+        pf = mf.parse_probe(text)["preflight"]
+        self.assertEqual(pf["pool_user"], self.POOL)
+        self.assertEqual(pf["pool_home"], "/Users/cmux-pr-runner")
+        self.assertEqual(pf["pool_secrets"], [{"path": "/Users/builder/.ssh/id_ed25519", "state": "eacces"},
+                                              {"path": "/Users/Shared/a|b.token", "state": "readable"},
+                                              {"path": "/Users/builder/.netrc", "state": "errno-ENOENT"}])
+        self.assertEqual(pf["pool_secrets_done"], self.POOL)
+        plain = mf.parse_probe(preflight_text())["preflight"]
+        self.assertEqual((plain["pool_user"], plain["pool_secrets"], plain["pool_secrets_done"]), (None, [], None))
+
+    def test_preflight_script_passes_the_pool_user(self) -> None:
+        self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        self.set_pool()
+        self.assertIn(b"POOL_USER=cmux-pr-runner\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        for bad in ("root", "Has Space", 3, "x;rm"):
+            self.manifest["hosts"]["build-mini-1"]["overrides"]["runner"]["poolUser"] = bad
+            self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+
+    def test_pool_user_getting_eacces_everywhere_is_ok(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # No login runners: the login user's own read is only shown.
+        result = self.result(self.pool_text(f"{key}|eacces", "/Users/Shared/cmux-build-fleet/secrets/r2.token|eacces",
+                                            secrets=(), runners=()))
+        self.assertEqual(result["checks"]["secrets"], {
+            "state": "ok", "detail": f"none readable by {self.POOL}, the user PR jobs run as (2 files give it EACCES)",
+            "fix": "", "group": ""})
+        self.assertTrue(result["ready"], result)
+
+    def test_a_file_the_pool_user_can_open_fails(self) -> None:
+        self.set_pool()
+        key, token = "/Users/builder/.ssh/id_ed25519", "/Users/cmux-pr-runner/.secrets/gh.token"
+        result = self.result(self.pool_text(f"{key}|eacces", f"{token}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {token}")
+        self.assertIn("cmuxterm-hq#18007", check["fix"])
+        self.assertIn("EACCES", check["fix"])
+        self.assertFalse(result["ready"])
+
+    def test_an_errno_other_than_eacces_fails(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|errno-ENOENT", runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "fail")
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {key} (errno-ENOENT)")
+
+    def test_an_incomplete_pool_read_is_unknown_and_blocks(self) -> None:
+        self.set_pool()
+        for text in (self.pool_text("/Users/builder/.netrc|eacces", done=None, runners=()),
+                     self.pool_text(done="builder", runners=()), preflight_text(runners=())):
+            result = self.result(text)
+            check = result["checks"]["secrets"]
+            self.assertEqual((check["state"], check["group"]), ("unknown", "person"))
+            self.assertEqual(check["detail"],
+                             f"could not read the secret files as {self.POOL} (sudo -n -u {self.POOL} failed?)")
+            self.assertIn("cmuxterm-hq#18007", check["fix"])
+            self.assertFalse(result["ready"], result)
+        self.assertIn("secrets", mf.UNKNOWN_BLOCKS)
+
+    def test_accepted_secrets_cover_the_pool_users_home(self) -> None:
+        self.set_pool()
+        own, shared = "/Users/cmux-pr-runner/.config/gh/hosts.yml", "/Users/Shared/x.token"
+        self.manifest["hosts"]["build-mini-1"]["accepted_secrets"] = ["~/.config/gh/hosts.yml", shared]
+        result = self.result(self.pool_text(f"{own}|readable", f"{shared}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (0 files give it "
+                                          f"EACCES); accepted: {own}, {shared}")
+        self.assertTrue(result["ready"], result)
+
+    def test_login_user_secrets_with_a_pool_user(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # The login user runs no runners: its own reads are information.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,), runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (1 files give it "
+                                          f"EACCES); readable by builder, which runs no PR runners (poolUser "
+                                          f"{self.POOL}): {key}")
+        # The login user still has a runner registered: as today, its reads fail.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
+        self.assertIn("cmuxterm-hq#595", check["fix"])
+
+    def test_without_a_pool_user_the_pool_lines_change_nothing(self) -> None:
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|readable", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
+
     def test_node_id_is_required_before_enrollment(self) -> None:
         checks = self.result(preflight_text(enroll_state=None, acceptance=None, node_id=None), host="small-mini")["checks"]
         self.assertEqual(checks["node"]["state"], "fail")
@@ -2065,6 +2173,12 @@ class PreflightScriptTests(unittest.TestCase):
                 if line.strip() and not line.strip().startswith("#")]
         # The update check reports the softwareupdate command line, not the sudo wrapper around it.
         body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body if not line.startswith("applying='")]
+        # The poolUser read (cmuxterm-hq#18007) is the one escalation: sudo -n (never a prompt) down to a
+        # non-admin account, running a read-only Python that opens and closes files.
+        pool = [line for line in body if "sudo" in line]
+        self.assertEqual(pool, ["(cd / && printf '%s\\0' \"${login_secrets[@]}\" | sudo -n -u \"$POOL_USER\" -H "
+                                "/usr/bin/python3 -I -c '"])
+        body = [line for line in body if line not in pool]
         for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
             self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
                              word)
@@ -2176,6 +2290,47 @@ class PreflightSecretsScriptTests(unittest.TestCase):
         self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", later)
         self.assertNotIn(f"{tmp}/.docker/config.json", later)
         self.assertNotIn("sekrit", out + again)
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a mode-0 file")
+    def test_reads_as_the_pool_user_through_sudo(self) -> None:
+        # cmuxterm-hq#18007. A fake sudo runs the read as this user, with the pool home as HOME (what -H gives).
+        with tempfile.TemporaryDirectory() as tmp:
+            login, pool, bin_dir = Path(tmp) / "login", Path(tmp) / "pool", Path(tmp) / "bin"
+            for rel, text in ((login / ".secrets/open.env", "sekrit-open\n"), (login / ".secrets/locked.env", "sekrit-locked\n"),
+                              (pool / ".secrets/own.token", "sekrit-own\n"), (pool / ".ssh/id_rsa.pub", "ssh-rsa AAAA\n"),
+                              (pool / ".config/glaeda/.hidden.key", "sekrit-key\n"), (pool / ".netrc", "")):
+                rel.parent.mkdir(parents=True, exist_ok=True)
+                rel.write_text(text)
+            bin_dir.mkdir()
+            calls = Path(tmp) / "calls"
+            (bin_dir / "fake-sudo").write_text(
+                f"#!/bin/bash\necho \"$*\" >> {calls}\n[ \"$1 $2 $3 $4\" = '-n -u cmux-pr-runner -H' ] || exit 1\n"
+                f"shift 4\nexec env HOME={pool} \"$@\"\n")
+            (bin_dir / "fake-sudo").chmod(0o755)
+            header = ("CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=/usr/bin\nWORKLOAD_TOOLS=''\nPYTHONS=''\n"
+                      "CANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\nPOOL_USER=cmux-pr-runner\n")
+            body = mf.PREFLIGHT_PROBE.read_text()
+            self.assertEqual(body.count("| sudo -n -u"), 1)
+            body = body.replace("| sudo -n -u", f"| {bin_dir}/fake-sudo -n -u")
+            # The login user reads locked.env during its walk; the pool user does not, by the time it looks.
+            body = body.replace('  login_secrets+=("$f")\n',
+                                f'  login_secrets+=("$f")\n  case "$f" in */locked.env) chmod 000 "$f" ;; esac\n')
+            script = mf.PROBE.read_text() + "\n" + header + body
+            run = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                 env={"HOME": os.fspath(login), "PATH": "/usr/bin:/bin"}, timeout=60)
+            (login / ".secrets/locked.env").chmod(0o600)
+            pf = mf.parse_probe(run.stdout)["preflight"]
+            ran = calls.read_text() if calls.exists() else ""
+        if not ran:
+            self.skipTest("no developer directory: the probe skips /usr/bin/python3")
+        self.assertEqual(pf["pool_user"], "cmux-pr-runner")
+        self.assertEqual(pf["pool_home"], os.fspath(pool))
+        import pwd
+        self.assertEqual(pf["pool_secrets_done"], pwd.getpwuid(os.geteuid()).pw_name)
+        self.assertEqual(sorted((e["path"], e["state"]) for e in pf["pool_secrets"] if e["path"].startswith(tmp)), sorted([
+            (f"{login}/.secrets/open.env", "readable"), (f"{login}/.secrets/locked.env", "eacces"),
+            (f"{pool}/.secrets/own.token", "readable"), (f"{pool}/.config/glaeda/.hidden.key", "readable")]))
+        self.assertNotIn("sekrit", run.stdout)
 
 
 def morning_text() -> str:
@@ -3335,7 +3490,8 @@ class ShareTests(unittest.TestCase):
             self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
             mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
         (host, command, options), (_, plain, plain_options) = calls
-        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        # ControlPath=none: a multiplexed master opened without -A forwards no agent.
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A", "-o", "ControlPath=none"), ()))
         self.assertTrue(remote_call(command).endswith(
             f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
         self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
@@ -3350,6 +3506,76 @@ class ShareTests(unittest.TestCase):
         self.assertIn("waits for --from HOST, a host that has it", waiting[0])
         planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
+
+    def test_every_declared_xcode_is_provisioned_beside_the_pin(self) -> None:
+        # Leo, 2026-11-26: "and also just have more xcode versions installed". A workflow asking for xcode-27.0
+        # waited with no carrier (cmux run 45717448413): an Xcode declared beside the pin is copied like the pin.
+        extra = {"path": "/Applications/Xcode_27.0.app", "version": "27.0", "build": "27A266a"}
+        self.manifest["defaults"]["xcode"]["apps"].append(dict(extra))
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        check = result["checks"]["xcode 27.0"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "self"))
+        self.assertEqual(check["action"], {"kind": "xcode_share", **extra})
+        self.assertEqual(result["checks"]["xcode"]["state"], "ok")  # the pin is unchanged
+        self.assertTrue(result["ready"])  # a missing extra Xcode never blocks the host's pin work
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", side_effect=lambda m, src, thing, log, yes=True, args=None:
+                                  (calls.append(("seed", thing, args)), None)[1]), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes:
+                                  (calls.append(("share", thing, a)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), \
+                mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        self.assertIn(("seed", "xcode", args), calls)
+        self.assertIn(("share", "xcode", args), calls)
+        # Short of disk: a person frees it first, and fix copies nothing.
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|35")
+        tight = mf.preflight_host(self.manifest, "build-mini-1",
+                                  observed(**{"build-mini-1": low})["hosts"]["build-mini-1"])["checks"]["xcode 27.0"]
+        self.assertEqual((tight["state"], tight["group"]), ("todo", "person"))
+        self.assertNotIn("action", tight)
+        self.assertIn(f"needs {mf.XCODE_COPY_GIB + 30}", tight["detail"])
+        # Installed but unlicensed: sudo-plan accepts its licence with its own developer directory.
+        have = preflight_text() + "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|27A266a\n" \
+            "xcode_ready\t/Applications/Xcode_27.0.app|needed|done\n"
+        checks = mf.preflight_host(self.manifest, "build-mini-1",
+                                   observed(**{"build-mini-1": have})["hosts"]["build-mini-1"])["checks"]
+        self.assertEqual(checks["xcode 27.0"]["action"],
+                         {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
+
+    def test_an_xcode_copy_runs_beside_a_build_and_a_busy_seed_still_seeds(self) -> None:
+        # 2026-11-26: fix --wait for Xcode 27.0 on four busy fleet minis copied nothing for an hour: the targets'
+        # build workers free the host lock only between jobs, and every seed that had 27.0 was busy too
+        # (share_prepare exit 20). An Xcode lands on its own path, staged and moved in whole, which no job reads.
+        self.assertIn("xcode_share", mf.BUSY_HOST_REPAIRS)
+        self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
+            commands, options_seen = [], []
+            with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
+                    mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                      (commands.append(c), options_seen.extend(options),
+                                       1 if remote_call(c).startswith("share_have ") else 0)[2]):
+                ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
+            self.assertTrue(ok, thing)
+            # Every command carries the whole library; the call line is what names the step and its gate.
+            have, pipeline, finish = commands
+            self.assertTrue(remote_call(have).startswith("share_have " + thing), remote_call(have))
+            self.assertIn(gate + "share_recv " + thing, pipeline, thing)
+            self.assertTrue(remote_call(finish).startswith(gate + "share_finish " + thing), (thing, remote_call(finish)))
+            self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
+        # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
+        for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
+            seen = []
+            mf.SEEDS_READY.clear()
+            with mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                   (seen.append(remote_call(c)), 0)[1]):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", thing, None, True, args=args))
+            self.assertTrue(seen[0].startswith(func if thing == "xcode" else "lock; " + func), seen)
+        mf.SEEDS_READY.clear()
 
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
