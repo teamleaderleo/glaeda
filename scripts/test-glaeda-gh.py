@@ -46780,6 +46780,22 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         self.assertFalse(self.check(json.dumps(settled), json.dumps(settled)))
         self.assertFalse(self.check("junk", self.fp()))
 
+    def test_probe_stands_in_for_a_queued_pending_row_past_an_hour(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 20000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"})
+        d.pr_behind = lambda c: True
+        d.rollup_stale = lambda key, c: False
+        e = {"key": "pr:o/r#1", "cache": {"fp": self.fp(), "via": "graphql", "data": {"state": "OPEN", "checks": []},
+                                          "fullAt": d.now - gg.PR_FULL_BEHIND_EVERY - 600}}
+        self.assertTrue(d.probe_ok(e))
+        e["cache"]["fullAt"] = d.now - gg.PR_FULL_PENDING_EVERY
+        self.assertFalse(d.probe_ok(e))
+        settled = json.loads(self.fp())
+        settled[7] = "SUCCESS"
+        e["cache"].update(fp=json.dumps(settled), fullAt=d.now - gg.PR_FULL_BEHIND_EVERY - 600)
+        self.assertFalse(d.probe_ok(e))
+
 
 class FullPrReadFoldsItsHead(unittest.TestCase):
     """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s

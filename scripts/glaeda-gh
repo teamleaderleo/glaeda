@@ -1495,8 +1495,11 @@ FULL_PR_SECS_FILE = "full-pr-secs.json"
 # merge yet. The land host, 2026-11-26 02:39-03:39Z: 470 queued rows, 262 gated, PR data p50 4,580 s, GraphQL in stop
 # mode. Such a row (same head, state, mergeability and review, a rollup still PENDING, only the counts moved) is
 # confirmed by its probe and read in full at most this often; a rollup that settles, a new head or a
-# changed merge state is read at once.
-PR_FULL_PENDING_EVERY = 900
+# changed merge state is read at once. The same bound replaces PR_FULL_EVERY/PR_FULL_BEHIND_EVERY in probe_ok for such
+# a row, which cannot merge until its rollup settles: at 900 s (#2853) no row qualified, as the land host's queued rows
+# were all past an hour since their last full read (05:38-06:04Z: 0 confirmed, PR data p50 2,580 s, the hourly GraphQL
+# quota under its reserve), and every one of them went back to a full read.
+PR_FULL_PENDING_EVERY = 7200
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -12031,7 +12034,8 @@ class Daemon:
                 and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
                 and isinstance(c.get("fullAt"), (int, float))
-                and self.now - c["fullAt"] < (PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
+                and self.now - c["fullAt"] < (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+                                              else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
                 and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
                 and not self.rollup_stale(e["key"], c))
 
@@ -12200,21 +12204,30 @@ class Daemon:
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
+    def queued_pending(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
+        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+        if e["key"] not in self.rollup_wanted():
+            return False
+        try:
+            fp = json.loads((e.get("cache") or {}).get("fp") or "null")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and fp[7] in ("PENDING", "EXPECTED")
+
     def pending_counts_only(self, e: dict, node: dict | None) -> bool:
-        """Whether E, a land-queue PR, differs from its cached answer only in the counts of its running checks: the
-        same head, state, mergeability and review, a rollup that was and is PENDING, and its last full read within
+        """Whether E, a queued_pending PR, differs from its cached answer only in the counts of its running checks:
+        the same head, state, mergeability and review, a rollup still PENDING, and its last full read within
         PR_FULL_PENDING_EVERY."""
         cache = e.get("cache") or {}
         full = cache.get("fullAt")
-        if e["key"] not in self.rollup_wanted() or not isinstance(full, (int, float)) \
-                or self.now - full >= PR_FULL_PENDING_EVERY:
+        if not isinstance(full, (int, float)) or self.now - full >= PR_FULL_PENDING_EVERY or not self.queued_pending(e):
             return False
         try:
             old, new = json.loads(cache.get("fp") or "null"), json.loads(pr_fingerprint(node) or "null")
         except (TypeError, ValueError):
             return False
-        return (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == 12
-                and old[:8] == new[:8] and old[0] == "OPEN" and old[7] in ("PENDING", "EXPECTED"))
+        return isinstance(new, list) and len(new) == 12 and old[:8] == new[:8]
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
