@@ -1396,7 +1396,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "2ed5b420a0f3d5259e7174c26a4a458febc6d158b2eb9d89a01df80477c6d780",
     "4b1ac78a53b20a3a3a1419579f25a9edbb9e012eb58fba86bfd27423824e4211",
     "c4a9926b25fb82d0f1115b1a6df45527563936bdbb8483d2f51f53fa8db280e7",
-    "5f6721163c6656f239cb6f3e08c6dda6abb762f0b95262f02dd11b2d50b0de0f",
+    "443c21047cf9e843f59cabc4dcf43a7187a9a83dc4ba8b1673ac0999f9fb97f5",
+    "4838b861b5d651804b529175018bb78ef15b9c12c8249c9cd90e620c9a46dd5c",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -11384,6 +11385,32 @@ def git_common_dir(path: Path) -> str:
 
 UNREADABLE: set[str] = set()
 
+# A dead FUSE or stale mount (ENOTCONN, ESTALE, EIO, ESHUTDOWN) makes pathlib's is_dir/is_file/exists/is_symlink raise, which
+# ended a whole cleaner pass (a lane VM, 2026-11-26: /home/cmux/.wt/checkouts/cmux/lane--share-black-screen-repair, a dead
+# cmux-projection mount, Errno 107). Each predicate answers False for such a path, which is then skipped and reported.
+DEAD_MOUNT_ERRNOS = frozenset(getattr(errno, n) for n in ("ENOTCONN", "ESTALE", "EIO", "ESHUTDOWN", "ENODEV") if hasattr(errno, n))
+DEAD_MOUNTS: set[str] = set()
+
+
+def _tolerate_dead_mounts(method):
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except OSError as error:
+            if error.errno not in DEAD_MOUNT_ERRNOS:
+                raise
+            DEAD_MOUNTS.add(str(self))
+            return False
+    wrapper.__name__ = method.__name__
+    wrapper._dead_mount_tolerant = True
+    return wrapper
+
+
+for _name in ("is_dir", "is_file", "exists", "is_symlink", "is_mount"):
+    _method = getattr(Path, _name, None)
+    if _method is not None and not getattr(_method, "_dead_mount_tolerant", False):
+        setattr(Path, _name, _tolerate_dead_mounts(_method))
+
 
 def _entries(path: Path, *, catalogue: bool = False) -> list[os.DirEntry]:
     """Like _children, but entries carry their type, so filtering tens of thousands (a macOS
@@ -11405,7 +11432,9 @@ def _children(path: Path) -> list[Path]:
     except PermissionError:
         UNREADABLE.add(str(path))
         return []
-    except OSError:
+    except OSError as error:
+        if error.errno in DEAD_MOUNT_ERRNOS:
+            DEAD_MOUNTS.add(str(path))
         return []
 
 
@@ -15483,6 +15512,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
         hint = (f"background jobs need Full Disk Access for {os.path.realpath(sys.executable)}"
                 if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")
         print(f"\ncannot read {u}: permission denied ({hint})", file=sys.stderr)
+    for u in sorted(DEAD_MOUNTS):
+        print(f"\nskipped {u}: dead mount (ENOTCONN/ESTALE/EIO); unmount or repair it, the pass went on", file=sys.stderr)
     total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
     if not DARWIN:
         for line in owned_elsewhere_lines():

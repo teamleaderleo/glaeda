@@ -17631,5 +17631,29 @@ class CmuxStandsDownTest(unittest.TestCase):
         self.assertIn("~/Library/Developer/Xcode/DerivedData", out.getvalue())
 
 
+class DeadMountTests(unittest.TestCase):
+    def test_wt_cargo_targets_skips_enotconn_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "r"
+            for name in ("dead", "ok"):
+                (root / "cmux" / name / ".git").mkdir(parents=True)
+            real = os.stat
+            dead = os.fspath(root / "cmux" / "dead")
+
+            def fake(path, *a, **k):
+                if os.fspath(path).startswith(dead):
+                    raise OSError(errno.ENOTCONN, "Transport endpoint is not connected", os.fspath(path))
+                return real(path, *a, **k)
+
+            with mock.patch("os.stat", fake):
+                self.assertEqual(gd.wt_cargo_targets(root), [])
+            self.assertTrue(any(p.endswith("dead") or "/dead/" in p for p in gd.DEAD_MOUNTS))
+
+    def test_other_errors_still_raise(self):
+        with mock.patch("os.stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(OSError):
+                Path("/x").is_dir()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3985,10 +3985,10 @@ APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reuse
 # App (gh-app-roles.json "posters") that is installed, has a token here and is not resting; ROLES are the posters this
 # daemon holds for their own throttle (app_create_hold). A throttle holds THAT App alone, for its Retry-After, and the
 # next turn picks the next one; the login makes the comment only when no poster is free. Stays on the login: reviews,
-# status-key comments, anything with GH_TOKEN set, and the comments a reader interprets by author (a risk receipt, a
-# `<!--` marker, a `/command`, an `owner:` claim) until GLAEDA_APP_POST_RECEIPTS=1 (set once every reader accepts the
-# App bots). GLAEDA_APP_POSTS=0 turns the pool off. A post that left an App and lost its answer is looked up (post_find),
-# never sent again on another identity before the look.
+# a status-key edit of its own earlier status, anything with GH_TOKEN set, and the comments a reader interprets by
+# author (a risk receipt, a `<!--` marker, a `/command`, an `owner:` claim) until GLAEDA_APP_POST_RECEIPTS=1 (set once
+# every reader accepts the App bots). GLAEDA_APP_POSTS=0 turns the pool off. A post that left an App and lost its answer
+# is looked up (post_find), never sent again on another identity before the look.
 APP_POSTS_ENV = "GLAEDA_APP_POSTS"
 APP_POST_RECEIPTS_ENV = "GLAEDA_APP_POST_RECEIPTS"
 APP_POST_REFUSED_HOLD = 600.0  # a poster App's refusal that is no throttle (its credential, its install) rests it this long
@@ -4002,11 +4002,17 @@ APP_AUTHOR_INTERPRETED = re.compile(r"<!--|^\s*(?:/|owner:)", re.M | re.I)
 # (`<!-- review-running ... -->`, `<!-- review-run=... -->`). These go on the poster pool by default. Until 2026-11-26
 # every `<!--` kept a comment on the login, and those were all of the land host's comments: a sample of 60 of that day's
 # 382 was 27 receipts, 20 review-running markers, 3 review-run lines and 10 pr-owner claims, 0 plain, and no comment left
-# on an App all day while the login's create pause held the outbox for up to 44 min. Every other marker (a pr-owner
-# claim, which pr-owner edits in place as the login), a `/command` and an `owner:` claim stay on the login unless
-# GLAEDA_APP_POST_RECEIPTS=1; GLAEDA_APP_POST_RECEIPTS=0 keeps these on the login too. Detector:
-# test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login.
-APP_POOL_READ_MARKER = re.compile(r"<!--\s*review-run(?:ning\s|=)(?:(?!-->).)*-->", re.S | re.I)
+# on an App all day while the login's create pause held the outbox for up to 44 min. A pr-owner claim
+# (`<!-- pr-owner {...} -->`) goes on the pool too: every reader of it takes our App bots as a claim's writer
+# (leo-workspace tools/pr_owner.py claim_comments: is_claim_writer over CLAIM_BOTS, which holds every App of
+# gh-app-roles.json; the lane-gh broker's land and push checks read the same raw_claim), while a marker from anyone else
+# still claims nothing. Until 2026-11-27 claims stayed on the login, and on the land host at 17:50Z 2026-11-26 the first
+# claims of four PRs (cmux#58752, #58419, #58073, #55022: no earlier marker to edit) waited 4 to 6 min behind the
+# login's create pause. pr-owner still edits its own earlier claim in place, which costs no create. Every other marker, a
+# `/command` and an `owner:` claim stay on the login unless GLAEDA_APP_POST_RECEIPTS=1; GLAEDA_APP_POST_RECEIPTS=0 keeps
+# these on the login too. Detector: test_receipts_and_review_markers_go_on_the_pool_other_markers_stay_on_the_login.
+APP_POOL_READ_MARKER = re.compile(r"<!--\s*review-run(?:ning\s|=)(?:(?!-->).)*-->|<!-- pr-owner \{[^\n]*?\} -->",
+                                  re.S | re.I)
 
 
 def app_author_bound(body: str, env: Any = None) -> bool:
@@ -8275,11 +8281,20 @@ class Daemon:
 
     def poster_due(self, item: dict) -> bool:
         """Whether ITEM is a comment that may go on the poster App pool (APP_POSTS_ENV): not a status-key edit, not
-        under a GH_TOKEN or an upstream, not a comment a reader interprets by its author (APP_POST_RECEIPTS_ENV)."""
-        if (item.get("kind") != "comment" or not app_posts_on() or item.get("appPosts") is False or item.get("status")
+        under a GH_TOKEN or an upstream, not a comment a reader interprets by its author (APP_POST_RECEIPTS_ENV).
+        A status-key comment with no earlier status of the login's to edit in place (status_editable) is a new comment
+        like any other, so it goes on the pool too. Until 2026-11-27 every status-key comment stayed on the login,
+        and router-review's `<!-- review-running -->` markers all carry one: on the land host, 2 h before 17:55Z
+        2026-11-26, 53 of 85 comments were review-run status comments on the login and 3 left on an App, while the
+        login's create pause held its writes (Leo: "we built the poster App for exactly this (glaeda#2946, #12134),
+        why are comments still going out on the login and getting throttled?"). Detector:
+        test_a_status_key_comment_with_nothing_to_edit_goes_on_the_pool."""
+        if (item.get("kind") != "comment" or not app_posts_on() or item.get("appPosts") is False
                 or item.get("delivered") or item.get("reviewers") or self.upstream() is not None
                 or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
             return False
+        if item.get("status") and self.status_editable(item) is not None:
+            return False  # the login edits its own earlier status in place (post_comment_graphql): no create at all
         body = str(item.get("body") or "")
         if app_author_bound(body):
             return False
@@ -9241,9 +9256,11 @@ class Daemon:
         statuses = read_json(BASE / POST_STATUSES)
         thread = f"{str(item['repo']).lower()}#{int(item['number'])}"
         prior = statuses.get(thread) if isinstance(statuses, dict) else None
+        # A status a poster App made is not the login's to edit (post_comment_graphql edits as the login): its next
+        # status is a new comment, on the pool again (poster_due).
         ok = (isinstance(prior, dict) and prior.get("key") == item["status"] and prior.get("by") == item.get("by")
               and isinstance(prior.get("nodeId"), str) and self.now - float(prior.get("at") or 0) < POST_STATUS_MAX
-              and not self.thread_watched(str(item["repo"]), item["number"]))
+              and not prior.get("appWriter") and not self.thread_watched(str(item["repo"]), item["number"]))
         return prior if ok else None
 
     def thread_watched(self, repo: str, number: Any) -> bool:
@@ -9258,6 +9275,8 @@ class Daemon:
         if item.get("status") and isinstance(node_id, str) and node_id:
             statuses[thread] = {"by": item.get("by"), "key": item["status"], "nodeId": node_id, "id": database_id,
                                 "url": url, "at": self.now}
+            if item.get("appWriter"):
+                statuses[thread]["appWriter"] = item["appWriter"]
         elif thread not in statuses:
             return
         else:
@@ -17556,6 +17575,18 @@ LAND_FORWARD_ASK_EVERY = 600.0
 LAND_FORWARD_LOST_ASKS = 2
 LAND_FORWARD_READ_WAIT = 900.0
 LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "waiting", LAND_FORWARDED, "requested"})
+# A far answer holding a row open (forwardHeld) restarted its give-up clock on every ask, so a row its far queue kept
+# open never reached the give-up: whatever loop held it there held it here too, with no verdict and nobody told.
+# 2026-11-26: cmux#56127, #56200, #56556 and #56603 sat forwarded 62-112 min, then 16 h; the far queue (land-judge's
+# merge train, fixed in leo-workspace#12255) re-judged each every 5 min and answered "waiting" each time. Now a
+# forwarded row has a bound of its own, counted from its first hand-off at its head (forwardBound: a re-send, a far
+# rearm or a far answer never restarts it, only a new head): past it the row is taken back (forward_settle: landed
+# again here, pinned, its requester told as an fyi naming the far row's last state), and LAND_FORWARD_GIVE_UP after
+# that take-back with still no outcome it stops forward_no_outcome. The value is the far queue's own hand-off to
+# merge time: 67 merges among the forwarded cmux rows it held at least 12 h (2026-11-25 23Z to 11-26 18Z) took p50
+# 8.8 h, p90 15.5 h, p95 15.7 h, max 18.5 h; 45 of those 193 rows were still open. A shorter bound takes back rows
+# the far queue merges later (2 h would have taken back 87 % of those merges).
+LAND_FORWARD_HELD_BOUND = 16 * 3600.0
 
 
 # The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
@@ -20188,6 +20219,50 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
+    def forward_bound_at(self, e: dict) -> float:
+        """Under the lock. When forwarded E was first handed off at its head (LAND_FORWARD_HELD_BOUND), kept on the
+        row as forwardBound {at, head}: started at its first forward, restarted (at its newest hand-off) only by a
+        new head, never by a far answer holding it open, a re-send, a far rearm or a take-back at the same head."""
+        head = str(e.get("pinSha") or (e.get("handedOff") or {}).get("head") or e.get("head") or "").lower()
+        b = e.get("forwardBound") if isinstance(e.get("forwardBound"), dict) else {}
+        at = float(b.get("at") or 0)
+        if at > 0 and not land_head_moved(str(b.get("head") or ""), head) \
+                and not land_head_moved(head, str(b.get("head") or "")):
+            if head and not b.get("head"):
+                e["forwardBound"] = {**b, "head": head}  # a head learned later is the same hand-off's
+            return at
+        start = (self.forwarded_since(e) if at > 0 else self.forwarded_at(e)) or self.now
+        e["forwardBound"] = {"at": min(start, self.now), "head": head}
+        return e["forwardBound"]["at"]
+
+    def forward_over(self, e: dict) -> bool:
+        """Under the lock. Whether forwarded E is past its own bound (LAND_FORWARD_HELD_BOUND), whatever its far host
+        answers: past it from its first hand-off at this head and not yet taken back at it, or taken back at it
+        LAND_FORWARD_GIVE_UP ago with still no outcome."""
+        at = self.forward_bound_at(e)
+        if self.now - at <= LAND_FORWARD_HELD_BOUND:
+            return False
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        if float(back.get("at") or 0) >= at:
+            return self.now - float(back["at"]) > LAND_FORWARD_GIVE_UP
+        return True
+
+    def forward_bound_hit(self, e: dict, host: str) -> None:
+        """Under the lock. Log once per bound that forwarded E passed it, with its far host's last word on it."""
+        b = e.get("forwardBound") or {}
+        if b.get("hit"):
+            return
+        held = e.get("forwardHeld") or {}
+        far = str(held.get("state") or "") or ("error: " + str((e.get("forwardAsk") or {}).get("error") or "")
+                                               if (e.get("forwardAsk") or {}).get("error") else "no answer")
+        age = round(self.now - float(b.get("at") or self.now))
+        e["forwardBound"] = {**b, "hit": self.now, "far": far, "heldAt": float(held.get("at") or 0) or None}
+        self.history(e, "forward_bound", to=host, far=far, held=age, head=str(b.get("head") or "")[:12])
+        log({"event": "land-forward-bound", "key": e["key"], "to": host, "far": far, "held": age,
+             "head": str(b.get("head") or "")[:12], "farAnsweredAt": utc_clock(float(held["at"])) if held.get("at")
+             else None, "resends": int((e.get("forwardResent") or {}).get("n") or 0)})
+        self.save(e)
+
     def silent_peers(self) -> dict[str, str]:
         """Under the lock. The far hosts that take forwarded rows and answer none (LAND_PEER_SILENT's comment), each to
         why, from this queue's own rows (no read, no call), at most once per LAND_FORWARD_LOOK_EVERY. Also notes the
@@ -20302,7 +20377,8 @@ class LandQueue:
         since = self.forwarded_since(e)
         first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
         held = float((e.get("forwardHeld") or {}).get("at") or 0)
-        past = self.now - max(first, held) > LAND_FORWARD_GIVE_UP
+        over = self.forward_over(e)  # its own bound, which no far answer restarts (LAND_FORWARD_HELD_BOUND)
+        past = self.now - max(first, held) > LAND_FORWARD_GIVE_UP or over
         if state not in ("MERGED", "CLOSED") and read_at < since:
             # No copy, or one older than the hand-off: ask the daemon to read it (its read scheduler paces and bounds
             # the read), so the far host's merge ends this row merged instead of forward_no_outcome. 2026-11-23
@@ -20332,8 +20408,9 @@ class LandQueue:
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
         if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
-        if isinstance(answer, dict) and self.forward_answered(e, answer, host, since, c, executor):
-            return False
+        if isinstance(answer, dict) and self.forward_answered(e, answer, host, since, c, executor) \
+                and not (over and e["state"] == LAND_FORWARDED and e.get("forwardHeld")):
+            return False  # ended, re-sent, or held open inside its bound; past it a hold holds nothing
         if e.get("forwardMissing") and self.forward_lost(e, host, c, since):
             return False  # the GitHub read a lost row waited for has landed: stopped on this look, not the next ask's
         last = e.get("forwardResent") or {}
@@ -20348,8 +20425,10 @@ class LandQueue:
             self.save(e)
         if not past and self.forward_state_wanted(e):
             return True  # read live before the give-up (forward_state_wanted)
-        if held >= since and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY:
+        if not over and held >= since and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY:
             return False  # the far host holds it open: its own queue's bounds end it, and it tells the requester
+        if over:
+            self.forward_bound_hit(e, host)
         if past:
             head = str(data.get("headRefOid") or "").lower()
             if state == "OPEN" and self.now - read_at <= LAND_FORWARD_STATE_FRESH and SHA40.fullmatch(head):
@@ -20527,7 +20606,8 @@ class LandQueue:
         e["stopReadAt"] = self.now  # a stop it makes now is not read again (LAND_STOP_SETTLE)
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         held = float((e.get("forwardHeld") or {}).get("at") or 0)  # the far host's last answer holding it open
-        if self.now - max(first, held) <= LAND_FORWARD_GIVE_UP:  # read early (forward_state_wanted): an end ends it, as the cache's
+        over = self.forward_over(e)  # past its own bound a far hold holds nothing (LAND_FORWARD_HELD_BOUND)
+        if self.now - max(first, held) <= LAND_FORWARD_GIVE_UP and not over:  # read early (forward_state_wanted): an end ends it, as the cache's
             if state == "MERGED":
                 self.merged(e, merge_sha or e.get("mergeSha") or "", f"forwarded to {host}: {how} merged")
                 return
@@ -20551,14 +20631,16 @@ class LandQueue:
                       f"merged", "", tell="quiet")
             log({"event": "land-forward-settled", "key": e["key"], "state": "closed", "how": how})
             return
-        if state == "OPEN" and not e.get("forwardRelanded"):
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        taken = float(back.get("at") or 0) >= float((e.get("forwardBound") or {}).get("at") or 0) > 0
+        if state == "OPEN" and (not e.get("forwardRelanded") or (over and not taken)):
             pin = str(e.get("pinSha") or "").lower()
             if SHA40.fullmatch(pin) and SHA40.fullmatch(head or "") and land_head_moved(pin, head):
                 self.stop(e, "head_moved", land_moved_clause(head, pin),
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}", tell="fyi")
                 return
             if SHA40.fullmatch(head or ""):
-                self.forward_reland(e, head, host, executor)
+                self.forward_reland(e, head, host, executor, bound=over)
                 return
             state, why = "", why or "the read named no head to pin it at"
         if state == "OPEN":
@@ -20577,10 +20659,15 @@ class LandQueue:
             self.forward_give_up(e, "", host, executor, f"its state could not be read {fails} times: "
                                  f"{land_trim(why, 160)}")
 
-    def forward_reland(self, e: dict, head: str, host: str, executor: bool) -> None:
+    def forward_reland(self, e: dict, head: str, host: str, executor: bool, bound: bool = False) -> None:
         """Under the lock. E's PR is still open at HEAD past its give-up: this host lands it again itself, pinned at
         HEAD, as a fresh request from E's own requester (a new request id, so a far queue that holds the old one
-        applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request)."""
+        applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request).
+        BOUND: taken back past its own bound (LAND_FORWARD_HELD_BOUND) while its far host held it open; kept as
+        forwardTakenBack (land status says it) and its requester is told as an fyi, naming the far row's last state."""
+        b = dict(e.get("forwardBound") or {})
+        held_s = round(self.now - float(b.get("at") or self.now))
+        far = str(b.get("far") or (e.get("forwardHeld") or {}).get("state") or "no answer")
         n = int((e.get("forwardRelanded") or {}).get("n") or 0) + 1
         # the row's gen in the id: a re-land after a repair that cleared forwardRelanded (n back to 1) is a new request,
         # never the id an earlier re-land used. cosmic-gray, 2026-11-25 08:15Z: 20 reopened rows re-landed under their
@@ -20600,11 +20687,24 @@ class LandQueue:
         self.apply(req, e["key"], e["repo"], int(e["number"]))
         e = self.entries[e["key"]]
         e["forwardRelanded"] = {"at": self.now, "head": head, "n": n, "from": host}
-        self.history(e, "forward_relanded", head=head[:12], was=host,
-                     why=f"still open with no outcome from {host} past the give-up: landed here again, pinned")
+        why = f"still open with no outcome from {host} past the give-up: landed here again, pinned"
+        if bound:
+            e["forwardBound"] = b
+            e["forwardTakenBack"] = {"at": self.now, "head": head, "from": host, "far": far, "held": held_s}
+            why = (f"{host} held it open ({far}) {held_s / 3600:.1f} h after its first hand-off at this head, past "
+                   f"its {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound: taken back, landed here again, pinned")
+        self.history(e, "forward_relanded", head=head[:12], was=host, why=why)
         self.save(e)
         log({"event": "land-forward-relanded", "key": e["key"], "head": head[:12], "was": host,
-             "executor": executor})
+             "executor": executor, **({"bound": True, "far": far, "held": held_s} if bound else {})})
+        if bound:
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} was handed to {host} {held_s / 3600:.1f} h ago and {host} still "
+                        f"holds it open ({far}) with no verdict, past the {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound "
+                        f"of a forwarded land: taken back and landed again, pinned at {head[:12]}. `glaeda-gh land "
+                        f"status {key_name(e['key'])}` follows it; if it again gets no verdict within "
+                        f"{LAND_FORWARD_GIVE_UP / 3600:.0f} h it stops forward_no_outcome",
+                        cls=LAND_FORWARD_FYI_CLASS)  # an inbox fyi, never a blocker (notice-flood.md rule 1)
 
     def forward_give_up(self, e: dict, state: str, host: str, executor: bool, why: str) -> None:
         """Under the lock. A forwarded E nothing could end or land again (forward_settle) stops forward_no_outcome,
@@ -20627,6 +20727,15 @@ class LandQueue:
             cause += f"; this host has no way to ask {host}"
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        bound = float(back.get("at") or 0) >= float((e.get("forwardBound") or {}).get("at") or 0) > 0
+        if bound:  # its own bound ran out twice: say what the far host last said, and tell the requester
+            first = min(first, float((e.get("forwardBound") or {}).get("at") or first))
+            far = str((e.get("forwardHeld") or {}).get("state") or back.get("far") or "no answer")
+            cause += (f"; {host} held it open ({far}) past its {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound "
+                      f"(LAND_FORWARD_HELD_BOUND), it was taken back at {utc_clock(float(back['at']))} and that "
+                      f"got no verdict in {LAND_FORWARD_GIVE_UP / 3600:.0f} h either")
+            told = False
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
@@ -27838,6 +27947,20 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
                     f"{land_trim(str((e.get('refresh') or {}).get('error') or '?'), 120)}")
     if e["state"] == "merged" and e.get("mergeSha"):
         bits.append(f"merge {e['mergeSha'][:12]}")
+    fb = e.get("forwardBound") if isinstance(e.get("forwardBound"), dict) else {}
+    back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+    if e["state"] == LAND_FORWARDED and _finite(fb.get("at")):
+        # a forwarded row's own bound (LAND_FORWARD_HELD_BOUND): where it went, what the far host last said, and
+        # when it is taken back whatever that host answers
+        far = str((e.get("forwardHeld") or {}).get("state") or "")
+        taken = _finite(back.get("at")) and float(back["at"]) >= float(fb["at"])
+        due = float(back["at"]) + LAND_FORWARD_GIVE_UP if taken else float(fb["at"]) + LAND_FORWARD_HELD_BOUND
+        bits.append(f"handed to {e.get('forwardedTo') or 'another host'} {max(0.0, now - float(fb['at'])) / 3600:.1f} h ago"
+                    + (f", held {far} there" if far else "")
+                    + (f"; {'stops' if taken else 'taken back'} {'by' if due > now else 'past'} {utc_clock(due)}"))
+    if _finite(back.get("at")) and e["state"] != "stopped":
+        bits.append(f"taken back from {back.get('from')} {utc_clock(float(back['at']))} after "
+                    f"{float(back.get('held') or 0) / 3600:.1f} h held {back.get('far') or 'open'} there")
     if e["state"] == "stopped":
         st = e.get("stop") or {}
         bits.append(f"{st.get('code')}: {land_reason(st.get('reason'), 160)}")
@@ -31921,12 +32044,36 @@ CACHE_WARM_HORIZON = 4 * 3600.0  # a chain of capped waits on one target stops b
 CACHE_WARM_GAP = 900.0  # a wait started within this of the last capped one on the target continues its chain
 
 
+def cache_warm_wait() -> float:
+    """CACHE_WARM_WAIT, or GLAEDA_WAIT_CACHE_WARM_S when set: the cap for a session whose prompt cache lives 5 min
+    (Leo, 2026-11-25: "we need to always be cognizant of those cache writes"). leo-workspace tools/tool_rewrites.py sets
+    it to 270 for every wait such a session runs (glaeda-gh wait, and the waits inside cmux-ci test and cmux-gh), as
+    the 1 h cap above never ended a wait before a 5 min cache went cold: cosmic-gray, 24 h to 2026-11-25 14:00Z, 123
+    helper requests on the 5 min cache came back cold from a glaeda-gh or cmux-ci wait, 14.4M tokens rewritten.
+    Clamped to 60..CACHE_WARM_WAIT; a bad value is the default."""
+    try:
+        got = float(os.environ.get("GLAEDA_WAIT_CACHE_WARM_S") or CACHE_WARM_WAIT)
+    except ValueError:
+        return CACHE_WARM_WAIT
+    return min(max(got, 60.0), CACHE_WARM_WAIT) if math.isfinite(got) else CACHE_WARM_WAIT
+
+
+def cache_warm_horizon(warm: float) -> float:
+    """How long a chain of capped waits stays capped: CACHE_WARM_HORIZON on the hour; on a shorter cap, 20 re-runs
+    (90 min at 270 s), as a 5 min cache's re-run reads at 0.05x and one rewrite costs 1.25x, about 25 reads."""
+    return CACHE_WARM_HORIZON if warm >= CACHE_WARM_WAIT else min(CACHE_WARM_HORIZON, 20 * warm)
+
+
 def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None,
                    now: float | None = None) -> tuple[float, float | None, str]:
     """TIMEOUT and CEILING for a wait a Claude Code session runs, held to CACHE_WARM_WAIT, and the line saying so
     ("" when nothing changed). See CACHE_WARM_WAIT."""
-    if os.environ.get("CLAUDECODE") != "1" or os.environ.get("GLAEDA_WAIT_CACHE_WARM", "1") == "0":
+    warm = cache_warm_wait()
+    if os.environ.get("GLAEDA_WAIT_CACHE_WARM", "1") == "0" or (
+            os.environ.get("CLAUDECODE") != "1" and warm == CACHE_WARM_WAIT):
         return timeout, ceiling, ""
+    horizon = cache_warm_horizon(warm)
+    life = "1 h" if warm == CACHE_WARM_WAIT else "5 min" if warm <= 300 else f"{warm:g}s-wait"
     whole = max(float(timeout), default_wait_max(timeout) if ceiling is None else float(ceiling))
     try:
         key = parse_key(kind, target) if kind in ("pr", "run", "comment") else f"{kind}:{target}"
@@ -31937,24 +32084,24 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
     chains = read_json(path)
     chains = chains if isinstance(chains, dict) else {}
     chain = chains.get(key) if isinstance(chains.get(key), dict) else None
-    going = chain is not None and now - float(chain.get("last") or 0) < CACHE_WARM_WAIT + CACHE_WARM_GAP
+    going = chain is not None and now - float(chain.get("last") or 0) < warm + CACHE_WARM_GAP
     first = float(chain.get("first") or now) if going and chain else now
-    if going and chain and (chain.get("done") or now - first >= CACHE_WARM_HORIZON):
+    if going and chain and (chain.get("done") or now - first >= horizon):
         # Past the horizon. The chain stays marked done while its waits follow one another, so the uncapped `next:`
         # does not start a new capped chain; a gap past CACHE_WARM_GAP (the session went cold anyway) starts one.
         words = ""
-        if not chain.get("done") and whole <= CACHE_WARM_WAIT:  # the capped `next:` again: the wait's own default
+        if not chain.get("done") and whole <= warm:  # the capped `next:` again: the wait's own default
             timeout, ceiling = WAIT_DEFAULT_TIMEOUT, None
             words = (f"glaeda-gh: re-run on {key} for {span(now - first)}: this wait runs --timeout "
-                     f"{WAIT_DEFAULT_TIMEOUT:g} (the cache-warm cap ends at {span(CACHE_WARM_HORIZON)})")
+                     f"{WAIT_DEFAULT_TIMEOUT:g} (the cache-warm cap ends at {span(horizon)})")
         chains[key] = {"first": first, "last": now, "done": True}
-    elif whole > CACHE_WARM_WAIT or going:
+    elif whole > warm or going:
         chains[key] = {"first": first, "last": now}
-        words = "" if whole <= CACHE_WARM_WAIT else (
-            f"glaeda-gh: this wait ends by {CACHE_WARM_WAIT:g}s (asked {whole:g}s), inside the prompt cache's 1 h, "
+        words = "" if whole <= warm else (
+            f"glaeda-gh: this wait ends by {warm:g}s (asked {whole:g}s), inside the prompt cache's {life}, "
             f"so the next request reads a warm cache: on exit 2 run its `next:` again "
             f"(GLAEDA_WAIT_CACHE_WARM=0 waits as asked)")
-        timeout, ceiling = min(float(timeout), CACHE_WARM_WAIT), min(whole, CACHE_WARM_WAIT)
+        timeout, ceiling = min(float(timeout), warm), min(whole, warm)
     else:
         return timeout, ceiling, ""
     for k in [k for k, v in chains.items() if not isinstance(v, dict) or now - float(v.get("last") or 0) > 86400]:

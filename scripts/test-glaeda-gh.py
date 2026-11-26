@@ -9168,9 +9168,31 @@ class CacheWarmCapTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         os.environ.pop("GLAEDA_WAIT_CACHE_WARM", None)
+        os.environ.pop("GLAEDA_WAIT_CACHE_WARM_S", None)
 
     def cap(self, timeout: float, ceiling: float | None, now: float) -> tuple[float, float | None, str]:
         return gg.cache_warm_cap("pr", self.KEY_TARGET, timeout, ceiling, now=now)
+
+    def test_a_5_minute_cache_session_waits_270s_and_its_chain_is_shorter(self) -> None:
+        """GLAEDA_WAIT_CACHE_WARM_S (tool_rewrites sets 270 for a 5 min cache session): a 600 s wait, under the 1 h cap,
+        ends by 270 s, says so, and the chain of re-runs stops being capped after 20 of them (90 min)."""
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": "270"}):
+            t, c, words = self.cap(600, None, NOW)
+            self.assertEqual((t, c), (270, 270))
+            self.assertIn("5 min", words)
+            self.assertEqual(gg.cache_warm_horizon(270), 5400)
+            at = NOW
+            while at - NOW < 5400 - 270:
+                at += 270
+                self.assertEqual(self.cap(t, c, at)[:2], (270, 270))
+            self.assertEqual(self.cap(t, c, at + 270)[:2], (gg.WAIT_DEFAULT_TIMEOUT, None))
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": "270", "CLAUDECODE": ""}):
+            self.assertEqual(self.cap(600, None, NOW + 86400 * 3)[:2], (270, 270), "set by name, it applies anywhere")
+
+    def test_a_bad_or_wild_5_minute_value_is_bounded(self) -> None:
+        for raw, want in (("x", gg.CACHE_WARM_WAIT), ("5", 60.0), ("99999", gg.CACHE_WARM_WAIT), ("nan", gg.CACHE_WARM_WAIT)):
+            with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": raw}):
+                self.assertEqual(gg.cache_warm_wait(), want, raw)
 
     def test_a_long_wait_ends_inside_the_cache_lifetime_and_says_how_to_go_on(self) -> None:
         timeout, ceiling, words = self.cap(5400, None, NOW)
@@ -18482,14 +18504,17 @@ class PostTest(unittest.TestCase):
         sha = "a" * 40
         pooled = (f"Review (claude claude-opus-5-5 medium, router-review): SHIP at {sha}\n\n<!-- review-run=run-1 -->\n",
                   f"<!-- review-running sha={sha} at=2026-11-26T01:57:40Z run=run-1 by=router-review -->\nReview running.",
-                  "<!-- review-run=run-1 --> Review finished at abc; its verdict is not posted again here.")
+                  "<!-- review-run=run-1 --> Review finished at abc; its verdict is not posted again here.",
+                  '<!-- pr-owner {"id": "aid-1", "at": "2026-11-26T17:46:04Z", "prev": ["aid-0"]} -->\n'
+                  "Owned by an agent session · took over from an earlier session")
         for body in pooled:
             item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
             self.assertEqual(d.poster_actor(item)["role"], "quota-goblin", body)
             with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "0"}):
                 self.assertTrue(gg.app_author_bound(body), body)  # the switch back to the login
-        kept = ('<!-- pr-owner {"id": "aid-1"} -->\nOwned by an agent session', "<!-- review-run=run-1 -->\n/land",
-                "<!-- review-running sha=x -->\n<!-- marker -->")
+        kept = ('<!-- pr-owner {"id": "aid-1"} -->\n<!-- marker -->', "<!-- review-run=run-1 -->\n/land",
+                "<!-- review-running sha=x -->\n<!-- marker -->", '<!-- pr-owner {"id": "aid-1"} -->\nowner: me',
+                "<!-- pr-owner aid-1 -->\nOwned")
         for body in kept:
             self.assertTrue(gg.app_author_bound(body), body)
 
@@ -18497,16 +18522,45 @@ class PostTest(unittest.TestCase):
         self.no_env_token()
         asked, _ = self.poster_pool()
         d, t = self.daemon()
-        for body in ("<!-- marker -->\nhi", "/land", "owner: me", '<!-- pr-owner {"id": "aid-1"} -->\nOwned'):
+        for body in ("<!-- marker -->\nhi", "/land", "owner: me", '<!-- pr-owner {"id": "aid-1"} -->\n/land'):
             item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
             self.assertIsNone(d.poster_actor(item), body)
-        status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
-        self.assertIsNone(d.poster_actor(status))
+        status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "<!-- marker -->", "--status-key", "k")
+        self.assertIsNone(d.poster_actor(status))  # a status key never frees an author-bound body
         self.assertEqual(asked, [])
+        d.now = NOW
+        d.note_status(status, "IC_1", 1, "u1")  # the login's own earlier status, editable in place
+        plain = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
         with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "1"}):
             receipt = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "/land")
             self.assertEqual(d.poster_actor(receipt)["role"], "quota-goblin")
-            self.assertIsNone(d.poster_actor(status))  # a status edit keeps the identity that posted it: the login
+            self.assertIsNone(d.poster_actor(plain))  # a status edit keeps the identity that posted it: the login
+
+    def test_a_status_key_comment_with_nothing_to_edit_goes_on_the_pool(self) -> None:
+        """router-review's review-running marker carries a status key: with no earlier status of the login's to edit,
+        it is a new comment and leaves on a poster App; the App's status is never edited as the login, so the next
+        status of that key is a new comment on the pool again. Leo, 2026-11-26: "we built the poster App for exactly
+        this (glaeda#2946, #12134), why are comments still going out on the login and getting throttled?" """
+        self.no_env_token()
+        asked, tokens = self.poster_pool()
+        sha = "a" * 40
+        running = self.queue("comment", "teamleaderleo/glaeda#1", "--body",
+                             f"<!-- review-running sha={sha} at=2026-11-26T17:45:36Z run=run-1 by=router-review -->\n"
+                             "Review running at aaaaaaaaaaaa (router-review).", "--status-key", "review-run=run-1")
+        made = {"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-5", "id": 5, "node_id": "IC_5"}
+        d, t = self.daemon((201, {}, made))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls], ["POST"])
+        self.assertEqual(seen, ["Bearer " + tokens["quota-goblin"]])  # the App's token, never the login's
+        self.assertEqual(gg.post_state(running["id"])["state"], "posted")
+        noted = gg.read_json(gg.BASE / gg.POST_STATUSES)["teamleaderleo/glaeda#1"]
+        self.assertEqual((noted["nodeId"], noted["appWriter"]), ("IC_5", "quota-goblin"))
+        verdict = self.queue("comment", "teamleaderleo/glaeda#1", "--body",
+                             "<!-- review-run=run-1 --> Review finished.", "--status-key", "review-run=run-1")
+        self.assertIsNone(d.status_editable(verdict))  # the App's comment is not the login's to edit
+        self.assertEqual(d.poster_actor(verdict)["role"], "quota-goblin")
 
     def test_an_uncertain_poster_comment_is_looked_up_not_sent_again_on_another_identity(self) -> None:
         self.no_env_token()
@@ -42308,6 +42362,60 @@ class LandForwardTest(Base):
         self.assertEqual(len(self.sent_batches), 1)
         self.assertGreater(len(self.asks), 10)
         self.assertFalse([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
+
+    def hold_forwarded_for(self, seconds: float) -> dict:
+        """Tick the forwarding host, the executor holding o/r#1 open the whole while, for SECONDS."""
+        e, end = self.q.entries[self.KEY], self.t + seconds
+        while self.t < end:
+            e = self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        return e
+
+    def test_a_forward_held_open_past_its_bound_is_taken_back_then_stops_with_the_far_state_said(self):
+        # 2026-11-26: cmux#56127, 56200, 56556 and 56603 sat forwarded 62-112 min, then hours, with no verdict while
+        # the far land queue held each open (its merge-train loop): every "still open" answer reset the give-up
+        # clock (forwardHeld), so no row ever ended. The bound counts from the first hand-off at the head.
+        self.forwarded_to_executor()
+        self.w.view_head = LA
+        first = self.sent_batches[0]["requests"][0]["id"]
+        told = len(self.w.sent())
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_HELD_BOUND - 3600)
+        self.assertEqual((e["state"], e["forwardHeld"]["state"], len(self.sent_batches)), ("forwarded", "requested", 1))
+        self.assertNotIn("forwardTakenBack", e)
+        self.assertIn("handed to big-exec", gg.land_line(e, self.t))
+        self.assertIn("held requested there", gg.land_line(e, self.t))
+        e = self.hold_forwarded_for(3600 + gg.LAND_FORWARD_ASK_EVERY + 2)
+        self.assertEqual((e["state"], e["pinSha"]), ("forwarded", LA))
+        self.assertEqual(e["forwardTakenBack"]["far"], "requested")
+        self.assertGreater(e["forwardTakenBack"]["held"], gg.LAND_FORWARD_HELD_BOUND)
+        events = [h.get("event") for h in e["history"]]
+        self.assertEqual((events.count("forward_bound"), events.count("forward_relanded")), (1, 1))
+        self.assertEqual(len(self.sent_batches), 2)
+        self.assertNotEqual(self.sent_batches[-1]["requests"][0]["id"], first)
+        self.assertEqual(self.sent_batches[-1]["requests"][0]["sha"], LA)
+        [fyi] = self.w.sent()[told:]
+        self.assertIn("16 h bound", fyi[-1])
+        self.assertEqual(fyi[fyi.index("--class") + 1], "fyi")
+        self.assertIn("taken back", gg.land_line(e, self.t))
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_GIVE_UP / 2)  # the take-back once, not every tick
+        self.assertEqual((e["state"], len(self.sent_batches)), ("forwarded", 2))
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_GIVE_UP / 2 + gg.LAND_FORWARD_ASK_EVERY + 2)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("requested", e["stop"]["reason"])
+        self.assertIn("16 h bound", e["stop"]["reason"])
+        self.assertTrue([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
+
+    def test_a_forward_bound_counts_from_the_first_hand_off_at_its_head_and_a_new_head_starts_it_again(self):
+        self.forwarded_to_executor()
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            self.q.now = self.t
+            began = self.q.forward_bound_at(e)
+            e["forwardHeld"] = {"at": self.t + 5000, "state": "waiting"}  # a hold is no new start
+            self.q.now = self.t + 9000
+            self.assertEqual(self.q.forward_bound_at(e), began)
+            e["pinSha"] = LB  # pushed: a new head is a new hand-off
+            e["handedOff"] = {**(e.get("handedOff") or {}), "at": self.t + 9000, "head": LB}
+            self.assertEqual(self.q.forward_bound_at(e), self.t + 9000)
 
     def test_a_forward_the_executor_never_got_is_sent_again_then_stops_lost_within_minutes(self):
         self.forwarded_to_executor()
