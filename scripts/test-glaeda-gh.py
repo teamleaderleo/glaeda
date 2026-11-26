@@ -37565,6 +37565,7 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 1)
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(gg.LAND_FEED_QUIET_MAX)
+        self.tick(1)  # a ws-check wait's copy, older than LAND_OWN_REFRESH_AFTER, is read first (LAND_STATUS_WAIT)
         self.assertEqual(len(self.w.explains()), 2)
 
     def test_an_unparked_entry_keeps_its_wait_while_the_feed_is_quiet(self):
@@ -39011,7 +39012,7 @@ class LandTest(Base):
 
         def posted(key):
             self.w.refreshed.append(key)
-            self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+            self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS", "passed")])
         self.q.refresh = posted
         self.t += gg.LAND_OWN_REFRESH_AFTER + gg.LAND_RECOVERY_SWEEP
         self.assertLess(self.t, original_wake)
@@ -39023,7 +39024,8 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 2)
 
     def test_a_ws_check_posted_after_ws_check_missing_is_judged_on_the_copy_with_a_quiet_feed(self):
-        # The same status post, reaching the copy by any read: the feed's quiet no longer holds the verdict
+        # The same status post, reaching the copy by any read: the feed's quiet no longer holds the verdict; a check
+        # run catching up in the copy still does (test_a_wait_verdict_the_feed_shows_nothing_against_is_not_judged_again)
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
         self.land()
         self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
@@ -39031,27 +39033,10 @@ class LandTest(Base):
         self.tick()
         self.q.feed_quiet = lambda *args: True
         self.t += gg.LAND_VERDICT_KEEP + 1
-        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS", "passed")])
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
-
-    def test_a_check_finishing_in_the_copy_judges_a_feed_held_wait(self):
-        # Any check finishing is an event, whatever the feed said: a webview wait on a running check, the copy since
-        # the verdict showing it done, is judged on that copy (feed_holds' copy check), not held to LAND_FEED_QUIET_MAX
-        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("webview", "IN_PROGRESS", None)])
-        self.land()
-        self.w.answers.append(refusal("webview", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
-                                                      "timeout_s": 1800}))
-        e = self.tick()
-        self.assertIsInstance((e.get("feedVerdict") or {}).get("shape"), list)
-        self.q.feed_quiet = lambda *args: True
-        self.t += gg.LAND_VERDICT_KEEP + 1
-        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("webview", "COMPLETED", "SUCCESS")])
-        self.w.answers.append(ok_answer(LA))
-        self.tick()
-        self.assert_merged_at(LA)
-        self.assertEqual(len(self.w.explains()), 2)
 
     def test_land_check_event_on_a_stale_running_pin_shares_the_host_read_budget(self):
         # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),

@@ -15750,10 +15750,18 @@ LAND_NO_DATA_WAIT = frozenset({"pr", "retry"})
 # (land_pending_status's comment): a quiet feed says nothing about them. Before, a ws_check_missing verdict was held
 # by feed_holds (the copy showing the status posted was not judged) and, on a host with its own login, its copy was
 # not re-read at all (refresh_due's recovery covered checks_running only), so a PR green on its ws-check sat unmerged
-# until its owner cancelled and re-landed (the coordinator, 2026-11-26, from the mirror-fetch lane). Now such a
-# verdict is never feed-held, its copy is re-read every LAND_OWN_REFRESH_AFTER under the host's refresh cap, and the
-# status post in that copy judges the row at once (the fingerprint moved).
+# until its owner cancelled and re-landed (the coordinator, 2026-11-26, from the mirror-fetch lane). Now a wait verdict
+# keeps the commit statuses its copy showed (feedVerdict "statuses", land_status_contexts); a copy read since it that
+# shows a status posted or changed is not feed-held, and for these codes the copy is re-read every
+# LAND_OWN_REFRESH_AFTER under the host's refresh cap, so the status post judges the row on the next sweep.
 LAND_STATUS_WAIT = frozenset({"ws_check_missing", "ws_check_not_run"})
+
+
+def land_status_contexts(data: dict) -> list[list[str]]:
+    """The commit status contexts DATA (a copy of the PR) shows, as [name, status, conclusion] sorted: checks with no
+    workflow and no check-run id (land_pending_status's rule), which the controller's feed carries no event for."""
+    return sorted([str(c.get("name") or ""), str(c.get("status") or ""), str(c.get("conclusion") or "")]
+                  for c in data.get("checks") or [] if isinstance(c, dict) and not c.get("workflow") and "id" not in c)
 # The check-completed event judges a wait on the PR's checks at once (LandQueue.checks_done_event, why=checks_done):
 # when the feed delivers a completed run or check suite for the head after the wait's verdict and the controller's
 # rollup of the head (no GitHub request) shows every check run there completed, land_judge is asked now, on its own
@@ -21700,9 +21708,9 @@ class LandQueue:
         at = started if isinstance(started, (int, float)) and not isinstance(started, bool) else self.now
         if not answer.get("ok") and act.get("kind") in LAND_WAIT_KINDS and SHA40.fullmatch(head or ""):
             e["feedVerdict"] = {"head": head, "at": at, "code": code, "kind": act.get("kind")}
-            shape = land_wait_shape(self.cache_of(e["key"]), head)
-            if shape[0]:
-                e["feedVerdict"]["shape"] = list(shape)  # what the checks looked like: feed_holds' copy check
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            if str(data.get("headRefOid") or "").lower() == head.lower():
+                e["feedVerdict"]["statuses"] = land_status_contexts(data)  # feed_holds' copy check (LAND_STATUS_WAIT)
         else:
             e.pop("feedVerdict", None)
 
@@ -21782,8 +21790,8 @@ class LandQueue:
         v = e.get("feedVerdict") or {}
         at = v.get("at")
         if not head or v.get("head") != head or not isinstance(at, (int, float)) or isinstance(at, bool) \
-                or self.now - at >= LAND_FEED_QUIET_MAX or v.get("code") in LAND_STATUS_WAIT:
-            return False  # LAND_STATUS_WAIT: what ends that wait is a commit status, which the feed never carries
+                or self.now - at >= LAND_FEED_QUIET_MAX:
+            return False
         if v.get("code") in LAND_TIMER_HELD:
             # A checks_running verdict whose checks the cache shows finished, in a read made since it (a commit status
             # going green: the feed carries no event for it): the wait is over, whatever the feed did not say.
@@ -21798,10 +21806,10 @@ class LandQueue:
         read = c.get("dataAt")
         if isinstance(read, (int, float)) and not isinstance(read, bool) and read >= at \
                 and str((c.get("data") or {}).get("headRefOid") or "").lower() == head \
-                and isinstance(v.get("shape"), list) and len(v["shape"]) == 2 \
-                and ((now := land_wait_shape(c, head))[0] != v["shape"][0] or now[1] > int(v["shape"][1] or 0)):
-            # A copy read since the verdict shows the checks it waited on changed (one finished, a status posted,
-            # one appeared) where the feed said nothing: the copy is the event, so the verdict does not hold.
+                and isinstance(v.get("statuses"), list) and land_status_contexts(c.get("data") or {}) != v["statuses"]:
+            # LAND_STATUS_WAIT: a copy read since the verdict shows a commit status posted or changed, which the feed
+            # never carries: the copy is the event, so the verdict does not hold. A check run's change is not (the
+            # feed carries runs and suites; a copy showing one with no event is a copy catching up to the verdict).
             return False
         if not self.feed_quiet(e["key"], head, at):
             return False
