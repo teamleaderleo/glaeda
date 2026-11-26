@@ -3636,7 +3636,11 @@ APP_POOL_ROLE = "ci-watch"
 # names the primary (APP_POOL_ROLE) is the whole chain in its order (app_pool_chain); one that does not is the roles
 # after the primary, as before, so GLAEDA_GH_APP_SPARES=quota-goblin is the chain before this change. A role whose
 # token this host does not hold is passed over (held_here), as a spare always was.
-APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin"
+# Then yap-goblin-9000 and yap-goblin-9001 (Leo, 2026-11-26: "maybe it's time for quota goblin"): huge-blue,
+# 12:44:51-12:45:26Z, the four Apps above each answered a pr-pages GraphQL read with a secondary rate limit, every
+# one rested about 300 s, and 185 of the daemon's GraphQL reads in 12:4x-12:5x went on the shared login
+# (graphqlLoginWhy "pool-resting") while both yaps, pushed to every host, sat at 9,431 and 12,488 of 12,500.
+APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
 
 
@@ -8762,7 +8766,7 @@ class Daemon:
         elif not actor and self.rest_out(status, h, text):
             write_json(path, item)  # nothing was written: GraphQL posts it if it can, else it waits for REST's reset
         elif item["kind"] == "update-branch" and status in (404, 422) and not THROTTLED.search(text) \
-                and (retired := update_branch_retired(status, text)):
+                and (retired := update_branch_retired(status, text, lambda: self.update_branch_pr(item))):
             if retired[0] == "done":
                 self.post_finish(path, item, note=retired[1])  # the branch needs nothing: done, never retried
             else:
@@ -8781,6 +8785,14 @@ class Daemon:
                              error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
+
+    def update_branch_pr(self, item: dict) -> dict | None:
+        """The queued update-branch's PR as GitHub answers it now (update_branch_retired's state), None unread."""
+        try:
+            status, _, doc = self.request("GET", f"/repos/{item['repo']}/pulls/{item['number']}")
+        except (WatchError, OutOfTime):
+            return None
+        return doc if status == 200 and isinstance(doc, dict) else None
 
     def post_through_broker(self, path: Path, item: dict) -> None:
         """A lane VM's queued write, made with the lane-gh broker's own tool (broker_write), the route this host's
@@ -8834,7 +8846,10 @@ class Daemon:
                 item["notBefore"] = max(float(item.get("notBefore") or 0), self.now + BROKER_POST_DEADLINE)
                 write_json(path, item)
         else:
-            ended = update_branch_retired(422, str(value)) if item["kind"] == "update-branch" else None
+            # A pin read that failed sent nothing: no second read of the PR it could not read (update_branch_retired)
+            unpinned = str(value).startswith(UPDATE_BRANCH_PIN_UNREAD)
+            ended = update_branch_retired(422, str(value), None if unpinned else lambda: broker_read_pr(item)) \
+                if item["kind"] == "update-branch" else None
             if ended and ended[0] == "done":
                 self.post_finish(path, item, note=ended[1])
             elif ended:
@@ -11190,8 +11205,10 @@ class Daemon:
                     explained = None
                 cached = read_cache(req["key"])
                 starved = None if explained else wait_starved(req, cached, now)
-                if starved is not None and self.wait_feed_quiet(req, cached, now):
+                if starved is not None and wait_sha_behind(req, cached) is None \
+                        and self.wait_feed_quiet(req, cached, now):
                     starved = None  # nothing reached the PR since its copy: a direct read reads the same
+                    # (not for a copy showing another head than the wait's --sha: the feed missed that push)
                 if starved is not None:
                     # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
                     # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
@@ -14969,6 +14986,11 @@ def land_retarget_args(repo: str, number: str, base: str, broker: bool) -> list[
 
 
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
+# A pinned land waiting for a read that shows its pin (pin_wait, refresh_due) needs one PR read, not a judgment, yet its
+# read took a worker of the pool a judgment takes, and a pool held by 170-300 s judgments left it waiting: cmux-cp-1,
+# 2026-11-26 11:01-11:29Z, cmux#58041 (pinned at 1db9c73ca9d0 after its own update_branch) sat 28 min on a cached 4b0b90460518
+# with 10 of 8-12 workers busy judging, until a person merged it. Up to this many such reads run past the worker count.
+LAND_PIN_READ_SLOTS = 4
 # A head_moved stop names the live head it read (its next step is `--sha LIVE`), so it also says the pin it stopped was
 # replaced. A row then re-pinned at LIVE whose copy still shows that replaced head is reading something older than the
 # stop's own read, not a new push: a lane host, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
@@ -17165,7 +17187,18 @@ LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "
                  "review_running": "wait_comment", "no_ship": "review", "same_model": "review",
                  "regen_refused": "review"}
 LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_comment", "rerun_failed", "repin",
-                        "retry", "review", "retarget", "stop", "command", "fetch"})
+                        "retry", "review", "retarget", "stop", "command", "fetch", "compile_check"})
+# A "compile_check" step: land_judge's compile_missing refusal names its one next step, `cmux-ci compile-check --ref
+# SHA --app --release` (compile_check_command), which gives the head its compile receipt in minutes. The queue stopped
+# on it as a command, and a person or agent ran it and landed again (cmux#57574 and #56907, 2026-11-26). Now the queue
+# sends it itself, in the background (`--background`: the controller queues it and the client returns), for the
+# judged head only, and waits LAND_COMPILE_WAIT before judging again; a head still missing its compile after that is
+# sent once more with `--urgent` (the controller moves a queued check ahead), and past LAND_COMPILE_SENDS sends it
+# stops as before, naming the command. Only that exact command, for a compile_missing answer at the judged head.
+LAND_COMMAND_COMPILE = re.compile(r"\s*cmux-ci compile-check --ref ([0-9a-f]{40}) --app --release\s*")
+LAND_COMPILE_WAIT = 600.0
+LAND_COMPILE_SENDS = 2
+LAND_COMPILE_DEADLINE = 120.0  # the client's own submit, --background
 SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: land_judge could not
@@ -17972,7 +18005,23 @@ def land_action(answer: dict, head: str) -> dict:
     if act.get("kind") != "command":
         return act
     return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
-        or land_command_label(act, answer) or land_command_wait(act, answer, head)
+        or land_command_label(act, answer) or land_command_compile(act, answer, head) \
+        or land_command_wait(act, answer, head)
+
+
+def land_command_compile(act: dict, answer: dict, head: str) -> dict | None:
+    """A "command" step that is land_judge's compile check for the judged HEAD (LAND_COMMAND_COMPILE's comment) as a
+    compile_check step, else None: any other text, code or head stays a command, which stops as before."""
+    if str(answer.get("code") or "") != "compile_missing":
+        return None
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_COMPILE.fullmatch(text)
+    if not named or not head or named.group(1) != head.lower():
+        return None
+    return {"v": 1, **{k: act[k] for k in ("repo", "number") if k in act}, "kind": "compile_check", "head": head,
+            "text": text.strip(), "from": "command"}
 
 
 def land_command_label(act: dict, answer: dict) -> dict | None:
@@ -20182,6 +20231,11 @@ class LandQueue:
         gen = int(e.get("gen") or 0)
         n = int(gone.get("n") or 0) + 1 if int(gone.get("gen") or 0) == gen else 1
         e["forwardMissing"] = {"n": n, "gen": gen, "at": self.now, "far": st or None}
+        far_stop = (row or {}).get("stop")
+        if st in ("stopped", "cancelled") and isinstance(far_stop, dict) and far_stop.get("code"):
+            # the row there ended before this hand-off and no re-send revived it: its stop is the outcome (cmux#55252,
+            # 2026-11-26: own_red, told to its requester as "the hand-off was lost")
+            e["forwardMissing"]["stop"] = {k: land_trim(str(far_stop.get(k) or ""), 400) for k in ("code", "reason", "next")}
         self.history(e, "forward_missing", to=host, n=n, far=st or None)
         log({"event": "land-forward-missing", "key": e["key"], "to": host, "n": n, "far": st or None})
         self.save(e)
@@ -20206,6 +20260,12 @@ class LandQueue:
         if not self.outcome_read(e, c, since):
             return False
         st = str(gone.get("far") or "")
+        far = gone.get("stop")
+        if isinstance(far, dict) and far.get("code"):
+            self.stop(e, "forward_stopped", f"{host}'s land queue holds it {st} ({far['code']}), from before this "
+                      f"hand-off, and handing it off again did not revive it: {far.get('reason') or 'it gave no reason'}",
+                      far.get("next") or f"glaeda-gh land {key_name(e['key'])} on {host}", tell="quiet")
+            return True
         resent = int((e.get("forwardResent") or {}).get("n") or 0)
         then = f" (its row there {st} before this hand-off)" if st else ""
         self.stop(e, "forward_lost", f"{host}'s land queue holds no row of it{then}: asked {n} times, "
@@ -22078,6 +22138,15 @@ class LandQueue:
             self.save(e)
         return True
 
+    def pin_read_slot(self, e: dict) -> bool:
+        """True while E, a pinned land still waiting for a read that shows its pin, may start its read past the worker
+        count (LAND_PIN_READ_SLOTS): at most that many of those reads run at once."""
+        if not e.get("pinSha") or e.get("pinSeen"):
+            return False
+        return sum(1 for k, (_, job) in self.job_started.items() if k in self.jobs and job == "refresh_job"
+                   and not (self.entries.get(k) or {}).get("pinSeen")
+                   and (self.entries.get(k) or {}).get("pinSha")) < LAND_PIN_READ_SLOTS
+
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
         """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
         the request, or when it stopped because that read shows another head. huge-blue, 2026-11-21 10:56Z:
@@ -22167,7 +22236,7 @@ class LandQueue:
                     return True
             elif self.refresh_held():
                 pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
-            elif self.busy() >= self.workers():
+            elif self.busy() >= self.workers() and not self.pin_read_slot(e):
                 # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
                 # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
                 # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
@@ -22459,7 +22528,7 @@ class LandQueue:
         repo = str(e.get("repo") or "").lower()
         queued = self.refresh_queued.get(repo) or []
         joins = self.refresh_many is not None and bool(queued) and len(queued) % LAND_REFRESH_BATCH != 0
-        if not joins and self.busy() + self.refresh_batches() >= self.workers():
+        if not joins and self.busy() + self.refresh_batches() >= self.workers() and not self.pin_read_slot(e):
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"]),
@@ -24354,8 +24423,9 @@ class LandQueue:
                 e.pop("overrideWait", None)
             self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
-        if kind in LAND_OVERRIDE_PIN_KINDS and land_override_pinned(e, head):
-            # LAND_OVERRIDE_PIN_KINDS' comment: the pinned merge carrying the override, once per head
+        if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
+            # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
+            # head
             if (e.get("overridePinMerge") or {}).get("head") == head:
                 with self.lock:
                     self.stop(e, "pinned_override_refused",
@@ -24447,6 +24517,9 @@ class LandQueue:
                 return
         if kind == "fetch":
             self.do_fetch(e, act, answer, head)
+            return
+        if kind == "compile_check":
+            self.do_compile_check(e, act, answer, head)
             return
         if kind == "rerun_failed":
             runs = [int(r) for r in act.get("runs") or [] if str(r).isdigit()]
@@ -25315,6 +25388,38 @@ class LandQueue:
                 named = self.step_refused(e, "label", head, got)
         if named == "update_branch":
             self.update_branch(e, head, named=True)
+
+    def do_compile_check(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Send the compile check land_judge named for HEAD (LAND_COMMAND_COMPILE's comment) and wait on its receipt.
+        e["compileSent"] counts the sends at this head, written before each send (a restart mid-send counts it)."""
+        sent = e.get("compileSent") or {}
+        n = int(sent.get("n") or 0) if sent.get("head") == head else 0
+        if n >= LAND_COMPILE_SENDS:
+            with self.lock:
+                self.stop(e, "compile_missing", f"sent the compile check {n} times at {head[:12]} and it still has no "
+                          f"verdict: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
+            return
+        argv = [self.path("cmuxCi", Path(shutil.which("cmux-ci") or "cmux-ci")).as_posix(), "compile-check",
+                "--ref", head, "--app", "--release", "--background",
+                "--reason", f"glaeda land {e['repo']}#{e['number']}"] + (["--urgent"] if n else [])
+        with self.lock:
+            self.claim(e, "compile_check", head=head, n=n + 1)
+            e["compileSent"] = {"head": head, "n": n + 1, "at": self.now}
+            self.history(e, "compile_sent", head=head[:12], n=n + 1, urgent=bool(n))
+            self.count("compile_sent")
+            self.save(e)
+        got = self.call(argv, LAND_COMPILE_DEADLINE, e)
+        with self.lock:
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.wait(e, {"kind": "retry", "why": f"compile check sent at {head[:12]}: judged once it has a "
+                                                      "receipt"}, LAND_COMPILE_WAIT)
+            else:
+                self.stop(e, "compile_missing", f"the compile check at {head[:12]} could not be sent (exit "
+                          f"{got.returncode}: {land_trim(got.stderr or got.stdout, 200)}): "
+                          f"{land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
@@ -26587,29 +26692,35 @@ def land_request_path(rid: str) -> Path:
     return _land_written[rid]
 
 
-LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason and receipt, one line each
-LAND_OVERRIDE_RECEIPT_MAX = 240
+# lane-gh land's own "override" limits (cmuxterm-hq lane-gh-broker OVERRIDE_REASON_MAX / OVERRIDE_RECEIPT_MAX): reason and
+# receipt, one line each. The broker judges every red or running check at the head by whether this text names it, so
+# the text goes whole: before 2026-11-26 both were cut here (and again at the broker, silently) at 200 and 240, and a
+# lane's override naming its reds past character 200 was refused "checks failed ... that the override does not name"
+# four times until it split the names across both fields. A text past these is refused by its length, never cut.
+LAND_OVERRIDE_REASON_MAX = 4000
+LAND_OVERRIDE_RECEIPT_MAX = 4000
 
 
 def fit_one_line(flag: str, text: str, most: int, *, stream=None) -> str:
-    """TEXT as one line of at most MOST characters, said on STREAM when it had to change. A reason and a receipt are
-    prose an agent writes for the record, so a newline or 2 characters too many is not worth a refused land and a
-    second call: both are things this function can do itself (tools/guard_refusal.py fit, the same contract for a
-    guard's own refusal text). What is left is what no guess can fix: an empty one, or only one of the pair."""
+    """TEXT as one line (its whitespace runs one space), said on STREAM when that changed it. A reason and a receipt
+    are prose an agent writes for the record, so a newline or padding is not worth a refused land and a second call
+    (tools/guard_refusal.py fit, the same contract for a guard's own refusal text). Never cut: the broker matches the
+    checks an override goes past against the whole text, so one past MOST is refused (WatchError) naming its length."""
     fitted = " ".join(text.split())
     if len(fitted) > most:
-        fitted = fitted[:most - 1].rstrip() + "\u2026"  # the head: a reason names its cause first
+        raise WatchError(f"{flag} is {len(fitted)} chars, limit {most}: name each check it goes past and its "
+                         "evidence in fewer words (nothing is cut: a check named past a cut would read as not named)")
     if fitted != text:
-        print(f"glaeda-gh land: {flag} fitted to one line of {most}: {fitted}",
+        print(f"glaeda-gh land: {flag} fitted to one line: {fitted}",
               file=sys.stderr if stream is None else stream)
     return fitted
 
 
 def land_override(reason: str | None, receipt: str | None) -> dict | None:
     """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
-    neither. A newline, padding or a text past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters is
-    fitted (fit_one_line), not refused: on 2026-11-21 a 202-character reason cost a refusal and a second land call
-    for 2 characters. Refused (WatchError) only for what no guess fixes: one of the two alone, or an empty one. Each
+    neither. A newline or padding is fitted (fit_one_line), not refused. Refused (WatchError) only for what no guess
+    fixes: one of the two alone, an empty one, or one past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX
+    characters (by its length: never cut, since the broker matches check names against the whole text). Each
     merge try then runs with LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's
     "override")."""
     if reason is None and receipt is None:
@@ -26649,8 +26760,9 @@ def land_override_given(reason: str | None, receipt: str | None,
 
 
 def land_request_override(req: dict) -> dict | None:
-    """A request's override as land_override takes it (fitted to the limits, not dropped for them), or None when it
-    names none or one no guess fixes (an older sender's, an empty one): never a merge override no queue checked."""
+    """A request's override as land_override takes it (fitted to one line, never cut), or None when it names none or
+    one no guess fixes (an older sender's, an empty one, one past the limits): never a merge override no queue
+    checked."""
     o = req.get("override")
     if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
         return None
@@ -26792,6 +26904,20 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
 # A hold, BLOCK, conflict or other LAND_STOP_CLASSES stop still stops; an unpinned override still waits on a running
 # check (land_override_carries), and a head off the pin is judged as before.
 LAND_OVERRIDE_PIN_KINDS = LAND_WAIT_KINDS | {"rerun_failed"}
+
+
+# land_judge's merge train (leo-workspace tools/land_judge/merge_train.py) replaces the update_branch step of a
+# manaflow-ai/cmux PR into feat-cmux-next with a timed retry that carries "board_train" (boarding) or "train" (boarded,
+# waiting on the train's status). A pinned override row is merged at its pin when land_judge names an update_branch
+# (update_branch's own comment), but the train's stand-in for that same step fell to the plain retry backoff, so the
+# override never reached a merge. manaflow-ai/cmux#58296, 2026-11-26: queued at 30061064 with --override-reason and
+# --override-receipt at 12:11:43Z (a base red on 'pr pipeline / linux' it does not touch), judged red_not_excused
+# step=retry (train=boarded) at 12:16:04Z and woken for another 5-minute retry, while the gh shim's own train hold had
+# already lapsed at 11:29:16Z. Now that retry is taken as the update_branch it replaces: the pinned merge carrying the
+# override, once per head. Any other retry (unreadable, quota, host_cap, explain_failed) waits as before.
+def land_train_retry(act: dict) -> bool:
+    """True when ACT is the merge train's retry standing in for an update_branch step (the comment above)."""
+    return act.get("kind") == "retry" and bool(act.get("train") or act.get("board_train"))
 
 
 def land_override_pinned(e: dict, head: str) -> bool:
@@ -33038,6 +33164,28 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
 # what keeps the hard reserve (the calls kept back for lands) out of it however many waits block at once.
 WAIT_DIAGNOSE_AFTER = 120
 
+# A `wait pr --sha FULL` whose copy shows another head is starved at SHA_BEHIND_DIRECT_AFTER, whatever the copy's age
+# and whatever the feed vouches for (cmuxterm-hq#16522, cmuxterm-hq#27501): the caller named a head it pushed, which
+# is better evidence than a probe's "confirmed unchanged" or a quiet feed. glaeda#2290, 2026-11-21 07:52-08:32Z: a
+# wait --sha afcb5dde spent its whole 2400 s on head 986d77e1 ("data 52m ago, confirmed unchanged over GraphQL") while
+# one `gh pr view` showed the new head at once; cmux#56457, 2026-11-26: `gh api` showed 87a1452 for an hour, the real
+# head 733f1f3. One direct read per gap (direct_gap doubles it while the head stays the same, to DIRECT_QUIET_MAX).
+SHA_BEHIND_DIRECT_AFTER = 90
+
+
+def wait_sha_behind(req: dict, entry: dict | None) -> float | None:
+    """When an open PR wait pinned to a full --sha began, while its copy names another head, or None: no pin, a
+    prefix, a merged or closed PR, no head in the copy, or the copy shows the pin. Timed from the wait's start, not
+    from the first sight of the other head (unseenSince): a probe keeps a stale copy fresh, so it is seen at once."""
+    sha = str(req.get("sha") or "").lower()
+    data = (entry or {}).get("data")
+    if req.get("kind") != "pr" or not sha or not req.get("exact", True) or not isinstance(data, dict):
+        return None
+    head = str(data.get("headRefOid") or "").lower()
+    if not head or head.startswith(sha) or str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+        return None
+    return float(req["began"])
+
 
 def direct_gap(req: dict, bound: float) -> float:
     """How long after its last direct read (directAt) a wait may read its target directly again: BOUND, doubled for
@@ -33063,6 +33211,15 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
     in that long. None otherwise. Only for an undecided wait: wait_step rules first."""
     began = float(req["began"])
+    behind = wait_sha_behind(req, entry)
+    if behind is not None:
+        # SHA_BEHIND_DIRECT_AFTER's comment: the copy is known stale, so neither its age nor the feed rules
+        if now - behind < SHA_BEHIND_DIRECT_AFTER \
+                or now - float(req.get("directAt") or float("-inf")) < direct_gap(req, SHA_BEHIND_DIRECT_AFTER):
+            return None
+        seen = (entry or {}).get("dataAt")
+        return max(now - behind, now - float(seen) if isinstance(seen, (int, float)) and not isinstance(seen, bool)
+                   else 0.0)
     # An upstream host that reads one target itself through the broker: UPSTREAM_DIRECT_AFTER (the broker host keeps
     # waited keys fresher than that), else STALE_DATA_AFTER.
     bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
@@ -40070,11 +40227,16 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     raise WatchError(f"unknown write kind {item['kind']!r}")
 
 
-def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
+def update_branch_retired(status: int, text: str, read_pr: Callable[[], Any] | None = None) -> tuple[str, str] | None:
     """How a queued update-branch ends on a 404/422 that is no limit: ("done", why) when the branch needs nothing,
     ("retired", why) when the write can no longer mean anything (the PR is gone or closed, or its head moved past the
     pinned sha), None for a refusal worth reading (a merge conflict): that one fails with GitHub's own words. Never
-    retried (cmuxterm-hq docs/handbook/outbox-drains-slower-than-it-fills.md)."""
+    retried (cmuxterm-hq docs/handbook/outbox-drains-slower-than-it-fills.md).
+
+    Closed or merged is the PR's own state (read_pr: the PR's JSON, read only when no word above explains the refusal),
+    never a word in the answer: `\\b(closed|merged)\\b` retired OPEN manaflow-ai/cmux#57082 and #57087 on 2026-11-26
+    as "closed or merged", since GitHub's and the broker's refusals say "merge conflict" or "closed or its head is not
+    a branch" of open PRs too. An unread state retires nothing: the post fails with the refusal's own text."""
     low = text.lower()
     if status == 404:
         return "retired", "the pull request or repository was not found (HTTP 404)"
@@ -40082,8 +40244,12 @@ def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
         return "done", "the branch was already up to date with its base"
     if re.search(r"expected head sha|head sha didn.?t match|head branch was modified", low):
         return "retired", "the pull request head moved past the pinned sha; the pin no longer describes it"
-    if re.search(r"\b(closed|merged)\b", low):
-        return "retired", "the pull request is closed or merged"
+    pr = read_pr() if read_pr is not None else None
+    if isinstance(pr, dict):
+        if pr.get("merged") or pr.get("merged_at"):
+            return "retired", "the pull request is merged (its state, read after the refusal)"
+        if str(pr.get("state") or "").lower() == "closed":
+            return "retired", "the pull request is closed (its state, read after the refusal)"
     return None
 
 
@@ -40475,6 +40641,9 @@ def post_lane_env(item: dict) -> dict[str, str] | None:
 # An unpinned update-branch means "whatever the head is now", so the daemon reads the PR's head through the broker's
 # own get and pins the call to it. Detector: test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_
 # broker_call.
+UPDATE_BRANCH_PIN_UNREAD = "could not read"  # broker_pin_update_branch's refusal: its own read failed, nothing was sent
+
+
 def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
     """CHOSEN with update_branch's expected_head_sha read from the PR when it has none: ("pinned", chosen), or the
     read's outcome as broker_write gives it ("limited", seconds; "refused", why: nothing was written either way)."""
@@ -40488,7 +40657,7 @@ def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: floa
         if outcome == "made" and isinstance(data, dict) else ""
     if not SHA40.fullmatch(head):
         why = data if outcome != "made" else "its answer named no 40-character head"
-        return "refused", f"could not read {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
+        return "refused", f"{UPDATE_BRANCH_PIN_UNREAD} {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
     return "pinned", (tool, {**call_args, "expected_head_sha": head})
 
 
@@ -40553,6 +40722,12 @@ def broker_find(item: dict, timeout: float) -> tuple[dict | None, bool]:
         if isinstance(found, dict) and found.get("html_url") and (kind == "pr" or (found.get("body") or "") == item["body"]):
             return found, True
     return None, True
+
+
+def broker_read_pr(item: dict) -> dict | None:
+    """The queued update-branch's PR read through the lane-gh broker's `get` (update_branch_retired's state)."""
+    outcome, data = broker_write(item, ("get", {"path": f"pulls/{item['number']}"}), BROKER_OUTBOX_DEADLINE, pin=False)
+    return data if outcome == "made" and isinstance(data, dict) else None
 
 
 def broker_made_where(data: Any) -> tuple[str | None, Any]:
@@ -42246,10 +42421,10 @@ def parser() -> argparse.ArgumentParser:
                          "and --pin (what the rulebook calls it) are the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
                     help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
-                         "line, at most 200 characters; needs --override-receipt. Neither flag: the caller's own "
+                         "line, at most 4000 characters, never cut; needs --override-receipt. Neither flag: the caller's own "
                          "LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) is taken")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
-                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 4000")
     ld.add_argument("--nominated-path", dest="nominated_path", metavar="PATH",
                     help="the merge path that nominated this head (next-autoland, repo-autoland): every judgment and "
                          f"merge try runs with {LAND_NOMINATED_ENV}, wherever the queue runs it (executor, overflow, "
