@@ -15616,6 +15616,16 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_OWNER_REMIND_READ: "a PR that is over owes nothing" was decided on whatever copy the cache held, and a stopped row
+# is unwatched, so that copy is the one from before the stop or none at all (a lane VM keeps no copy of an unwatched PR).
+# gcp-agent-lane-2, 2026-11-26 04:42Z: cmux#55358 stopped update_branch_refused at 03:08Z on 11-25, merged at 07:56Z by
+# another host's queue, and was reminded "still stopped after 26 h" -- this host's cache held no file for it. A due
+# reminder whose copy is missing or older than its last word (the stop, or the last reminder) first asks one direct
+# read (refresh_job, as after_blind_read does) and is decided on the pass after it lands. Bounded: past
+# LAND_OWNER_REMIND_READ_WAIT beyond due with no read (a hold, a full pool, a failed read) it is told on the copy there
+# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
+# test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
+LAND_OWNER_REMIND_READ_WAIT = 1800.0
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19679,6 +19689,11 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
+        if self.remind_read_pending(e, last):
+            return False
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return False  # the read it waited for shows the PR over
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
@@ -19693,6 +19708,29 @@ class LandQueue:
         self.save(e)
         self.notify(e, to, msg)
         return True
+
+    def remind_read_pending(self, e: dict, last: float) -> bool:
+        """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
+        (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
+        LAND_OWNER_REMIND_READ_WAIT past due."""
+        def read_since() -> list[float]:
+            c = self.cache_of(e["key"]) or {}
+            return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
+        reads = read_since()
+        if (reads and max(reads) > last) or self.now - (last + LAND_OWNER_REMIND_EVERY) >= LAND_OWNER_REMIND_READ_WAIT:
+            return False
+        if float(e.get("remindReadAt") or 0) > last:
+            return True  # asked since the last word: told on the pass after it lands
+        if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return True  # asked on a later pass
+        e["remindReadAt"] = self.now
+        age = round(self.now - max(reads)) if reads else None
+        self.history(e, "remind_read", age=age)
+        log({"event": "land-remind-read", "key": e["key"], "age": age})
+        self.save(e)
+        self.submit(e["key"], self.refresh_job, e["key"])
+        after = read_since()
+        return not (after and max(after) > last)  # a read that already landed (an inline pool) decides it now
 
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
