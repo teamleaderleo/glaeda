@@ -14557,6 +14557,14 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
+def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
+    """The gh argv that takes LAND_UNLABEL off REPO#NUMBER: the broker's `pr edit --remove-label` form (BROKER, a lane
+    VM: the broker sends no REST DELETE), else GitHub's REST DELETE of the issue label."""
+    if broker:
+        return ["pr", "edit", number, "-R", repo, "--remove-label", LAND_UNLABEL]
+    return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
+
+
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
                             force: str = "") -> list[str]:
     """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
@@ -15764,7 +15772,10 @@ LAND_OWNER_REMIND_READ_WAIT = 1800.0
 # Taken off: a `cancelled` entry, a `closed` stop at once, and any other stop LAND_UNLABEL_AFTER after it when it will
 # not re-arm by itself (rearm: not a LAND_REARM_CODES code, or today's LAND_REARM_CAP spent). Never: full-ci (a person
 # or agent set that on purpose), a teammate's PR (a `teammate` stop in the history: their label is their opt-in), a
-# forwarded row (its executor's own loop takes it off), a broker client (no GitHub login of its own). One REST DELETE
+# forwarded row or one handed to the broker host's queue (that executor's own loop takes it off). A broker client (a
+# lane VM, no GitHub login of its own) sends it as the broker's `gh pr edit N --remove-label ready-to-land`
+# (land_unlabel_args): until 2026-11-26 it skipped, and lane VMs' queues never took a label off, so 998 open cmux PRs
+# still carried it (ci-min-per-pr-30). One REST DELETE (or broker pr edit)
 # per ended land (e["unlabeled"]), a 404 counting as gone, at most LAND_UNLABEL_BATCH a pass, off the pass thread;
 # a refused one is retried after LAND_UNLABEL_AFTER, LAND_UNLABEL_TRIES times. Detector: test-glaeda-gh.py -k unlabel.
 LAND_UNLABEL = "ready-to-land"
@@ -19974,8 +19985,10 @@ class LandQueue:
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
         state = e.get("state")
-        if state not in ("stopped", "cancelled") or e.get("unlabeled") or self.broker_client():
+        if state not in ("stopped", "cancelled") or e.get("unlabeled"):
             return False
+        if self.broker_client() and e.get("handedOff"):
+            return False  # its host's queue owns the row and takes the label off itself
         if any(h.get("code") == "teammate" for h in e.get("history") or []):
             return False  # a teammate's label is their opt-in
         fail = e.get("unlabelFail") or {}
@@ -20020,8 +20033,8 @@ class LandQueue:
                 e = self.entries.get(key)
                 if e is None:
                     continue
-                path = f"repos/{e['repo']}/issues/{e['number']}/labels/{LAND_UNLABEL}"
-                got = self.call([gh, "api", "-X", "DELETE", path], LAND_GH_DEADLINE, None)
+                argv = land_unlabel_args(str(e["repo"]), str(e["number"]), self.broker_client())
+                got = self.call([gh, *argv], LAND_GH_DEADLINE, None)
                 said = f"{got.stderr or ''} {got.stdout or ''}"
                 gone = got.returncode == 0 or "404" in said or "Label does not exist" in said
                 with self.lock:

@@ -30491,6 +30491,29 @@ class LandTest(Base):
         self.tick(gg.LAND_UNLABEL_AFTER + 1)
         self.assertEqual(len(self.unlabels()), 2)
 
+    def test_unlabel_on_a_lane_vm_goes_through_the_brokers_pr_edit(self):
+        # 2026-11-26 (ci-min-per-pr-30): a broker client skipped the removal, so lane VMs' queues never took a label off
+        # and 998 open cmux PRs kept ready-to-land; the broker sends no REST DELETE, so it goes as its `pr edit`.
+        self.broker = True
+        self.stopped_on("block")
+        self.tick(gg.LAND_UNLABEL_AFTER - 10)
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        e = self.tick(20)
+        self.assertEqual(self.unlabels(), [])  # no REST DELETE from a lane VM
+        self.assertEqual(self.w.gh_calls("pr", "edit"),
+                         [["pr", "edit", "1", "-R", "o/r", "--remove-label", "ready-to-land"]])
+        self.assertEqual(e["history"][-1]["event"], "label_removed")
+        self.tick(gg.LAND_UNLABEL_AFTER)
+        self.assertEqual(len(self.w.gh_calls("pr", "edit")), 1)  # once per ended land
+
+    def test_unlabel_on_a_lane_vm_leaves_a_row_handed_to_its_host(self):
+        self.broker = True
+        e = self.stopped_on("block")
+        with self.q.lock:
+            e["handedOff"] = {"at": self.t, "host": "h"}
+        self.tick(gg.LAND_UNLABEL_AFTER * 3)
+        self.assertEqual(self.w.gh_calls("pr", "edit", "1", "-R", "o/r", "--remove-label"), [])
+
     def test_unlabel_never_touches_a_teammates_pr(self):
         self.stopped_on("teammate")
         self.tick(gg.LAND_UNLABEL_AFTER * 3)
