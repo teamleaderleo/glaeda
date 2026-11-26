@@ -17860,6 +17860,39 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/issues/2/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
 
+    def test_each_create_rechecks_a_clear_answer_and_holds_on_new_pause_or_failure(self) -> None:
+        for answer in (json.dumps({"blocked_until": NOW + 100}), "not json"):
+            with self.subTest(answer=answer):
+                first = self.queue("comment", "o/r#1", "--body", "one")
+                second = self.queue("comment", "o/r#2", "--body", "two")
+                calls = self.pause_cmd(0, level=0)
+                calls.unlink(missing_ok=True)
+                ok = (201, {}, {"html_url": "u"})
+                d, t = self.daemon(ok, ok)
+                d.clock_real = False
+                self.step(d, NOW)
+                self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+                (calls.parent / "pause.json").write_text(answer)
+                self.step(d, NOW + gg.POST_SPACING)
+                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(gg.post_state(second["id"])["state"], "queued")
+                self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+                # Restore authority and drain this subcase's queue after its bounded retry/hold.
+                (calls.parent / "pause.json").write_text('{"blocked_until": 0}')
+                self.step(d, NOW + 200)
+                self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+
+    def test_an_expired_short_hold_requires_a_new_answer(self) -> None:
+        item = self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 1)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        (calls.parent / "pause.json").write_text('{"blocked_until": 0}')
+        self.step(d, NOW + 2)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+
     def test_a_failed_pause_read_keeps_the_last_answer(self) -> None:
         self.queue("comment", "o/r#1", "--body", "one")
         calls = self.pause_cmd(NOW + 100)
@@ -18090,7 +18123,7 @@ class PostTest(unittest.TestCase):
         for unread in ("nan", "-inf", "soon", "", None):
             self.assertIsNone(gg.retry_after_seconds(unread), unread)
 
-    def test_a_malformed_pause_command_is_no_command_logged_once(self) -> None:
+    def test_a_malformed_pause_command_holds_creates_and_is_logged_once(self) -> None:
         # shlex.split raised ValueError outside post_tick's try: every pass failed and nothing was ever sent.
         first = self.queue("comment", "o/r#1", "--body", "one")
         second = self.queue("comment", "o/r#2", "--body", "two")
@@ -18103,7 +18136,8 @@ class PostTest(unittest.TestCase):
             self.assertIsNone(gg.content_pause_cmd())
             self.step(d, NOW)
             self.step(d, NOW + gg.POST_SPACING)
-        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["queued", "queued"])
+        self.assertEqual(t.calls, [])
         self.assertEqual(len([e for e in lines if e.get("event") == "content-pause-cmd"]), 1)
 
     def test_a_timed_out_ask_is_not_repeated_for_a_minute_and_the_last_answer_stands(self) -> None:
@@ -18155,9 +18189,8 @@ class PostTest(unittest.TestCase):
         self.assertEqual((d.pause_failures, t.calls), (0, []))
         self.assertGreaterEqual(gg.CONTENT_PAUSE_SLOW_DEADLINE, 10)
 
-    def test_asks_that_keep_failing_hold_creates_for_a_bound_and_status_shows_them(self) -> None:
-        # With no answer, the pause is unknown: creates wait rather than go out into one other writers reported, for
-        # CONTENT_PAUSE_BLIND_MAX past the last answer at most, so a keeper broken for good stops nothing for long.
+    def test_asks_that_keep_failing_hold_creates_until_recovery_and_status_shows_them(self) -> None:
+        # With no answer, creates stay queued even past the outage logging bound. A later valid answer releases them.
         item = self.queue("comment", "o/r#1", "--body", "one")
         calls = self.pause_cmd(0, level=0)
         (calls.parent / "hang").touch()
@@ -18189,17 +18222,21 @@ class PostTest(unittest.TestCase):
             self.assertIn("last answer never", line)
             self.assertIn("creates wait until the pause is known", line)
             self.assertRegex(line, r"GitHub holds writes for (89|90)s;")  # a length, not an epoch's age
-            at(NOW + gg.CONTENT_PAUSE_BLIND_MAX + 1)  # past the bound: it posts as a host with no keeper
-            self.assertEqual(len(t.calls), 1)
+            at(NOW + gg.CONTENT_PAUSE_BLIND_MAX + 1)  # a deadline is not permission to post
+            self.assertEqual(t.calls, [])
+            self.assertEqual(gg.post_state(item["id"])["state"], "queued")
             self.assertEqual(len([e for e in lines if e.get("event") == "post-pause-unknown"]), 1)
             (calls.parent / "hang").unlink()
             clock[0] = NOW + gg.CONTENT_PAUSE_BLIND_MAX + gg.CONTENT_PAUSE_RETRY + 2  # the keeper answers again
-            d.content_pause_until()  # the outbox is empty, so no pass asks: ask as one would
+            d.content_pause_until()  # recover the keeper before allowing the queued write
             d.content_pause_settle(10)
         self.assertEqual((d.pause_failures, d.pause_timeouts, d.content_pause_unknown()), (0, 0, False))
         self.assertEqual(d.content_pause_status()["answeredAgo"], 0)
+        self.step(d, clock[0])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(len(t.calls), 1)
 
-    def test_a_keeper_without_content_pause_is_no_keeper_and_is_asked_again(self) -> None:
+    def test_a_keeper_without_content_pause_holds_creates_until_upgraded(self) -> None:
         # cosmic-gray, 2026-11-18: the installed gh-quota had no content-pause. Each ask's usage error counted as a
         # failed ask, so `post pr` sat held ("pause ask failed 9 in a row ... creates wait until the pause is known").
         first = self.queue("comment", "o/r#1", "--body", "one")
@@ -18222,11 +18259,11 @@ class PostTest(unittest.TestCase):
             d.clock = lambda: clock[0]
             self.step(d, NOW)
             d.content_pause_settle(10)
-            self.step(d, NOW)  # the answer is in: no keeper, so the create goes out at once
-            self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+            self.step(d, NOW)  # the old keeper cannot authorize this write
+            self.assertEqual(gg.post_state(first["id"])["state"], "queued")
             status = d.content_pause_status()
             self.assertEqual({k: status[k] for k in ("failures", "holding", "absent", "lastError")},
-                             {"failures": 0, "holding": False, "absent": True, "lastError": None})
+                             {"failures": 0, "holding": True, "absent": True, "lastError": None})
             self.assertIn("has no content-pause", " ".join(gg.pause_line(status)))
             self.assertFalse(any(e.startswith("content pause") for e in d.errors))
             d.report_content_pause(NOW + 30, "comment")  # a throttle is this daemon's own: no --hold it cannot take
@@ -18236,7 +18273,7 @@ class PostTest(unittest.TestCase):
                 clock[0] = at
                 self.step(d, at)
                 d.content_pause_settle(10)
-            self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+            self.assertEqual(gg.post_state(second["id"])["state"], "queued")
             self.assertEqual((root / "calls").read_text().splitlines(), ["content-pause"])  # not re-asked yet
             # the keeper gains the command: the next probe hears it, and its pause holds creates again
             (root / "pause.json").write_text(json.dumps({"blocked_until": NOW + 2000, "level": 1}))
@@ -18247,10 +18284,21 @@ class PostTest(unittest.TestCase):
             self.step(d, clock[0])
         self.assertEqual(gg.post_state(third["id"])["state"], "queued")
         self.assertEqual((d.pause_absent, d.pause_until), (False, NOW + 2000))
-        self.assertEqual(len(t.calls), 2)
+        self.assertEqual(t.calls, [])
         absent = [e for e in lines if e.get("event") == "content-pause-absent"]
         self.assertEqual(len(absent), 2)  # once when it went missing, once when it came back
         self.assertIn("invalid choice: 'content-pause'", absent[0]["error"])
+        # Upgrade and a fresh zero pause release each queued write, in order.
+        (root / "pause.json").write_text(json.dumps({"blocked_until": 0, "level": 0}))
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}):
+            clock[0] = NOW + 2001
+            d.content_pause_until()
+            d.content_pause_settle(10)
+            for item in (first, second, third):
+                self.step(d, clock[0])
+                self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+                clock[0] += gg.POST_SPACING
+        self.assertEqual(len(t.calls), 3)
 
     def test_a_keepers_real_failure_still_holds_creates(self) -> None:
         # Only a usage error is "no command": a crash (exit 1, no usage) is a failed ask, held for the blind bound.
@@ -18649,7 +18697,7 @@ class InstalledKeeperTest(unittest.TestCase):
         if has:  # it may fail for real (no broker), but never as a command it lacks
             self.assertFalse(d.pause_error and gg.CONTENT_PAUSE_USAGE.search(d.pause_error), d.pause_error)
         else:
-            self.assertEqual((d.pause_failures, d.content_pause_unknown()), (0, False))
+            self.assertEqual((d.pause_failures, d.content_pause_unknown()), (0, True))
 
 
 class PostJoinTest(unittest.TestCase):
