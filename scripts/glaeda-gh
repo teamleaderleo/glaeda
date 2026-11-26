@@ -18046,10 +18046,41 @@ def land_create_pause_until(now: float) -> float:
     "never pause. if you have to pause, it means we have to fix things")."""
     state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
     doc = read_json(state / "content-gate.json")
+    until = land_pause_field(doc, now)
+    if not until:
+        # The file knows only the pauses this host has seen. A pause another host reported reaches it when the shim
+        # next asks the authority, and that ask came with the step itself: 2026-11-26 06-14Z, after #2856, 16 of 35
+        # paced refusals fleet-wide were this executor's `update-branch --land --force 'land-judge: ...'` and pinned
+        # merges, each refused "from the broker (primary content_pause)" with no pause in the file before it. The
+        # shim's own `content-pause` asks it (a broker call, no GitHub request; the shim keeps the answer fresh for
+        # PAUSE_FRESH_S, so the write right after it asks nothing). An ask that fails sends as before: the shim judges.
+        until = land_pause_field(land_asked_pause(), now)
+    return min(until, now + LAND_CREATE_PAUSE_MAX) if until else 0.0
+
+
+LAND_PAUSE_ASK_DEADLINE = 10.0  # under CONTENT_PAUSE_SLOW_DEADLINE: a step waits this long at most, on its own thread
+
+
+def land_pause_field(doc: Any, now: float) -> float:
+    """DOC's blocked_until when it is a finite time after NOW, else 0.0."""
     until = doc.get("blocked_until") if isinstance(doc, dict) else None
     if not isinstance(until, (int, float)) or isinstance(until, bool) or not math.isfinite(until) or until <= now:
         return 0.0
-    return min(float(until), now + LAND_CREATE_PAUSE_MAX)
+    return float(until)
+
+
+def land_asked_pause() -> dict | None:
+    """The shim's `content-pause` answer ({"blocked_until": ..., "level": ...}), or None: no shim command here, or it
+    failed, timed out or printed no JSON object."""
+    cmd = content_pause_cmd()
+    if cmd is None:
+        return None
+    try:
+        done = run_bounded([*cmd, "content-pause"], LAND_PAUSE_ASK_DEADLINE)
+        doc = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def land_quota_said(text: str, now: float) -> float | None:
@@ -40216,6 +40247,19 @@ def post_item(args: argparse.Namespace) -> dict:
             # the login's create pause (gcp-agent-lane-11 2026-11-24 18:19Z: 2 refused "paced", "the queue has no
             # form for gh pr update-branch --needs-newer-base") carries it here. A login's REST PUT has no such gate.
             item["needsNewerBase"] = needs
+        force = getattr(args, "force_reason", None)
+        force = force.strip() if isinstance(force, str) else ""
+        land = getattr(args, "land_asks", False) is True
+        if (force or land) and args.kind != "update-branch":
+            raise WatchError("--land and --force are for post update-branch: the broker's base merge gate words")
+        # The broker refuses a base merge of a cmux PR that is not landing unless the caller says land asks for it
+        # (--land) or gives a reason to merge anyway (--force REASON, logged; cmuxterm-hq#16488). A lane VM's `gh pr
+        # update-branch N --force R` the gh shim held on the login's create pause had no queue form: 2026-11-26
+        # 06-14Z, 15 of 35 paced refusals fleet-wide (goal github-writes-never-pause). Both are carried as they were.
+        if force:
+            item["forceReason"] = force
+        if land:
+            item["landAsks"] = True
         key = getattr(args, "status_key", None)
         if key is not None and not isinstance(key, str):
             key = None  # a caller's own namespace without the flag (an older argv, a test's Mock)
@@ -40422,7 +40466,9 @@ def broker_post_args(item: dict) -> tuple[str, dict] | None:
     if tool == "update_branch":
         return tool, {"repo": item["repo"], "number": item["number"],
                       **({"expected_head_sha": item["expectedHead"]} if item.get("expectedHead") else {}),
-                      **({"needs_newer_base": list(item["needsNewerBase"])} if item.get("needsNewerBase") else {})}
+                      **({"needs_newer_base": list(item["needsNewerBase"])} if item.get("needsNewerBase") else {}),
+                      **({"land": True} if item.get("landAsks") else {}),
+                      **({"force": item["forceReason"]} if item.get("forceReason") else {})}
     return tool, {"repo": item["repo"], "number": item["number"], "body": item["body"]}
 
 
@@ -42194,6 +42240,10 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--needs-newer-base", action="append", metavar="CHECK",
                     help="update-branch: a check that needs the newer base (repeatable); a lane VM's broker takes a "
                          "SHIP'd head's base merge only with it")
+    po.add_argument("--land", dest="land_asks", action="store_true",
+                    help="update-branch: land asks for this base merge (a lane VM's broker gate; a login's PUT has none)")
+    po.add_argument("--force", dest="force_reason", metavar="REASON",
+                    help="update-branch: merge the base in past the broker's not-landing gate, for REASON (logged)")
     po.add_argument("--json", action="store_true")
     lg = sub.add_parser("log", help="a finished job's log, read once per host (cache, build controller, then REST)")
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
