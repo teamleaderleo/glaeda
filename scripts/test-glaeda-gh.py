@@ -6186,15 +6186,40 @@ class ClientTest(Base):
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
         out = io.StringIO()
+        reads: list[str] = []
         with mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "daemon_failing", return_value=None), \
-                mock.patch.object(gg, "daemon_stale", return_value=None), contextlib.redirect_stdout(out):
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=lambda req: reads.append(req["key"]) or "rest: HTTP 502"), \
+                contextlib.redirect_stdout(out):
             self.assertEqual(gg.cmd_status("pr", "o/r#404", False, False, first_wait=0), gg.EXIT_FAIL)
             self.assertEqual(gg.cmd_status("pr", "o/r#5", False, True, first_wait=0), gg.EXIT_DOWN)
         plain, doc = out.getvalue().split("\n{", 1)
         self.assertEqual(plain.strip().splitlines()[-1], "next: gh pr list -R o/r --state all --limit 5")
         doc = json.loads("{" + doc)
         self.assertEqual((doc["ok"], doc["code"], doc["next"]), (False, "no-data-yet", "glaeda-gh wait pr o/r#5 --timeout 600"))
+        self.assertEqual(reads, ["pr:o/r#5"])  # missing is an answer; an error alone gets its one direct read
+
+    def test_status_reads_directly_a_key_whose_entry_holds_only_an_error(self) -> None:
+        """An entry with an error and no data (an upstream's failed read, kept for minutes) is unread: `status` makes
+        its direct read and answers with the data, rather than exiting 3 at once."""
+        self.put("pr:o/r#11", None, error="graphql: HTTP 200")
+
+        def fill(req: dict) -> None:
+            self.put(req["key"], gg.parse_pr(pr_node(11, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=fill) as read, contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#11", False, True, first_wait=0), gg.EXIT_OK)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(json.loads(out.getvalue())["ok"])
 
     def test_a_run_github_cannot_resolve_is_missing_only_when_never_read(self) -> None:
         self.daemon.now = NOW
@@ -23444,6 +23469,40 @@ class ConcurrentWaitsRestTest(Base):
         self.daemon.tick(t)
         self.assertEqual(gg.read_cache("pr:o/r#3")["data"]["headRefOid"], "f" * 40)
 
+    def test_through_the_broker_with_no_etag_the_issue_updated_at_vouches_for_the_kept_pull(self) -> None:
+        """glaeda-upstream, 2026-11-25: through broker_transport (no ETag asked or answered, `etags` off) every direct
+        read sent GET pulls/N, 274-551 an hour fleet-wide, the broker's top App read. The issue's updated_at, which
+        GitHub moves on any change to the PR itself (a push, a title, a review), vouches for the kept pull within
+        PULL_REUSE_MAX instead, the way a 304 on the issue does with ETags; a base push alone does not move it."""
+        gh = self.gh
+
+        def broker(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+            status, answer, data = gh(method, url, {k: v for k, v in headers.items() if k != "If-None-Match"}, body)
+            return status, {k: v for k, v in answer.items() if k.lower() != "etag"}, data
+
+        self.daemon.transport = broker
+        self.daemon.etags = False
+        self.ten_minutes_over_rest()
+        pulls = [c for c in gh.calls[self.after_setup:] if re.search(r"/pulls/\d+$", c[1].split("?")[0])]
+        print(f"\nHARNESS 7 waits, 10 min through the broker: {len(pulls)} pull reads (70 before)", file=sys.stderr)
+        self.assertLessEqual(len(pulls), 7 * (10 * gg.CYCLE // gg.PULL_REUSE_MAX) + 2, len(pulls))
+        for owner, repo, n in self.WAITS:
+            settled = (owner, repo, n) in {("o", "r", 2), ("o", "lw", 1)}
+            data = gg.read_cache(f"pr:{owner}/{repo}#{n}")["data"]
+            self.assertEqual(data["checkState"], "SUCCESS" if settled else "PENDING", (owner, repo, n))
+            if settled:
+                self.assertEqual(data["mergeStateStatus"], "CLEAN", "a settled head's merge state was not read anew")
+        # a push moves the issue's updated_at: the next read takes the pull, never the kept one
+        node = gh.prs[("o", "r", 3)]
+        node["headRefOid"] = "f" * 40
+        node["updatedAt"] = "pushed"
+        t = NOW + 11 * gg.CYCLE
+        path = gg.watch_dir() / gg.file_name("pr:o/r#3")
+        gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+        os.utime(path, (t, t))
+        self.daemon.tick(t)
+        self.assertEqual(gg.read_cache("pr:o/r#3")["data"]["headRefOid"], "f" * 40)
+
     def test_a_pr_read_costs_more_over_rest_so_rest_must_be_that_much_richer(self) -> None:
         self.daemon.now = NOW
         self.daemon.started_tick = NOW
@@ -24457,11 +24516,14 @@ class StaleDataTest(Base):
         self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
 
-    def test_direct_reads_through_the_broker_share_the_repo_parts_and_send_no_issue_probe(self) -> None:
+    def test_direct_reads_through_the_broker_share_the_repo_parts_and_ask_the_issue_for_the_kept_pull(self) -> None:
         """gcp-codex-lane-12, 2026-11-17 07:00-07:55Z: 166 direct reads made 1,571 of the VM's 1,857 broker GETs,
         each asking the base's rulesets and the workflow list again (one process each, so repo_parts began empty) and
         an issues/N probe whose answer, with no ETag through the broker, could never vouch for a kept pull. Two direct
-        reads of one PR, as two waits' processes make them: the second reads only what moves (the pull and the head)."""
+        reads of one PR, as two waits' processes make them: the second reads only what moves. Since 2026-11-25 the
+        issue's updated_at vouches for the pull kept within PULL_REUSE_MAX (glaeda-upstream's pulls/N was the broker's
+        top App read, 274-551 an hour): the second read asks issues/N, which the broker keeps and revalidates free,
+        in place of pulls/N, whose ETag moves on every push to the repository."""
         config = Path(self.tmp.name) / "upstream.json"
         gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
         patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
@@ -24475,10 +24537,11 @@ class StaleDataTest(Base):
             for _ in range(2):
                 self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
                                                   "began": time.time() - 700}))
-        self.assertEqual([p for p in served if p.startswith("issues/")], [], served)
+        self.assertEqual(len([p for p in served if p.startswith("issues/")]), 1, served)
         self.assertEqual(len([p for p in served if p.startswith("rules/branches/")]), 1, served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
-        self.assertEqual(len([p for p in served if p == "pulls/9"]), 2, served)
+        self.assertEqual(len([p for p in served if p == "pulls/9"]), 1, served)
+        self.assertLess(served.index("pulls/9"), served.index("issues/9"), "the first read asked the issue")
         print(f"\ntwo direct reads of one PR through the broker: {len(served)} GETs ({served})")
         # past the TTL the next read asks them again
         later = time.time() + gg.REST_REPO_PART_TTL + 1
@@ -26846,12 +26909,12 @@ class LandTest(Base):
         # Its timeout: judged, and handed a snapshot rather than reading live.
         self.snap_pr(LA, snap_head=LA)  # the read the prefetch asked for
         day = gg.land_day(self.t)
-        live_before = gg.land_counts()[day].get("live") or 0
+        live_before = gg.land_counts().get(day, {}).get("live") or 0  # (a day with no row yet: a run past midnight UTC)
         self.w.answers.append(ok_answer(LA))
         self.tick(gg.LAND_WAKE_PREFETCH)
         self.assertEqual(len(self.w.explains()), 2)
         self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
-        self.assertEqual(gg.land_counts()[day].get("live") or 0, live_before)
+        self.assertEqual(gg.land_counts().get(day, {}).get("live") or 0, live_before)
         self.assertNotIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
         self.assert_merged_at(LA)
 
@@ -45723,6 +45786,71 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(10)))
             self.assertIsNone(d.fetch_prs(self.entries(10)))
         self.assertEqual(d.sent, [10, 10])
+
+
+class LandCarryTest(unittest.TestCase):
+    """A manaflow-ai/glaeda PR cannot merge in the fork (ruleset "main: deploy keys only"): manaflow-ai/glaeda#43,
+    2026-11-25, approved and green, answered "Cannot update this protected ref". `land` carries it upstream."""
+    HEAD = "2d1020d6eda41b4643371932a015b2c82372f17e"
+
+    def pr(self, **over):
+        pr = {"state": "OPEN", "isDraft": False, "isCrossRepository": False, "headRefOid": self.HEAD,
+              "title": "Admit rc", "url": "https://github.com/manaflow-ai/glaeda/pull/43",
+              "author": {"login": "azooz2003-bit"},
+              "reviews": {"nodes": [{"author": {"login": "teamleaderleo"}, "commit": {"oid": self.HEAD}}]}}
+        pr.update(over)
+        return pr
+
+    def test_a_teammates_pr_approved_at_its_head_is_carried(self):
+        self.assertEqual(gg.land_carry_refusal(self.pr(), ""), "")
+        self.assertEqual(gg.land_carry_refusal(self.pr(), self.HEAD[:12]), "")
+
+    def test_an_approval_of_an_older_head_or_by_the_author_is_no_review(self):
+        old = {"nodes": [{"author": {"login": "teamleaderleo"}, "commit": {"oid": "0" * 40}}]}
+        self.assertIn("no approving review", gg.land_carry_refusal(self.pr(reviews=old), ""))
+        own = {"nodes": [{"author": {"login": "azooz2003-bit"}, "commit": {"oid": self.HEAD}}]}
+        self.assertIn("no approving review", gg.land_carry_refusal(self.pr(reviews=own), ""))
+        self.assertEqual(gg.land_carry_refusal(self.pr(reviews=old, author={"login": "teamleaderleo"}), ""), "")
+
+    def test_a_closed_draft_foreign_or_moved_pr_is_not_carried(self):
+        self.assertIn("closed", gg.land_carry_refusal(self.pr(state="CLOSED"), ""))
+        self.assertIn("draft", gg.land_carry_refusal(self.pr(isDraft=True), ""))
+        self.assertIn("another fork", gg.land_carry_refusal(self.pr(isCrossRepository=True), ""))
+        self.assertIn("not the pinned", gg.land_carry_refusal(self.pr(), "abcdef1234567"))
+
+    def test_the_carry_pushes_the_head_and_opens_one_twin(self):
+        calls = []
+
+        def run(argv, timeout=None, **_):
+            calls.append(argv)
+            out = ""
+            if argv[:3] == ["gh", "api", "graphql"]:
+                out = json.dumps({"data": {"repository": {"pullRequest": self.pr()}}})
+            elif argv[:3] == ["gh", "pr", "create"]:
+                out = "https://github.com/teamleaderleo/glaeda/pull/2827\n"
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        with mock.patch.object(gg, "run_bounded", side_effect=run), mock.patch.object(gg, "say_waiting"):
+            self.assertEqual(gg.land_carry("manaflow-ai/glaeda", 43, ""), ("teamleaderleo/glaeda#2827", self.HEAD))
+        push = next(a for a in calls if "push" in a)
+        self.assertEqual(push[-2:], ["git@github.com:teamleaderleo/glaeda.git",
+                                     f"+{self.HEAD}:refs/heads/carry/manaflow-ai-glaeda-43"])
+        self.assertFalse(any("main" in a[-1] and "push" in a for a in calls[:-2] if a[0] == "git"))
+        create = next(a for a in calls if a[:3] == ["gh", "pr", "create"])
+        self.assertIn("carries manaflow-ai/glaeda#43", create[create.index("--title") + 1])
+
+    def test_an_unapproved_teammate_pr_is_refused_before_any_push(self):
+        calls = []
+
+        def run(argv, timeout=None, **_):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"data": {"repository": {"pullRequest": self.pr(reviews={"nodes": []})}}}), "")
+
+        with mock.patch.object(gg, "run_bounded", side_effect=run), self.assertRaises(gg.WatchError) as said:
+            gg.land_carry("manaflow-ai/glaeda", 43, "")
+        self.assertIn("no approving review", str(said.exception))
+        self.assertEqual(len(calls), 1)
 
 if __name__ == "__main__":
     unittest.main()
