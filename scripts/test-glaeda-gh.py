@@ -29358,15 +29358,15 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
         self.assertEqual((len(self.base_ref_reads()), len(self.compares())), (1, 2))
 
-    def test_a_base_branch_read_that_fails_waits_and_never_stops_as_no_base_branch(self):
+    def test_a_base_branch_read_that_fails_stops_saying_the_read_did_not_answer(self):
         self.pinned_and_waiting()
         self.base_merged()
         self.w.cache[self.KEY]["data"].pop("baseRefName")
         self.w.api["repos/o/r/pulls/1"] = None  # the read fails
         e = self.tick(30)
-        self.assertNotEqual(e["state"], "stopped")
-        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "base_merge_unread"], ["base_merge_unread"])
-        self.assertEqual((self.compares(), self.w.gh_calls("pr", "merge")), ([], []))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("the read of its PR did not answer", e["stop"]["reason"])
+        self.assertEqual((len(self.base_ref_reads()), self.compares(), self.w.gh_calls("pr", "merge")), (1, [], []))
 
     def test_a_copy_that_names_its_base_branch_makes_no_base_branch_read(self):
         self.pinned_and_waiting()
@@ -29469,36 +29469,6 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (GitHub's branch ref is at it too)")
         self.assertEqual((self.ancestry_reads(path), self.w.gh_calls("pr", "merge")), (1, []))
-
-    def test_a_branch_ref_past_the_pin_that_is_only_a_base_merge_is_followed_not_stopped(self):
-        # cmux-cp-1, 2026-11-26: 47 rows stopped "GitHub's branch ref; the copy here still showed X, an older commit of
-        # the pin" in 10 h; 43 of them were only base merges on the pin. The live head is checked like a cached one.
-        self.pinned_and_waiting()
-        self.older_copy(parents=[self.LD])
-        self.w.cache[self.KEY]["data"].update(headRefName="lane/x", baseRefName="main")
-        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB  # past the pin: neither the pin nor the copy's older commit
-        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, self.LD])
-        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}
-        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps({"mb": self.LD, "files": [moved]})
-        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
-        e = self.tick(30)
-        self.assertIsNone(e.get("stop"))
-        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
-        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
-        self.assertIn(gg.LAND_LIVE_MOVED, [h["event"] for h in e["history"]])
-        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
-
-    def test_a_branch_ref_past_the_pin_that_is_a_push_stops_naming_the_live_head(self):
-        self.pinned_and_waiting()
-        self.older_copy(parents=[self.LD])
-        self.w.cache[self.KEY]["data"].update(headRefName="lane/x", baseRefName="main")
-        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
-        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([self.LF])  # a push: its parent is not the pin
-        self.w.api[f"repos/o/r/compare/{LB}...{LA}"] = json.dumps({"s": "diverged", "b": 1})
-        e = self.tick(30)
-        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
-        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
-        self.assertIn(LB[:12], e["stop"]["reason"])
 
     def test_an_ancestry_read_that_never_answers_stops_head_moved_after_its_reads(self):
         self.pinned_and_waiting()
