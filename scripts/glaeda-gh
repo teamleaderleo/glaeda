@@ -15626,6 +15626,18 @@ LAND_OWNER_REMIND_CAP = 2
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_STOPPED_OVER: a stopped row whose PR merged or closed is over, and ends (merged, or stopped "closed"), whatever
+# its code. Only rearm ended one (re-armable codes, on a cached copy), and a stopped row is unwatched, so a lane VM
+# holds no copy of it at all: gcp-agent-lane-11, 2026-11-26 05:30Z, 59 stopped rows not ended, 56 with no copy, and
+# cmux#52553 (merged 11-24), cmux#54984 and cmuxterm-hq#17663 (closed unmerged 11-25) sat stopped until a lane
+# cancelled them by hand, warned on from both hosts. Each such row is read once every LAND_STOPPED_READ_EVERY since
+# its last read (or its stop), in LAND_REFRESH_BATCH batches a repository, never while refreshes are held or the queue
+# is parked; the pass after the read ends it. Quiet (the log and `land status`): its requester was told at the stop and
+# the PR's end asks nothing of it. A due owner reminder waits on this read instead of asking its own
+# (LAND_OWNER_REMIND_READ). Cost: one batched read per repository per stopped rows' cadence. Detector: test-glaeda-gh.py
+# test_a_stopped_row_whose_pr_merged_or_closed_elsewhere_is_read_and_ends.
+LAND_STOPPED_OVER_CODES = frozenset({"closed", "cancelled", "merged"})
+LAND_STOPPED_READ_EVERY = LAND_OWNER_REMIND_EVERY
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -18020,7 +18032,9 @@ class LandQueue:
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
-                        if not self.rearm(e):  # judged from the next pass
+                        if self.stopped_over(e):  # LAND_STOPPED_OVER: its PR is over, the row ended
+                            pass
+                        elif not self.rearm(e):  # judged from the next pass
                             self.remind(e)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
@@ -19709,6 +19723,49 @@ class LandQueue:
         self.notify(e, to, msg)
         return True
 
+    def stopped_over(self, e: dict) -> bool:
+        """Under the lock. LAND_STOPPED_OVER: True when stopped E's PR reads MERGED or CLOSED and E ended here,
+        quietly. Otherwise asks one read of it when LAND_STOPPED_READ_EVERY has passed (decided on the pass after it
+        lands) and returns False, so rearm and remind go on as before."""
+        st = e.get("stop") or {}
+        if str(st.get("code") or "") in LAND_STOPPED_OVER_CODES:
+            return False
+        key = e["key"]
+        c = self.cache_of(key) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state == "MERGED":
+            merge = data.get("mergeCommit")
+            self.merged(e, str((merge or {}).get("oid") or "") if isinstance(merge, dict) else "",
+                        "a stopped row's read shows it", wake=False)
+            return True
+        if state == "CLOSED":
+            self.stop(e, "closed", "closed unmerged (a stopped row's read shows it closed)", "", tell="quiet")
+            return True
+        if key in self.refresh_batched:
+            return False
+        reads = [float(t) for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt"),
+                                    st.get("at"), e.get("stoppedReadAt")) if _finite(t)]
+        if reads and self.now - max(reads) < LAND_STOPPED_READ_EVERY:
+            return False
+        if key in self.jobs or self.refresh_held() or self.queue_quota_parked():
+            return False
+        repo = str(e.get("repo") or "").lower()
+        queued = self.refresh_queued.get(repo) or []
+        joins = self.refresh_many is not None and bool(queued) and len(queued) % LAND_REFRESH_BATCH != 0
+        if not joins and self.busy() + self.refresh_batches() >= self.workers():
+            return False  # asked on a later pass
+        e["stoppedReadAt"] = self.now
+        self.history(e, "stopped_read", age=round(self.now - max(reads)) if reads else None)
+        log({"event": "land-stopped-read", "key": key, "code": st.get("code")})
+        self.save(e)
+        if self.refresh_many is None:
+            self.submit(key, self.refresh_job, key)
+        else:
+            self.refresh_queued.setdefault(repo, []).append(key)
+            self.refresh_batched[key] = ""  # its batch's first key, once flush_refreshes hands it a worker
+        return False
+
     def remind_read_pending(self, e: dict, last: float) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
         (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
@@ -19719,8 +19776,8 @@ class LandQueue:
         reads = read_since()
         if (reads and max(reads) > last) or self.now - (last + LAND_OWNER_REMIND_EVERY) >= LAND_OWNER_REMIND_READ_WAIT:
             return False
-        if float(e.get("remindReadAt") or 0) > last:
-            return True  # asked since the last word: told on the pass after it lands
+        if max(float(e.get("remindReadAt") or 0), float(e.get("stoppedReadAt") or 0)) > last:
+            return True  # asked since the last word (here, or LAND_STOPPED_OVER's): told on the pass after it lands
         if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
             return True  # asked on a later pass
         e["remindReadAt"] = self.now
