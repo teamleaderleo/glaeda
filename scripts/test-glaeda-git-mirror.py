@@ -30,6 +30,8 @@ def load():
     return module
 
 
+# No test reaches the real build controller: a test that wants the proxy sets GLAEDA_GIT_MIRROR_PROXY itself.
+os.environ["GLAEDA_GIT_MIRROR_PROXY"] = "off"
 gm = load()
 
 
@@ -756,7 +758,7 @@ class SubmodulePass(unittest.TestCase):
 
     def test_a_new_pin_is_fetched_once_and_kept(self) -> None:
         report = gm.submodule_pass(self.mirror, root=self.root)
-        self.assertEqual(report, {"ghostty": {"pins": 1, "held": 1, "fetched": 1}})
+        self.assertEqual(report, {"ghostty": {"pins": 1, "held": 1, "fetched": 1, "via": {"github": 1}}})
         repo = self.root / "ghostty.git"
         self.assertEqual(sh("git", "rev-parse", "refs/heads/main", cwd=repo), self.pin)
         self.assertEqual(sh("git", "rev-parse", f"refs/pins/{self.pin}", cwd=repo), self.pin)
@@ -779,6 +781,72 @@ class SubmodulePass(unittest.TestCase):
         self.assertEqual(sleeps, list(gm.BACKOFF[:gm.SUBMODULE_TRIES - 1]))
         self.assertEqual(report["ghostty"]["held"], 0)
         self.assertIn("429", report["ghostty"]["errors"][0])
+
+
+    def test_a_new_pin_comes_through_the_proxy_and_never_github(self) -> None:
+        calls = []
+
+        def proxy_only(command, timeout):
+            calls.append(command)
+            url = command[command.index("--depth=1") + 1]
+            self.assertEqual(url, "http://controller.test:18765/v1/git/manaflow-ai/ghostty.git")
+            # stand in for the proxy: fetch what GitHub would serve
+            real = [*command[:command.index("--depth=1") + 1], "https://github.com/manaflow-ai/ghostty.git",
+                    *command[command.index("--depth=1") + 2:]]
+            return gm.run_group(real, timeout)
+        with mock.patch.dict(os.environ, {"GLAEDA_GIT_MIRROR_PROXY": "http://controller.test:18765/"}):
+            report = gm.submodule_pass(self.mirror, root=self.root, runner=proxy_only)
+        self.assertEqual(report, {"ghostty": {"pins": 1, "held": 1, "fetched": 1, "via": {"proxy": 1}}})
+        self.assertEqual(len(calls), 1)
+
+
+class Proxy(unittest.TestCase):
+    """Every mirror fetch asks the build controller's git proxy first; GitHub directly only if the proxy fails."""
+
+    def test_the_proxy_url_comes_from_the_env_the_client_config_or_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            url = "https://github.com/manaflow-ai/cmux.git"
+            with mock.patch.dict(os.environ, {"GLAEDA_GIT_MIRROR_PROXY": "", "CMUX_CI_CONTROLLER": ""}):
+                self.assertEqual(gm.proxied(url, home), f"{gm.PROXY_DEFAULT}/v1/git/manaflow-ai/cmux.git")
+                (home / gm.PROXY_CONFIG).parent.mkdir(parents=True)
+                (home / gm.PROXY_CONFIG).write_text('{"controller": "http://127.0.0.1:18765"}')
+                self.assertEqual(gm.proxied(url, home), "http://127.0.0.1:18765/v1/git/manaflow-ai/cmux.git")
+            with mock.patch.dict(os.environ, {"GLAEDA_GIT_MIRROR_PROXY": "", "CMUX_CI_CONTROLLER": "http://c:1/"}):
+                self.assertEqual(gm.proxied("https://github.com/manaflow-ai/ghostty", home),
+                                 "http://c:1/v1/git/manaflow-ai/ghostty.git")
+            with mock.patch.dict(os.environ, {"GLAEDA_GIT_MIRROR_PROXY": "off"}):
+                self.assertIsNone(gm.proxied(url, home))
+            # a repository the proxy does not serve, or not GitHub at all
+            self.assertIsNone(gm.proxied("https://github.com/someone/else.git", home))
+            self.assertIsNone(gm.proxied("file:///tmp/upstream", home))
+
+    def test_the_proxy_is_tried_once_and_github_only_when_it_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            mirror = Path(temp)
+            (mirror / "objects/pack").mkdir(parents=True)
+            urls = []
+
+            def runner(command, timeout):
+                urls.append(command[command.index("--prune") + 1])
+                return (0, "") if "github.com" not in urls[-1] else (128, "HTTP 403")
+            result = gm.fetch_via_proxy(mirror, "https://github.com/manaflow-ai/cmux.git",
+                                        proxy="http://c:1/v1/git/manaflow-ai/cmux.git", runner=runner)
+            self.assertEqual((result["ok"], result["via"]), (True, "proxy"))
+            self.assertEqual(urls, ["http://c:1/v1/git/manaflow-ai/cmux.git"])
+
+            urls.clear()
+
+            def proxy_down(command, timeout):
+                urls.append(command[command.index("--prune") + 1])
+                return (128, "Failed to connect") if "c:1" in urls[-1] else (0, "")
+            result = gm.fetch_via_proxy(mirror, "https://github.com/manaflow-ai/cmux.git",
+                                        proxy="http://c:1/v1/git/manaflow-ai/cmux.git", runner=proxy_down,
+                                        sleep=lambda _: None)
+            self.assertEqual((result["ok"], result["via"]), (True, "github"))
+            self.assertEqual(urls, ["http://c:1/v1/git/manaflow-ai/cmux.git",
+                                    "https://github.com/manaflow-ai/cmux.git"])
+            self.assertIn("Failed to connect", result["proxy_errors"][0])
 
 
 if __name__ == "__main__":
