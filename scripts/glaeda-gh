@@ -16397,8 +16397,8 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
 # host, 11-25, 183 update_branch steps for 137 merges (1.34 a merge, 0.83 on 11-23), and of 120 update_branch steps in
 # the 24 h to 11-26 10:50Z, 43 were update_again. So at its own head the queue sends another only when a check is
 # named as needing the newer base (land_judge's needs_newer_base, a force) or GitHub's refusal of a step named it:
-#   - a rerun whose only staleness is the base's age (stale_replay_why's "commits behind", no CI path changed) is the
-#     rerun, at that head, not a new base merge: the run's merge is this land's own, its red judged like any other;
+#   - a stale rerun (stale_replay_why answers, the base's age alone included) is a base merge naming the rerun's red
+#     checks as needs_newer_base, at this head too (LAND_STALE_MERGE_KEY's comment);
 #   - an update land_judge names with no needs_newer_base (not_run's "one base merge") stops the row by name
 #     (update_again_unnamed) instead of a second merge.
 # The merge gate is unchanged: every merge still passes land_judge at the head it merges. Undo:
@@ -16407,14 +16407,47 @@ def land_update_once() -> bool:
     return os.environ.get("GLAEDA_LAND_UPDATE_ONCE", "1").strip() != "0"
 
 
-def land_stale_named(why: str) -> bool:
-    """Whether a stale_replay_why answer names a base change a rerun lacks (a CI path), not only the base's age."""
-    return "has changed the CI path" in str(why or "")
+# A stale merge is never replayed, at this land's own head too (gcp-agent-lane-1/coord-successor, 2026-11-26: "on a
+# stale_merge answer, call update_branch ... instead of rerun. Fix the class: any rerun path in the land daemon that
+# can replay a stale merge."). glaeda#2903 let an age-only stale rerun (stale_replay_why's "commits behind") go at a
+# head this land's own update made; manaflow-ai/cmux#56958's ios ffi job then failed again on a merge 509 commits
+# behind main, after earlier reruns of the same merge. A replay that old re-tests code the base has long left, so it
+# spends a job's minutes on an answer that never lands; one base merge gets the fresh one. Both rerun steps
+# (rerun_failed, rerun_unrelated) therefore take the pinned base merge whenever stale_replay_why answers, naming the
+# rerun's red checks as needing the newer base (needs_newer_base), which is the named second merge update-once allows.
+# The broker's rerun (lane-gh-broker rerun_stale_merge) applies the same rule and, when it finds staleness this host's
+# own read missed (a read that failed here), still reruns and says so in data.stale_merge: that answer is taken the
+# same way, a pinned base merge naming the reds, never a wait on the replay.
+LAND_STALE_MERGE_KEY = re.compile(r'"stale_merge"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
-def land_own_update_head(e: dict, head: str) -> bool:
-    """Whether HEAD is the head this land's own base merge made (update_again's test)."""
-    return bool(head) and str(e.get("updatedHead") or "").lower() == str(head).lower()
+def land_stale_merge_note(out: str) -> str:
+    """The broker's data.stale_merge note in a rerun's answer (lane-gh's JSON envelope, on stdout or stderr), or ""."""
+    text = out or ""
+    try:
+        doc = json.loads(text.strip())
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        for where in (doc.get("data"), doc):
+            note = where.get("stale_merge") if isinstance(where, dict) else None
+            if isinstance(note, str) and note.strip():
+                return note.strip()
+    found = LAND_STALE_MERGE_KEY.search(text)  # an envelope among other lines
+    try:
+        note = json.loads(found.group(1)) if found else ""
+    except ValueError:
+        note = ""
+    return note.strip() if isinstance(note, str) else ""
+
+
+def land_rerun_red_names(checks: list, runs: list) -> list[str]:
+    """The names of RUNS' red checks among CHECKS (LAND_RED_CONCLUSIONS), sorted: the checks a pinned base merge
+    taken instead of their rerun names as needing the newer base."""
+    want = {str(r) for r in runs}
+    return sorted({str(c.get("name")) for c in checks if isinstance(c, dict) and c.get("name")
+                   and str(c.get("runId") or "") in want
+                   and str(c.get("conclusion") or "").upper() in LAND_RED_CONCLUSIONS})
 
 
 # A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (land_judge could not judge:
@@ -24707,15 +24740,13 @@ class LandQueue:
                               "no gh-quota shim to rerun through" if runs else "rerun_failed named no run",
                               land_trim(answer.get("next")))
                 return
-            stale = {r: why for r in runs if (why := self.stale_replay(e, gh, r))}  # STALE_REPLAY_BEHIND's comment
-            if stale and land_update_once() and land_own_update_head(e, head) and not any(
-                    land_stale_named(w) for w in stale.values()):
-                with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
-                    first = next(iter(stale.values()))
-                    self.history(e, "stale_replay_own_head", head=head[:12], why=land_trim(first, 200))
-                stale = {}
+            # STALE_REPLAY_BEHIND's and LAND_STALE_MERGE_KEY's comments: stale at any head is a base merge
+            stale = {r: why for r in runs if (why := self.stale_replay(e, gh, r))}
+            checks: list = []
             with self.lock:
                 self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
+                checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
+                checks = checks if isinstance(checks, list) else []
                 sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
                 capped = [r for r in runs if int(sent.get(f"{head}|{r}") or 0) >= LAND_RERUN_CAP]
                 if capped:
@@ -24735,10 +24766,9 @@ class LandQueue:
                     self.save(e)
                 else:
                     self.claim(e, "rerun_failed", runs=runs)
-                    checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
-                    marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
+                    marks = land_rerun_marks(checks, runs)
             if stale:
-                self.update_branch(e, head, named=True)
+                self.update_branch(e, head, land_rerun_red_names(checks, list(stale)), named=True)
                 return
             # A whole rerun ("all": land_command_rerun), never --failed, when the step's point is that the run's own
             # path routing must route again: its jobs did not fail, they were never run.
@@ -24759,8 +24789,18 @@ class LandQueue:
                 if no_lane:
                     self.step_refused(e, "rerun_failed", head, no_lane[0])
                     return
-                self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs", "rerun": True, "runs": marks},
-                          LAND_WAIT_DEFAULT)
+                noted = {r: note for r, g in zip(runs, results) if g.returncode == 0
+                         and (note := land_stale_merge_note(g.stdout) or land_stale_merge_note(g.stderr))}
+                if noted:  # LAND_STALE_MERGE_KEY's comment: the broker says the rerun replays a stale merge
+                    for r, note in noted.items():
+                        self.history(e, "stale_merge_answer", run=r, head=head[:12], why=land_trim(note, 200))
+                    self.count("stale_merge_answer")
+                    self.save(e)
+                else:
+                    self.wait(e, {"kind": "pr", "sha": head, "why": "reran failed jobs", "rerun": True, "runs": marks},
+                              LAND_WAIT_DEFAULT)
+            if noted:
+                self.update_branch(e, head, land_rerun_red_names(checks, list(noted)), named=True)
             return
         if kind == "review":
             self.do_review(e, head, answer)
@@ -24908,11 +24948,8 @@ class LandQueue:
                                    f"{len(files)} files)")
             elif touched := [f for f in files if not land_path_inert(f, rule)]:
                 take, why = False, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
-        stale = self.stale_replay(e, gh, run) if take and gh is not None else ""  # STALE_REPLAY_BEHIND's comment
-        if stale and land_update_once() and land_own_update_head(e, head) and not land_stale_named(stale):
-            with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
-                self.history(e, "stale_replay_own_head", run=run, head=head[:12], why=land_trim(stale, 200))
-            stale = ""
+        # STALE_REPLAY_BEHIND's and LAND_STALE_MERGE_KEY's comments: stale at any head is a base merge
+        stale = self.stale_replay(e, gh, run) if take and gh is not None else ""
         with self.lock:
             self.check(e)
             if not take:
@@ -24928,9 +24965,10 @@ class LandQueue:
             else:
                 self.claim(e, "rerun_failed", runs=[run], unrelated=True)
         if stale:
-            self.update_branch(e, head, named=True)
+            self.update_branch(e, head, land_rerun_red_names(checks, [run]), named=True)
             return True
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+        note = (land_stale_merge_note(got.stdout) or land_stale_merge_note(got.stderr)) if got.returncode == 0 else ""
         with self.lock:
             self.finish(e, got)
             if got.returncode != 0:  # refused: the stop goes ahead, naming the red as before
@@ -24938,6 +24976,14 @@ class LandQueue:
                                                                    f"{got.stderr or got.stdout}", 200))
                 return False
             self.nudge(e["key"])
+            if note:  # LAND_STALE_MERGE_KEY's comment: the broker says the rerun replays a stale merge
+                self.history(e, "stale_merge_answer", run=run, head=head[:12], why=land_trim(note, 200))
+                self.count("stale_merge_answer")
+                self.save(e)
+        if note:
+            self.update_branch(e, head, land_rerun_red_names(checks, [run]), named=True)
+            return True
+        with self.lock:
             self.wait(e, {"kind": "pr", "sha": head, "rerun": True, "runs": land_rerun_marks(checks, [run]),
                           "why": f"reran run {run}, " + (f"a job {stopped}" if setup
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
