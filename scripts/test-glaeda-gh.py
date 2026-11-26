@@ -30161,23 +30161,66 @@ class LandTest(Base):
         gen = e.get("gen")
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
         self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
+        self.pr(LA, mergeable="CONFLICTING")  # the daemon's fresh copy: still open (LAND_OWNER_REMIND_FRESH)
         e = self.tick(20)
         self.assertEqual((e["state"], e["reminds"]["n"], e.get("rearms")), ("stopped", 1, None))
         self.assertEqual((len(self.w.explains()), e.get("gen")), (judged, gen))  # reminded, never re-judged
-        said = self.w.sent()[-1][-1]
-        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
-        self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
+        said = self.w.sent()[-1]
+        self.assertIn("resolve the conflicts and push", said[-1])  # the stop's own one step, again
+        self.assertIn("still stopped after 6 h", said[-1])  # and how long it has sat there
+        self.assertEqual(said[said.index("--class") + 1], "fyi")  # LAND_OWNER_REMIND_FYI: the stop woke it already
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.pr(LA, mergeable="CONFLICTING")
+        e = self.tick()
         self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (2, sent + 2, gen))
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
+        self.pr(LA, mergeable="CONFLICTING")
+        e = self.tick()
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
 
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
         sent = len(self.w.sent())
+        self.t += gg.LAND_OWNER_REMIND_EVERY
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))  # the row ends, never reminded
+        self.assertEqual(len(self.w.sent()), sent + 1)
+        said = self.w.sent()[-1]
+        self.assertNotIn("still stopped", said[-1])
+        self.assertEqual(said[said.index("--class") + 1], "fyi")  # one merged fyi, never a block
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(len(self.w.sent()), sent + 1)
+
+    def test_a_stopped_row_with_no_copy_is_read_before_any_reminder(self):
+        # LAND_OWNER_REMIND_FRESH: a stopped row is watched by nothing, so the daemon deletes its copy after
+        # CACHE_KEEP and the reminder found none. gcp-agent-lane-9, 2026-11-26 04:43:54Z: 100 reminders in one pass,
+        # 94 on rows with no copy, among them cmux#49814/#49840/#48963 merged 2-4 days before, each woken as a block.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        del self.w.cache[self.KEY]  # CACHE_KEEP: the copy is gone
+        self.w.watched.clear()
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        self.assertEqual(self.w.watched, [self.KEY])  # one read asked for
+        e = self.tick()
+        self.assertEqual(self.w.watched, [self.KEY])  # and not again every tick (LAND_PEEK_EVERY)
+        self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # the read lands: merged days ago
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))
+        self.assertTrue(all("still stopped" not in c[-1] for c in self.w.sent()))
+        self.assertEqual(self.w.sent()[-1][self.w.sent()[-1].index("--class") + 1], "fyi")
+
+    def test_a_stopped_row_closed_unmerged_ends_quietly_instead_of_a_reminder(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.t += gg.LAND_OWNER_REMIND_EVERY
+        self.pr(LA, state="CLOSED", mergeable="CONFLICTING")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("reminds")), ("stopped", "closed", None))
+        self.assertEqual(len(self.w.sent()), sent)  # nobody woken for a closed PR
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+        self.assertEqual(len(self.w.sent()), sent)  # `closed` is in LAND_OWNER_REMIND_SKIP
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
