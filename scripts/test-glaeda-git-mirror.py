@@ -821,6 +821,32 @@ class Proxy(unittest.TestCase):
             self.assertIsNone(gm.proxied("https://github.com/someone/else.git", home))
             self.assertIsNone(gm.proxied("file:///tmp/upstream", home))
 
+    def test_a_github_fetch_goes_direct_when_its_connect_proxy_does_not_answer(self) -> None:
+        # cmux release runs 45811016977 and 45805086277: the loopback tunnel accepted and never answered a CONNECT
+        dead, live = (lambda _: False), (lambda _: True)
+        tunnel = lambda: "http://127.0.0.1:18434"  # noqa: E731
+        url = "https://github.com/manaflow-ai/cmux.git"
+        self.assertEqual(gm.github_route(url, proxy=tunnel, probe=dead), gm.DIRECT)
+        self.assertEqual(gm.github_route(url, proxy=tunnel, probe=live), ())
+        self.assertEqual(gm.github_route(url, proxy=lambda: None, probe=dead), ())  # no proxy: nothing to probe
+        self.assertEqual(gm.github_route("http://c:1/v1/git/manaflow-ai/cmux.git", proxy=tunnel, probe=dead), ())
+        with tempfile.TemporaryDirectory() as temp:
+            mirror = Path(temp)
+            (mirror / "objects/pack").mkdir(parents=True)
+            seen = []
+
+            def runner(command, timeout):
+                seen.append(command)
+                return 0, ""
+            result = gm.fetch(mirror, url, runner=runner, route=lambda u: gm.github_route(u, proxy=tunnel, probe=dead))
+            self.assertTrue(result["ok"])
+            self.assertIn("did not answer", result["direct"])
+            self.assertEqual(seen[0][1:1 + len(gm.LOW_SPEED) + len(gm.DIRECT)], [*gm.LOW_SPEED, *gm.DIRECT])
+            seen.clear()
+            result = gm.fetch(mirror, url, runner=runner, route=lambda u: gm.github_route(u, proxy=tunnel, probe=live))
+            self.assertNotIn("direct", result)
+            self.assertNotIn("http.proxy=", seen[0])
+
     def test_the_proxy_is_tried_once_and_github_only_when_it_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             mirror = Path(temp)
