@@ -27038,6 +27038,8 @@ class LandTest(Base):
         self.addCleanup(cap.stop)
         self.t = NOW
         self.github_head = {}
+        # a token pool of its own (land_own_token_pool), never the test host's files; TokenlessLaneKeepsRowsForwarded
+        self.own_pool = True
         self.q = self.queue()
 
     def queue(self) -> Any:
@@ -27045,7 +27047,7 @@ class LandTest(Base):
                             nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
                             config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
                             behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
-                            snapshot_of=self.snaps.get)
+                            own_pool=lambda: self.own_pool, snapshot_of=self.snaps.get)
 
     # GitHub's own head per PR when a test moves it behind the daemon's back (the cache not told); a nudge reads it.
     github_head: dict[str, str] = {}
@@ -27137,7 +27139,7 @@ class LandTest(Base):
                               nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
                               config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
                               behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
-                              snapshot_of=self.snaps.get, head_watch=heads.append)
+                              own_pool=lambda: self.own_pool, snapshot_of=self.snaps.get, head_watch=heads.append)
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
         self.land()
         self.tick()
@@ -34232,6 +34234,70 @@ class LandTest(Base):
         # the hold ends: the next hand-off goes to the peer again (it may answer now)
         self.tick(gg.LAND_PEER_SILENT_HOLD + 1)
         self.assertEqual(self.q.silent_peers(), {})
+
+    def tokenless_silent(self) -> tuple[list[str], list[dict]]:
+        """silent_rows on a lane VM with no token pool of its own, then LAND_PEER_SILENT and four ticks with the peer
+        still silent, each row's next judgment here answering "unreadable" (as one through a quiet broker does)."""
+        self.own_pool = False
+        keys = self.silent_rows()
+        logged: list[dict] = []
+        for _ in range(len(keys)):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick(gg.LAND_PEER_SILENT + 1)
+            for _ in range(4):
+                self.tick()
+        return keys, logged
+
+    def test_a_tokenless_lane_keeps_rows_forwarded_to_a_silent_peer_and_judges_none_here(self):
+        # LAND_PEER_SILENT: a lane VM with no token pool took 42 of 70 rows back and judged them unreadable, each read
+        # going through the quiet broker unauthenticated. Kept forwarded, none is judged here again.
+        keys, logged = self.tokenless_silent()
+        self.assertIn("huge-blue", self.q.silent_peers())
+        self.assertEqual([d for d in logged if d.get("event") == "land-forward-reclaimed"], [])
+        for key in keys:
+            e = self.q.entries[key]
+            self.assertEqual(e["state"], "forwarded", e["history"][-4:])
+            self.assertNotIn("forwardReclaimed", e)
+            self.assertEqual(e["forwardedTo"], "huge-blue")
+        self.assertEqual(len(self.w.explains()), len(keys), "no judgment here after the hand-off")
+
+    def test_a_tokenless_lane_re_sends_its_rows_on_their_bound_and_ends_them_when_the_peer_answers(self):
+        keys, _ = self.tokenless_silent()
+        sent = len(self.handoffs())
+        self.assertEqual(sent, 2 * len(keys), "each re-sent once at LAND_FORWARD_RESEND, as to any peer")
+        self.pr(LA, key=keys[0], state="MERGED")  # the broker host is back: its first outcome
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["forwardOutcome"]["host"]), ("merged", "huge-blue"))
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(self.q.silent_peers(), {})
+        for key in keys[1:]:
+            self.assertEqual(self.q.entries[key]["state"], "forwarded")
+        self.assertEqual(len(self.w.explains()), len(keys))
+
+    def test_a_tokenless_lane_still_hands_a_new_unreadable_row_to_a_silent_peer(self):
+        keys, _ = self.tokenless_silent()
+        self.pr(LA, key="pr:o/r#9")
+        self.land("o/r#9")
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        before = len(self.handoffs())
+        for _ in range(4):
+            self.tick()
+        self.assertEqual(self.q.entries["pr:o/r#9"]["state"], "forwarded")
+        self.assertEqual(len(self.handoffs()), before + 1)
+
+    def test_own_token_pool_is_any_chain_role_held_here(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(gg, "APP_POOL_DIR", Path(d)), \
+                mock.patch.object(gg, "app_pool_tool", lambda: Path(d) / "gh_app_token.py"), \
+                mock.patch.object(gg, "app_pool_pushed_owners", lambda role, now=None: []):
+            self.assertFalse(gg.land_own_token_pool())
+            (Path(d) / "glaeda.json").write_text("{}")
+            self.assertFalse(gg.land_own_token_pool(), "metadata without its key")
+            (Path(d) / "glaeda.pem").write_text("k")
+            self.assertTrue(gg.land_own_token_pool())
+        with mock.patch.object(gg, "app_pool_tool", lambda: None), \
+                mock.patch.object(gg, "app_pool_pushed_owners", lambda role, now=None: ["o"] if role == "ci-watch" else []):
+            self.assertTrue(gg.land_own_token_pool(), "a pushed token")
 
     def test_a_peer_that_ended_a_forwarded_row_lately_is_not_silent_and_its_rows_are_re_sent(self):
         keys = self.silent_rows()

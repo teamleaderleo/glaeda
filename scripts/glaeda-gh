@@ -14557,6 +14557,19 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
+def land_own_token_pool(now: float | None = None) -> bool:
+    """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
+    as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
+    through the broker and holds none reads GitHub only through the broker (LAND_PEER_SILENT's comment)."""
+    tool = app_pool_tool()
+    for role in app_pool_chain(APP_POOL_SPARES):
+        if tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file():
+            return True
+        if app_pool_pushed_owners(role, now):
+            return True
+    return False
+
+
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
                             force: str = "") -> list[str]:
     """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
@@ -16647,6 +16660,13 @@ LAND_FORWARD_STATE_FRESH = 900.0
 # retrying (unjudgeable_here, early_hand_off, infra_read_stop), and a forwarded row it handed for a judgment is taken
 # back to be judged here (forward_reclaim). An ownership hand-off still goes (no merge of another lane's PR is possible
 # here), and an overflow skips a silent peer for the next one (overflow_send).
+# Not on a lane VM with no token pool of its own (land_own_token_pool false): there a judgment made here reads GitHub
+# through the same broker that went quiet, unauthenticated, and reads nothing. One lane VM's log held 460 "no-token"
+# lookups and 42 of 70 land judgments unreadable after a take-back; another's five days held 1,024 "unreadable" of the
+# 2,263 judgments of the 141 rows it took back (2026-11-21..26). Such a lane keeps the rows forwarded: no
+# take-back, and a row that cannot be judged here is still handed to the broker host. Each forwarded row is re-sent on
+# its own bound (LAND_FORWARD_RESEND, doubling), so the broker host gets it again once it answers, and its first
+# outcome ends the silence for every other row (silent_peers).
 LAND_PEER_SILENT = 1800.0
 LAND_PEER_SILENT_ROWS = 3
 LAND_PEER_SILENT_HOLD = 7200.0
@@ -17645,6 +17665,7 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
+                 own_pool: Callable[[], bool] = land_own_token_pool,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
                  head_watch: Callable[[str], None] | None = None,
@@ -17669,6 +17690,8 @@ class LandQueue:
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
+        self.own_pool = own_pool  # this host holds a token pool of its own (land_own_token_pool, LAND_PEER_SILENT)
+        self.own_pool_seen = (float("-inf"), False)  # (until, held): own_pool's file reads once per APP_POOL_TTL
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
@@ -19200,9 +19223,21 @@ class LandQueue:
         self.peer_quiet = quiet
         return quiet
 
-    def broker_peer_silent(self) -> str:
-        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or ""."""
+    def tokenless(self) -> bool:
+        """Under the lock. A broker client with no token pool of its own (own_pool, read once per APP_POOL_TTL): its
+        judgments read GitHub only through the broker, so it keeps rows forwarded to a silent peer (LAND_PEER_SILENT)."""
         if not self.broker_client():
+            return False
+        until, held = self.own_pool_seen
+        if self.now >= until:
+            held = bool(self.own_pool())
+            self.own_pool_seen = (self.now + APP_POOL_TTL, held)
+        return not held
+
+    def broker_peer_silent(self) -> str:
+        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or "".
+        Always "" on a tokenless lane VM: it keeps handing rows to the broker host (LAND_PEER_SILENT's comment)."""
+        if not self.broker_client() or self.tokenless():
             return ""
         quiet = self.silent_peers()
         return quiet.get(self.broker_peer, "") if self.broker_peer else ""
@@ -19295,7 +19330,8 @@ class LandQueue:
         last = e.get("forwardResent") or {}
         if not executor and e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e):
             quiet = self.silent_peers().get(str(e.get("forwardedTo") or ""))
-            if quiet:  # re-sending to a peer that answers none only waits longer (LAND_PEER_SILENT's comment)
+            # a tokenless lane VM keeps it forwarded and re-sends it on its bound (LAND_PEER_SILENT's comment)
+            if quiet and not self.tokenless():  # re-sending to a peer that answers none only waits longer
                 self.forward_reclaim(e, host, quiet)
                 return False
         if not e.get("forwardFirst"):
