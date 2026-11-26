@@ -21268,6 +21268,7 @@ class LandQueue:
         pin = str(e.get("pinSha") or "")
         if head and not land_head_moved(pin, head):
             e["pinSeen"] = True
+            e.pop("prUnsynced", None)  # the PR shows the pin: LAND_PR_UNSYNCED's wait is over
             if e.pop("pinWait", None) is not None:
                 self.history(e, "pin_seen", head=head[:12])
             self.save(e)
@@ -22159,6 +22160,23 @@ class LandQueue:
         repo_n = f"{e['repo']}#{e['number']}"
         if live == pin:
             e.pop("baseMergeUnread", None)
+            # LAND_PR_UNSYNCED: kept for at most LAND_PR_SYNC_MAX since the branch ref first showed the pin over this
+            # copy; past it GitHub's PR has not synced to its branch, and only a reopen (or a push) makes it.
+            u = e.get("prUnsynced") if isinstance(e.get("prUnsynced"), dict) else {}
+            if u.get("head") != head or u.get("pin") != pin:
+                u = e["prUnsynced"] = {"head": head, "pin": pin, "since": self.now}
+            waited = self.now - float(u.get("since") or self.now)
+            if waited >= LAND_PR_SYNC_MAX:
+                e.pop("prUnsynced", None)
+                e.pop("oldPinWait", None)
+                number = str(e["number"])
+                self.stop(e, "pr_head_unsynced",
+                          f"GitHub's branch ref has been at the --sha {pin[:12]} for {waited:.0f} s, but every PR read "
+                          f"since still shows {head[:12]}, an older commit of it: GitHub has not synced the PR to its "
+                          "branch, so its checks and merge stay on the old head",
+                          f"gh pr close {number} -R {e['repo']} && gh pr reopen {number} -R {e['repo']} (GitHub syncs "
+                          f"the PR's head on reopen), then glaeda-gh land {repo_n} --sha {pin}")
+                return True
             e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
             self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
                          why="an older commit of the pin; GitHub's branch is at the pin")
@@ -25728,6 +25746,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
 # and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
+# LAND_PR_UNSYNCED: stale_live kept the pin while GitHub's branch ref showed it and every PR read showed an older
+# commit, re-reading the ref each LAND_HEAD_TIMEOUT with no end: GitHub's own PR object can lag its branch for hours
+# (manaflow-ai/cmux#53968, 2026-11-26: the branch at f50bddc3 from 06:23Z, pulls/53968 read straight from GitHub at
+# 07:59Z still at 160c9a8c, 13 stale_head_kept in 70 min and no one told). That keep is bounded by LAND_PR_SYNC_MAX
+# from the first read that showed it, as the update-branch path's is (update_noop), and then stops pr_head_unsynced
+# naming the reopen that makes GitHub sync, and the pin to land again at.
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 
