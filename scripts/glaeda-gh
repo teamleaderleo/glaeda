@@ -15736,6 +15736,15 @@ LAND_FEED_QUIET_MAX = 1800.0
 # the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
 # never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
 LAND_TIMER_HELD = frozenset({"checks_running"})
+# LAND_ROLLUP_READY: a wait on the PR's checks whose copy still shows one running is judged as soon as the controller's
+# rollup of the head says every check run and commit status there is done and green (LandQueue.rollup_ready,
+# why=rollup_ready; the judgment's snapshot is that rollup, not the older GitHub read), at most once per head per
+# LAND_VERDICT_KEEP, asked only when the feed shows something for the PR since that verdict. The
+# check-completed event (below) needs a completed run or suite event after the verdict and spends each event once,
+# so a head whose last check was a commit status, or whose last event the rollup could not vouch for yet, slept to its
+# timer while its copy, starved of reads, still showed a check running. 2026-11-26: manaflow-ai/cmuxterm-hq#28474,
+# green at 10:06Z, last judged checks_running at 09:49Z, merged by hand at 10:13Z; at 11:05Z seven green, CLEAN PRs
+# sat unmerged with the queue's workers 13 busy of 7 and PR copies a median 2,500 s old.
 # The check-completed event judges a wait on the PR's checks at once (LandQueue.checks_done_event, why=checks_done):
 # when the feed delivers a completed run or check suite for the head after the wait's verdict and the controller's
 # rollup of the head (no GitHub request) shows every check run there completed, land_judge is asked now, on its own
@@ -15809,7 +15818,7 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
                             "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", "checks_done",
-                            ""})
+                            "rollup_ready", ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
@@ -21164,6 +21173,11 @@ class LandQueue:
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        if not ready and data.get("state") == "OPEN" and head:
+            # the controller's green rollup of the head, as last asked (no ask here): one merge away, whatever the
+            # stale copy shows (LAND_ROLLUP_READY)
+            seen = getattr(self, "rollup_seen", {}).get((key, head.lower()))
+            ready = seen is not None and seen[1] is not None
         tier = self.judge_tier(e)
         # a re-read (reread: its last answer judged nothing at this head) is never "one merge away", and goes behind
         # every other due entry: a lane VM, 2026-11-22, three CLEAN-looking PRs judged "unreadable" every few
@@ -21419,6 +21433,14 @@ class LandQueue:
                     # is not spent, asked again next pass. glaeda#2744, 2026-11-25: green 07:29Z, its done event met
                     # a quota-refused refresh, the event was marked seen and the row slept to its 08:23Z wake.
                     e.pop("doneEventSeen", None)
+                    self.save(e)
+            elif kind == "pr" and self.rollup_ready(e, head):
+                # the copy still shows a check running; the controller's rollup says every check run and commit
+                # status at the head is done and green (LAND_ROLLUP_READY): judged now, whatever event was missed
+                if self.judge(e, head, fp, counts=False, why="rollup_ready"):
+                    e["rollupReady"] = {"head": head, "at": self.now}
+                    self.count("rollup_ready")
+                    self.history(e, "rollup_ready", head=head[:12])
                     self.save(e)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
@@ -21727,6 +21749,20 @@ class LandQueue:
             self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
         return True
 
+    def rollup_ready(self, e: dict, head: str) -> bool:
+        """True when E, waiting on its checks at HEAD with the copy still showing one running, has not been judged on
+        a green rollup since its last verdict, the feed does not show the PR quiet since that verdict (feed_quiet: a
+        run, suite or commit status for it arrived, or there is no feed to say), and the controller's rollup of HEAD
+        (rollup_green, no GitHub request, asked at most every LAND_ROLLUP_SEEN_TTL) is done and green. At most once
+        per head per LAND_VERDICT_KEEP (rollupReady), spent only once handed to a worker (consider)."""
+        last = e.get("rollupReady") or {}
+        if not head or (last.get("head") == head and self.now - float(last.get("at") or 0) < LAND_VERDICT_KEEP):
+            return False  # judged on it at this head lately: a second ask within LAND_VERDICT_KEEP is the timer's
+        at = (e.get("explain") or {}).get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and self.feed_quiet(e["key"], head, at):
+            return False
+        return self.rollup_green(e["key"], head) is not None
+
     def feed_holds(self, e: dict, head: str) -> bool:
         """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
         for the PR, its head or its branch since that judgment started (feed_quiet), within LAND_FEED_QUIET_MAX of it:
@@ -22008,7 +22044,16 @@ class LandQueue:
         the daemon's next full read will write it, else the reason no snapshot will come for this judgment). A GitHub
         snapshot that is not ready gives way to the controller's green rollup of SHA (LAND_ROLLUP_JUDGE)."""
         snap, why = self.github_snapshot(key, sha)
-        if snap is not None or why in ("unpinned", "upstream"):
+        if snap is not None:
+            # a green controller rollup asked after the GitHub read the snapshot is of stands in for it: that read
+            # can show a check running that finished since (LAND_ROLLUP_READY judges on exactly that)
+            seen = self.rollup_seen.get((key, str(sha).lower()))
+            read = snap.get("dataAt")
+            if seen is not None and seen[1] is not None and isinstance(read, (int, float)) and seen[0] > read:
+                return {"rollup": {"nodes": seen[1]}, "complete": True, "head": sha, "readAt": seen[0],
+                        "dataAt": seen[0], "via": "controller"}, ""
+            return snap, why
+        if why in ("unpinned", "upstream"):
             return snap, why
         nodes = self.rollup_green(key, sha)
         if nodes is None:
