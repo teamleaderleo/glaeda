@@ -30144,6 +30144,7 @@ class LandTest(Base):
         self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the reminders below stay inside one UTC day
         self.assertFalse(gg.LAND_REARM_CODES.match("conflict"))  # the row's code for land_judge's conflicts_base
         self.pr(LA, mergeable="CONFLICTING")
+        self.fresh_head = LA  # the read a due reminder asks first (LAND_OWNER_REMIND_READ) answers, PR unchanged
         self.land()
         self.w.answers.append(refusal("conflicts_base", LA, {"kind": "stop", "stop": "conflicts_base"},
                                       nxt="merge main into o/r#1, resolve the conflicts and push",
@@ -30179,6 +30180,30 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
 
+    def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
+        # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
+        # another host's queue, and was reminded "still stopped after 26 h" on a copy from before the stop.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.q.refresh = lambda key: (self.w.refreshed.append(key),
+                                      self.w.set_pr(key, land_pr(LA, state="MERGED"), self.t))[1]
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(self.w.refreshed, [self.KEY])  # one read, asked by the due reminder
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+
+    def test_a_reminder_whose_read_never_comes_is_still_told(self):
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None  # every read fails
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT - 60)
+        self.assertEqual((e.get("reminds"), len(self.w.refreshed)), (None, 1))  # asked once, not every pass
+        e = self.tick(60)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
@@ -30194,37 +30219,6 @@ class LandTest(Base):
         sent = len(self.w.sent())
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)  # the cap is spent and the row still sits
         self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
-
-    def remind_reads(self) -> list[list[str]]:
-        return self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefOid,mergeCommit,state")
-
-    def test_a_reminder_reads_the_pr_first_so_a_row_that_merged_ends_instead(self):
-        # gcp-agent-lane-3, 2026-11-26: 8 reminders in one hour, every one for a PR already MERGED (cmux#49097 among
-        # them, its cache still holding the pre-merge head). A stopped row is left out of the pass's live list, so its
-        # cache never moves again after the stop: the reminder reads the PR itself before writing anything.
-        self.conflict_stop()
-        sent = len(self.w.sent())
-        self.assertEqual(self.remind_reads(), [])  # nothing read while the cadence has not come round
-        self.w.view_state = "MERGED"  # merged by hand, or by another queue, after the stop
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))  # over: the row ends, nobody is reminded
-        self.assertEqual(len(self.remind_reads()), 1)  # one read a reminder due, not one a tick
-        self.assertNotIn("still stopped", " ".join(str(w) for c in self.w.sent()[sent:] for w in c))
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # and an ended row reads nothing more
-        self.assertEqual((e["state"], len(self.remind_reads())), ("merged", 1))
-
-    def test_a_reminder_names_the_head_now_when_the_stop_head_moved(self):
-        # lw#9376's reminder quoted 4a7ee5cb2b6a, the head its stop was evidence at; re-queued there it stopped again
-        # at 0d18d91f773a. 53 of this host's 110 stopped rows quote their own stop's head that way.
-        e = self.conflict_stop()
-        self.assertEqual(e["stop"]["head"], LA)
-        self.w.view_head = LB  # pushed since the stop: its reason and its one step are evidence at LA
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        said = self.w.sent()[-1][-1]
-        self.assertEqual((e["state"], e["reminds"]["n"], e["reminds"]["head"]), ("stopped", 1, LB))
-        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, still said
-        self.assertIn(LA[:12], said)  # dated at the head it was read at
-        self.assertIn(f"--pin {LB}", said)  # and the step that judges the head now
 
     def unlabels(self) -> list[list[str]]:
         return [c for c in self.w.gh_calls("api", "-X", "DELETE") if "/labels/" in c[3]]
@@ -40219,6 +40213,18 @@ class LandWaitAlarmTest(AlarmBase):
         running = lambda key: {"key": key, "data": {**clean(key)["data"],  # noqa: E731
                                                     "checks": [{"status": "IN_PROGRESS"}]}}
         self.assertEqual(gg.land_green_waits([queued], running, NOW)["rows"], 0)
+
+    def test_a_row_waiting_after_another_pr_is_not_one_merge_away(self) -> None:
+        """2026-11-26 04:00Z: a row queued --after a PR still open was a host clock's only row and paged "green PRs
+        wait to merge: p50 88m"; its wait is its requester's order."""
+        clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+        after = {"key": "pr:o/r#9", "state": "waiting_after", "created": NOW - 5280, "dueAt": NOW - 5280,
+                 "after": ["pr:o/r#1"]}
+        self.assertEqual(gg.land_green_waits([after], clean, NOW)["rows"], 0)
+        self.assertIsNone(gg.land_green_alarm(gg.land_green_waits([after], clean, NOW), "h"))
+        freed = {**after, "state": "queued", "dueAt": NOW - 60}  # after_merged: queued again, its clock from then
+        self.assertEqual(gg.land_green_waits([freed], clean, NOW)["p50S"], 60)
 
     def test_a_median_past_30_minutes_pages_and_under_it_stays_quiet(self) -> None:
         self.policy()
