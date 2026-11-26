@@ -14384,15 +14384,23 @@ def core_busy(before: list[tuple[int, ...]], after: list[tuple[int, ...]]) -> li
 
 
 def efficiency_cores() -> int | None:
-    """How many efficiency cores the mini has (hw.perflevel1.logicalcpu; on Apple silicon they are the
-    lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM) or when unreadable."""
+    """How many efficiency cores the mini has (the lowest perf level's logicalcpu when its name is Efficiency; on
+    Apple silicon they are the lowest-numbered CPUs), or None on a host with one performance level (Intel, a VM),
+    with no efficiency level, or when unreadable. The M5 Pro has two levels and no efficiency cores (5 super, 10
+    performance: hw.perflevel1 is its performance cores), so a bare hw.perflevel1 read would call its performance
+    cores efficiency cores and the P-core stall check could hold and drain-reboot a healthy mini."""
     try:
-        out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels", "hw.perflevel1.logicalcpu"],
-                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split()
-        levels, ecores = int(out[0]), int(out[1])
+        levels = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.nperflevels"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=5).stdout.strip())
+        if levels < 2:
+            return None
+        low = f"hw.perflevel{levels - 1}"
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", f"{low}.name", f"{low}.logicalcpu"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5).stdout.split("\n")
+        name, ecores = out[0].strip(), int(out[1])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
-    return ecores if levels >= 2 and ecores > 0 else None
+    return ecores if name == "Efficiency" and ecores > 0 else None
 
 
 def boot_epoch() -> int | None:
