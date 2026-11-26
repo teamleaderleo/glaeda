@@ -30195,6 +30195,37 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)  # the cap is spent and the row still sits
         self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
 
+    def remind_reads(self) -> list[list[str]]:
+        return self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefOid,mergeCommit,state")
+
+    def test_a_reminder_reads_the_pr_first_so_a_row_that_merged_ends_instead(self):
+        # gcp-agent-lane-3, 2026-11-26: 8 reminders in one hour, every one for a PR already MERGED (cmux#49097 among
+        # them, its cache still holding the pre-merge head). A stopped row is left out of the pass's live list, so its
+        # cache never moves again after the stop: the reminder reads the PR itself before writing anything.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.assertEqual(self.remind_reads(), [])  # nothing read while the cadence has not come round
+        self.w.view_state = "MERGED"  # merged by hand, or by another queue, after the stop
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))  # over: the row ends, nobody is reminded
+        self.assertEqual(len(self.remind_reads()), 1)  # one read a reminder due, not one a tick
+        self.assertNotIn("still stopped", " ".join(str(w) for c in self.w.sent()[sent:] for w in c))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # and an ended row reads nothing more
+        self.assertEqual((e["state"], len(self.remind_reads())), ("merged", 1))
+
+    def test_a_reminder_names_the_head_now_when_the_stop_head_moved(self):
+        # lw#9376's reminder quoted 4a7ee5cb2b6a, the head its stop was evidence at; re-queued there it stopped again
+        # at 0d18d91f773a. 53 of this host's 110 stopped rows quote their own stop's head that way.
+        e = self.conflict_stop()
+        self.assertEqual(e["stop"]["head"], LA)
+        self.w.view_head = LB  # pushed since the stop: its reason and its one step are evidence at LA
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        said = self.w.sent()[-1][-1]
+        self.assertEqual((e["state"], e["reminds"]["n"], e["reminds"]["head"]), ("stopped", 1, LB))
+        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, still said
+        self.assertIn(LA[:12], said)  # dated at the head it was read at
+        self.assertIn(f"--pin {LB}", said)  # and the step that judges the head now
+
     def unlabels(self) -> list[list[str]]:
         return [c for c in self.w.gh_calls("api", "-X", "DELETE") if "/labels/" in c[3]]
 
