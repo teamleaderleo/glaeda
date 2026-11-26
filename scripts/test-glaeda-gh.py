@@ -31602,8 +31602,7 @@ class LandTest(Base):
             rounds += 1
         self.assertEqual(e["stop"]["code"], "pr_head_unsynced", e.get("stop"))
         self.assertIsNone(e.get("stepFail"))  # never counted toward LAND_STEP_STOP
-        self.assertIn("allow-empty", e["stop"]["next"])
-        self.assertIn("HEAD:lane/x", e["stop"]["next"])
+        self.assertIn("gh pr close 1 -R o/r && gh pr reopen 1 -R o/r", e["stop"]["next"])
         self.assertIn("branch_ahead_of_pr", [h["event"] for h in e["history"]])
         # one branch read per refused send, and no read on any other step
         reads = [c for c in self.w.gh_calls("api") if "git/ref/heads/lane/x" in c[1]]

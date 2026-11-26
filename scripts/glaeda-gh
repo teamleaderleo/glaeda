@@ -15508,7 +15508,8 @@ LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the 
 # commit, the PR object is what lags, not the branch: GitHub made the branch's new head (someone's update-branch, a
 # push) and has not synchronized the PR to it, so no further update-branch can succeed and none is counted toward
 # LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_SYNC_STUCK it stops pr_head_unsynced, naming the
-# one step that makes GitHub read the branch again (a new commit on it). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
+# one step that made GitHub read the branch again: closing and reopening the PR (a new commit pushed at 08:02Z did
+# not; the reopen at 08:08Z read head 1fd256a5 at once). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
 # own update-branch made 40818337 (07:28:42Z, committer web-flow), and 30 min later pulls/56682 still read head
 # 54746b5f, updated_at 06:06Z, with no check run at 40818337; this queue sent update-branch at 54746b5f five times
 # (07:29-07:41Z), each refused for the head mismatch and counted as a refusal of the PR.
@@ -24557,11 +24558,9 @@ class LandQueue:
                       f"GitHub's PR still reads head {head[:12]} {waited / 60:.0f} min after its branch {branch} moved "
                       f"to {ref[:12]}: GitHub has not synchronized the PR to its branch, so update-branch at "
                       f"{head[:12]} is refused ({land_trim(land_tail(out), 160)})",
-                      f"push a commit to {branch} so GitHub reads it again (git fetch origin {branch} && git checkout "
-                      f"{ref} && git commit --allow-empty -m 'ci: resync the PR to its branch head' && git push origin "
-                      f"HEAD:{branch}); if GitHub does not follow that push either, close and reopen the PR (gh pr "
-                      f"close {e['number']} -R {e['repo']} && gh pr reopen {e['number']} -R {e['repo']}); then "
-                      f"glaeda-gh land {name} --sha <the new 40-hex head>")
+                      f"close and reopen the PR so GitHub reads its branch again (gh pr close {e['number']} -R "
+                      f"{e['repo']} && gh pr reopen {e['number']} -R {e['repo']}; nothing in {branch} changes), then "
+                      f"glaeda-gh land {name} --sha <the head it then reads>")
             return
         self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
                       "why": f"the branch is at {ref[:12]}; GitHub's PR still reads {head[:12]}"},
