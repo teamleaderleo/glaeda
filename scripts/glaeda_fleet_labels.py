@@ -798,7 +798,8 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay, user}], None), or ([], why
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, trustedRef, trustedRepo,
+    yieldToExclusive, yieldToWaiters, lanRelay, user}], None), or ([], why
     the member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
     floor, or None for the member's disk.min_free_gib. lanRelay is the private LAN "IPv4:port" the entry's relay
     agent forwards to (LAN_RELAY), the list of one host's adapter addresses on one port it tries in order
@@ -826,7 +827,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay", "user"})
+                                       "yieldToWaiters", "lanRelay", "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -902,6 +903,10 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        # YIELD_TO_WAITERS: the runner's listener holds off while a build waits for the host lock, as a pool gate does
+        waits = entry.get("yieldToWaiters", False)
+        if not isinstance(waits, bool):
+            return [], f"{where}.yieldToWaiters must be boolean"
         relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None,
                                runner.get("dedicatedOnly") is True)
         if why:
@@ -916,13 +921,14 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             if trusted_ref is None:
                 return [], (f"{where}.user needs trustedRef and trustedRepo: a runner in its own macOS account takes "
                             "only merged code of its repository, never PR code")
-            if relay is not None or yields:
-                return [], (f"{where}.user goes without lanRelay and yieldToExclusive: both are the member user's "
-                            "(its relay socket, its capacity ledger)")
+            if relay is not None or yields or waits:
+                return [], (f"{where}.user goes without lanRelay, yieldToExclusive and yieldToWaiters: each is the "
+                            "member user's (its relay socket, its capacity ledger, its host lock's waiter spans)")
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
+                    "yieldToWaiters": waits,
                     "lanRelay": relay, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
