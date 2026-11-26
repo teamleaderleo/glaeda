@@ -17200,7 +17200,7 @@ def land_create_pause_until(now: float) -> float:
     """When the login's create pause the gh-quota shim holds ends (its $GH_QUOTA_STATE/content-gate.json
     blocked_until), or 0.0: none, or no shim state here. The shim refuses every content write (merge, update-branch)
     before that time, and its ask of the authority only ever extends the file, never shortens it, so a step sent
-    before then is refused for certain. The land queue's own steps were: gcp-agent-lane-4 2026-11-25 17:11Z, five
+    before then is refused for certain. The land queue's own steps were: one lane VM, 2026-11-25 17:11Z, five
     `gh pr update-branch N --land ...` from this executor refused "content writes are paced until reset (60s ...)",
     each one a refusal row on the fleet's paced count (cmuxterm-hq goal github-writes-never-pause; Leo, 2026-11-23:
     "never pause. if you have to pause, it means we have to fix things")."""

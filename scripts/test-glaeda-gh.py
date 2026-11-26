@@ -34976,7 +34976,7 @@ class LandTest(Base):
                                                     "have been met, add the --auto flag"))
 
     def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
-        # gcp-agent-lane-4 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
+        # one lane VM, 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
         # "content writes are paced until reset (60s ...)", each a refusal row on the fleet's paced count (goal
         # github-writes-never-pause). The pause the shim holds (content-gate.json) is read first: nothing is sent
         # into it, the row waits it out, and the step goes after it.
