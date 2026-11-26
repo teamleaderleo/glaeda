@@ -29343,6 +29343,38 @@ class LandTest(Base):
         self.assertEqual(self.compares(), [])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    # LAND_BASE_REF_READ: a copy of the PR that names no base branch is a read not made yet, not "no base branch to
+    # read it with". cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 73 rows stopped head_moved on that reason.
+    def base_ref_reads(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if c[1] == "repos/o/r/pulls/1" and c[-1] == gg.LAND_BASE_REF_READ]
+
+    def test_a_base_merge_on_a_copy_with_no_base_branch_reads_the_base_and_is_followed(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = "main"
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual((len(self.base_ref_reads()), len(self.compares())), (1, 2))
+
+    def test_a_base_branch_read_that_fails_waits_and_never_stops_as_no_base_branch(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.cache[self.KEY]["data"].pop("baseRefName")
+        self.w.api["repos/o/r/pulls/1"] = None  # the read fails
+        e = self.tick(30)
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "base_merge_unread"], ["base_merge_unread"])
+        self.assertEqual((self.compares(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_copy_that_names_its_base_branch_makes_no_base_branch_read(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], self.base_ref_reads()), ("merged", []))
+
     # A copy of the PR showing an older commit of the pin (one of its ancestors) is a stale read, not a moved head (the
     # host that executes forwarded lands, 2026-11-23 00:38-01:38Z: 11 of 26 head_moved stops in one hour were on a head
     # GitHub's compare said is behind the pin, ahead 0; LAND_ANCESTRY_JQ's comment).

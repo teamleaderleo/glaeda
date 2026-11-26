@@ -22196,6 +22196,9 @@ class LandQueue:
             if e is None:
                 return
             live = self.update_live_tip(e, (self.cache_of(key) or {}).get("data") or {})[0]
+            if land_live_moved(live, head, pin):
+                self.live_moved_check(e, pin, live)  # LAND_LIVE_MOVED: that head is judged, not stopped unread
+                return
             with self.lock:
                 self.check(e)
                 if str(e.get("pinSha") or "") != pin or e.get("state") == "stopped":
@@ -22269,6 +22272,24 @@ class LandQueue:
                   "the land is not judged on it", f"glaeda-gh land {repo_n} --sha {pin}")
         return True
 
+    def live_moved_check(self, e: dict, pin: str, live: str) -> bool:
+        """On a worker, off the lock (LAND_LIVE_MOVED's comment): GitHub's branch ref is at LIVE, neither E's PIN nor
+        the older commit of it the copy here shows. LIVE is checked the way a cached head is (base_merge_check): only
+        base merges on the pin, the pin follows it and E is looked at again; a push stops head_moved naming LIVE and
+        why; a read that fails waits and is read again (base_merge_unread). Always False: nothing is judged now."""
+        with self.lock:
+            self.check(e)
+            if str(e.get("pinSha") or "") != pin or e.get("state") == "stopped":
+                return False
+            self.history(e, LAND_LIVE_MOVED, pin=pin[:12], live=live[:12])
+            self.save(e)
+        if self.base_merge_check(e, {"head": live, "pin": pin, "parent": "", "live": True}):
+            with self.lock:
+                self.check(e)
+                e.pop("staleLive", None)
+                self.requeue(e)  # the pin is LIVE now; the copy here is read again before any judgment (old_pin_wait)
+        return False
+
     def requeue(self, e: dict) -> None:
         """Under the lock: E, whose worker judged nothing, is looked at again on the next pass (its head checks first)."""
         e.update(state="queued", wait=None, wakeAt=None)
@@ -22328,8 +22349,13 @@ class LandQueue:
             if (e.get("oldPinWait") or {}).get("head") == head:
                 ancestor = True  # a pin it followed away from (old_pin_wait's own case): an older commit, no read
             kept = str(((e.get("headAncestry") or {}).get(f"{head}...{pin}") or {}).get("why") or "")
-        why = "" if gh and base else "no gh-quota shim or base branch to read it with"
+        why = "" if gh else "no gh-quota shim to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
+        if gh and not base and not kept:
+            # LAND_BASE_REF_READ's comment: a copy with no base branch is a read not made yet, not an answer
+            base, said = self.base_ref_read(e)
+            if not base:
+                why, unread = "its PR's base branch could not be read, so it is not shown to be only a base merge", True
         parents: Any = None
         chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
         if kept:
@@ -22380,6 +22406,8 @@ class LandQueue:
             w = e.get("oldPinWait") or {}
             if w.get("head") == head and self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
                 live = self.update_live_tip(e, data)[0]  # LAND_STALE_LIVE's comment: one REST read of the branch
+        if land_live_moved(live, head, pin) and not check.get("live"):
+            return self.live_moved_check(e, pin, live)  # LAND_LIVE_MOVED: that head is judged, not stopped unread
         with self.lock:
             self.check(e)
             if older is not False:
@@ -22407,6 +22435,20 @@ class LandQueue:
                          **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def base_ref_read(self, e: dict) -> tuple[str, str]:
+        """On a worker, from base_merge_check: (E's PR's base branch, "") from one REST read of the PR, for a head
+        whose cached copy names none (LAND_BASE_REF_READ's comment); ("", what the read said) when it did not
+        answer, which is unread (base_merge_unread waits and reads again), never a no."""
+        gh = self.gh()
+        if not gh:
+            return "", ""
+        got = self.call([gh, "api", f"repos/{e['repo']}/pulls/{e['number']}", "--jq", LAND_BASE_REF_READ],
+                        LAND_GH_DEADLINE)
+        ref = (got.stdout or "").strip() if got.returncode == 0 else ""
+        if not ref or len(ref.split()) != 1:
+            return "", f"{got.stdout or ''}\n{got.stderr or ''}"
+        return ref, ""
 
     def base_merge_chain(self, e: dict, head: str, pin: str, base: str) -> tuple[str, str, bool, str, int]:
         """On a worker, from base_merge_check: whether HEAD is a run of base merges on PIN (land_base_merge_chain), from
@@ -25777,6 +25819,13 @@ def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
 # queue itself sent, "tools/perf_bug_land.py shows no patch", and each stop cost a hand re-pin and half an hour.
 LAND_BASE_MERGE_JQ = ("{mb: .merge_base_commit.sha, files: [.files[]? | {f: .filename, s: .status, "
                       "p: .previous_filename, d: .patch, b: .sha}]}")
+# The base branch base_merge_check compares against comes from the cache's copy of the PR, and a copy that has not
+# read the PR (a head land_judge's live read named first, a row re-armed or handed over by the broker before the
+# refresh reached it) names none. That was answered as a no: "no gh-quota shim or base branch to read it with", a
+# head_moved stop made with no read at all, on the host that has the shim. cmux-cp-1, 2026-11-25 22:30Z to
+# 2026-11-26 08:30Z: 73 stopped rows carry that reason (62 cmux, 6 leo-workspace, 5 hq), each a hand re-pin. One REST
+# read of the PR says its base; a read that fails is unread (base_merge_unread: waits, reads again, bounded).
+LAND_BASE_REF_READ = ".base.ref"
 LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: a list that long may be cut short
 # base_merge_check's reads of one head that may fail before it stops head_moved, and the first wait between them
 # (doubled each time: 30 s to 16 min, about half an hour in all). A failed read stopped the land at once before.
@@ -25819,6 +25868,20 @@ LAND_STALE_LIVE = "stale_head_kept"
 # cmux#54723's branch ref at the pin 7a36daca, pulls/54723 at 1e7bbef5 (65 commits behind) for 7.5 h; stale_head_kept
 # 33 times, the row requeued after each and read "due since 00:42:40Z: every worker busy" in `land status` throughout.
 LAND_STALE_LIVE_MAX = 1800.0
+# LAND_LIVE_MOVED: stale_live's branch ref read at a head that is neither the pin nor the stale older commit stopped
+# head_moved at once, "(GitHub's branch ref; the copy here still showed X, an older commit of the pin)", with no read
+# of what that head is. cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 50 rows stopped so (32 in the last 3 h);
+# of the 47 whose two commits a mirror holds, 43 are only base merges on the pin (every commit from the pin to the
+# head along first parents is a merge), 3 carry new commits. The head the branch ref names goes through
+# base_merge_check as a cached head does: followed when it is only base merges on the pin, stopped with why when
+# it is a push, read again when a read fails.
+LAND_LIVE_MOVED = "stale_live_moved"
+
+
+def land_live_moved(live: str | None, head: str, pin: str) -> bool:
+    """Whether LIVE, GitHub's branch ref as stale_live's callers read it (None: not read, "": the read failed), is a
+    whole sha that is neither HEAD (the copy's) nor PIN: the branch moved on to it."""
+    return bool(live) and SHA40.fullmatch(str(live)) is not None and live != head and land_head_moved(pin, str(live))
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 
