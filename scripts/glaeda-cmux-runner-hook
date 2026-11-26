@@ -6345,7 +6345,8 @@ fi
 tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
 budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
 stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
-bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1; sets rc and stopped
+bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
+  # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
   "$real" -c http.lowSpeedLimit=1000 -c "http.lowSpeedTime=$stall" "${orig[@]}" <&0 2>"$errf" &
   gp=$!
   stopped=
@@ -6353,10 +6354,11 @@ bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped p
   while kill -0 "$gp" 2>/dev/null; do
     if [ "$SECONDS" -ge "$end" ]; then
       stopped=1
-      pkill -TERM -P "$gp" 2>/dev/null; kill -TERM "$gp" 2>/dev/null
+      kids=$(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$gp" '$2 == p { print $1 }')
+      kill -TERM $kids "$gp" 2>/dev/null
       end=$((SECONDS + 5))
       while kill -0 "$gp" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
-      pkill -KILL -P "$gp" 2>/dev/null; kill -KILL "$gp" 2>/dev/null
+      kill -KILL $kids "$gp" 2>/dev/null
       break
     fi
     sleep 0.2
