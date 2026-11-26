@@ -1021,6 +1021,17 @@ POST_KEEP = 7 * 86400  # finished writes stay this long for `post status`
 POST_UNREADABLE = 60  # a queue file unreadable this long after its last write is dropped as failed
 POST_BODY_MAX = 65536  # GitHub's limit for a comment, review or PR body
 POST_ID = re.compile(r"\d{13}-\d+-[0-9a-f]{6}")  # queued-at ms, client pid, random: sorts oldest first
+# The stall page (Leo, 2026-11-26, relayed: "the PR-creation queue should page when its position is unchanged for 10
+# minutes"). A queued write whose place in send order has not moved for POST_STALL_AFTER sends one FIRE: to the session
+# that queued it ("requester", recorded by post_item) and to the queue's owner (tell-coordinator's default route),
+# naming the post, its place and what it waits behind. Measured on the land host 2026-11-26: nothing left the outbox
+# 12:46-13:31Z while the login's create pause and the pacer's secondary hold kept renewing; 34 of 491 writes that day
+# sat 10+ min at one place (the worst 44 min, 58 deep) and nobody was told. Places are kept in POST_STALLS_FILE so a
+# restart (five in that window) neither restarts the clock nor sends a page twice. The owner gets one page per blocker
+# (the write at the head), not one per write behind it; each requester gets one per write. Detector:
+# PostStallPageTest in test-glaeda-gh.py.
+POST_STALL_AFTER = 600.0
+POST_STALLS_FILE = "post-stalls.json"
 THROTTLED = re.compile(r"submitted too quickly|secondary rate limit|abuse detection", re.I)
 # Comments for one thread that are in the queue together, queued within POST_JOIN_WINDOW of the first, go out as one
 # comment: each body whole, in queue order, under a rule. Only what is already queued is joined (no write waits for a
@@ -8355,6 +8366,77 @@ class Daemon:
                     self.post_at = logged_at  # a poster's write spaces nothing of the login's
             return
 
+    def post_blocker_why(self, head: dict) -> str:
+        """What holds the outbox's head write, in words: the daemon's holds on the login, then the head's own."""
+        clock, parts = self.clock(), []
+        if self.pause_until > clock:
+            parts.append(f"the login's create pause for {span(self.pause_until - clock)}")
+        if self.secondary_until > clock:
+            parts.append(f"GitHub's secondary-limit hold for {span(self.secondary_until - clock)}")
+        if self.post_hold > self.now:
+            parts.append(f"the outbox's throttle hold for {span(self.post_hold - self.now)}")
+        if (head.get("notBefore") or 0) > self.now:
+            parts.append(f"its own retry in {span(head['notBefore'] - self.now)}")
+        if head.get("throttleWhy"):
+            parts.append(f"throttled {head.get('throttled', 1)}x ({head['throttleWhy']})")
+        if head.get("lastError"):
+            parts.append(f"last attempt: {land_trim(str(head['lastError']), 160)}")
+        return "; ".join(parts) or "no hold this daemon knows of (its turn has not come)"
+
+    def post_stall_check(self) -> list[str]:
+        """POST_STALL_AFTER's page: every queued write whose place in send order has not changed for that long gets
+        one FIRE, to its requester and the queue's owner. Returns the ids paged this call."""
+        queue = [(p, i) for p, i in outbox_queue() if isinstance(i, dict) and i.get("id") == p.stem]
+        path = BASE / POST_STALLS_FILE
+        if not queue:
+            if path.exists():
+                with contextlib.suppress(OSError):
+                    path.unlink()
+            return []
+        saved = read_json(path)
+        saved = saved if isinstance(saved, dict) else {}
+        places = saved.get("places") if isinstance(saved.get("places"), dict) else {}
+        owner_told = list(saved["ownerTold"]) if isinstance(saved.get("ownerTold"), list) else []
+        head = queue[0][1]
+        kept, paged = {}, []
+        for ahead, (_, item) in enumerate(queue):
+            pid = item["id"]
+            was = dict(places[pid]) if isinstance(places.get(pid), dict) else None  # a copy: saved is compared below
+            if was is None or was.get("ahead") != ahead:
+                was = {"ahead": ahead, "since": self.now, "paged": False}  # first seen here, or moved: now
+            kept[pid] = was
+            if was["paged"] or self.now - float(was["since"]) < POST_STALL_AFTER:
+                continue
+            was["paged"] = True
+            paged.append(pid)
+            self.post_stall_page(item, ahead, self.now - float(was["since"]), head, len(queue),
+                                 tell_owner=head["id"] not in owner_told)
+            if head["id"] not in owner_told:
+                owner_told.append(head["id"])
+        doc = {"places": kept, "ownerTold": [i for i in owner_told if i in kept][-50:]}
+        if doc != saved:
+            write_json(path, doc)
+        return paged
+
+    def post_stall_page(self, item: dict, ahead: int, still: float, head: dict, depth: int, tell_owner: bool) -> None:
+        """One stalled write's FIRE: a notice line always, the requester's page, and the owner's when TELL_OWNER."""
+        where = lambda i: f"{i.get('kind', '?')} {i.get('repo') or '?'}" + (  # noqa: E731
+            f"#{i['number']}" if i.get("number") else f" {i.get('head')}" if i.get("head") else "")
+        behind = ("it is at the head; " if head["id"] == item["id"]
+                  else f"it waits behind {head['id']} ({where(head)}); ")
+        text = (f"FIRE glaeda-gh post queue on {policy_host()}: post {item['id']} ({where(item)}) has sat at position "
+                f"{ahead} ({ahead} ahead, {depth} queued) for {span(still)}; {behind}held by "
+                f"{self.post_blocker_why(head)}. Read it: glaeda-gh post status {item['id']}")
+        requester = str(item.get("requester") or "")
+        data = {"id": item["id"], "ahead": ahead, "depth": depth, "stillS": round(still), "head": head["id"],
+                "requester": requester}
+        log({"event": "post-stalled", **data})
+        notice_line(self.now, "post-stalled", "fire", text, data)
+        if requester:
+            incident_send(text, "fire", f"post-stalled:{item['id']}", to=requester, cls="block")
+        if tell_owner:
+            incident_send(text, "fire", f"post-stalled-head:{head['id']}")
+
     def post_due(self) -> None:
         """post_between on the outbox's own clock, asked before every read request: once POST_SPACING has passed since
         post_tick last ran, the outbox gets its turn, under every hold post_tick keeps (the pacer, the secondary limit,
@@ -9930,6 +10012,10 @@ class Daemon:
                 self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        try:
+            self.post_stall_check()
+        except Exception as error:  # noqa: BLE001  a page that cannot be judged never stops the reads
+            self.errors.append(f"outbox stall check: {describe(error)} at {error_site(error)}")
         # Wall time, as a watch file's mtime is when it was asked. Linux stamps mtimes from its coarse clock, up to a
         # jiffy behind time.time(), so a head asked just after this read could carry an earlier mtime and was skipped
         # until the next tick (2026-11-25): read_heads_between also takes a file up to WATCH_MTIME_SLACK older, unless
@@ -40010,6 +40096,10 @@ def post_item(args: argparse.Namespace) -> dict:
     item: dict[str, Any] = {"kind": args.kind, "body": body, "queuedAt": time.time(),
                             "attempts": 0, "by": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("ACPMUX_SESSION")
                             or os.getcwd()}
+    with contextlib.suppress(Exception):  # who the stall page tells (POST_STALL_AFTER); none is fine
+        requester = land_requester(None)
+        if requester:
+            item["requester"] = requester
     lane = post_queue_lane()
     if lane:
         item["lane"] = lane  # the lane a lane VM's daemon writes it as (post_lane_env): the caller's, not its own

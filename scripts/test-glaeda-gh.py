@@ -19105,6 +19105,77 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None, "pause": None})  # no keeper, no ask
 
 
+class PostStallPageTest(unittest.TestCase):
+    """POST_STALL_AFTER (Leo, 2026-11-26, relayed: "the PR-creation queue should page when its position is unchanged
+    for 10 minutes"): a queued write whose place has not moved for 10 minutes sends one FIRE, to its requester and the
+    queue's owner, naming the post, its place and what it waits behind; once per write, once per blocker for the owner,
+    across a restart."""
+
+    daemon = PostTest.daemon
+    queue = PostTest.queue
+
+    def setUp(self) -> None:
+        PostTest.setUp(self)  # type: ignore[arg-type]  # its own BASE, no body guard
+        self.sent: list[tuple] = []
+        spawn = mock.patch.object(gg, "incident_send", side_effect=lambda *a, **k: self.sent.append((a, k)))
+        spawn.start()
+        self.addCleanup(spawn.stop)
+        notices = mock.patch.object(gg, "NOTICES_DIR", Path(self.tmp.name) / "notices")
+        notices.start()
+        self.addCleanup(notices.stop)
+
+    def queued(self, number: int, requester: str) -> dict:
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": requester.split("/", 1)[1]}), \
+                mock.patch.object(gg, "policy_host", lambda: requester.split("/", 1)[0]), \
+                mock.patch.object(gg, "land_session_host", lambda name: ("", name)):
+            return self.queue("comment", f"o/r#{number}", "--body", "x")
+
+    def test_a_write_stuck_at_one_place_for_ten_minutes_pages_its_requester_and_the_owner_once(self) -> None:
+        head = self.queued(1, "peer/one")
+        second = self.queued(2, "peer/two")
+        self.assertEqual(head["requester"], "peer/one")
+        d, _ = self.daemon()
+        d.pause_until = NOW + 3600  # the login's create pause holds every write
+        d.clock_real = False
+        d.now = NOW
+        self.assertEqual(d.post_stall_check(), [])
+        d.now = NOW + gg.POST_STALL_AFTER - 1
+        self.assertEqual(d.post_stall_check(), [], "under ten minutes: no page")
+        d.now = NOW + gg.POST_STALL_AFTER
+        self.assertEqual(d.post_stall_check(), [head["id"], second["id"]])
+        to_requesters = [k.get("to") for _, k in self.sent if k.get("to")]
+        self.assertEqual(to_requesters, ["peer/one", "peer/two"])
+        owner = [a for a, k in self.sent if not k.get("to")]
+        self.assertEqual(len(owner), 1, "the owner hears once per blocker, not once per write behind it")
+        text = next(a[0] for a, k in self.sent if k.get("to") == "peer/two")
+        self.assertIn(f"post {second['id']}", text)
+        self.assertIn("position 1", text)
+        self.assertIn(f"behind {head['id']}", text)
+        self.assertIn("create pause", text)
+        self.assertTrue(all(a[1] == "fire" for a, _ in self.sent))
+        # deduped, and across a restart (a new daemon reads the kept places)
+        d2, _ = self.daemon()
+        d2.clock_real, d2.pause_until, d2.now = False, NOW + 3600, NOW + 3 * gg.POST_STALL_AFTER
+        self.assertEqual(d2.post_stall_check(), [])
+        self.assertEqual(len(self.sent), 3)
+
+    def test_a_moving_queue_never_pages_and_an_empty_one_keeps_nothing(self) -> None:
+        first = self.queued(1, "peer/one")
+        second = self.queued(2, "peer/two")
+        d, _ = self.daemon()
+        d.clock_real, d.now = False, NOW
+        d.post_stall_check()
+        d.now = NOW + gg.POST_STALL_AFTER - 60
+        gg.outbox_dir().joinpath(f"{first['id']}.json").unlink()  # the head went out: the second moved up
+        d.post_stall_check()
+        d.now = NOW + gg.POST_STALL_AFTER + 60
+        self.assertEqual(d.post_stall_check(), [], "its place changed 2 min ago")
+        self.assertEqual(self.sent, [])
+        gg.outbox_dir().joinpath(f"{second['id']}.json").unlink()
+        d.post_stall_check()
+        self.assertFalse((gg.BASE / gg.POST_STALLS_FILE).exists())
+
+
 class PauseKeeperNeverStallsReadsTest(Base):
     """2026-11-18: a daemon whose gh-quota answered every `content-pause` ask with a usage error was found with PR data
     an hour old behind a fresh heartbeat, the ask's error the newest in its stale alarm. The ask runs on its own
