@@ -8188,6 +8188,27 @@ LANE_HOME_FAMILY_IDS = frozenset(t[0] for t in LANE_HOME_TREES)
 WT_CARGO_TARGET = "wt-cargo-target"
 WT_CHECKOUTS = ".wt/checkouts"  # tools/wt's host_worktrees, below HOME
 SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | LANE_HOME_FAMILY_IDS | {"claude-scratchpad", WT_CARGO_TARGET}
+# The machine git cache on a lane VM (`cmux host git-cache serve --cache /var/cache/cmux/git-cache`, started by
+# leo-workspace tools/lane_vm_git_cache.py; cmux-tui crates/cmux-git-cache). Its layout is
+# <root>/<tenant>/github.com/<owner>/<repo>.git (full bare mirrors of GitHub) and <root>/crates (a crates.io mirror).
+# No family's root reached /var/cache, so fs-agent-lane-24 (2026-11-26, 83% of 63G) reported 36.1G "unclassified"
+# and 0.0G reclaimable while 24G of it was this cache: a 16G fill pack of manaflow-ai/cmux.git, its kept clone packs,
+# and 7.9G of objects/pack/tmp_pack_* that the cache's stopped fetches left behind (it killed git, not git's
+# index-pack, which wrote on after the cache's own clear). Two families:
+# - GIT_CACHE_PARTIAL: a mirror's partial writes (objects/pack/tmp_*, .tmp-*), any run, once nothing wrote them for
+#   GIT_CACHE_PARTIAL_IDLE_HOURS (the cache's own STALE_PARTIAL: every live writer touches its file) and no process
+#   holds them open. Nothing reads them: git never serves a tmp pack.
+# - GIT_CACHE_MIRRORS: a whole mirror, and the crates store, under pressure only, once nothing below it changed for
+#   GIT_CACHE_MIRROR_IDLE_HOURS and no process (an upload-pack serving it, a fill) has a file open in it. The cache
+#   refills a mirror on the next miss, and only above its own disk floor (cmux-git-cache room.rs), so an evicted
+#   mirror stays away until the host has room.
+GIT_CACHE_ROOT = Path("/var/cache/cmux/git-cache")
+GIT_CACHE_PARTIAL = "git-cache-partial-writes"
+GIT_CACHE_MIRRORS = "git-cache-mirrors"
+GIT_CACHE_CRATES = "git-cache-crates"
+GIT_CACHE_PARTIAL_IDLE_HOURS = 1.0
+GIT_CACHE_MIRROR_IDLE_HOURS = 0.5
+GIT_CACHE_OWNER = "cmux host git-cache (leo-workspace tools/lane_vm_git_cache.py)"
 ACPMUX_DEAD_STATUSES = frozenset({"closed"})  # acpmux's own: a closed session's folder goes at its purge
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION_ENV_KEYS = ("ACPMUX_SESSION_ID",)
@@ -8610,6 +8631,39 @@ def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
         fams.append(Family(WT_CARGO_TARGET, wt_root, True, "cargo builds it again in its worktree",
                            checkout_builds=True, build_output=True, min_idle_hours=window, deep_mtime=True,
                            owner="cargo, in a tools/wt lane worktree", rebuild_minutes=10, platform="linux"))
+    fams += git_cache_families(GIT_CACHE_ROOT)
+    return fams
+
+
+def git_cache_mirrors(root: Path) -> list[Path]:
+    """The git cache's mirror directories, <root>/<tenant>/github.com/<owner>/<repo>.git; no symlink is followed."""
+    def dirs(p: Path) -> list[Path]:
+        return [c for c in _children(p) if not c.is_symlink() and c.is_dir()]
+    return [repo for tenant in dirs(root) if tenant.name != "crates"
+            for host in dirs(tenant) if host.name == "github.com"
+            for owner in dirs(host) for repo in dirs(owner) if repo.name.endswith(".git")]
+
+
+def git_cache_families(root: Path) -> list[Family]:
+    """The machine git cache's families (GIT_CACHE_ROOT's comment says which and why): none when it is absent."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    fams = [Family(GIT_CACHE_MIRRORS, root, True, "the git cache fills the mirror again on its next miss",
+                   depth=4, skip=("crates",), pressure_only=True, build_output=True,
+                   min_idle_hours=GIT_CACHE_MIRROR_IDLE_HOURS, deep_mtime=True, owner=GIT_CACHE_OWNER,
+                   rebuild_minutes=20, platform="linux")]
+    crates = root / "crates"
+    if crates.is_dir() and not crates.is_symlink():
+        fams.append(replace(fams[0], id=GIT_CACHE_CRATES, root=crates, depth=1, skip=(),
+                            rebuild="the git cache downloads the crate again on its next miss"))
+    for mirror in git_cache_mirrors(root):
+        pack = mirror / "objects/pack"
+        if pack.is_dir() and not pack.is_symlink():
+            fams.append(Family(GIT_CACHE_PARTIAL, pack, True, "nothing: git never serves a partial pack",
+                               files=True, include=("tmp_", ".tmp-"), build_output=True,
+                               min_idle_hours=GIT_CACHE_PARTIAL_IDLE_HOURS,
+                               max_idle_hours=GIT_CACHE_PARTIAL_IDLE_HOURS, owner=GIT_CACHE_OWNER,
+                               rebuild_minutes=0.0, platform="linux"))
     return fams
 
 
