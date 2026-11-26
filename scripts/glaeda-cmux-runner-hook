@@ -6236,6 +6236,7 @@ GIT_SHIM_TRIES = 3
 GIT_SHIM_STALL_S = 60
 GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
 GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
+GIT_SHIM_CONTROLLER_S = 120  # one fetch of ids the mirror lacks from the build controller's git proxy
 GIT_SHIM_PROXY_PROBE_S = 10  # one CONNECT to github.com through the configured proxy; no answer in this long: go direct
 GIT_SHIM_BODY = r'''
 say() { echo "glaeda git shim: $*" >&2; }
@@ -6463,6 +6464,29 @@ bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped p
   wait "$gp" 2>/dev/null
   rc=$?
 }
+# An id the mirror lacks (a pull request's merge commit: the mirror keeps only its branches, and refs/pull/N/merge
+# moves with every push to the base, so a once-a-minute poll of hundreds of them is no fit) is asked of the build
+# controller's git proxy first: it fetches from GitHub with an App read token and caches a fetch of ids, so the
+# mini's GitHub tunnel and anonymous quota are out of the path (cmux job 139897456067, 2026-11-26: a merge commit
+# fetched through the tunnel died with curl 18, then curl 92; "the mirror served 0"). One bounded try; on failure
+# github.com as before.
+if [ -n "$ids_only" ] && [ "$kind" = cmux ] && [ -n "${controller:-}" ] && [ "${GLAEDA_GIT_SHIM_CONTROLLER:-1}" != 0 ]; then
+  errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
+  saved=(${route[@]+"${route[@]}"})
+  route=(-c "url.$controller/v1/git/manaflow-ai/cmux.git.insteadOf=$url")
+  cbound=${GLAEDA_GIT_SHIM_CONTROLLER_S:-$controller_s}
+  say "asking the build controller's git proxy for ${refspecs[*]} (at most $cbound s)"
+  bounded_git "$cbound"
+  route=(${saved[@]+"${saved[@]}"})
+  if [ $rc -eq 0 ]; then
+    rm -f "$errf"
+    note controller
+    say "served by the build controller's git proxy; github.com git fetches this job: $(count)"
+    exit 0
+  fi
+  say "the build controller's git proxy failed (exit $rc${stopped:+, stopped at $cbound s}): $(tail -1 "$errf"); asking github.com"
+  rm -f "$errf"
+fi
 try=1
 while :; do
   # A shallow fetch of commit ids (actions/checkout's) is small, so a slow one is a stuck one: the watchdog
@@ -6489,10 +6513,13 @@ while :; do
   fi
   refused=
   grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect|too slow|timed out' "$errf" && refused=1
-  # curl's words for a proxy or tunnel that failed (case-sensitive: "unexpected disconnect" is GitHub's, not these)
-  if [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] &&
-     grep -Eq '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf"; then
-    go_direct "failed this attempt ($(grep -E '[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect' "$errf" | head -1 | sed -E "s/^.*'[^']*': //; s/^[a-z]+: //"))"
+  # curl's words for a proxy or tunnel that failed (case-sensitive: "unexpected disconnect" is GitHub's, not these).
+  # A transfer cut short inside the tunnel counts too: curl 18 (partial file), 56 (recv) and 92 (HTTP/2 stream
+  # CANCEL) through the proxy (cmux job 139897456067, 2026-11-26: curl 18, then curl 92, 5 min apart). The retry
+  # goes direct, a second route, rather than through the same tunnel again.
+  tunnel_err='[Pp]roxy|CONNECT|Recv failure|Connection reset|Failed to connect|Couldn.t connect|curl (18|56|92)[^0-9]'
+  if [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && grep -Eq "$tunnel_err" "$errf"; then
+    go_direct "failed this attempt ($(grep -E "$tunnel_err" "$errf" | head -1 | sed -E "s/^.*'[^']*': //; s/^[a-z]+: //; s/^RPC failed; //"))"
     refused=1
   fi
   rm -f "$errf"
@@ -6520,13 +6547,14 @@ done
 '''
 
 
-def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
+def git_shim_script(real_git: str, mirror: Path, log: Path, controller: str | None = None) -> str:
     """The shim's text: the values the hook resolved, then GIT_SHIM_BODY. /bin/bash, so 3.2 on a mini."""
     head = (f"#!/bin/bash\n# glaeda-cmux-runner-hook GIT_SHIM: written at job-started; see the hook.\n"
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
             f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
             f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
-            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n")
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n"
+            f"controller={shlex.quote(controller or '')}\ncontroller_s={GIT_SHIM_CONTROLLER_S}\n")
     return head + GIT_SHIM_BODY
 
 
@@ -6550,7 +6578,9 @@ def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mappi
         shim_dir.mkdir(parents=True, exist_ok=True)
         log = Path(temp) / GIT_SHIM_LOG
         tmp = shim_dir / f".git.{os.getpid()}"
-        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log), encoding="utf-8")
+        # the job's own environ (production) reads the controller like glaeda-gh; a test's environ names it or none
+        controller = load_cap_controller() if environ is None else env.get("GLAEDA_GIT_SHIM_CONTROLLER_URL")
+        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log, controller), encoding="utf-8")
         tmp.chmod(0o755)
         os.replace(tmp, shim_dir / "git")
         with open(path_file, "a", encoding="utf-8") as fh:

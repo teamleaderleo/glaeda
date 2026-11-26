@@ -23878,6 +23878,58 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", second)
         self.assertEqual(self.log(), ["github", "github"])
 
+    def test_a_merge_commit_the_mirror_lacks_comes_from_the_controller_proxy(self) -> None:
+        # cmux job 139897456067: a pull request's merge commit, which no mirror pass brings, went to github.com
+        # through the tunnel and died (curl 18, then curl 92). The controller's git proxy is asked first.
+        controller = self.dir / "controller"
+        served = controller / "v1" / "git" / "manaflow-ai" / "cmux.git"
+        served.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(self.github), os.fspath(served))
+        self.git(served, "config", "uploadpack.allowAnySHA1InWant", "true")
+        hook.install_git_shim("manaflow-ai/cmux", self.mirror,
+                              {**self.job_env, "GLAEDA_GIT_SHIM_CONTROLLER_URL": f"file://{controller}"})
+        shutil.rmtree(self.github)  # github.com is unreachable: only the controller has it
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("served by the build controller's git proxy", result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+        self.assertEqual(self.git(self.ws, "config", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(self.log(), ["controller"])
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "github.com git fetches: 0 (the mirror served 0)")
+
+    def test_a_controller_proxy_that_fails_falls_back_to_github(self) -> None:
+        hook.install_git_shim("manaflow-ai/cmux", self.mirror,
+                              {**self.job_env, "GLAEDA_GIT_SHIM_CONTROLLER_URL": f"file://{self.dir}/nowhere"})
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the build controller's git proxy failed", result.stderr)
+        self.assertEqual(self.log(), ["github"])
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+
+    def test_a_transfer_cut_short_in_the_tunnel_retries_direct(self) -> None:
+        # cmux job 139897456067: "RPC failed; curl 18 Transferred a partial file", then "curl 92 HTTP/2 stream 5
+        # was not closed cleanly: CANCEL (err 8)", both through the mini's proxy, 5 min apart
+        for error in ("error: RPC failed; curl 18 Transferred a partial file",
+                      "error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL (err 8)",
+                      "error: RPC failed; curl 56 Recv failure: Operation timed out"):
+            with self.subTest(error=error):
+                for leftover in ("argv", "curl-argv", "failed", "fake-git", "bin"):
+                    path = self.dir / leftover
+                    shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+                self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n'
+                                          "[protocol \"file\"]\n\tallow = always\n")
+                for mark in ("glaeda-git-fetches.log", "glaeda-git-fetches.log.direct",
+                             "glaeda-git-fetches.log.proxy-ok"):
+                    (self.temp / mark).unlink(missing_ok=True)
+                argv, _, env = self.proxied(curl_exit=0, first_fetch_error=error + "\nfatal: early EOF")
+                result = self.checkout_fetch(self.pr_sha, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("failed this attempt (curl ", result.stderr)
+                self.assertIn("going direct", result.stderr)
+                first, second = argv.read_text().splitlines()
+                self.assertNotIn(".proxy=", first)
+                self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", second)
+
     def test_another_github_repos_clone_and_fetch_get_the_probe_too(self) -> None:
         # SwiftPM's package clones and another repo's fetch run the shim's git too, through the same proxy
         argv, curl_argv, env = self.proxied(curl_exit=28)
