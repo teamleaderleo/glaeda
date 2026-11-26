@@ -355,7 +355,22 @@ class HookTest(unittest.TestCase):
         self.dir = Path(self.tmp.name)
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        # job-started and job-completed leave a detached disk pass (disk_pressure_detached) that outlives the hook and
+        # writes its trigger, lock and log under HOME/.cache/glaeda-disk: a cleanup that races it fails with
+        # "Directory not empty: 'glaeda-disk'" (runner-tests shard 2, glaeda#2876, 2026-11-26). Wait, bounded, for the
+        # pass lock to be let go, then retry the removal of what the pass wrote meanwhile.
+        lock = self.dir / ".cache" / "glaeda-disk" / hook.DISK_PASS_LOCK
+        deadline = time.monotonic() + 10
+        while lock.exists() and hook.disk_pass_running(lock) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for attempt in range(20):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.ENOENT) or attempt == 19:
+                    raise
+                time.sleep(0.1)
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -1611,6 +1626,58 @@ class HookTest(unittest.TestCase):
             self.assertIn("host reserved by cmux-nightly", held.stdout)
         finally:
             (fleet / "reservation.json").unlink(missing_ok=True)
+            self.finish("")
+
+    def test_the_nightly_slot_takes_no_stack_job_while_the_mini_drains_for_a_measurement(self) -> None:
+        """MEASURE_DRAIN_SLOT: 2026-11-26, new PR jobs started through the nightly slot on 5 minis cmux-ci drained for a
+        measurement (its marker skips the slot so nightlies run). While another runner carries cmux-ci's live drain
+        marker, the slot refuses a stack-blocker PR job at once; a nightly job is still admitted, and another
+        writer's marker or an expired one changes nothing. Before: the stack job was admitted under the drain."""
+        drained = self.dir / "actions-runner-glaeda-3"
+        drained.mkdir()
+        marker = drained / hook.RUNNER_DRAIN_FILE
+
+        def mark(by: str, until: float) -> None:
+            marker.write_text(json.dumps({"until": until, "by": by,
+                                          "reason": "cmux-ci lend drain: a measurement waits for this mini"}))
+
+        now = time.time()
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "no marker")
+        mark(hook.CMUX_CI_DRAIN_BY, now + 600)
+        self.assertIn("actions-runner-glaeda-3 is draining for cmux-ci lend drain",
+                      hook.measurement_drain(self.dir, now))
+        mark(hook.APPLY_DRAIN_BY, now + 600)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an apply's relabel drain is no measurement")
+        mark(hook.CMUX_CI_DRAIN_BY, now - 1)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an expired marker")
+
+        self.fleet()
+        pull = event(self.dir, "stack-pr-drained", {
+            "repository": CMUX,
+            "pull_request": {"number": 45498, "labels": [{"name": hook.STACK_BLOCKER_LABEL}],
+                             "head": {"repo": {"full_name": "manaflow-ai/cmux"}}, "base": {"repo": CMUX}}})
+        pr_env = {"GITHUB_REF": "refs/pull/45498/merge", "GITHUB_JOB": "daemon-test",
+                  "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/45498/merge"}
+        push = event(self.dir, "nightly-push-drained", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        nightly_env = {"GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "build-nightly-app",
+                       "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"), "--gui-wait", "0", "--nightly-runner")
+        try:
+            mark(hook.CMUX_CI_DRAIN_BY, time.time() + 600)
+            refused = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("drains for a measurement", refused.stdout)
+            self.assertIn("owned-pool rescue", refused.stdout)
+            nightly = self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=nightly_env)
+            self.assertEqual(nightly.returncode, 0, "a nightly job on the slot is admitted under the drain: "
+                             + nightly.stdout + nightly.stderr)
+            self.finish("")
+            marker.unlink()
+            admitted = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+        finally:
             self.finish("")
 
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
@@ -6268,13 +6335,15 @@ time.sleep(60)
         for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
                      "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
             self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
-        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+        uid = 501
+        daemon, root = (4242, uid, "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
 
         def recycle(*tables, error=None):
             """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
             seq = list(tables)
             ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
             with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook.os, "getpid", return_value=4241), mock.patch.object(hook.os, "getuid", return_value=uid), \
                     mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
                 return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
 
@@ -6283,12 +6352,12 @@ time.sleep(60)
         self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
         self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
         # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "Z", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242")
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "SE", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
         # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
-        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        note, kills = recycle([daemon], [daemon, (7, uid, "S", "/x/usr/bin/xctest /x/a.xctest")])
         self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
         self.assertEqual(kills, [(4242, term)])
         self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
@@ -7867,7 +7936,11 @@ elif args[:1] == ["default"] and args[1] in installed:
     open(state + "/rustup-default", "w").write(args[1])
     print("info: default toolchain set to " + args[1])
 elif args[:1] == ["run"]:
-    print(json.load(open(state + "/rustc-by-toolchain.json")).get(args[1] + "-aarch64-apple-darwin", ""))
+    name = args[1] if args[1] in installed else args[1] + "-aarch64-apple-darwin"
+    if name not in installed:  # as rustup 1.29: "error: toolchain '...' is not installed", exit 1
+        print("error: toolchain '" + name + "' is not installed", file=sys.stderr)
+        sys.exit(1)
+    print(json.load(open(state + "/rustc-by-toolchain.json")).get(name, ""))
 else:
     sys.exit(1)
 """)
@@ -7971,7 +8044,6 @@ else:
             "other-receipt": (dict(enrolled_sha="sha256:bb"), "does not reference the m4pro-48 class receipt"),
             "rustc-drift": (dict(tools={"rustcVersion": "rustc 1.99.0"}), "rustcVersion 'rustc 1.99.0'"),
             "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
-            "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
             "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
             "receipt-invalid": (dict(valid=False), "class receipt does not validate"),
             "wrong-role": (dict(role="some_other_role"), "some_other_role: ok"),
@@ -8054,6 +8126,36 @@ else:
         self.assertIn("diffRustcVersion", result.stdout)
         self.assertTrue(self.lock_free())
 
+    def test_an_empty_toolchain_probe_warns_and_never_reads_as_drift(self) -> None:
+        """PROBE_EMPTY_WARNS. 2026-11-22: cruft-sweep reclaimed the DiffSidecar toolchain (1.88.0) on m6-16 minis,
+        `rustup run 1.88.0 rustc --version` exited 1, and every fast-tier job was refused as
+        "diffRustcVersion '' != 'rustc 1.88.0 ...'" (cmuxterm-hq#19552 fault 2). A probe that read nothing is a
+        failed probe: it warns and admits; only a different answer is drift."""
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.node(receipt_toolchain=receipt, installed=("1.98.1-aarch64-apple-darwin",))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: diffRustcVersion read nothing", result.stdout)
+        self.assertIn("rust toolchain 1.88.0 is not installed", result.stdout)
+        self.done()
+        import shutil as _sh
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None})  # zig prints nothing: a failed probe, not drift
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("zigVersion read nothing (receipt '0.16.0')", result.stdout)
+        self.done()
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None, "rustcVersion": "rustc 1.99.0"})  # one real answer still refuses
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("rustcVersion 'rustc 1.99.0'", result.stdout)
+        self.assertNotIn("zigVersion ''", result.stdout)
+        self.assertTrue(self.lock_free())
+
     def test_a_timed_out_eligibility_probe_is_named_as_a_timeout_not_an_invalid_receipt(self) -> None:
         """On a mini too loaded to start Python within ELIGIBILITY_BUDGET_S the validator or node status gives no
         answer. node_answer flags it, so the health agent raises no node_ineligible; the refusal names the timeout."""
@@ -8092,14 +8194,17 @@ else:
                                   env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                        "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"})
         self.assertLess(time.monotonic() - start, 30)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        # PROBE_EMPTY_WARNS: the hung tool's empty reading warns, never reads as drift
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("xcodeVersion read nothing", result.stdout)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.done()
         # the same hung tool on a busy host admits: the job is slower, never failed
         result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
                               env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                    "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"})
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("admitted on no answer", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: xcodeVersion read nothing", result.stdout)
 
     def test_no_enrollment_refuses(self) -> None:
         self.fleet()
@@ -9137,9 +9242,9 @@ class XcodeToolchainTest(unittest.TestCase):
                 self.assertIn("timed out after 0 s; no answer, not a missing or drifted tool", why)
                 self.assertIn("gh is not on the job PATH", why)
                 answers.update(gh="gh version 2", zig="")
-                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
-                self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
-                self.assertIn("zigVersion '' != '0.16.0'", why)
+                why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIsNone(why, "an empty reading is a failed probe, never drift (PROBE_EMPTY_WARNS)")
+                self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
                 answers.update(zig="0.15.0")
                 why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
                 self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
@@ -9178,7 +9283,7 @@ class XcodeToolchainTest(unittest.TestCase):
             answers.update(gh="gh version 2", zig="")
             why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertIsNone(why, "an empty drift past the budget admits too")
-            self.assertIn("zigVersion '' != '0.16.0'", note)
+            self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
             answers.update(zig="0.15.0")
             why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
@@ -13845,6 +13950,103 @@ class GateTest(unittest.TestCase):
         self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
         gate.thaw()
 
+    def drained_listener_with_worker(self) -> tuple[subprocess.Popen, int, Path]:
+        """A process whose command is this runner's Runner.Listener, with one child (its Worker); the runner carries
+        a live RUNNER_DRAIN marker. Returns the listener, the Worker's pid and the runner's glaeda-hooks/."""
+        hooks = self.runner / "glaeda-hooks"
+        hooks.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps({"until": time.time() + 600, "reason": "a hold"}))
+        listener = subprocess.Popen(
+            [sys.executable, "-c", "import subprocess, sys, time\n"
+             "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+             "print(c.pid, flush=True)\ntime.sleep(60)\n", os.fspath(self.runner / "bin/Runner.Listener")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(listener.wait)
+        self.addCleanup(listener.kill)
+        self.addCleanup(lambda: os.kill(listener.pid, signal.SIGCONT) if listener.poll() is None else None)
+        worker = int(listener.stdout.readline())
+
+        def end_worker() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(worker, signal.SIGKILL)
+        self.addCleanup(end_worker)
+        return listener, worker, hooks
+
+    def test_job_completed_freezes_a_draining_runners_listener_before_its_worker_exits(self) -> None:
+        """A lent mini, 2026-11-25 19:59-20:03Z: under cmux-ci's RUNNER_DRAIN marker, runners took new PR jobs
+        1-3 s after the last ended, before the gate's freeze at the Worker's exit (glaeda#2809 narrowed that race,
+        it did not close it). job-completed runs while the Worker still runs, so it freezes the listener first; with
+        no gate to take it over, the backstop thaws it soon after the Worker's exit."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 1.0), mock.patch.object(hook, "JOB_END_THAW_WAIT_S", 30.0):
+            note = hook.freeze_listener_at_job_end(hooks, worker)
+        self.assertIn(f"froze the listener (pid {listener.pid})", note or "")
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "the listener is frozen while its Worker runs")
+        doc = hook.job_end_frozen_doc(hooks / hook.JOB_END_FROZEN)
+        self.assertEqual((doc["listener"], doc["worker"]), (listener.pid, worker))
+        time.sleep(1.5)
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "still frozen: its Worker has not exited")
+        os.kill(worker, signal.SIGKILL)  # a zombie: the frozen listener cannot reap it
+        deadline = time.monotonic() + 15
+        while self.stat(listener.pid).startswith("T") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertFalse(self.stat(listener.pid).startswith("T"), "the backstop thawed a listener no gate took")
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_nothing_without_a_drain(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        (self.runner / hook.RUNNER_DRAIN_FILE).unlink()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, worker))
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_only_this_runners_listener(self) -> None:
+        """The Worker's parent must be this runner's own Runner.Listener: another parent is never signalled."""
+        _, _, hooks = self.drained_listener_with_worker()
+        other = self.sleeper()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, other.pid))  # its parent is this test process
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_the_gate_takes_over_the_listener_job_completed_froze_and_stops_it_under_the_drain(self) -> None:
+        """The gate takes the hook's frozen listener over only once the Worker has exited, in the state its own
+        JOB_END_FREEZE leaves (frozen, the Worker done, armed), so the poll after it stops the listener under the
+        drain and step() thaws it whatever it decided."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        marker = hooks / hook.JOB_END_FROZEN
+        with mock.patch.object(gate, "listener_list", return_value=(listener.pid,)):
+            gate.adopt_job_end_freeze()  # the Worker still runs: nothing taken over, the listener stays frozen
+            self.assertEqual(gate.frozen, ())
+            self.assertTrue(marker.exists())
+            self.assertTrue(self.stat(listener.pid).startswith("T"))
+            os.kill(worker, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while not self.stat(worker).startswith("Z") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, (listener.pid,))
+        self.assertIn(worker, gate.done)
+        self.assertTrue(gate.freeze_at_exit)
+        self.assertFalse(marker.exists(), "taken over: the backstop leaves it to the gate")
+        self.assertTrue(self.stat(listener.pid).startswith("T"))
+        gate.thaw()
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+
+    def test_the_gate_leaves_a_frozen_listener_of_another_tree_to_its_backstop(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        os.kill(worker, signal.SIGKILL)
+        with mock.patch.object(gate, "listener_list", return_value=()):
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, ())
+        self.assertTrue((hooks / hook.JOB_END_FROZEN).exists())
+
     def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
         """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
         it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
@@ -15392,6 +15594,20 @@ class GateTest(unittest.TestCase):
         after = [(200, 0, 900, 0), (0, 0, 1100, 0)]
         self.assertEqual(hook.core_busy(before, after), [100.0, 0.0])
         self.assertIsNone(hook.core_busy(before, after[:1]))
+
+    def test_efficiency_cores_counts_only_an_efficiency_level(self) -> None:
+        """M4 Pro: perflevel1 is Efficiency. M5 Pro (5 super + 10 performance, no efficiency cores; Leo's
+        cmux25-34): perflevel1 is Performance, so the P-core stall check must not see efficiency cores there."""
+        def sysctl(levels: dict[str, str]):
+            def run(argv, **_kw):
+                return subprocess.CompletedProcess(argv, 0, stdout="\n".join(levels[k] for k in argv[2:]) + "\n")
+            return run
+        m4pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Efficiency", "hw.perflevel1.logicalcpu": "4"}
+        m5pro = {"hw.nperflevels": "2", "hw.perflevel1.name": "Performance", "hw.perflevel1.logicalcpu": "10"}
+        intel = {"hw.nperflevels": "1"}
+        for levels, want in ((m4pro, 4), (m5pro, None), (intel, None)):
+            with mock.patch.object(hook.subprocess, "run", side_effect=sysctl(levels)):
+                self.assertEqual(hook.efficiency_cores(), want, levels)
 
     def pcore_gate(self, busy: list[float], boot: int = 1794342904):
         totals: list[list[int]] = []
@@ -19560,6 +19776,10 @@ class DedicatedRunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
         self.assertEqual(self.by_kind(receipt)["private"]["state"], "create")
         self.assertTrue(self.by_kind(receipt)["private"]["applied"])
+        agents = [p for p in (self.home / "Library/LaunchAgents").glob("*.plist") if "hq-two-mac-a" in p.read_text()]
+        self.assertEqual(len(agents), 1, agents)
+        self.assertFalse(plistlib.loads(agents[0].read_bytes()).get("SessionCreate", False),
+                         "a user entry's runner runs in its account's GUI session, where /usr/bin/open reaches the app")
         self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
         self.assertEqual(runner.stat().st_mode & 0o777, 0o700)
         ledger = self.home / ".local/state/glaeda/cmux-runner" / cr.USER_CAPACITY_DIR
@@ -23351,6 +23571,269 @@ class JobScratchTest(unittest.TestCase):
         self.assertEqual(seen["argv"], ["/usr/bin/hdiutil", "detach", "-force", "/x"])
         self.assertEqual(seen["env"], {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
         self.assertEqual(seen["timeout"], hook.HDIUTIL_TIMEOUT_S)
+
+
+class GitShimTest(unittest.TestCase):
+    """GIT_SHIM: a cmux job's git fetches read the mini's mirror first and count what still goes to github.com
+    (run 45744507889: the NEXT nightly's checkout got 429 four times, then 403, from github.com)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.gitconfig = self.dir / "gitconfig"
+        # github.com is a local repository here: a fetch the shim sends "to github.com" lands in self.github
+        self.github = self.dir / "github" / "manaflow-ai" / "cmux.git"
+        self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n'
+                                  "[protocol \"file\"]\n\tallow = always\n")
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.fspath(self.gitconfig), "TMPDIR": os.fspath(self.dir),
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com", "GLAEDA_GIT_SHIM_POLL_S": "1",
+                    "GLAEDA_GIT_SHIM_BACKOFF_S": "1", "GLAEDA_GIT_SHIM_WAIT_S": "0"}
+        src = self.dir / "src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        (src / "a.txt").write_text("a\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "on main")
+        self.main_sha = self.git(src, "rev-parse", "HEAD")
+        self.mirror = self.dir / "fleet" / "git" / "cmux.git"
+        self.mirror.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.mirror))
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        (src / "b.txt").write_text("b\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "a pull request's merge commit")  # only github.com has it
+        self.pr_sha = self.git(src, "rev-parse", "HEAD")
+        self.github.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.github))
+        self.git(self.github, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.ws = self.dir / "work" / "cmux"
+        self.ws.mkdir(parents=True)
+        self.git(self.ws, "init", "-q")
+        self.git(self.ws, "remote", "add", "origin", "https://github.com/manaflow-ai/cmux")
+        self.temp = self.dir / "runner-temp"
+        self.temp.mkdir()
+        self.path_file = self.dir / "github_path"
+        self.path_file.write_text("")
+        self.job_env = {**self.env, "RUNNER_TEMP": os.fspath(self.temp), "GITHUB_PATH": os.fspath(self.path_file)}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def install(self, repo: str = "manaflow-ai/cmux") -> str:
+        return hook.install_git_shim(repo, self.mirror, self.job_env)
+
+    def shim(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([os.fspath(self.temp / hook.GIT_SHIM_DIR / "git"), *args], cwd=self.ws,
+                              env={**self.job_env, **(env or {})}, capture_output=True, text=True, timeout=60)
+
+    def log(self) -> list[str]:
+        path = self.temp / hook.GIT_SHIM_LOG
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def checkout_fetch(self, sha: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        """actions/checkout v6's fetch of one commit."""
+        return self.shim("-c", "protocol.version=2", "fetch", "--no-tags", "--prune", "--no-recurse-submodules",
+                         "--depth=1", "origin", f"+{sha}:refs/remotes/origin/main", env=env)
+
+    def test_install_puts_the_shim_first_on_a_cmux_jobs_path(self) -> None:
+        self.assertIn("read", self.install())
+        self.assertEqual(self.path_file.read_text(), f"{self.temp / hook.GIT_SHIM_DIR}\n")
+        text = (self.temp / hook.GIT_SHIM_DIR / "git").read_text()
+        self.assertIn(f"mirror={self.mirror}", text)
+        self.assertNotIn(hook.GIT_SHIM_DIR, text.splitlines()[2])  # real git is never the shim itself
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "github.com git fetches: 0 (the mirror served 0)")
+
+    def test_no_shim_for_another_repository_an_unverified_mirror_or_the_kill_switch(self) -> None:
+        self.assertEqual(self.install("manaflow-ai/cmux-platform"), "")
+        self.assertEqual(hook.install_git_shim("manaflow-ai/cmux", self.mirror,
+                                               {**self.job_env, "GLAEDA_GIT_SHIM": "0"}), "")
+        (self.mirror / "glaeda-repair-pending").write_text("")
+        self.assertIn("off", self.install())
+        self.assertEqual(self.path_file.read_text(), "")
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "")
+
+    def test_a_commit_the_mirror_holds_comes_from_the_mirror_with_no_github_fetch(self) -> None:
+        self.install()
+        shutil.rmtree(self.github)  # github.com is unreachable: only the mirror can serve it
+        result = self.checkout_fetch(self.main_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("served from the mirror", result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.main_sha)
+        self.assertEqual(self.git(self.ws, "config", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(self.log(), ["mirror"])
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "github.com git fetches: 0 (the mirror served 1)")
+
+    def test_a_commit_only_github_has_is_fetched_from_github_and_counted(self) -> None:
+        self.install()
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+        self.assertEqual(self.log(), ["github"])
+        self.assertIn("github.com git fetches this job: 1", result.stderr)
+
+    def test_a_pattern_fetch_or_another_remote_is_never_redirected(self) -> None:
+        self.install()
+        result = self.shim("fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)  # github's tip
+        self.assertEqual(self.log(), ["github"])
+        self.git(self.ws, "remote", "add", "other", "https://github.com/manaflow-ai/cmux-platform")
+        self.shim("fetch", "other", self.main_sha)
+        self.assertEqual(self.log(), ["github"])  # not cmux: passed through, not counted
+        self.assertEqual(self.shim("--version").returncode, 0)
+
+    def test_a_refusal_backs_off_and_the_mirror_serves_once_it_has_the_commit(self) -> None:
+        self.install()
+        # a git that github.com refuses: the first call fails with a 429, then the mirror gains the commit
+        fake = self.dir / "fake-git"
+        fake.write_text("#!/bin/bash\n"
+                        f"if [[ \" $* \" == *' fetch '* && ! -e {self.dir}/refused ]]; then touch {self.dir}/refused;"
+                        f" /usr/bin/git -C {self.mirror} fetch -q {self.github} {self.pr_sha} 2>/dev/null;"
+                        " echo 'fatal: unable to access: The requested URL returned error: 429' >&2; exit 128; fi\n"
+                        'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("github.com refused", result.stderr)
+        self.assertEqual(self.log(), ["github", "mirror"])
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+
+    def test_a_failure_that_is_no_refusal_is_not_retried(self) -> None:
+        self.install()
+        shutil.rmtree(self.github)
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_run_on_a_mirrored_branch_waits_for_the_mirror_before_asking_github(self) -> None:
+        self.install()
+        fill = subprocess.Popen(["/bin/bash", "-c", f"sleep 2; git -C {self.mirror} fetch -q {self.github} {self.pr_sha}"],
+                                env=self.env)
+        try:
+            result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "push",
+                                                          "GITHUB_REF": "refs/heads/nightly-next",
+                                                          "GLAEDA_GIT_SHIM_WAIT_S": "30"})
+        finally:
+            fill.wait(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+
+class SubmoduleShimTest(unittest.TestCase):
+    """GIT_SHIM for submodules: a cold cmux checkout's `git submodule update` clones each submodule from the
+    mirror pass's submodule mirror (glaeda-git-mirror SUBMODULES), so it sends github.com no git fetch."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.gitconfig = self.dir / "gitconfig"
+        # no protocol.file.allow here: git refuses file:// inside a submodule unless the shim allows it
+        self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n')
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.fspath(self.gitconfig), "TMPDIR": os.fspath(self.dir),
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com", "GLAEDA_GIT_SHIM_POLL_S": "1",
+                    "GLAEDA_GIT_SHIM_BACKOFF_S": "1", "GLAEDA_GIT_SHIM_WAIT_S": "0"}
+        self.url = "https://github.com/manaflow-ai/ghostty.git"
+        src = self.dir / "ghostty-src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        (src / "build.zig").write_text("zig\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "ghostty")
+        self.pin = self.git(src, "rev-parse", "HEAD")
+        self.github = self.dir / "github" / "manaflow-ai" / "ghostty.git"
+        self.github.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.github))
+        self.git(self.github, "config", "uploadpack.allowAnySHA1InWant", "true")
+        fleet = self.dir / "fleet" / "git"
+        self.mirror = fleet / "cmux.git"
+        self.mirror.mkdir(parents=True)
+        self.git(self.mirror, "init", "-q", "--bare")
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        self.sm = fleet / "submodules" / "ghostty.git"
+        self.sm.mkdir(parents=True)
+        self.git(self.sm, "init", "-q", "--bare")
+        self.git(self.sm, "config", "glaeda.url", self.url)
+        self.git(self.sm, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.ws = self.dir / "work" / "cmux"
+        self.ws.mkdir(parents=True)
+        self.git(self.ws, "init", "-q", "-b", "main")
+        (self.ws / ".gitmodules").write_text(f'[submodule "ghostty"]\n\tpath = ghostty\n\turl = {self.url}\n')
+        self.git(self.ws, "update-index", "--add", "--cacheinfo", f"160000,{self.pin},ghostty")
+        self.git(self.ws, "add", ".gitmodules")
+        self.git(self.ws, "commit", "-qm", "cmux")
+        self.git(self.ws, "remote", "add", "origin", "https://github.com/manaflow-ai/cmux")
+        self.temp = self.dir / "runner-temp"
+        self.temp.mkdir()
+        self.path_file = self.dir / "github_path"
+        self.path_file.write_text("")
+        self.job_env = {**self.env, "RUNNER_TEMP": os.fspath(self.temp), "GITHUB_PATH": os.fspath(self.path_file)}
+        self.assertIn("read", hook.install_git_shim("manaflow-ai/cmux", self.mirror, self.job_env))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def shim(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([os.fspath(self.temp / hook.GIT_SHIM_DIR / "git"), *args], cwd=self.ws,
+                              env={**self.job_env, **(env or {})}, capture_output=True, text=True, timeout=60)
+
+    def log(self) -> list[str]:
+        path = self.temp / hook.GIT_SHIM_LOG
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def warm_mirror(self) -> None:
+        self.git(self.sm, "fetch", "-q", "--depth=1", self.url, f"+{self.pin}:refs/heads/main")
+
+    def test_a_cold_checkout_s_submodules_come_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)  # github.com is gone: only the mirror can serve it
+        self.shim("submodule", "sync", "--recursive")
+        done = self.shim("-c", "protocol.version=2", "submodule", "update", "--init", "--force", "--depth=1",
+                         "--recursive")  # actions/checkout v6, submodules: true
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["mirror"])
+        self.assertIn("github.com git fetches: 0 (the mirror served 1)", hook.git_fetch_summary(self.job_env))
+        again = self.shim("-C", "ghostty", "fetch", "--depth=1", "origin", self.pin)  # a fetch inside it
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.log(), ["mirror", "mirror"])
+
+    def test_init_submodule_s_named_path_comes_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)
+        done = self.shim("-c", "http.lowSpeedLimit=1000", "submodule", "update", "--init", "--depth", "1", "--",
+                         "ghostty")  # scripts/ci/init-submodule.sh
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_pin_the_mirror_lacks_goes_to_github_and_is_counted(self) -> None:
+        allow = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+        done = self.shim("submodule", "update", "--init", "--depth=1", env=allow)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_submodule_already_here_sends_nothing_anywhere(self) -> None:
+        self.warm_mirror()
+        self.assertEqual(self.shim("submodule", "update", "--init", "--depth=1").returncode, 0)
+        shutil.rmtree(self.github)
+        shutil.rmtree(self.sm)
+        done = self.shim("submodule", "update", "--init", "--force", "--depth=1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
 
 
 if __name__ == "__main__":
