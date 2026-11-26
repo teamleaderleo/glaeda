@@ -16338,7 +16338,8 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # the merge's draft refusal otherwise (LandQueue.mark_ready), which covers lands queued by any tool. Once per head:
 # a PR converted back to a draft after that is someone's deliberate hold, and stops merge_draft as before; so does a
 # `gh pr ready` that is itself refused. A hold is not a draft's job here: [hold-own-pr] is a HOLD: line or a hold
-# label, which land_judge refuses before any merge is sent.
+# label, which land_judge refuses before any merge is sent. Readying a draft that carries neither is intended policy
+# (coordinator, 2026-11-26), not a side effect: to keep a PR from landing, hold it, or do not queue its land.
 LAND_READY_ONCE = "readySent"
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
@@ -25339,13 +25340,13 @@ class LandQueue:
     def mark_ready(self, e: dict, head: str) -> None:
         """The merge at HEAD was refused because the PR is a draft: mark it ready (LAND_READY_ONCE's comment), once per
         head, and judge it again soon. A refused `gh pr ready` stops the entry merge_draft, as every draft did before.
-        e[LAND_READY_ONCE] is written before the send, so a restart mid-send counts it as sent."""
+        e[LAND_READY_ONCE] is written only once `gh pr ready` answered OK: a restart mid-send (the claim re-judged,
+        load()) or a failed send leaves it unset, so the next draft refusal at this head sends it again."""
         gh = self.gh()
         repo, number = e["repo"], str(e["number"])
         name = key_name(e["key"])
         with self.lock:
             self.claim(e, "ready", sha=head)
-            e[LAND_READY_ONCE] = {"head": head, "at": self.now}
             self.history(e, "ready_sent", head=head[:12])
             self.save(e)
         got = self.call([gh, "pr", "ready", number, "-R", repo], LAND_GH_DEADLINE, e) if gh is not None else \
@@ -25353,6 +25354,7 @@ class LandQueue:
         with self.lock:
             self.finish(e, got)
             if got.returncode == 0:
+                e[LAND_READY_ONCE] = {"head": head, "at": self.now}
                 e.pop("stepFail", None)
                 e.pop("stepTransient", None)
                 self.history(e, "readied", head=head[:12])
@@ -27213,16 +27215,40 @@ def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple
             f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}{pinned}")
 
 
-def land_ready_at_request(key: str, repo: str, number: int, pin: str = "") -> tuple[str, tuple[str, str] | None]:
+# The request-time `gh pr ready` is an early start, never a gate: the merge step's mark_ready answers the same draft
+# anyway. So it is bounded well under a land request's own budget, and a send that does not answer in time queues the
+# land (the merge readies it) instead of holding the request. `land serve` does not wait for it at all: the forwarding
+# host's land_forward_loop waits on that answer, one request at a time, and a slow GitHub there would stall every
+# forward behind it; it starts the send detached (spawn_detached, bounded by LAND_GH_DEADLINE) and answers at once.
+LAND_READY_REQUEST_DEADLINE = 20.0
+
+
+def land_ready_at_request(key: str, repo: str, number: int, pin: str = "",
+                          wait: bool = True) -> tuple[str, tuple[str, str] | None]:
     """(a note, a refusal) for a land request on a PR this host already knows is a draft (land_draft_refusal): the
     request is the intent to merge it, so it is marked ready here (LAND_READY_ONCE's comment) and queued, with a note
-    saying so. ("", None) when the cache knows no draft; a refusal, as before, only when `gh pr ready` is refused."""
+    saying so. ("", None) when the cache knows no draft. A refusal only when `gh pr ready` answered with a refusal
+    within LAND_READY_REQUEST_DEADLINE; no answer in time queues it. WAIT False (land serve) starts the send detached
+    and refuses nothing: a refused send is met by the merge step (mark_ready, merge_draft)."""
     draft = land_draft_refusal(key, repo, number, pin)
     if draft is None:
         return "", None
+    argv = ["gh", "pr", "ready", str(number), "-R", repo]
+    if not wait:
+        try:
+            spawn_detached(argv, LAND_GH_DEADLINE, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except OSError as err:
+            return (f"{repo}#{number} is a draft; `gh pr ready` could not start here ({err}), so the merge step "
+                    "marks it ready"), None
+        return (f"{repo}#{number} was a draft; started `gh pr ready {number} -R {repo}` (the merge step marks it "
+                "ready if that does not take)"), None
     try:
-        got = run_bounded(["gh", "pr", "ready", str(number), "-R", repo], timeout=60)
-    except (subprocess.TimeoutExpired, OSError) as err:
+        got = run_bounded(argv, timeout=LAND_READY_REQUEST_DEADLINE)
+    except subprocess.TimeoutExpired:
+        return (f"{repo}#{number} is a draft; `gh pr ready` did not answer within {LAND_READY_REQUEST_DEADLINE:g} s, "
+                "so it is queued and the merge step marks it ready"), None
+    except OSError as err:
         got = subprocess.CompletedProcess([], 1, "", str(err) or type(err).__name__)
     if got.returncode == 0:
         return (f"{repo}#{number} was a draft; marked it ready (gh pr ready {number} -R {repo}): a land is the "
@@ -27666,7 +27692,8 @@ def cmd_land_serve(text: str) -> int:
         except (WatchError, TypeError):
             key = repo = pin = ""  # land_serve_one below answers a target or pin this host cannot read
             number = 0
-        draft = land_ready_at_request(key, repo, number, pin)[1] if key else None
+        # wait=False: land_forward_loop on the forwarding host waits on this answer (LAND_READY_REQUEST_DEADLINE)
+        draft = land_ready_at_request(key, repo, number, pin, wait=False)[1] if key else None
         if draft is not None:
             print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": draft[0], "next": draft[1],
                               "host": policy_host()}, sort_keys=True))

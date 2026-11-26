@@ -32995,6 +32995,92 @@ class LandTest(Base):
         self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
         self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
 
+    def test_ready_sent_is_recorded_only_after_gh_pr_ready_answers_ok_so_a_restart_mid_send_sends_it_again(self):
+        """F3 of glaeda#2902's review: LAND_READY_ONCE was written before the send, so a restart while `gh pr ready`
+        ran counted it as sent, and the next draft refusal at that head stopped merge_draft with the PR never readied.
+        It is written only once the send answered OK; a restart mid-send re-judges and sends it again."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        path = gg.LandQueue.entries_dir() / gg.file_name(self.KEY)
+        on_disk: list[dict] = []
+        run = self.w.run
+
+        def sending(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if "ready" in argv:
+                on_disk.append(gg.read_json(path))  # what a restart at this instant would load
+            return run(argv, timeout, env)
+
+        self.q.run = sending
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(on_disk), 1)
+        self.assertNotIn(gg.LAND_READY_ONCE, on_disk[0])
+        self.assertEqual(((on_disk[0].get("action") or {}).get("kind"), on_disk[0]["state"]), ("ready", "acting"))
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)  # recorded once it answered OK
+        # The daemon restarts mid-send: the entry on disk is the one taken while `gh pr ready` ran.
+        gg.write_json(path, on_disk[0])
+        self.q = self.queue()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["history"][-1]["event"], e["history"][-1].get("claimed")), ("restart", "ready"))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 2)  # sent again, not counted as sent
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"), e.get("stop"))
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)
+
+    def test_a_refused_ready_send_records_nothing_sent(self):
+        """A `gh pr ready` that failed is not a ready sent: the entry stops merge_draft without LAND_READY_ONCE, so a
+        re-queue after the requester readies or fixes access is met by a fresh send, not a 'draft again' stop."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.gh_rc["ready"] = 1
+        self.w.gh_err["ready"] = "gh-quota: no answer within 120s"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertNotIn(gg.LAND_READY_ONCE, e)
+
+    def test_the_request_time_ready_is_bounded_and_land_serve_never_waits_for_it(self):
+        """F1 of glaeda#2902's review: the request-time `gh pr ready` ran with a 60 s bound inside `land serve`,
+        whose answer the forwarding host's land_forward_loop waits on one request at a time. `land` now bounds it at
+        LAND_READY_REQUEST_DEADLINE and queues on no answer (the merge step readies it), and `land serve` starts it
+        detached and answers at once."""
+        self.pr(LA, draft=True)
+        self.store_pr(land_pr(LA, draft=True))
+        argv = ["gh", "pr", "ready", "1", "-R", "o/r"]
+        # `land`, its caller's own process: bounded, and no answer in time is not a refusal.
+        with mock.patch.object(gg, "run_bounded",
+                               side_effect=subprocess.TimeoutExpired(argv, gg.LAND_READY_REQUEST_DEADLINE)) as run:
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1)
+        self.assertIsNone(refusal)
+        self.assertEqual(run.call_args.kwargs["timeout"], gg.LAND_READY_REQUEST_DEADLINE)
+        self.assertLess(gg.LAND_READY_REQUEST_DEADLINE, 60)
+        self.assertIn("did not answer within 20 s", note)
+        self.assertIn("the merge step marks it ready", note)
+        # wait=False (land serve): started detached, never waited on, and a refusal cannot be given here.
+        with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("serve must not wait")), \
+                mock.patch.object(gg, "spawn_detached") as spawn:
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1, wait=False)
+        self.assertIsNone(refusal)
+        self.assertEqual(spawn.call_args.args, (argv, gg.LAND_GH_DEADLINE))
+        self.assertIn("started `gh pr ready 1 -R o/r`", note)
+        with mock.patch.object(gg, "spawn_detached", side_effect=OSError("no gh")):
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1, wait=False)
+        self.assertIsNone(refusal)
+        self.assertIn("could not start here (no gh)", note)
+        # and `land serve` is the caller that passes wait=False
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_ready_at_request", return_value=("", ("why", "nxt"))) as ready, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1", "sha": LA}))
+        self.assertEqual(json.loads(out.getvalue())["code"], "land_draft")
+        self.assertIs(ready.call_args.kwargs["wait"], False)
+
     def test_a_pin_this_queue_already_followed_forward_leaves_the_live_row_alone(self):
         """A land the queue already followed forward is answered with the pin the row holds, never re-pinned backwards.
         efficiency-standing-lane, 2026-11-22: glaeda#2542 was queued pinned 27b86dab, followed to 3ec2af7c by
