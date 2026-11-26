@@ -40214,6 +40214,18 @@ class LandWaitAlarmTest(AlarmBase):
                                                     "checks": [{"status": "IN_PROGRESS"}]}}
         self.assertEqual(gg.land_green_waits([queued], running, NOW)["rows"], 0)
 
+    def test_a_row_waiting_after_another_pr_is_not_one_merge_away(self) -> None:
+        """2026-11-26 04:00Z: a row queued --after a PR still open was a host clock's only row and paged "green PRs
+        wait to merge: p50 88m"; its wait is its requester's order."""
+        clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+        after = {"key": "pr:o/r#9", "state": "waiting_after", "created": NOW - 5280, "dueAt": NOW - 5280,
+                 "after": ["pr:o/r#1"]}
+        self.assertEqual(gg.land_green_waits([after], clean, NOW)["rows"], 0)
+        self.assertIsNone(gg.land_green_alarm(gg.land_green_waits([after], clean, NOW), "h"))
+        freed = {**after, "state": "queued", "dueAt": NOW - 60}  # after_merged: queued again, its clock from then
+        self.assertEqual(gg.land_green_waits([freed], clean, NOW)["p50S"], 60)
+
     def test_a_median_past_30_minutes_pages_and_under_it_stays_quiet(self) -> None:
         self.policy()
         self.queue_with([self.green(n, 29 * 60) for n in range(5)])
