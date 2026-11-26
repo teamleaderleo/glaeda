@@ -16340,6 +16340,13 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # `gh pr ready` that is itself refused. A hold is not a draft's job here: [hold-own-pr] is a HOLD: line or a hold
 # label, which land_judge refuses before any merge is sent.
 LAND_READY_ONCE = "readySent"
+# LAND_READY_AT_READ: land_ready_at_request readies a draft only when this host's cache read it within LAND_DRAFT_AGE,
+# so a land queued on a cold or stale copy met the draft only at the merge, after its whole CI wait and judgment
+# (gcp-agent-lane-2, 2026-11-26: teamleaderleo/leo-workspace#11870 stopped merge_draft at e09b2017 that way). So the
+# daemon's first copy read after the request that shows an open draft takes the same mark_ready step (once per head,
+# under LAND_READY_ONCE), and a refused `gh pr ready` stops merge_draft as at the merge. Same bounds as the request's
+# check: a copy read before the request, or shadowed by a later write, readies nothing. Detector: test-glaeda-gh.py
+# test_a_draft_queued_on_a_cold_cache_is_marked_ready_at_the_queues_first_read.
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
 # push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
@@ -21330,6 +21337,11 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
+        if self.ready_due(e, c or {}, data, head):
+            # LAND_READY_AT_READ: a draft the request could not see is marked ready on this first read, through the
+            # merge step's own path (mark_ready, once per head), not after its checks are waited out
+            self.submit(e["key"], self.mark_ready, e, head, "on the queue's first read after the request")
+            return
         if e.get("pinSha") and not e.get("pinSeen"):
             if e.get("infraRetry") and e["state"] == "waiting" and float(e.get("wakeAt") or 0) > self.now:
                 return  # pin_unread's backoff (infra_read_stop): no read of the pin before it runs out
@@ -25336,7 +25348,25 @@ class LandQueue:
         elif named == "ready":
             self.mark_ready(e, sha)
 
-    def mark_ready(self, e: dict, head: str) -> None:
+    def ready_due(self, e: dict, c: dict, data: dict, head: str) -> bool:
+        """Under the lock. Whether E's PR is to be marked ready now (LAND_READY_AT_READ): the daemon's copy, read since
+        E's last land request and shadowed by no later write that could have marked it ready, shows an open draft at a
+        full HEAD the queue has not readied yet (LAND_READY_ONCE), and no job of E's is running. A cache read only."""
+        if e.get("state") in LAND_DONE or e["key"] in self.jobs or not SHA40.fullmatch(head or "") \
+                or data.get("isDraft") is not True or data.get("merged") or str(data.get("state") or "") != "OPEN":
+            return False
+        if (e.get(LAND_READY_ONCE) or {}).get("head") == head:
+            return False  # readied once at this head: a draft again is someone's hold, the merge step stops it
+        at = c.get("dataAt")
+        since = max(float(e["requestedAt"]) if _finite(e.get("requestedAt")) else 0.0,
+                    float(e["created"]) if _finite(e.get("created")) else 0.0)
+        if not _finite(at) or at < since or at > self.now + 60:
+            return False  # a copy from before the request may predate a `gh pr ready`; one from the future is no read
+        repo, number = str(e.get("repo") or ""), str(e.get("number") or "")
+        writes = gh_cache_writes()
+        return not any(writes.get(stamp, 0.0) >= at for stamp in gh_cache_stamps(["pr", repo, number], repo) or [])
+
+    def mark_ready(self, e: dict, head: str, where: str = "at the merge") -> None:
         """The merge at HEAD was refused because the PR is a draft: mark it ready (LAND_READY_ONCE's comment), once per
         head, and judge it again soon. A refused `gh pr ready` stops the entry merge_draft, as every draft did before.
         e[LAND_READY_ONCE] is written before the send, so a restart mid-send counts it as sent."""
@@ -25357,12 +25387,13 @@ class LandQueue:
                 e.pop("stepTransient", None)
                 self.history(e, "readied", head=head[:12])
                 self.nudge(e["key"])
-                self.wait(e, {"kind": "retry", "why": f"{name} was a draft at the merge; marked it ready (gh pr "
-                              "ready): the merge is taken next"}, float(NUDGE_MIN))
+                self.wait(e, {"kind": "retry", "why": f"{name} was a draft {where}; marked it ready (gh pr "
+                              "ready): it is judged next"}, float(NUDGE_MIN))
                 return
             said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
-            self.stop(e, "merge_draft", f"the merge at {head[:12]} was refused while the PR is a draft, and marking "
-                      f"it ready was refused too: {said}",
+            what = (f"the merge at {head[:12]} was refused while the PR is a draft" if where == "at the merge" else
+                    f"the PR was a draft at {head[:12]} {where}")
+            self.stop(e, "merge_draft", f"{what}, and marking it ready was refused too: {said}",
                       f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
