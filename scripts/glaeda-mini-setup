@@ -207,6 +207,13 @@ GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh"
 TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
                 "glaeda-disk-registry": "cmux-disk-registry"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
+
+
+def primary_name(name: str) -> str:
+    """The name an agent runs a tool by: its cmux-* primary name when this release has the shim (installed beside the
+    tool, plan_install), else the old one. The old name counts its uses (cmuxterm-hq docs/design/glaeda-into-cmux.md)."""
+    alias = TOOL_ALIASES.get(name)
+    return alias if alias and (SCRIPT_DIR / alias).is_file() else name
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
                                  "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
 # long-running Linux services with no timer: enabled and started themselves
@@ -1033,7 +1040,8 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         # nothing (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2; the per-host rollout sets the flag).
         LABEL_PREFIX + "disk-registry-evict": {
             "Label": LABEL_PREFIX + "disk-registry-evict",
-            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-disk-registry"), "evict", "--json", "--apply"],
+            "ProgramArguments": [python, os.fspath(ctx.bin / primary_name("glaeda-disk-registry")), "evict", "--json",
+                                 "--apply"],
             "StartInterval": 3600,
             "ProcessType": "Background",
             "LowPriorityIO": True,

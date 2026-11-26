@@ -15837,11 +15837,17 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return os.path.abspath(explicit) if os.path.isfile(explicit) else None
-    found = shutil.which("glaeda-disk")
-    if found:
-        return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
-    fallback = Path.home() / ".local/bin/glaeda-disk"
-    return os.fspath(fallback) if fallback.is_file() else None
+    # cmux-disk, glaeda-disk's primary name, first: glaeda-disk counts uses of its old name (cmuxterm-hq
+    # docs/design/glaeda-into-cmux.md, Rename map); a host that has only the old name still runs it
+    for name in ("cmux-disk", "glaeda-disk"):
+        found = shutil.which(name)
+        if found:
+            return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
+    for name in ("cmux-disk", "glaeda-disk"):
+        fallback = Path.home() / ".local/bin" / name
+        if fallback.is_file():
+            return os.fspath(fallback)
+    return None
 
 
 def hooks_floor_gib() -> float:
