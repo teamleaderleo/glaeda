@@ -26611,14 +26611,17 @@ LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
 def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
-            draft: bool = False, mergeable: str = "MERGEABLE") -> dict:
+            draft: bool = False, mergeable: str = "MERGEABLE", changed: int | None = None) -> dict:
     """A PR cache entry's data, as parse_pr stores it. PARENT is the head commit's first parent as the read gave it
-    (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give."""
+    (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give.
+    CHANGED is how many files GitHub reads the PR as changing; None is a read that does not say, as every case that
+    does not care about it leaves it (LAND_ZERO_DIFF)."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
     return {"state": state, "headRefOid": head, "mergeable": mergeable, "mergeStateStatus": "CLEAN",
             "isDraft": draft,
             **({"headParent": parent} if parent else {}),
+            **({"changedFiles": changed} if changed is not None else {}),
             # a 4-tuple is a status context, as parse_pr stores one: no workflow, and the description the read gave
             "checks": [{"name": c[0], "workflow": None if len(c) > 3 else "w", "status": c[1], "conclusion": c[2],
                         **({"description": c[3]} if len(c) > 3 else {})} for c in checks]}
@@ -30179,6 +30182,36 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
 
+    def test_a_stopped_rows_reminder_rereads_the_pr_and_drops_a_closed_one(self):
+        # LAND_REMIND_STATE_READ: teamleaderleo/leo-workspace#7494 was closed as superseded on 2026-11-23 and its
+        # lane was still told "still stopped after 69 h: conflict: merge main into ... resolve the conflicts and
+        # push next: none" on 2026-11-26. A stopped row is watched by nothing, so its cached copy is as old as the
+        # stop: the reminder re-reads the PR's state itself, and a closed one ends the row instead, waking nobody.
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        self.w.view_state = "CLOSED"  # closed as superseded since the stop; the daemon's copy still reads open
+        self.assertEqual(((self.w.cache[self.KEY]["data"]).get("state")), "OPEN")
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("reminds")), ("stopped", "closed", None))
+        self.assertEqual(len(self.w.sent()), sent)  # news three days old owes its requester no wake
+        reads = [h for h in e["history"] if h["event"] == "state_read" and h.get("before") == "remind"]
+        self.assertEqual([h["state"] for h in reads], ["CLOSED"])
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # and the row is tracked no further: closed never reminds
+        self.assertEqual((e["stop"]["code"], e.get("reminds"), len(self.w.sent())), ("closed", None, sent))
+
+    def test_a_reminder_whose_pr_still_reads_open_is_sent_and_an_unreadable_state_does_not_stop_it(self):
+        # The read decides only the closed case: an unreadable GitHub is not a closed PR (LAND_REMIND_STATE_READ).
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        self.w.view_err = "HTTP 502"
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"], e["reminds"]["n"]), ("stopped", "conflict", 1))
+        self.assertIn("still stopped after 6 h", self.w.sent()[-1][-1])
+        self.w.view_err = None  # reads OPEN: reminded again, and the row stays the stop it was
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"], e["reminds"]["n"], len(self.w.sent())),
+                         ("stopped", "conflict", 2, sent + 2))
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
@@ -32687,10 +32720,12 @@ class LandTest(Base):
                         'request-branch","status":"422"}')
 
     def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md",
-                     main_path: str = "") -> tuple[str, str]:
+                     main_path: str = "", same: bool = False) -> tuple[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
         line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. With MAIN_PATH,
-        main appends to that file instead, so git merges the two cleanly. (head, base)."""
+        main appends to that file instead, so git merges the two cleanly. With SAME, main appends the lane's own
+        line, so a plain merge of the two leaves main's own tree: the PR changes nothing (LAND_ZERO_DIFF).
+        (head, base)."""
         origin = Path(self.tmp.name) / "origin"
         env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
@@ -32716,7 +32751,7 @@ class LandTest(Base):
         git("checkout", "-q", "main")
         (origin / (main_path or path)).parent.mkdir(parents=True, exist_ok=True)
         with open(origin / (main_path or path), "a") as f:
-            f.write("- 11:05Z another PR's line, landed first\n")
+            f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
         git("add", "-A")
         git("commit", "-qam", "main appends")
         base = git("rev-parse", "HEAD")
@@ -32766,6 +32801,46 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
+
+    def test_a_pr_that_changes_no_file_is_reported_superseded_instead_of_merged(self):
+        # LAND_ZERO_DIFF: teamleaderleo/glaeda#2447's 5 conflicting hunks all resolved to main's side, because main
+        # had already shipped their intent, so GitHub read it mergeable: true, mergeable_state: clean,
+        # changed_files: 0 -- green, CLEAN, and a merge of it would have merged nothing. The queue reports it as
+        # superseded, for a person to close; it closes no PR itself.
+        self.pr(LA, changed=0)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "zero_diff"), e.get("stop"))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])  # never a no-op merge
+        self.assertEqual([c for c in self.w.gh_calls("pr", "close")], [])  # and no PR closed by a daemon
+        said = self.w.sent()[-1][-1]
+        self.assertIn("changing no file", said)
+        self.assertIn("gh pr close 1 -R o/r", said)  # the one step, for a person
+        self.assertEqual([h["where"] for h in e["history"] if h["event"] == "zero_diff"], ["merge"])
+
+    def test_a_pr_that_changes_files_is_still_merged_and_an_unread_count_decides_nothing(self):
+        for changed in (3, None):
+            with self.subTest(changed=changed):
+                self.setUp()
+                self.pr(LA, changed=changed)
+                self.land()
+                self.w.answers.append(ok_answer(LA))
+                e = self.tick()
+                self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+                self.assert_merged_at(LA)
+
+    def test_a_base_merge_that_leaves_the_bases_own_tree_is_reported_superseded_and_pushed_nowhere(self):
+        # LAND_ZERO_DIFF, the other read: git merges the base into the head cleanly and the result is the base's own
+        # tree, so the merge commit and the land after it would both change nothing. Not a conflict to resolve.
+        head, base = self.union_origin(attrs="", same=True)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "zero_diff"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed to the branch
+        self.assertEqual([h["where"] for h in e["history"] if h["event"] == "zero_diff"], ["base_merge"])
+        said = self.w.sent()[-1][-1]
+        self.assertIn("leaves main's own tree", said)
+        self.assertIn("gh pr close 1 -R o/r", said)
 
     def test_a_merge_step_conflict_only_in_union_files_is_merged_here_and_the_pinned_land_goes_on(self):
         """cmuxterm-hq, 2026-11-23: findings PRs #20862 and #20882 that only appended a line to
