@@ -23768,11 +23768,49 @@ class GitShimTest(unittest.TestCase):
         try:
             result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "push",
                                                           "GITHUB_REF": "refs/heads/nightly-next",
+                                                          "GITHUB_SHA": self.pr_sha,
                                                           "GLAEDA_GIT_SHIM_WAIT_S": "30"})
         finally:
             fill.wait(timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_snapshot_that_is_not_the_runs_commit_goes_to_github_at_once(self) -> None:
+        # cmux job 139823571654: a lane-gh ci merge snapshot, minutes old, fetched by a workflow_dispatch run on
+        # feat-cmux-next. No mirror pass of a kept branch brings it, so the shim must not wait for one.
+        self.install()
+        started = time.monotonic()
+        result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "workflow_dispatch",
+                                                      "GITHUB_REF": "refs/heads/feat-cmux-next",
+                                                      "GITHUB_SHA": self.main_sha,
+                                                      "GLAEDA_GIT_SHIM_WAIT_S": "30"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting up to", result.stderr)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_stalled_github_fetch_is_stopped_and_the_budget_ends_the_retries(self) -> None:
+        # cmux job 139837960264: a github.com fetch hung with its stderr held, then a retry ran into the checkout
+        # step's 10 min timeout. Each attempt now has the low-speed limit and a watchdog, and the budget ends retries.
+        self.install()
+        argv = self.dir / "argv"
+        fake = self.dir / "fake-git"
+        fake.write_text("#!/bin/bash\n"
+                        f"if [[ \" $* \" == *' fetch '* ]]; then echo \"$*\" >> {argv}; sleep 300; fi\n"
+                        'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        started = time.monotonic()
+        result = self.checkout_fetch(self.pr_sha, env={"GLAEDA_GIT_SHIM_ATTEMPT_S": "2",
+                                                      "GLAEDA_GIT_SHIM_BUDGET_S": "4"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 20)  # the sleeping child was stopped too: the pipe closed
+        self.assertIn("asking github.com (try 1 of 3; at most 2 s;", result.stderr)
+        self.assertIn("github.com did not finish within 2 s; stopped it", result.stderr)
+        self.assertIn("no try left in the shim's 4 s budget", result.stderr)
+        self.assertIn("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60", argv.read_text())
+        self.assertEqual(self.log(), ["github"])
 
 
 class SubmoduleShimTest(unittest.TestCase):
