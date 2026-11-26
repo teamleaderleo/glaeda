@@ -30536,11 +30536,10 @@ class LandTest(Base):
         self.assertNotIn(gg.LAND_NOTICE_CLASS, classes()[sent:])
         self.assertIsNone(e["reminds"].get("staleHead"))
         self.assertIn("unread", [h.get("why") for h in e["history"] if h.get("event") == "remind_held"])
-        self.fresh_head = LA  # a read lands, unchanged: now the stale stop wakes its owner
-        self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
-        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
-        self.assertEqual(classes()[-1], gg.LAND_NOTICE_CLASS)
-        self.assertEqual(e["reminds"]["staleHead"], LA)
+        for _ in range(2):  # and stays held, never a blocker, while no read refreshes the copy
+            self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+            e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((classes()[sent:], e["state"]), (["fyi"], "stopped"))
 
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
