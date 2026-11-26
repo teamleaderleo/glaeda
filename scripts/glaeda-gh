@@ -15983,6 +15983,31 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
         return (f"{what} was built on {ref} at {then[:12]} ({created}); {ref} has changed the CI path {hits[0]}{more} "
                 "since, and a rerun replays the merge without it")
     return ""
+# One base merge per land (Leo, 2026-11-25: "de facto, im asking for 99% fewer minutes of ci time, period."). A
+# second update-branch at a head this land's own update made (update_again) starts the whole CI again: on one land
+# host, 11-25, 183 update_branch steps for 137 merges (1.34 a merge, 0.83 on 11-23), and of 120 update_branch steps in
+# the 24 h to 11-26 10:50Z, 43 were update_again. So at its own head the queue sends another only when a check is
+# named as needing the newer base (land_judge's needs_newer_base, a force) or GitHub's refusal of a step named it:
+#   - a rerun whose only staleness is the base's age (stale_replay_why's "commits behind", no CI path changed) is the
+#     rerun, at that head, not a new base merge: the run's merge is this land's own, its red judged like any other;
+#   - an update land_judge names with no needs_newer_base (not_run's "one base merge") stops the row by name
+#     (update_again_unnamed) instead of a second merge.
+# The merge gate is unchanged: every merge still passes land_judge at the head it merges. Undo:
+# GLAEDA_LAND_UPDATE_ONCE=0 in the daemon's environment restores the second update.
+def land_update_once() -> bool:
+    return os.environ.get("GLAEDA_LAND_UPDATE_ONCE", "1").strip() != "0"
+
+
+def land_stale_named(why: str) -> bool:
+    """Whether a stale_replay_why answer names a base change a rerun lacks (a CI path), not only the base's age."""
+    return "has changed the CI path" in str(why or "")
+
+
+def land_own_update_head(e: dict, head: str) -> bool:
+    """Whether HEAD is the head this land's own base merge made (update_again's test)."""
+    return bool(head) and str(e.get("updatedHead") or "").lower() == str(head).lower()
+
+
 # A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (land_judge could not judge:
 # an old land_judge checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
 # 5xx, LAND_STEP_TRANSIENT) and review_cannot_start (router-review is not on this host, or would not exec: a link or
@@ -23715,6 +23740,11 @@ class LandQueue:
                               land_trim(answer.get("next")))
                 return
             stale = {r: why for r in runs if (why := self.stale_replay(e, gh, r))}  # STALE_REPLAY_BEHIND's comment
+            if stale and land_update_once() and land_own_update_head(e, head) and not any(
+                    land_stale_named(w) for w in stale.values()):
+                with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
+                    self.history(e, "stale_replay_own_head", head=head[:12], why=land_trim(next(iter(stale.values())), 200))
+                stale = {}
             with self.lock:
                 self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
                 sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
@@ -23739,7 +23769,7 @@ class LandQueue:
                     checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
                     marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
             if stale:
-                self.update_branch(e, head)
+                self.update_branch(e, head, named=True)
                 return
             # A whole rerun ("all": land_command_rerun), never --failed, when the step's point is that the run's own
             # path routing must route again: its jobs did not fail, they were never run.
@@ -23910,6 +23940,10 @@ class LandQueue:
             elif touched := [f for f in files if not land_path_inert(f, rule)]:
                 take, why = False, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
         stale = self.stale_replay(e, gh, run) if take and gh is not None else ""  # STALE_REPLAY_BEHIND's comment
+        if stale and land_update_once() and land_own_update_head(e, head) and not land_stale_named(stale):
+            with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
+                self.history(e, "stale_replay_own_head", run=run, head=head[:12], why=land_trim(stale, 200))
+            stale = ""
         with self.lock:
             self.check(e)
             if not take:
@@ -23925,7 +23959,7 @@ class LandQueue:
             else:
                 self.claim(e, "rerun_failed", runs=[run], unrelated=True)
         if stale:
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
             return True
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
@@ -24005,7 +24039,7 @@ class LandQueue:
         if named == "hand_off":
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
         elif named == "union_merge":
             self.union_merge(e, head)
 
@@ -24516,7 +24550,7 @@ class LandQueue:
             else:
                 named = self.step_refused(e, "label", head, got)
         if named == "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
@@ -24575,7 +24609,7 @@ class LandQueue:
             else:
                 named = self.step_refused(e, "fetch", head, got)
         if named == "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
 
     def fetch_once(self) -> str:
         """git-fetch-once to run a git-form fetch step through: land.json's gitFetchOnce, LAND_FETCH_ONCE, PATH's; ""
@@ -24797,7 +24831,8 @@ class LandQueue:
         tried = e.get("unionMerge") or {}
         return not (tried.get("head") == head and tried.get("tried"))
 
-    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
+    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "",
+                      named: bool = False) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -24869,6 +24904,18 @@ class LandQueue:
                              why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
         e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
+            if land_update_once() and not needs and not force and not named:
+                # LAND_UPDATE_ONCE's comment: this land's one base merge is spent and no check is named as needing a
+                # newer one
+                with self.lock:
+                    self.count("update_again_unnamed")
+                    self.stop(e, "update_again_unnamed",
+                              f"land_judge named a second base merge at {head[:12]}, the head this land's own update "
+                              "made, and named no check that needs a newer base; one base merge per land",
+                              f"glaeda-gh status pr {repo}#{number} (a check still to report: glaeda-gh land "
+                              f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr update-branch "
+                              f"{number} -R {repo}, then land the new head)")
+                return
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
         self.push_step(e, "update_branch", head,
@@ -25319,7 +25366,7 @@ class LandQueue:
         if named == "hand_off":
             self.hand_off(e, sha)
         elif named == "update_branch":
-            self.update_branch(e, sha)
+            self.update_branch(e, sha, named=True)
         elif named == "union_merge":
             self.union_merge(e, sha)
 
