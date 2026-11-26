@@ -34769,6 +34769,38 @@ class LandTest(Base):
         self.origin_git = git
         return head, base
 
+    def test_union_seed_borrows_the_hosts_warm_wt_mirror_for_the_base(self):
+        """gcp-agent-lane-12, 2026-11-26: the union mirror's feat-cmux-next was five weeks stale, so the broker refused
+        every base merge's fetch (HTTP 413, bundle over 256 MiB) and cmux#56666 and #56078 stopped base_merge_transient.
+        union_seed points the union mirror at the host's wt mirror and moves its origin/BASE up to that tip, so the
+        broker's fetch names it as had. A tip not ahead of the union's own, or no mirror, is left alone."""
+        head, base = self.union_origin()
+        old = self.origin_git("rev-parse", "main~1")
+        wt = Path(self.tmp.name) / "wt-mirrors"
+        mirror = wt / "o" / "r.git"
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(Path(self.tmp.name) / "origin"), os.fspath(mirror)],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "--git-dir", os.fspath(mirror), "update-ref", "refs/remotes/origin/main", base],
+                       check=True)
+        union = Path(self.tmp.name) / "union.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(union)], check=True)
+        self.assertTrue(self.q.union_seed(os.fspath(union), "o/r", "main").startswith("no wt mirror"))
+        self.w.config["wtMirrors"] = os.fspath(wt)
+        self.assertEqual(self.q.union_seed(os.fspath(union), "o/r", "main"), base)
+        self.assertIn(os.fspath(mirror / "objects"), (union / "objects/info/alternates").read_text().splitlines())
+        rev = subprocess.run(["git", "--git-dir", os.fspath(union), "rev-parse", "refs/remotes/origin/main"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(rev, base)
+        # the base's tree is readable through the alternate (what merge-tree reads)
+        subprocess.run(["git", "--git-dir", os.fspath(union), "cat-file", "-e", f"{base}:goals/x.md"], check=True)
+        self.assertIn("already at", self.q.union_seed(os.fspath(union), "o/r", "main"))
+        self.assertEqual((union / "objects/info/alternates").read_text().count("\n"), 1)  # added once
+        # a union tip not under the mirror's (here: the lane's head, a side branch) is never moved
+        subprocess.run(["git", "--git-dir", os.fspath(union), "update-ref", "refs/remotes/origin/main", head],
+                       check=True)
+        self.assertIn("is not under", self.q.union_seed(os.fspath(union), "o/r", "main"))
+        self.assertNotEqual(old, base)
+
     def union_conflict_tick(self, head: str, owners: frozenset = frozenset({"o"})) -> dict:
         """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
         conflict, as it does whatever .gitattributes says. OWNERS stands in for LAND_MERGE_OWNERS (the test repo is

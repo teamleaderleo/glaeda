@@ -16919,6 +16919,14 @@ LAND_READY_ONCE = "readySent"
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# A lane VM's union mirror is filled only by the broker's fetch (lane-gh fetch), which names the mirror's own tips as
+# had. gcp-agent-lane-12, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
+# commits back), so every base merge's fetch asked for five weeks of history and the broker refused it in 13 s ("HTTP
+# 413: the bundle is over 256 MiB"); glaeda read that as base_merge_transient and stopped cmux#56666 and #56078 after
+# 8 tries. The same host's wt mirror (wt keeps it warm for every checkout) had feat-cmux-next from minutes before.
+# union_seed borrows it: its objects as an alternate, its base tip as GITDIR's origin/BASE when ahead; the fetch then
+# took 0.22 s. Only the base ref is seeded: base branches are not rewritten, so the borrowed objects stay reachable.
+LAND_WT_MIRRORS = Path.home() / "Projects" / ".wt-mirrors"  # land.json "wtMirrors"; <owner>/<name>.git under it
 # land_judge's own conflict verdict takes the same base merge (LAND_BASE_MERGE_FIRST). cmux-cp-1, 2026-11-25 00:00Z to
 # ~10:40Z: 352 land stops were conflicts, 322 of them land_judge's conflicts_base ("merge main into <PR>, resolve the
 # conflicts and push"), against 25 update_branch_conflict and 5 merge_conflict; the 41 base merges LAND_UNION tried
@@ -25483,6 +25491,34 @@ class LandQueue:
         text = "\n".join(out)
         return text if len(text) <= LAND_HUNK_CHARS else text[:LAND_HUNK_CHARS] + "\n... (cut)"
 
+    def union_seed(self, gitdir: str, repo: str, base: str, e: dict | None = None) -> str:
+        """Before a lane VM's broker fetch into GITDIR (union_plan): borrow this host's warm wt mirror of REPO
+        (LAND_WT_MIRRORS, its objects as an alternate) and move GITDIR's origin/BASE up to the mirror's tip when that
+        is ahead of it, so lane-gh fetch names a fresh tip as had and the broker sends only the commits since. The
+        tip it names is the mirror's, why when nothing was seeded (no mirror, no tip there, already as far)."""
+        mirror = self.path("wtMirrors", LAND_WT_MIRRORS) / (repo + ".git")
+        if not (mirror / "objects").is_dir():
+            return f"no wt mirror of {repo} at {mirror}"
+        tip = (self.union_git(os.fspath(mirror), "rev-parse", "--verify", "-q",
+                              f"refs/remotes/origin/{base}^{{commit}}", e=e).stdout or "").strip()
+        if not SHA40.fullmatch(tip):
+            return f"{mirror} holds no origin/{base}"
+        alt = Path(gitdir) / "objects" / "info" / "alternates"
+        line = os.fspath(mirror / "objects")
+        with contextlib.suppress(OSError):
+            have = alt.read_text().splitlines() if alt.exists() else []
+            if line not in have:
+                alt.parent.mkdir(parents=True, exist_ok=True)
+                alt.write_text("".join(f"{x}\n" for x in [*have, line]))
+        own = (self.union_git(gitdir, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}^{{commit}}",
+                              e=e).stdout or "").strip()
+        if own == tip:
+            return f"origin/{base} already at the mirror's {tip[:12]}"
+        if own and self.union_git(gitdir, "merge-base", "--is-ancestor", own, tip, e=e).returncode != 0:
+            return f"origin/{base} at {own[:12]} is not under the mirror's {tip[:12]}"
+        got = self.union_git(gitdir, "update-ref", f"refs/remotes/origin/{base}", tip, e=e)
+        return tip if got.returncode == 0 else f"update-ref failed: {land_trim(got.stderr or '', 160)}"
+
     def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
                   e: dict | None = None, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
@@ -25530,6 +25566,7 @@ class LandQueue:
             self.union_git(gitdir, "config", "remote.origin.url", url)
         refs = [f"+refs/heads/{base}:refs/remotes/origin/{base}", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"]
         if self.broker_client():  # a lane VM reads github.com through the broker (lane-gh fetch)
+            self.union_seed(gitdir, repo, base, e)
             got = self.call([self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "fetch", repo, "--dir", gitdir,
                              "--branch", base, "--branch", branch], LAND_FETCH_DEADLINE, e)
         else:
