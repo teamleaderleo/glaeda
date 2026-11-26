@@ -24950,6 +24950,31 @@ class UpstreamDirectAfterTest(unittest.TestCase):
             self.assertIsNotNone(gg.wait_starved({**base, "directQuiet": 1, "directAt": now - 2 * bound - 5}, old, now))
 
 
+    def test_a_pinned_wait_whose_copy_shows_another_head_reads_directly_soon_whatever_the_copy_says(self) -> None:
+        """cmuxterm-hq#16522 / #27501: `wait pr --sha NEW` sat its whole timeout on the old head while the copy's
+        probe kept saying "confirmed unchanged" (fresh dataAt) or the feed vouched for it. A full --sha the copy does
+        not show is starved at SHA_BEHIND_DIRECT_AFTER, and once per direct_gap after."""
+        now = time.time()
+        pin, old_head = "a" * 40, "b" * 40
+        fresh = {"dataAt": now - 5, "data": {"state": "OPEN", "headRefOid": old_head},
+                 "upstreamFeed": {"liveSince": now - 7200, "at": now - 1, "eventAt": None, "head": old_head}}
+        req = {"kind": "pr", "key": "pr:o/r#7", "sha": pin, "exact": True,
+               "began": now - gg.SHA_BEHIND_DIRECT_AFTER - 1, "unseenSince": now - 5}
+        self.assertIsNotNone(gg.wait_starved(req, fresh, now), "a fresh copy of another head is no answer")
+        self.assertIsNone(gg.wait_starved({**req, "began": now - 10}, fresh, now), "the push gets its grace")
+        self.assertIsNone(gg.wait_starved({**req, "directAt": now - 10}, fresh, now), "one direct read per gap")
+        self.assertIsNone(gg.wait_starved({**req, "directAt": now - gg.SHA_BEHIND_DIRECT_AFTER - 5, "directQuiet": 1},
+                                          fresh, now), "a read that found the same head doubles the gap")
+        self.assertIsNone(gg.wait_starved({**req, "exact": False}, fresh, now), "a prefix is not a pin")
+        self.assertIsNone(gg.wait_starved({**req, "sha": old_head}, fresh, now), "the copy shows the pin")
+        merged = {**fresh, "data": {"state": "MERGED", "headRefOid": old_head}}
+        self.assertIsNone(gg.wait_starved(req, merged, now), "a merged PR is decided by wait_step")
+        self.assertIsNone(gg.wait_starved({**req, "kind": "run"}, fresh, now))
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNotNone(gg.wait_starved(req, fresh, now), "the feed's word does not cover another head")
+
+
 class StaleDataTest(Base):
     """huge-blue, 2026-11-11: a merged PR read OPEN for 50 minutes while `restart` called the daemon healthy. One
     null check context in GitHub's answer raised AttributeError in parse_pr; batched() dropped the whole batch with
@@ -25354,6 +25379,26 @@ class StaleDataTest(Base):
         quiet[0] = False  # the feed delivered something for the PR
         self.daemon.serve_waits()
         self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists())
+
+    def test_a_pinned_wait_on_a_fresh_quiet_copy_of_another_head_is_handed_back(self) -> None:
+        """cmuxterm-hq#16522: a copy read a minute ago, which the feed vouches for, still shows a head the wait's full
+        --sha is not. Past SHA_BEHIND_DIRECT_AFTER the wait is handed back to read its PR itself."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+        node = pr_node(9)
+        self.assertNotEqual(str(node.get("headRefOid") or ""), "f" * 40)
+        rid = gg.write_wait_request("pr", "o/r#9", "done", 3600, False, False, "f" * 40, True, gg.RESCUE_GRACE,
+                                    os.getpid(), began=time.time() - gg.SHA_BEHIND_DIRECT_AFTER - 30)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        self.put("pr:o/r#9", gg.parse_pr(node), at=time.time() - 60)
+        self.daemon.land_feed_quiet = lambda key, sha, since: True
+        self.daemon.now = time.time()
+        self.daemon.serve_waits()
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists(), "the copy of another head kept the wait")
 
     def test_a_pr_copy_past_the_feed_bound_is_handed_back(self) -> None:
         rid, _ = self.starved_request()  # read 3000 s ago, past LAND_FEED_QUIET_MAX
