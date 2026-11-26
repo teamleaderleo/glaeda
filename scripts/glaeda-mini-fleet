@@ -18,6 +18,8 @@
     glaeda-mini-fleet borrow   [HOST ...] [--class std] --for TEXT (--hours N | --until EPOCH) [--owner O] [--yes]
     glaeda-mini-fleet release  HOST ... [--owner O] [--force] [--yes]           drop a reservation
     glaeda-mini-fleet manifest-sync [--manifest M] [--yes]                      copy cmuxterm-hq main's manifest here
+    glaeda-mini-fleet admit    HOST ... [--class std] [--hardware KEY] [--observed FILE] [--yes]
+                                                                                new hosts into the manifest from a probe
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware and scheduling class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -84,6 +86,14 @@ recorded acceptance (hardware.<h>.acceptance) and enrolls without accept-local; 
 runs accept-local on the host instead. Runner registration is a hook (runner_register_command,
 glaeda#1174) that nothing fills yet, so onboard ends at an eligible enrollment. Dry run by default;
 never_touch hosts are refused.
+
+`admit HOST ...` writes manifest entries for hosts that are not in it yet, from what a probe of
+each sees: the hardware key whose model, chip, cpus and memory match (or a new one, named
+<chip>-<memory>, which onboard --acceptance node then proves), a free node_id, the --class
+(default std), dedicated availability, the ci-runner role and the sudo mode. Every complete
+Xcode app installed beside the declared ones becomes a host override, so the runner gets an
+xcode-<version> label for each Xcode on the disk. Hosts already in the manifest are left alone.
+Dry run (the diff) by default.
 
 `repair` is the same pipeline for hosts that are already enrolled (onboard is repair for a host
 with no enrollment yet): preflight, fix, sudo-plan (printed, --sudo stop by default), then every
@@ -5586,6 +5596,142 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
 # ---------------------------------------------------------------- cli
 
 
+
+# ---------------------------------------------------------------- admit
+
+ADMIT_ROLES = ("ci-runner",)
+
+
+def chip_slug(chip: str) -> str:
+    """"Apple M5 Pro" -> "m5pro": the chip half of a new hardware key."""
+    slug = re.sub(r"[^a-z0-9]", "", re.sub(r"^apple\s+", "", chip.strip().lower()))
+    return slug or "mac"
+
+
+def hardware_for(manifest: dict[str, Any], obs: dict[str, Any]) -> str | None:
+    """The hardware key whose declared shape is exactly what obs saw (model, chip, cpus, memory), or None."""
+    for key, shape in manifest["hardware"].items():
+        if all(shape.get(field) in (None, obs.get(field)) for field in ("model", "chip", "cpus", "memory_gib")) \
+                and shape.get("model") == obs.get("model"):
+            return key
+    return None
+
+
+def next_node_id(taken: set[str]) -> str:
+    """The first cmux-mac-NNN after the highest numbered one already used."""
+    numbers = [int(m.group(1)) for t in taken if (m := re.fullmatch(r"cmux-mac-(\d+)", t))]
+    n = max(numbers, default=0) + 1
+    while f"cmux-mac-{n:03d}" in taken:
+        n += 1
+    return f"cmux-mac-{n:03d}"
+
+
+def installed_xcodes(obs: dict[str, Any]) -> list[dict[str, str]]:
+    """The complete Xcode apps a probe found (a real directory with a version and build), by path."""
+    out = []
+    for app in obs.get("xcode_apps") or []:
+        path, version, build = app.get("path") or "", app.get("version") or "", app.get("build") or ""
+        if app.get("kind") == "dir" and SAFE_PATH_RE.fullmatch(path) and path.endswith(".app") \
+                and re.fullmatch(r"\d+(\.\d+)*", version) and re.fullmatch(r"[0-9A-Za-z]+", build):
+            out.append({"path": path, "version": version, "build": build})
+    return out
+
+
+def admit_plan(manifest: dict[str, Any], observed: dict[str, Any], names: list[str], klass: str,
+               hardware: str | None = None) -> tuple[dict[str, Any], list[str]]:
+    """({"hardware": new keys, "hosts": new entries}, notes) for the named hosts that are not members yet.
+
+    Raises Failure for a host that cannot be admitted (unreachable, never_touch, hardware unlike --hardware)."""
+    never = {host_key(n) for n in manifest.get("never_touch", [])}
+    members = {host_key(n) for n in manifest["hosts"]} | \
+        {host_key(h.get("alias") or "") for h in manifest["hosts"].values()} - {""}
+    taken = {h["node_id"] for h in manifest["hosts"].values() if h.get("node_id")}
+    declared = (manifest["defaults"].get("xcode") or {}).get("apps") or []
+    declared = [a for a in declared if isinstance(a, dict)]
+    new_hw: dict[str, Any] = {}
+    new_hosts: dict[str, Any] = {}
+    notes: list[str] = []
+    for name in names:
+        if host_key(name) in never:
+            raise Failure(f"{name} is in never_touch")
+        if host_key(name) in members:
+            notes.append(f"{name}: already a member; left alone")
+            continue
+        obs = (observed.get("hosts") or {}).get(name) or {}
+        if not obs.get("reachable"):
+            raise Failure(f"{name}: not reachable: {obs.get('error', 'no observation')}")
+        missing = [f for f in ("model", "chip") if not obs.get(f)] + \
+            [f for f in ("cpus", "memory_gib") if not obs.get(f)]
+        if missing:
+            raise Failure(f"{name}: the probe did not report {', '.join(missing)}")
+        shape = {"model": obs["model"], "chip": obs["chip"], "cpus": obs["cpus"], "memory_gib": obs["memory_gib"]}
+        key = hardware_for({"hardware": {**manifest["hardware"], **new_hw}}, obs)
+        if hardware is not None:
+            known = {**manifest["hardware"], **new_hw}.get(hardware)
+            if known is not None and key != hardware:
+                raise Failure(f"{name} is {shape}, not hardware {hardware}")
+            key = hardware
+        if key is None:
+            key = f"{chip_slug(obs['chip'])}-{obs['memory_gib']}"
+        if key not in manifest["hardware"] and key not in new_hw:
+            if not FLEET_CLASS_RE.fullmatch(key):
+                raise Failure(f"hardware key {key!r} is not a class name (pass --hardware)")
+            new_hw[key] = dict(shape)
+            notes.append(f"hardware {key}: new ({obs['chip']}, {obs['cpus']} cpus, {obs['memory_gib']} GiB); "
+                         f"its first host needs onboard --acceptance node, then upgrade records the class receipt")
+        node_id = obs.get("enrolled_node_id")
+        if not (isinstance(node_id, str) and NODE_ID_RE.fullmatch(node_id) and node_id not in taken):
+            node_id = next_node_id(taken)
+        taken.add(node_id)
+        entry: dict[str, Any] = {"hostname": obs.get("hostname") or name, "node_id": node_id, "hardware": key,
+                                 "class": klass, "availability": "dedicated", "roles": list(ADMIT_ROLES)}
+        if obs.get("sudo") in ("nopasswd", "password"):
+            entry["sudo"] = obs["sudo"]
+        installed = installed_xcodes(obs)
+        paths = {a.get("path") for a in declared}
+        extra = [a for a in installed if a["path"] not in paths]
+        if extra:
+            entry["overrides"] = {"xcode": {"apps": [*declared, *extra]}}
+            notes.append(f"{name}: Xcode {', '.join(a['version'] + ' ' + a['build'] for a in extra)} "
+                         f"installed beside the declared ones; labelled from the host override")
+        absent = [a["path"] for a in declared if not a.get("clone_from") and a.get("path") not in
+                  {i["path"] for i in installed}]
+        if absent:
+            notes.append(f"{name}: declared Xcode {', '.join(absent)} not installed; preflight provisions it")
+        floor = ((manifest["defaults"].get("disk") or {}).get("min_free_gib"))
+        data = (obs.get("disk") or {}).get("/System/Volumes/Data") or (obs.get("disk") or {}).get("/") or {}
+        if isinstance(floor, (int, float)) and isinstance(data.get("free_gib"), int) and data["free_gib"] < floor:
+            notes.append(f"{name}: {data['free_gib']} GiB free on the data volume, under the fleet floor of {floor}")
+        new_hosts[name] = entry
+    return {"hardware": new_hw, "hosts": new_hosts}, notes
+
+
+def cmd_admit(path: Path, manifest: dict[str, Any], names: list[str], observed: dict[str, Any] | None, klass: str,
+              hardware: str | None, write: bool) -> int:
+    if not names:
+        raise Failure("admit needs the new hosts' names")
+    if observed is None:
+        # Probe the new names as stub members, so they get the fleet's ssh user.
+        scratch = {**manifest, "hosts": {**manifest["hosts"], **{n: {} for n in names if n not in manifest["hosts"]}}}
+        observed = observe(scratch, [n for n in names if n not in manifest["hosts"]])
+    plan, notes = admit_plan(manifest, observed, names, klass, hardware)
+
+    def change(raw: dict[str, Any]) -> None:
+        raw["hardware"].update(plan["hardware"])
+        raw["hosts"].update(plan["hosts"])
+
+    raw = json.loads(path.read_text())
+    change(raw)
+    load_manifest(path, json.dumps(raw))  # refuse a plan the manifest would not load with
+    diff = rewrite_manifest(path, change, write=write)
+    for note in notes:
+        print(f"admit: {note}")
+    print(diff or "admit: no change")
+    if plan["hosts"] and not write:
+        print("admit: dry run; --yes writes it")
+    return 0
+
+
 def read_observed(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
@@ -5600,7 +5746,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
                                             "share", "onboard", "repair", "upgrade", "pools", "reserve", "borrow", "release",
-                                            "manifest-sync"))
+                                            "manifest-sync", "admit"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, help="the fleet manifest (default ~/.config/glaeda/mini-fleet.json "
                         "or $GLAEDA_MINI_FLEET_MANIFEST, compared with cmuxterm-hq main's on every run)")
@@ -5641,7 +5787,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--until", type=int, metavar="EPOCH", help="reserve, borrow: end time in Unix seconds")
     parser.add_argument("--owner", help="reserve, borrow, release: who holds it (default $USER@$(hostname -s))")
     parser.add_argument("--class", dest="borrow_class", choices=RUNNER_CLASSES, default="std",
-                        help="borrow: scheduling class to acquire (default std)")
+                        help="borrow: scheduling class to acquire; admit: the new hosts' class (default std)")
+    parser.add_argument("--hardware", metavar="KEY",
+                        help="admit: the hardware key for the new hosts (default: the matching one, else <chip>-<memory>)")
     parser.add_argument("--force", action="store_true",
                         help="reserve, release: override another owner's active reservation or an invalid marker")
     parser.add_argument("--glaeda-ref", metavar="COMMIT",
@@ -5688,6 +5836,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest = load_manifest(args.manifest)
         MANIFEST_PATH = args.manifest
         PINNED_CANDIDATE = manifest.get("candidate")
+        if args.command == "admit":
+            return cmd_admit(args.manifest, manifest, args.hosts or [],
+                             read_observed(args.observed) if args.observed else None,
+                             args.borrow_class, args.hardware, args.yes)
         hosts = select_hosts(manifest, args.hosts)
         if args.command == "apply":
             if not args.hosts:

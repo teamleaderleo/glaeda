@@ -6320,13 +6320,15 @@ time.sleep(60)
         for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
                      "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
             self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
-        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+        uid = 501
+        daemon, root = (4242, uid, "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
 
         def recycle(*tables, error=None):
             """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
             seq = list(tables)
             ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
             with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook.os, "getpid", return_value=4241), mock.patch.object(hook.os, "getuid", return_value=uid), \
                     mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
                 return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
 
@@ -6335,12 +6337,12 @@ time.sleep(60)
         self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
         self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
         # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "Z", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242")
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "SE", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
         # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
-        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        note, kills = recycle([daemon], [daemon, (7, uid, "S", "/x/usr/bin/xctest /x/a.xctest")])
         self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
         self.assertEqual(kills, [(4242, term)])
         self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
@@ -7919,7 +7921,11 @@ elif args[:1] == ["default"] and args[1] in installed:
     open(state + "/rustup-default", "w").write(args[1])
     print("info: default toolchain set to " + args[1])
 elif args[:1] == ["run"]:
-    print(json.load(open(state + "/rustc-by-toolchain.json")).get(args[1] + "-aarch64-apple-darwin", ""))
+    name = args[1] if args[1] in installed else args[1] + "-aarch64-apple-darwin"
+    if name not in installed:  # as rustup 1.29: "error: toolchain '...' is not installed", exit 1
+        print("error: toolchain '" + name + "' is not installed", file=sys.stderr)
+        sys.exit(1)
+    print(json.load(open(state + "/rustc-by-toolchain.json")).get(name, ""))
 else:
     sys.exit(1)
 """)
@@ -8023,7 +8029,6 @@ else:
             "other-receipt": (dict(enrolled_sha="sha256:bb"), "does not reference the m4pro-48 class receipt"),
             "rustc-drift": (dict(tools={"rustcVersion": "rustc 1.99.0"}), "rustcVersion 'rustc 1.99.0'"),
             "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
-            "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
             "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
             "receipt-invalid": (dict(valid=False), "class receipt does not validate"),
             "wrong-role": (dict(role="some_other_role"), "some_other_role: ok"),
@@ -8106,6 +8111,36 @@ else:
         self.assertIn("diffRustcVersion", result.stdout)
         self.assertTrue(self.lock_free())
 
+    def test_an_empty_toolchain_probe_warns_and_never_reads_as_drift(self) -> None:
+        """PROBE_EMPTY_WARNS. 2026-11-22: cruft-sweep reclaimed the DiffSidecar toolchain (1.88.0) on m6-16 minis,
+        `rustup run 1.88.0 rustc --version` exited 1, and every fast-tier job was refused as
+        "diffRustcVersion '' != 'rustc 1.88.0 ...'" (cmuxterm-hq#19552 fault 2). A probe that read nothing is a
+        failed probe: it warns and admits; only a different answer is drift."""
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.node(receipt_toolchain=receipt, installed=("1.98.1-aarch64-apple-darwin",))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: diffRustcVersion read nothing", result.stdout)
+        self.assertIn("rust toolchain 1.88.0 is not installed", result.stdout)
+        self.done()
+        import shutil as _sh
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None})  # zig prints nothing: a failed probe, not drift
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("zigVersion read nothing (receipt '0.16.0')", result.stdout)
+        self.done()
+        _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+        self.node(tools={"zigVersion": None, "rustcVersion": "rustc 1.99.0"})  # one real answer still refuses
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("rustcVersion 'rustc 1.99.0'", result.stdout)
+        self.assertNotIn("zigVersion ''", result.stdout)
+        self.assertTrue(self.lock_free())
+
     def test_a_timed_out_eligibility_probe_is_named_as_a_timeout_not_an_invalid_receipt(self) -> None:
         """On a mini too loaded to start Python within ELIGIBILITY_BUDGET_S the validator or node status gives no
         answer. node_answer flags it, so the health agent raises no node_ineligible; the refusal names the timeout."""
@@ -8144,14 +8179,17 @@ else:
                                   env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                        "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "0.5"})
         self.assertLess(time.monotonic() - start, 30)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        # PROBE_EMPTY_WARNS: the hung tool's empty reading warns, never reads as drift
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("xcodeVersion read nothing", result.stdout)
+        self.assertNotIn("toolchain drifted", result.stdout)
+        self.done()
         # the same hung tool on a busy host admits: the job is slower, never failed
         result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
                               env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
                                    "GLAEDA_RUNNER_PROBE_LOAD_PER_CPU": "14"})
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("admitted on no answer", result.stdout)
+        self.assertIn("warning: toolchain probe failed, not drift: xcodeVersion read nothing", result.stdout)
 
     def test_no_enrollment_refuses(self) -> None:
         self.fleet()
@@ -9189,9 +9227,9 @@ class XcodeToolchainTest(unittest.TestCase):
                 self.assertIn("timed out after 0 s; no answer, not a missing or drifted tool", why)
                 self.assertIn("gh is not on the job PATH", why)
                 answers.update(gh="gh version 2", zig="")
-                why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
-                self.assertIn("timed out after 0 s", why, "an empty drift past the budget is no answer too")
-                self.assertIn("zigVersion '' != '0.16.0'", why)
+                why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
+                self.assertIsNone(why, "an empty reading is a failed probe, never drift (PROBE_EMPTY_WARNS)")
+                self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
                 answers.update(zig="0.15.0")
                 why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
                 self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
@@ -9230,7 +9268,7 @@ class XcodeToolchainTest(unittest.TestCase):
             answers.update(gh="gh version 2", zig="")
             why, note = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertIsNone(why, "an empty drift past the budget admits too")
-            self.assertIn("zigVersion '' != '0.16.0'", note)
+            self.assertIn("zigVersion read nothing (receipt '0.16.0')", note)
             answers.update(zig="0.15.0")
             why, _ = hook.toolchain_refusal("m4pro-48", want, None, align=False)
             self.assertTrue(why.startswith("node not eligible (toolchain drifted"), "a real answer is a drift")
