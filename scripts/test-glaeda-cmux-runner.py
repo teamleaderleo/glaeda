@@ -23983,6 +23983,21 @@ class GitShimTest(unittest.TestCase):
                 self.assertNotIn("using direct HTTPS", result.stderr)
                 self.assertEqual(receipt.read_text().splitlines(), [expected])
 
+    def test_hq_checkout_with_the_jobs_token_goes_direct_with_no_probe(self) -> None:
+        # cmuxterm-hq#27837: a healthy tunnel answers, yet a token's checkout still skips it (and its relay)
+        env, receipt = self.hq_checkout_fixture()
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        ref = "refs/remotes/origin/main"
+        env = {**env, "TEST_CONNECT": "200", "TEST_CURL_EXIT": "0"}
+        for args in (["fetch", "--no-tags", "--filter=blob:none", "--depth=1", "origin", f"+{self.pr_sha}:{ref}"],
+                     ["checkout", "--force", "--detach", ref]):
+            result = subprocess.run(["git", *args], cwd=self.ws, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("this checkout carries the job's token; using direct HTTPS", result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(), ["", ""])
+        self.assertFalse((Path(env["RUNNER_TEMP"]) / hook.HQ_GIT_SHIM_DEAD).exists())
+        self.assertEqual((self.ws / "b.txt").read_text(), "b\n")
+
     def test_hq_later_steps_use_git_without_checkout_recovery(self) -> None:
         env, receipt = self.hq_checkout_fixture()
         env.pop("GITHUB_ACTION_REPOSITORY")
@@ -24154,6 +24169,34 @@ class GitShimTest(unittest.TestCase):
         self.assertNotIn("going direct", result.stderr)
         self.assertTrue(curl_argv.exists())
         self.assertNotIn(".proxy=", argv.read_text())
+
+    def test_a_fetch_with_the_jobs_token_skips_the_tunnel_with_no_probe(self) -> None:
+        # cmuxterm-hq#27837: the tunnel rode a congested relay (a depth-1 clone 8-20 s through it, 1.5 s direct), and
+        # GitHub's block on the office address was on anonymous fetches. actions/checkout's fetch carries the token.
+        argv, curl_argv, env = self.proxied(curl_exit=0)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        result = self.checkout_fetch(self.pr_sha, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("this fetch carries the job's token, so it goes direct to github.com", result.stderr)
+        self.assertFalse(curl_argv.exists())  # no probe of the tunnel at all
+        self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", argv.read_text())
+        self.assertFalse((self.temp / f"{hook.GIT_SHIM_LOG}.direct").exists())  # no failure mark for later calls
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+        # a lazy blob fetch from any other command in the same repository skips it too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
+
+    def test_an_anonymous_call_keeps_the_tunnel(self) -> None:
+        # with no token (SwiftPM's package clones, a clone in another directory) the tunnel protects the office address
+        argv, curl_argv, env = self.proxied(curl_exit=0)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "X-Other: 1")
+        result = self.shim("fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("carries the job's token", result.stderr)
+        self.assertTrue(curl_argv.exists())
+        self.assertNotIn(".proxy=", argv.read_text())
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "http://127.0.0.1:18434", other.stderr)
 
     def test_a_proxy_failure_after_a_good_probe_retries_direct(self) -> None:
         # the probe passed, then the tunnel dropped mid-fetch (run 45811016977's third try: "Recv failure")

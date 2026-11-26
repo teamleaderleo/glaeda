@@ -6270,6 +6270,13 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # answer, or an attempt fails with a proxy-shaped error, that attempt and the rest go direct (an empty
 # http.<url>.proxy for this command: actions/checkout's fetch carries the job's token, so it is no anonymous fetch),
 # and so do the job's later github.com git calls (a mark beside GIT_SHIM_LOG).
+# A call that carries the job's token (actions/checkout's http.<url>.extraheader, in the repository's config or the
+# credentials file it includes) never takes the tunnel at all: GitHub's block on the office address was on anonymous
+# fetches, and a token's fetch is the job's own, so only anonymous fetches (SwiftPM, other clones) need the tunnel.
+# Measured 2026-11-26 22:5xZ on six minis: github.com 200 direct in 0.19-0.22 s against 0.7-4.2 s through
+# the tunnel; cmux info/refs (7.2 MB) 0.36-0.66 s direct against 2.4-10.4 s, and a 30 s timeout on a relayed mini;
+# a depth-1 clone 1.4-1.6 s direct against 8.2-19.9 s; twenty direct info/refs in a row, all 200 (cmuxterm-hq#27837).
+GIT_SHIM_TUNNEL = "http://127.0.0.1:18434"
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6292,6 +6299,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 sub=$1
+# this repository's git sends the job's token to github.com: actions/checkout's extraheader, read with includes
+authed() { "$real" "${globals[@]}" config --get-urlmatch http.extraheader https://github.com/ 2>/dev/null | grep -qi '^authorization:'; }
 '''
 GIT_SHIM_BODY = r'''
 say() { echo "glaeda git shim: $*" >&2; }
@@ -6310,6 +6319,10 @@ sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.u
 # this job's proxy failed, it goes direct too, as fetches do (cmuxterm-hq run 45860743368: the HQ shim's twin gap).
 case $sub in fetch|ls-remote|submodule) ;; *)
   [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
+  # one config read on this hot path: a token's call skips the tunnel (GIT_SHIM_TUNNEL), anything else keeps it
+  http=$("$real" "${globals[@]}" config --get-urlmatch http https://github.com/ 2>/dev/null) &&
+    printf '%s\n' "$http" | grep -qxF "http.proxy $tunnel" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
+    exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   exec "$real" "${orig[@]}" ;; esac
 shift
 args=("$@")
@@ -6469,6 +6482,10 @@ go_direct() {  # $1: why. This attempt, the rest and the job's later git calls s
 if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
+elif [ "$proxy" = "$tunnel" ] && [ "$kind" != submodule ] && authed; then
+  # not a submodule update: its clones are other repositories, with no token, and -c reaches them
+  route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
+  say "this fetch carries the job's token, so it goes direct to github.com (the tunnel $proxy is for anonymous fetches)"
 fi
 probe_proxy() {  # one CONNECT through the proxy, bounded; any HTTP answer from github.com means the path works
   [ -n "$proxy" ] && [ ${#route[@]} -eq 0 ] && command -v curl >/dev/null 2>&1 || return 0
@@ -6559,7 +6576,8 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
             f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
             f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
-            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n")
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\nproxy_probe_s={GIT_SHIM_PROXY_PROBE_S}\n"
+            f"tunnel={shlex.quote(GIT_SHIM_TUNNEL)}\n")
     return head + GIT_SHIM_BODY
 
 
@@ -6576,13 +6594,14 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 # feat-cmux-next after HQ, and that fetch passed straight to the dead tunnel ("Failed to connect to
 # 127.0.0.1 port 18434" three times, cmuxterm-hq job 140064510755, 2026-11-26 17:30Z). So any
 # github.com origin an actions/checkout step fetches in an HQ job takes the same probe and mark.
+# A checkout whose git carries the job's token (its extraheader) goes direct with no probe, as the cmux shim's does.
 HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
 ''' + GIT_SHIM_COMMAND + r'''
 passthrough() { exec "$real" "${orig[@]}"; }
 mark=${RUNNER_TEMP:+$RUNNER_TEMP/$dead}
-case "$sub" in fetch|checkout) ;; *) [ -n "$mark" ] && [ -e "$mark" ] || passthrough ;; esac
+case "$sub" in fetch|checkout) ;; *) [ -n "$mark" ] && [ -e "$mark" ] || authed || passthrough ;; esac
 url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
 case "$url" in
   https://github.com/*) ;;
@@ -6592,6 +6611,10 @@ esac
 proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
 [ "$proxy" = http://127.0.0.1:18434 ] || passthrough
 case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
+if authed; then  # checkout's fetch carries the job's token: the tunnel is only for anonymous fetches (GIT_SHIM_TUNNEL)
+  echo "glaeda git shim: this checkout carries the job's token; using direct HTTPS for ${url#https://github.com/}" >&2
+  exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@"
+fi
 connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
           --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
 case "$?:$connect" in
