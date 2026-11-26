@@ -24998,6 +24998,8 @@ class RollupController(FakeController):
         self.gh, self.rollups, self.incomplete, self.slow = gh, [], set(), set()
         self.pulls: dict = {}
         self.pull_asks: list = []
+        self.bodies: dict = {}
+        self.body_asks: list = []
 
     def get(self, path: str, timeout: float | None = None) -> dict:
         self.fail()
@@ -25008,6 +25010,12 @@ class RollupController(FakeController):
             if row is None:
                 raise gg.NoReceiver("controller: HTTP 404")
             return {"found": True, "seeded": True, "pr": row}
+        if "/v1/github/pull-rest" in path:  # a kept pull body: only those a test seeded (`bodies`), else none
+            q = urllib.parse.parse_qs(path.split("?", 1)[1])
+            key = (q["repo"][0], int(q["number"][0]))
+            self.body_asks.append(key)
+            body = self.bodies.get(key)
+            return {"found": body is not None, **(body or {})}
         sha = path.split("/commits/", 1)[1].split("/", 1)[0]
         self.rollups.append(sha)
         if sha in self.slow:
@@ -25766,6 +25774,19 @@ class StaleDataTest(Base):
         self.assertEqual((data["state"], data["checkState"], data["mergeable"]), ("OPEN", "SUCCESS", "MERGEABLE"))
         self.assertEqual(ctl.pull_asks, [("o/r", 9)] * 2)
         self.assertTrue(served_by(row(gg.PULL_REUSE_MAX + 5)))  # a stale row: GitHub answers, as before
+        # PULL_CURRENT: a stale row whose kept pull body the controller proves current answers at any age
+        head = self.gh.prs[("o", "r", 9)]["headRefOid"]
+        body = {"number": 9, "state": "open", "title": "PR 9", "html_url": "https://github.com/o/r/pull/9",
+                "draft": False, "merged": False, "mergeable": True, "mergeable_state": "clean",
+                "updated_at": "2026-11-26T07:00:00Z", "head": {"sha": head, "ref": "lane/x"}, "base": {"ref": "main"}}
+        ctl.bodies = {("o/r", 9): {"current": True, "pull": body}}
+        self.assertEqual(served_by(row(gg.PULL_REUSE_MAX + 5)), [])
+        self.assertIn(("o/r", 9), ctl.body_asks)
+        for unproven in ({"current": False, "pull": body}, {"current": True, "pull": {**body, "mergeable": None}},
+                         {"current": True, "pull": {**body, "head": {"sha": "f" * 40, "ref": "lane/x"}}}):
+            ctl.bodies = {("o/r", 9): unproven}
+            self.assertTrue(served_by(row(gg.PULL_REUSE_MAX + 5)), unproven)  # not proven current: GitHub
+        ctl.bodies = {}
         self.assertTrue(served_by(row(30, mergeable=None)))  # mergeability not computed yet: GitHub
         self.assertTrue(served_by(None))  # no row: GitHub
         merged = row(90000, state="closed", merged=True, merged_at="2026-11-25T01:00:00Z", mergeable=None)

@@ -13779,7 +13779,7 @@ class Daemon:
         stored = iso_epoch(stream_time(row.get("received_at")))
         if row["state"] == "open" and (not isinstance(row.get("mergeable"), bool) or stored is None
                                        or self.now - stored >= PULL_REUSE_MAX):
-            return None
+            return self.controller_pull_current(get, repo, int(number), str(row["head_sha"]))
         doc = slim_pull({"number": row["number"], "html_url": row.get("url"), "title": row.get("title"),
                          "state": row["state"], "draft": bool(row.get("draft")), "merged": bool(row.get("merged")),
                          "merged_at": github_time(row.get("merged_at")) if row.get("merged") else None,
@@ -13789,6 +13789,31 @@ class Daemon:
                          "head": {"sha": str(row["head_sha"]).lower(), "ref": row.get("head_ref")},
                          "base": {"ref": row.get("base_ref")}})
         return {"doc": doc, "at": min(self.now, stored or self.now), "via": "controller"}
+
+    def controller_pull_current(self, get: Any, repo: str, number: int, head: str) -> dict | None:
+        """GET pulls/N's part from the controller's kept pull body (/v1/github/pull-rest) when the controller proves
+        it current (PULL_CURRENT, cmuxterm-hq#29955: received since the controller started and since any lost pull,
+        review, comment, check run or status delivery, no check run or status on its head since, mergeability
+        known), at any age, on the head the PR row names; else None (GitHub answers, as before). No GitHub request.
+        Why (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-26 16:45Z): glaeda-upstream still read pulls/{n}
+        about 735 times an hour, nearly all for open PRs quiet past PULL_REUSE_MAX, whose row nothing proved current."""
+        try:
+            body = get(f"/v1/github/pull-rest?repo={urllib.parse.quote(repo, safe='/')}&number={number}",
+                       timeout=CONTROLLER_ROLLUP_TIMEOUT)
+        except (ControllerTimeout, NoReceiver):
+            return None
+        except WatchError:
+            self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
+            return None
+        pull = body.get("pull") if isinstance(body, dict) and body.get("found") is True \
+            and body.get("current") is True else None
+        if (not isinstance(pull, dict) or pull.get("number") != number or pull.get("state") != "open"
+                or str((pull.get("head") or {}).get("sha") or "").lower() != head.lower()
+                or not isinstance(pull.get("mergeable"), bool) or not pull.get("mergeable_state")
+                or pull.get("mergeable_state") == "unknown" or not pull.get("updated_at")):
+            return None
+        # proven unchanged as of now: its reuse bound starts now
+        return {"doc": slim_pull(pull), "at": self.now, "via": "controller"}
 
     def issue_vouches(self, held: dict) -> bool:
         """Whether HELD, a kept GET issues/N answer, can say a PR has not changed (issue_same): its ETag, or with no
