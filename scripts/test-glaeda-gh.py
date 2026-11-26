@@ -30144,6 +30144,7 @@ class LandTest(Base):
         self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the reminders below stay inside one UTC day
         self.assertFalse(gg.LAND_REARM_CODES.match("conflict"))  # the row's code for land_judge's conflicts_base
         self.pr(LA, mergeable="CONFLICTING")
+        self.fresh_head = LA  # the read a due reminder asks first (LAND_OWNER_REMIND_READ) answers, PR unchanged
         self.land()
         self.w.answers.append(refusal("conflicts_base", LA, {"kind": "stop", "stop": "conflicts_base"},
                                       nxt="merge main into o/r#1, resolve the conflicts and push",
@@ -30178,6 +30179,30 @@ class LandTest(Base):
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+
+    def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
+        # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
+        # another host's queue, and was reminded "still stopped after 26 h" on a copy from before the stop.
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.q.refresh = lambda key: (self.w.refreshed.append(key),
+                                      self.w.set_pr(key, land_pr(LA, state="MERGED"), self.t))[1]
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(self.w.refreshed, [self.KEY])  # one read, asked by the due reminder
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+
+    def test_a_reminder_whose_read_never_comes_is_still_told(self):
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        self.fresh_head = None  # every read fails
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT - 60)
+        self.assertEqual((e.get("reminds"), len(self.w.refreshed)), (None, 1))  # asked once, not every pass
+        e = self.tick(60)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
