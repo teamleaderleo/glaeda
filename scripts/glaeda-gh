@@ -1435,7 +1435,7 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 # 19:22Z-19:27Z, stopped head_moved on cmux-agents-lander[bot]'s "Merge branch 'main'" over the pin, the cache's
 # headParents [efbd3106...] one entry long.
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
-headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
+headRefName baseRefName reviewDecision updatedAt changedFiles baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
 parents(first: 3) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
@@ -5160,7 +5160,7 @@ def upper(value: Any) -> str | None:
 
 def slim_pull(doc: dict) -> dict:
     keep = ("number", "html_url", "title", "state", "draft", "merged", "merged_at", "mergeable", "mergeable_state",
-            "updated_at")
+            "updated_at", "changed_files")
     head, base = doc.get("head") or {}, doc.get("base") or {}
     return {**{k: doc.get(k) for k in keep}, "head": {"sha": head.get("sha"), "ref": head.get("ref")},
             "base": {"ref": base.get("ref")}}
@@ -5436,7 +5436,7 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
             "mergeable": mergeable, "mergeStateStatus": upper(pull.get("mergeable_state")) or "UNKNOWN",
             "headRefOid": head.get("sha"), "headRefName": head.get("ref"),
             "baseRefName": (pull.get("base") or {}).get("ref"), "reviewDecision": review,
-            "updatedAt": pull.get("updated_at"),
+            "updatedAt": pull.get("updated_at"), "changedFiles": pull.get("changed_files"),
             "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": sorted(required)}, "rules": {"nodes": []}},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
 
@@ -5675,6 +5675,8 @@ def parse_pr(node: dict) -> dict:
         **({"headParent": head_parent} if head_parent else {}),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
+        # LAND_ZERO_DIFF: how many files the PR changes, as GitHub counts it; None from a read that does not say
+        "changedFiles": node.get("changedFiles"),
         **({"headParents": parents} if (parents := head_parents(node)) is not None else {}),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
@@ -15616,6 +15618,27 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_REMIND_STATE_READ: a reminder re-reads the PR's state before it says a word (remind_state_open). The skip above
+# reads the *cache*, and a stopped row is watched by nothing: its copy is as old as the stop, so a PR closed since
+# then still reads OPEN there and the reminder goes out anyway. teamleaderleo/leo-workspace#7494 was closed as
+# superseded on 2026-11-23 and a lane was told "still stopped after 69 h: conflict: merge main into ... resolve the
+# conflicts and push next: none" on 2026-11-26, three days later, for a PR nobody can push to. The reminder is the
+# one place in the queue that both costs a wake and has no fresher read behind it, and it is rare (at most
+# LAND_OWNER_REMIND_CAP a row a day, every LAND_OWNER_REMIND_EVERY), so it pays for one `pr view --json state`: a PR
+# that reads MERGED or CLOSED ends its row there (ended, quietly -- the row is over, and its requester is owed no
+# wake for news this old), and only a row that still reads OPEN is reminded. A state that cannot be read reminds as
+# before: an unreadable GitHub is not a closed PR. Detector: test-glaeda-gh.py
+# test_a_stopped_rows_reminder_rereads_the_pr_and_drops_a_closed_one.
+# LAND_ZERO_DIFF: a PR that changes nothing is never "ready to land" (zero_diff_seen, zero_diff_stop). Two reads say
+# it: GitHub's own changedFiles 0 at the head the cache shows, and git's merge of the base into the head leaving the
+# base's own tree (union_plan). teamleaderleo/glaeda#2447, 2026-11-22..26: its 5 conflicting hunks all resolved to
+# main's side because main had already shipped their intent, so GitHub read it `mergeable: true, mergeable_state:
+# clean, additions 0, deletions 0, changed_files 0` -- green, CLEAN, and a merge of it would merge nothing. The
+# queue's advice ("merge main into it, resolve the conflicts and push") was satisfiable and pointless, and its
+# verdict after that push would have been a no-op merge. So the terminal state is a person's decision to close it as
+# superseded, named as the one step; the daemon reports it and closes nothing itself. Every merge the queue sends
+# goes through do_merge, the override-carried and pinned ones included: an override answers a check, never an empty
+# diff. Detector: test-glaeda-gh.py test_a_pr_that_changes_no_file_is_reported_superseded_instead_of_merged.
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -18010,8 +18033,12 @@ class LandQueue:
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
-                        if not self.rearm(e):  # judged from the next pass
-                            self.remind(e)  # a stop that never re-arms still reaches its owner
+                        owed = not self.rearm(e) and self.remind_due(e)  # re-armed: judged from the next pass
+                    # a stop that never re-arms still reaches its owner -- for a PR that is still open
+                    # (LAND_REMIND_STATE_READ: the read is off the lock, as every live read of GitHub is)
+                    if owed and self.remind_state_open(e):
+                        with self.lock:
+                            self.remind(e)
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
@@ -19655,32 +19682,62 @@ class LandQueue:
         self.save(e)
         return True
 
-    def remind(self, e: dict) -> bool:
-        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
-        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+    def remind_due(self, e: dict) -> bool:
+        """Under the lock: whether stopped E is owed its reminder now (remind), before the PR's state is re-read.
+        The one gate both the reminder and that read go through, so there is no second reading of "owed"."""
         if e.get("state") != "stopped":
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
         if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
-        to = str(e.get("requester") or "")
-        if not to:
+        if not str(e.get("requester") or ""):
             return False  # notify's land-unnotified already said it at the stop
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
             return False  # a PR that is over owes its requester nothing; `land status` still shows the row
-        day = land_day(self.now)
         r = e.get("reminds") or {}
-        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        n = int(r.get("n") or 0) if r.get("day") == land_day(self.now) else 0
         if n >= LAND_OWNER_REMIND_CAP:
             return False
         at = float(st.get("at") or 0)
         last = float(r.get("at") or 0) or at
-        if self.now - last < LAND_OWNER_REMIND_EVERY:
+        return self.now - last >= LAND_OWNER_REMIND_EVERY
+
+    def remind_state_open(self, e: dict) -> bool:
+        """Outside the lock: the one live read of E's PR state a reminder is worth (LAND_REMIND_STATE_READ's
+        comment). True when the PR still reads OPEN, or its state could not be read at all (an unreadable GitHub is
+        not a closed PR: the reminder goes as before). False when the row ended on that read and owes nobody a word."""
+        state, merge_sha, why = self.read_state(e)
+        with self.lock:
+            if not self.remind_due(e):
+                return False  # cancelled, re-requested or re-armed while the read was out: nothing is owed on it
+            self.history(e, "state_read", state=state or "unreadable", before="remind",
+                         why="a stopped row is watched by nothing: its copy is as old as the stop")
+            if self.ended(e, state, merge_sha, "a reminder's state read shows it", tell="quiet"):
+                log({"event": "land-remind-pr-over", "key": e["key"], "state": state,
+                     "to": str(e.get("requester") or "")})
+                return False
+            if state == "OPEN":
+                e["stateReadAt"] = self.now
+            elif why:
+                log({"event": "land-remind-state-unread", "key": e["key"], "why": land_trim(why, 200)})
+            self.save(e)
+            return True
+
+    def remind(self, e: dict) -> bool:
+        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+        if not self.remind_due(e):
             return False
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        to = str(e.get("requester") or "")
+        day = land_day(self.now)
+        r = e.get("reminds") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
-        hours = (self.now - at) / 3600.0
+        hours = (self.now - float(st.get("at") or 0)) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
         if st.get("next"):
@@ -23448,6 +23505,32 @@ class LandQueue:
                   f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
                   f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>", detail=detail)
 
+    def zero_diff_seen(self, e: dict, head: str) -> str:
+        """Why a merge of E at HEAD would merge nothing (LAND_ZERO_DIFF's comment), or "" when something it reads
+        says the PR does change a file, or nothing read says either way: GitHub's own changedFiles 0 at the head the
+        cache shows, or the base merge made here leaving the base's own tree (union_plan)."""
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        n = data.get("changedFiles")
+        same = str(data.get("headRefOid") or "").lower() == (head or "").lower()
+        if same and isinstance(n, int) and not isinstance(n, bool) and n == 0:
+            return (f"GitHub reads the PR as changing no file at {head[:12]} (changedFiles 0, state "
+                    f"{data.get('state') or '?'}, {data.get('mergeStateStatus') or '?'})")
+        zero = (e.get("unionMerge") or {}).get("zeroDiff") or {}
+        if str(zero.get("head") or "").lower() == (head or "").lower():
+            return str(zero.get("why") or "")
+        return ""
+
+    def zero_diff_stop(self, e: dict, head: str, why: str) -> None:
+        """Under the lock: stop E because landing it would merge nothing (LAND_ZERO_DIFF's comment). Not a conflict
+        to resolve and never "ready to land": the one step is a person's decision to close it as superseded, and
+        this daemon closes no PR itself."""
+        name = key_name(e["key"])
+        repo, _, number = name.partition("#")
+        self.stop(e, "zero_diff", f"{name} is superseded: {why}, so merging it would change nothing",
+                  f"decide whether to close it: gh pr close {number} -R {repo} --comment 'superseded: its base "
+                  f"already holds this change' -- or push the work of it that the base is still missing and land "
+                  f"that head")
+
     def union_merge_backoff(self, e: dict, kind: str, head: str, said: str, why: str) -> None:
         """Under the lock: the base merge at HEAD failed before git could say anything about a conflict (its fetch
         timed out or failed, a git command or the broker failed): a transient step, not a conflict. cmux#50870 (three
@@ -23598,6 +23681,15 @@ class LandQueue:
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        base_tree = (self.union_git(gitdir, "rev-parse", f"{base_sha}^{{tree}}").stdout or "").strip()
+        if SHA40.fullmatch(base_tree) and base_tree == tree:
+            # LAND_ZERO_DIFF: the merge resolves to the base's own tree, so the merge commit (and the land after it)
+            # would change nothing. Not pushed, and not a conflict to resolve: the row stops as superseded.
+            why = (f"the merge of {base} {base_sha[:12]} into {head[:12]} leaves {base}'s own tree {tree[:12]}: "
+                   f"this PR changes no file the base does not already hold")
+            e["unionMerge"].update(zeroDiff={"head": head, "base": base_sha, "tree": tree, "why": why},
+                                   base=base_sha, baseRef=base, gitdir=gitdir)
+            return "", "", "", why
         kind = str(e["unionMerge"].get("kind") or "update_branch")
         why_here = {"base": "land_judge read the PR as conflicting with its base",
                     "ci_start": "the repo's own CI never ran at the head (a retarget or a push no workflow saw)",
@@ -23644,6 +23736,13 @@ class LandQueue:
         if why:
             with self.lock:
                 tried = dict(e.get("unionMerge") or {})
+                if (tried.get("zeroDiff") or {}).get("head") == head:
+                    # LAND_ZERO_DIFF: git merged the base cleanly and the result is the base: nothing to push, and
+                    # no conflict for its requester to resolve.
+                    self.history(e, "zero_diff", head=head[:12],
+                                 base=str(tried["zeroDiff"].get("base") or "")[:12], where="base_merge")
+                    self.zero_diff_stop(e, head, why)
+                    return
                 if infra or tried.get("retry") or why.startswith("git ") or "timed out" in why:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                     self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200), transient=True)
@@ -24330,6 +24429,14 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "policy", f"land_judge said merge but named no full head ({sha!r})", "")
             return
+        empty = self.zero_diff_seen(e, sha)
+        if empty:
+            # LAND_ZERO_DIFF: a no-op merge is never what the land was for, whatever said merge (land_judge's ok, an
+            # override it carries, a pinned one): it is reported as superseded instead, for a person to close.
+            with self.lock:
+                self.history(e, "zero_diff", head=sha[:12], where="merge")
+                self.zero_diff_stop(e, sha, empty)
+            return
         sent = e.get("updateSent") or {}
         if answer.get("pinned", True) and e.get("preStepHead") == sha \
                 and (e.get("lastAction") or {}).get("kind") == "update_branch" \
@@ -24481,14 +24588,15 @@ class LandQueue:
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
                     cls=None if own else LAND_FORWARD_FYI_CLASS)
 
-    def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
+    def ended(self, e: dict, state: str, merge_sha: str, how: str, tell: str = "") -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
-        MERGE_SHA, or stopped "closed unmerged" naming no step. True when it ended."""
+        MERGE_SHA, or stopped "closed unmerged" naming no step. True when it ended. TELL "quiet" ends it in the log
+        and the entry's history only, waking nobody (the reminder's read: LAND_REMIND_STATE_READ)."""
         if state == "MERGED":
-            self.merged(e, merge_sha or e.get("mergeSha") or "", f"{how} merged")
+            self.merged(e, merge_sha or e.get("mergeSha") or "", f"{how} merged", wake=tell != "quiet")
             return True
         if state == "CLOSED":
-            self.stop(e, "closed", f"closed unmerged ({how} closed)", "")
+            self.stop(e, "closed", f"closed unmerged ({how} closed)", "", tell=tell)
             return True
         return False
 
