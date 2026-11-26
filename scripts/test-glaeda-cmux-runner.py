@@ -19709,6 +19709,10 @@ class DedicatedRunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
         self.assertEqual(self.by_kind(receipt)["private"]["state"], "create")
         self.assertTrue(self.by_kind(receipt)["private"]["applied"])
+        agents = [p for p in (self.home / "Library/LaunchAgents").glob("*.plist") if "hq-two-mac-a" in p.read_text()]
+        self.assertEqual(len(agents), 1, agents)
+        self.assertFalse(plistlib.loads(agents[0].read_bytes()).get("SessionCreate", False),
+                         "a user entry's runner runs in its account's GUI session, where /usr/bin/open reaches the app")
         self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
         self.assertEqual(runner.stat().st_mode & 0o777, 0o700)
         ledger = self.home / ".local/state/glaeda/cmux-runner" / cr.USER_CAPACITY_DIR
