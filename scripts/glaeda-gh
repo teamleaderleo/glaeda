@@ -23743,7 +23743,8 @@ class LandQueue:
             if stale and land_update_once() and land_own_update_head(e, head) and not any(
                     land_stale_named(w) for w in stale.values()):
                 with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
-                    self.history(e, "stale_replay_own_head", head=head[:12], why=land_trim(next(iter(stale.values())), 200))
+                    first = next(iter(stale.values()))
+                    self.history(e, "stale_replay_own_head", head=head[:12], why=land_trim(first, 200))
                 stale = {}
             with self.lock:
                 self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
@@ -24913,8 +24914,8 @@ class LandQueue:
                               f"land_judge named a second base merge at {head[:12]}, the head this land's own update "
                               "made, and named no check that needs a newer base; one base merge per land",
                               f"glaeda-gh status pr {repo}#{number} (a check still to report: glaeda-gh land "
-                              f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr update-branch "
-                              f"{number} -R {repo}, then land the new head)")
+                              f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr "
+                              f"update-branch {number} -R {repo}, then land the new head)")
                 return
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
