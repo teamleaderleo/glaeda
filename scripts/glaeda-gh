@@ -15615,6 +15615,9 @@ LAND_REARM_CAP = 3
 # test_a_stop_that_never_rearms_still_reaches_its_owner.
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
+# A reminder whose PR copy is older than LAND_OWNER_REMIND_EVERY asks one unwaited read first (remind) and waits up to
+# this long for it; past that it reminds on the copy it has.
+LAND_REMIND_READ = 600.0
 LAND_OWNER_REMIND_CAP = 2
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
@@ -19667,9 +19670,15 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
-            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state in ("MERGED", "CLOSED"):
+            # a PR that is over owes its requester nothing, and its row ends as rearm's does
+            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "") \
+                if isinstance(data.get("mergeCommit"), dict) else ""
+            self.ended(e, state, merge_sha, "remind: the PR's cached state shows it")
+            return False
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0
@@ -19679,6 +19688,23 @@ class LandQueue:
         last = float(r.get("at") or 0) or at
         if self.now - last < LAND_OWNER_REMIND_EVERY:
             return False
+        # A stopped row reads nothing, so its cached state can be from before the PR merged by hand or by another
+        # queue: read it once before a reminder (LAND_REMIND_READ). gcp-agent-lane-4, 2026-11-26: lw#10730 and
+        # lw#10040, merged hours before, were reminded "still stopped after 21 h" and "29 h" on a cache that still
+        # said OPEN; cmux-cp-1 sent lw#11097's "7 h" the same way.
+        seen = c.get("dataAt")
+        if not (isinstance(seen, (int, float)) and not isinstance(seen, bool)
+                and self.now - float(seen) < LAND_OWNER_REMIND_EVERY):
+            asked = float(e.get("remindReadAt") or 0)
+            if asked <= last:
+                e["remindReadAt"] = self.now
+                self.save(e)
+                with contextlib.suppress(OSError, WatchError):
+                    self.peek(e["key"])
+                return False  # the next pass reminds on what the read says
+            if self.now - asked < LAND_REMIND_READ:
+                return False
+            # the read never came: remind on the cached state, as before
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "

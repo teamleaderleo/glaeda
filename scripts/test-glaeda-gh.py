@@ -30161,15 +30161,21 @@ class LandTest(Base):
         gen = e.get("gen")
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
         self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
+        fresh = lambda: self.pr(LA, mergeable="CONFLICTING")  # noqa: E731  a copy read inside the cadence: still open
+        fresh()
         e = self.tick(20)
         self.assertEqual((e["state"], e["reminds"]["n"], e.get("rearms")), ("stopped", 1, None))
         self.assertEqual((len(self.w.explains()), e.get("gen")), (judged, gen))  # reminded, never re-judged
         said = self.w.sent()[-1][-1]
         self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
         self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.t += gg.LAND_OWNER_REMIND_EVERY - 1
+        fresh()
+        e = self.tick(1)
         self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (2, sent + 2, gen))
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
+        self.t += gg.LAND_OWNER_REMIND_EVERY - 1
+        fresh()
+        e = self.tick(1)  # 19:00Z, still the same UTC day: the cap
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
 
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
@@ -30177,7 +30183,32 @@ class LandTest(Base):
         sent = len(self.w.sent())
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))  # its row ends, as rearm's would
+        self.assertNotIn("still stopped", " ".join(str(m[-1]) for m in self.w.sent()[sent:]))
+
+    def test_a_stopped_rows_stale_copy_is_read_once_before_a_reminder(self):
+        # gcp-agent-lane-4, 2026-11-26: lw#10730 and lw#10040, merged hours before, were reminded "still stopped
+        # after 21 h" and "29 h": a stopped row reads nothing, and its copy still said OPEN.
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        self.w.watched.clear()
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)  # merged on GitHub; the copy is 6 h old and says OPEN
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        self.assertIn(self.KEY, self.w.watched)  # one read asked instead of a reminder
+        self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # the read lands
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))
+        self.assertNotIn("still stopped", " ".join(str(m[-1]) for m in self.w.sent()[sent:]))
+
+    def test_a_reminder_whose_read_never_comes_still_goes_out(self):
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 10)
+        self.assertEqual(len(self.w.sent()), sent)  # the read is asked
+        e = self.tick(gg.LAND_REMIND_READ - 20)
+        self.assertEqual(len(self.w.sent()), sent)  # and waited for
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 1, sent + 1))
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
