@@ -1615,6 +1615,18 @@ busy one as its job ends (`JOB_END_FREEZE`), and starts it again once the claim 
 to a runner that can start it, so a member whose dedicated runners all yield needs a second member with the same
 labels.
 
+### Yielding to a build waiting for the host lock (`yieldToWaiters`)
+
+A pool runner's listener gate stops while a build waits for `host.lock` (a fleet build, a lend drain, cmux15's
+catch-up fill in its slot), bounded by `GATE_WAITER_MAX_HOLD_S` (10 min) and then waived for `GATE_WAITER_WAIVE_S`.
+A dedicated runner's gate never read those waiters, so a builder beside a waiter kept starting jobs. A
+runner.dedicated entry with `"yieldToWaiters": true` gets the hook's `--yield-to-waiters`, and its gate reads the
+waiters exactly as a pool gate does: it stops an idle listener and freezes a busy one as its job ends
+(`JOB_END_FREEZE`). `job-started` does not change: a job already handed to it runs. cmux15's `trusted-main` declares
+it. Its Seed DerivedData jobs build from the same local CAS as the catch-up fill, the compiler CAS store's only
+writer, and the label's other servers (cmux7s-mac-mini, ultra1) take the job meanwhile. Without the key nothing
+changes. A `user` entry cannot declare it (the waiter spans are the member user's state).
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and
@@ -1661,7 +1673,8 @@ account's session and a token (cmuxterm-hq#13863): a PR job on the same Mac then
 - Allowed only on a trusted entry (`trustedRef` and `trustedRepo`, registered at that repository even when the
   member's pools are org-scoped), so only merged code of that branch runs in the account (push and schedule jobs).
   Refused: root, the member's own `ssh_user`, a name outside `[a-z_][a-z0-9_-]{0,31}`, and `user` together with
-  `lanRelay` or `yieldToExclusive` (both are the member user's: its relay socket, its capacity ledger).
+  `lanRelay`, `yieldToExclusive` or `yieldToWaiters` (each is the member user's: its relay socket, its capacity
+  ledger, its waiter spans).
 - `glaeda-cmux-runner-fleet --apply` stages the scripts into that account's home and runs
   `glaeda-cmux-runner --dedicated NAME --apply` over `ssh -l USER MEMBER` (the same options; the token on stdin). The
   plan names the user per entry. When ssh as that user fails, that entry alone fails, reported `missing: user-ssh`.

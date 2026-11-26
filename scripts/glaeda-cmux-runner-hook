@@ -8599,6 +8599,7 @@ class RunnerScope(NamedTuple):
     yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
     sim: bool = False  # --sim-runner (SIM_FIRST): the sim-first runner listens on a full mini
     small: bool = False  # --small-runner (SMALL_ONLY): SMALL_JOBS only, its disk hold is theirs (SMALL_JOB_DISK_GIB)
+    waiter_yields: bool = False  # --yield-to-waiters (YIELD_TO_WAITERS): a dedicated gate holds off for host.lock waiters
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -9270,6 +9271,17 @@ def dedicated_admission(script: Path, min_free_gib: float = 0.0) -> tuple[bool, 
 YIELD_TO_EXCLUSIVE_WAIT_S = 3 * 3600.0  # a drain (SIGNING_DRAIN_WAIT_S) plus a signing job's 160 min timeout, about
 ABANDONED = "abandoned"
 
+# YIELD_TO_WAITERS: a dedicated runner's gate never reads host.lock waiters (Gate.claimed), so a build that waits for
+# the host lock cannot hold its jobs off. cmux15's trusted-main entry (cmuxterm-hq mini-fleet.json, since 2026-11-25)
+# runs main's Seed DerivedData jobs, which build from the same local CAS as cmux15's catch-up fill, the compiler CAS
+# store's only writer. The fill's slot registers as a host.lock waiter so the pool gates hold new jobs for a gap, but
+# trusted-main kept listening: a seed started beside the slot, and the fill, which never builds beside a job, yielded
+# (11-26 07:58Z, after 147 s; the store's write_floor fired and cleared three times that day). A runner.dedicated entry
+# with yieldToWaiters (--yield-to-waiters) has its gate read the waiters as a pool gate does (blocking_waiters, with
+# bounded_waiters' GATE_WAITER_MAX_HOLD_S hold and GATE_WAITER_WAIVE_S waiver), stop an idle listener, and freeze one
+# whose job ends while a build waits (JOB_END_FREEZE). The label's other servers take the job meanwhile. job-started
+# admits as before: a job already handed here is never refused for a waiter (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER).
+
 
 def exclusive_claim(capacity_dir: Path) -> str | None:
     """Why a yielding dedicated runner holds off now (a signing job waits for this mini or holds it), or None."""
@@ -9341,7 +9353,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim, small)
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim, small,
+                       dedicated and re.search(r"\s--yield-to-waiters(?:\s|$)", text) is not None)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -12185,8 +12198,9 @@ class Gate:
         if runner_scope(self.runner_dir).dedicated:
             # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
-            # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
-            return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
+            # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner), and on a
+            # yieldToWaiters runner a build waiting for the host lock (YIELD_TO_WAITERS)
+            return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield() or self.waiter_yield()
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = self.host_claim()
         if why is None and self.waiters and self.waiters_due():
@@ -12225,6 +12239,22 @@ class Gate:
             return exclusive_claim(self.capacity_dir)
         except Exception:  # noqa: BLE001
             return None
+
+    def yields_to_waiters(self) -> bool:
+        """Whether this gate reads the host's waiters: a pool gate unless started --no-waiters, and a dedicated
+        runner only with yieldToWaiters (YIELD_TO_WAITERS), read from its job-started hook on every look so a hook
+        refresh counts without restarting the gate's listen.sh argv."""
+        scope = runner_scope(self.runner_dir)
+        return scope.waiter_yields if scope.dedicated else self.waiters
+
+    def waiter_yield(self) -> str | None:
+        """YIELD_TO_WAITERS at a dedicated runner's listener: why it takes no job now (a build waits for host.lock,
+        bounded as for a pool runner by bounded_waiters), or None. Only a yieldToWaiters entry reads the waiters."""
+        if not runner_scope(self.runner_dir).waiter_yields:
+            return None
+        if self.waiters_due():
+            self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
+        return waiter_why(self.host_lock, min(self.waiting)) if self.waiting else None
 
     def signer_yield(self) -> str | None:
         """SIGNER_SIBLING_YIELD: why an idle trusted signing listener takes no job now, or None. While a signing job
@@ -13966,7 +13996,7 @@ class Gate:
                 if not self.job_ending and self.job_end_marker().exists():
                     self.job_ending = True  # job-completed ran: watch the Worker until it exits (job_end)
                     self.waiting_at = -GATE_WAITER_EVERY_S  # and read the waiters afresh before it does
-                if self.waiters and self.waiters_due():
+                if self.yields_to_waiters() and self.waiters_due():
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
                 # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
@@ -16453,6 +16483,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yield-to-exclusive", action="store_true",
                    help="job-started, a dedicated runner: start no job while a signing job on this mini waits for "
                         "it to drain or holds it (YIELD_TO_EXCLUSIVE)")
+    p.add_argument("--yield-to-waiters", action="store_true",
+                   help="job-started, a dedicated runner: read by its listener gate, which takes no job while a build "
+                        "waits for the host lock (YIELD_TO_WAITERS); job-started itself admits as before")
     p.add_argument("--exclusive-yield-wait", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")

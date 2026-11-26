@@ -2589,6 +2589,90 @@ class GraphqlDietTest(Base):
             self.daemon.tick(t)
         self.assertEqual(len(self.gh.gql_calls()), 2)  # the quiet TTL: read once more (a lost delivery's bound)
 
+    def gate_controller(self, incomplete: bool = False) -> None:
+        """The controller's rollup of each fake head (HEAD_ROLLUP_GATE_MAX), as its webhooks keep it: one check run per
+        context with its status and conclusion, complete unless INCOMPLETE."""
+        gh = self.gh
+
+        def get(path: str, timeout: float | None = None) -> dict:
+            if "/rollup" not in path:
+                raise gg.NoReceiver("controller: HTTP 404")
+            sha = path.split("/commits/", 1)[1].split("/", 1)[0]
+            nodes = next((v for (_, _, s), v in gh.heads.items() if s == sha), [])
+            runs = [{"id": i + 1, "name": c["name"], "status": c["status"].lower(),
+                     "conclusion": (c.get("conclusion") or "").lower() or None} for i, c in enumerate(nodes)]
+            self.rollup_asks.append(sha)
+            return {"sha": sha, "complete": not incomplete, "check_runs_complete": not incomplete,
+                    "check_runs": {"total_count": len(runs), "check_runs": runs}, "status": {"statuses": []}}
+
+        self.rollup_asks: list[str] = []
+        self.ctl.get = get
+
+    def ask(self, key: str, at: float) -> None:
+        """A consumer asks for KEY at the test's clock AT (its interest, HEAD_INTEREST, is aged by the daemon's now)."""
+        with mock.patch.object(gg.time, "time", return_value=at):
+            gg.register(key, consumer="merge-guard")
+        self.touch(key, at)
+
+    def test_a_due_head_whose_controller_rollup_is_unchanged_is_not_read_from_github(self) -> None:
+        # HEAD_ROLLUP_GATE_MAX: cmux-cp-2, 2026-11-26 12:56Z, 116 GitHub head reads in 600 s took 351 s of the tick.
+        self.gate_controller()
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        read_at = gg.read_cache(key)["dataAt"]
+        t = NOW + gg.TICK
+        while t < read_at + 2 * gg.HEAD_QUIET_FED_TTL + gg.HEAD_ALIGN:
+            t += gg.TICK
+            self.ask(key, t)
+            self.daemon.tick(t)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # due twice since its read, the rollup unchanged: polled, 3
+        self.assertTrue(self.daemon.head_gated)
+        entry = gg.read_cache(key)
+        self.assertGreaterEqual(entry["gatedFrom"], read_at)
+        self.assertGreater(entry["dataAt"], entry["gatedFrom"])
+        # A check finishes: its webhook moves the rollup, so the next time the head is due it is read from GitHub.
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "COMPLETED", "SUCCESS")]
+        before = len(self.gh.gql_calls())
+        changed_at = t
+        while len(self.gh.gql_calls()) == before and t < changed_at + gg.HEAD_QUIET_FED_TTL + gg.HEAD_PENDING_FED_TTL:
+            t += gg.TICK
+            self.ask(key, t)
+            self.daemon.tick(t)
+        self.assertEqual(len(self.gh.gql_calls()), before + 1)
+        self.assertTrue(gg.read_cache(key)["data"]["settled"])
+        self.assertNotIn("gatedFrom", gg.read_cache(key))
+
+    def test_an_unchanged_rollup_still_reads_github_at_the_gate_bound_and_an_incomplete_one_always(self) -> None:
+        self.gate_controller()
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        read_at = gg.read_cache(key)["dataAt"]
+        t = NOW + gg.TICK
+        while t < read_at + gg.HEAD_ROLLUP_GATE_MAX + 2 * gg.HEAD_QUIET_FED_TTL:
+            t += gg.TICK
+            self.ask(key, t)
+            self.daemon.tick(t)
+        reads = len(self.gh.gql_calls())
+        self.assertGreaterEqual(reads, 2)  # a lost webhook's bound: a GitHub read past the gate's max
+        self.assertLess(reads, (gg.HEAD_ROLLUP_GATE_MAX + 2 * gg.HEAD_QUIET_FED_TTL) / gg.HEAD_QUIET_FED_TTL)  # polled: 5
+        self.gate_controller(incomplete=True)
+        e = {"key": key, "cache": gg.read_cache(key)}
+        self.daemon.head_rollup[key] = ("x", 0.0)
+        self.assertFalse(self.daemon.head_rollup_served(e))
+        self.assertNotIn(key, self.daemon.head_rollup)
+        self.assertIsNone(gg.rollup_digest({"sha": sha, "complete": True, "check_runs": {"check_runs": []}}, sha))
+
     def test_a_running_head_read_before_the_feed_went_live_keeps_the_fed_ttl(self) -> None:
         sha = "a" * 40
         self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]

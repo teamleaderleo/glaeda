@@ -957,6 +957,15 @@ HEAD_PENDING_FED_TTL = 180  # a running head on such a repository: its check eve
 # land host, 2026-11-26: the read loop spent 581 of each 600 s reading, 274 of them on heads, and waited PR copies aged
 # a median 2,538 s behind them. A quiet head is re-read at the settled TTL, the bound for a lost delivery.
 HEAD_QUIET_FED_TTL = 600
+# A head that is due is first put to the controller's rollup of its commit (/v1/github/commits/SHA/rollup, built from the
+# github_receiver's check_run, check_suite and status webhooks, no GitHub request): when that rollup is whole and has
+# not changed since the GitHub read the cache holds began (head_rollup_served: its digest, rollup_digest, is the
+# ETag), the answer stands and no GraphQL head query goes out. The control-plane host cmux-cp-2, 2026-11-26 12:56Z: 116
+# GitHub head reads in 600 s took 351 s of the tick (3.0 s each, 37 of the queries a cmux head's later check pages),
+# while 489 waited PR reads were deferred behind the GraphQL pace and waited PR data reached 4,753 s old. A head is
+# still read from GitHub at least this often (a lost webhook's bound), and whenever the rollup is incomplete,
+# unanswered, or for a repository whose checks of record live in another one (CHECKS_OF_RECORD).
+HEAD_ROLLUP_GATE_MAX = 1800.0
 HEAD_ALIGN = 30  # a head read also takes the heads due within this long, so they share one query
 CONTROLLER_FRESH = 60  # the controller's feed answered this recently: its webhooks are flowing
 FED_REPO_KEEP = 3600  # a repository the feed delivered an event for this recently is one the controller covers
@@ -5387,6 +5396,22 @@ def rollup_suites(doc: object, sha: str) -> dict | None:
 CONTROLLER_GREEN = {"success", "skipped", "neutral"}
 
 
+def rollup_digest(doc: object, sha: str) -> str | None:
+    """The controller rollup DOC of SHA as one digest of every check run's id, status and conclusion and every commit
+    status's context and state (head_rollup_served's ETag), else None: not whole (complete), another commit's, or a
+    part missing. Any webhook that changes the head's checks changes it."""
+    if not isinstance(doc, dict) or doc.get("complete") is not True or str(doc.get("sha") or sha).lower() != sha.lower():
+        return None
+    runs = (doc.get("check_runs") or {}).get("check_runs") if isinstance(doc.get("check_runs"), dict) else None
+    statuses = (doc.get("status") or {}).get("statuses") if isinstance(doc.get("status"), dict) else None
+    if not isinstance(runs, list) or not isinstance(statuses, list):
+        return None
+    shape = sorted([["run", r.get("id"), r.get("status"), r.get("conclusion")] for r in runs if isinstance(r, dict)],
+                   key=str) + sorted([["status", s.get("context"), s.get("state"), s.get("updated_at")]
+                                      for s in statuses if isinstance(s, dict)], key=str)
+    return hashlib.sha1(json.dumps(shape, sort_keys=True).encode()).hexdigest()
+
+
 def controller_green_checks(doc: object, sha: str) -> list[dict] | None:
     """The controller rollup DOC of SHA as its checks, when it says the head is done and green (LAND_ROLLUP_JUDGE),
     else None: incomplete (either part), another commit's, nothing in it, a check run whose newest attempt (per app,
@@ -6570,6 +6595,9 @@ class Daemon:
         self.feed_done: dict[str, float] = {}
         self.feed_live_since: float | None = None
         self.feed_unstarved = 0  # PR waits not handed back as starved: the feed showed their copy current
+        # head key -> (rollup_digest, when it was seen): the controller's rollup when this daemon last chose a GitHub read
+        self.head_rollup: dict[str, tuple[str, float]] = {}
+        self.head_gated: list[float] = []  # when head_rollup_served answered a due head with no GitHub read
         # On an upstream host: PR key -> the upstream's feed view of it (feed_view) and when it was given (answeredAt)
         self.upstream_feed: dict[str, dict] = {}
         self.feed_view_saved: tuple | None = None  # what save_feed_view last wrote (it writes only on a change)
@@ -10691,6 +10719,8 @@ class Daemon:
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
                   "staleWaited": dict(self.stale_waited), "feedUnstarved": self.feed_unstarved,
+                  # due heads the controller's rollup answered in the last 600 s, no GitHub read (head_rollup_served)
+                  "headGated": len([t for t in self.head_gated if self.now - t < 600]),
                   "staleAfter": STALE_DATA_AFTER, "stale": self.stale_record(),
                   "staleWhy": self.stale_why(), "progress": self.progress(), "staleCause": self.stale_causes(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
@@ -12547,6 +12577,40 @@ class Daemon:
         self.reads.append((self.now, "head", "fold"))
         return True
 
+    def head_rollup_served(self, e: dict) -> bool:
+        """Whether E's cached answer stands with no GitHub read (HEAD_ROLLUP_GATE_MAX): the controller's rollup of the
+        commit is whole and its digest is the one seen before the GitHub read the cache holds began, that read is
+        under HEAD_ROLLUP_GATE_MAX old and stored without error. Served: the entry's dataAt moves to now (as a probe's
+        match moves it) and gatedFrom keeps the GitHub read's own time. Not served: the digest seen now is kept for
+        the read that follows. Never raises: anything else is a GitHub read as before."""
+        try:
+            key = e["key"]
+            _, owner, repo, sha = split_key(key)
+            cache = e.get("cache") or {}
+            if (owner.lower(), repo.lower()) in {(o.lower(), r.lower()) for o, r in CHECKS_OF_RECORD} \
+                    or not self.fed(key):
+                return False
+            digest = rollup_digest(self.controller_rollup_doc(f"/repos/{owner}/{repo}", sha.lower()), sha.lower())
+            if digest is None:
+                self.head_rollup.pop(key, None)
+                return False
+            if not isinstance(cache.get("data"), dict) or cache.get("error"):
+                self.head_rollup[key] = (digest, self.now)  # the read that follows is the one this digest stands for
+                return False
+            seen = self.head_rollup.get(key)
+            read_at = cache.get("gatedFrom") if isinstance(cache.get("gatedFrom"), (int, float)) else cache.get("dataAt")
+            if (seen is None or seen[0] != digest or not isinstance(read_at, (int, float)) or seen[1] > read_at
+                    or self.now - read_at >= HEAD_ROLLUP_GATE_MAX):
+                self.head_rollup[key] = (digest, self.now)
+                return False
+            if not self.store(key, cache, dataAt=self.now, data=cache["data"], gatedFrom=read_at):
+                return False
+        except Exception:  # noqa: BLE001  the gate only ever saves a read: on any doubt the head is read
+            return False
+        self.refund(key)
+        self.head_gated = [t for t in self.head_gated if self.now - t < 600] + [self.now]
+        return True
+
     def head_folded_now(self, e: dict) -> bool:
         """Whether a full PR read stored this head this tick (fold_pr_head): its read is skipped, its charge refunded."""
         if self.__dict__.get("head_folded", {}).get(e["key"]) != self.now:
@@ -12645,7 +12709,8 @@ class Daemon:
         """Every check on each head commit, in aliased queries sized by the repository's measured cost per head
         (head_size). None, or the error of the first query that failed: the heads it and the ones after it carried
         are left to batched(), which splits them, and a head an earlier query of this tick stored is not read again."""
-        entries = [e for e in entries if not self.head_folded_now(e) and not self.head_read_now(e)]
+        entries = [e for e in entries if not self.head_folded_now(e) and not self.head_read_now(e)
+                   and not self.head_rollup_served(e)]
         if not entries:
             return None
         size = self.head_size(entries)
@@ -13807,7 +13872,7 @@ class Daemon:
         """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
         _, owner, repo, sha = split_key(e["key"])
         prior = e["cache"] or {}
-        if self.head_folded_now(e):
+        if self.head_folded_now(e) or self.head_rollup_served(e):
             return None
         if self.rest_oversized(e):
             # (a GraphQL read that spilled here this tick: due_heads leaves these out of REST's own turn)
