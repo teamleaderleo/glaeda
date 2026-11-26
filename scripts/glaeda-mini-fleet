@@ -3434,6 +3434,10 @@ def routed_ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes
     return ssh_stream(name, user, command, log, stdin=stdin, timeout=timeout)
 
 
+# Agent forwarding for a peer-to-peer LAN step. ControlPath=none: an operator's ssh config that multiplexes
+# (ControlMaster auto) reuses a master opened without -A and silently forwards no agent, so the seed's ssh to the
+# peer failed "Permission denied (publickey)" (exit 255) on 2026-11-26 for every Xcode 27.0 copy.
+AGENT_FORWARD = ("-A", "-o", "ControlPath=none")
 HELD_EXIT = 20  # cmux_mini_fix.sh: the host is held by the fleet host lock or a reservation
 # host_held's reason when the fleet host lock alone holds the host: it checks the reservation first, so a host
 # held for this reason has no active reservation.
@@ -3817,7 +3821,7 @@ def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | No
         else:
             lan = lan_settings(manifest)
             args = [f"ssh://{user}@{address}/opt/homebrew", *([lan["identity"]] if lan["identity"] else [])]
-            options = ("-A",) if lan["agent"] else ()
+            options = AGENT_FORWARD if lan["agent"] else ()
     code = routed_ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
                              timeout=FIX_TIMEOUTS["homebrew_fetch"],
                              options=(*host_ssh_options(manifest, name), *options))
@@ -4264,7 +4268,7 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
         streams = SEED_STREAMS.setdefault(source, threading.Semaphore(SEED_STREAMS_PER_SOURCE))
     with streams:  # fix and onboard run many peers at once; one source serves a few at a time
         code = routed_ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
-                                 options=(*source_route, *( ("-A",) if lan["agent"] else () )))
+                                 options=(*source_route, *(AGENT_FORWARD if lan["agent"] else ())))
     if code:
         return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
     if routed_ssh_stream(name, user, library_command("share_finish", [thing, *args], gate=gate), log, timeout=3600,

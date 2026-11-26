@@ -3490,7 +3490,8 @@ class ShareTests(unittest.TestCase):
             self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
             mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
         (host, command, options), (_, plain, plain_options) = calls
-        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        # ControlPath=none: a multiplexed master opened without -A forwards no agent.
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A", "-o", "ControlPath=none"), ()))
         self.assertTrue(remote_call(command).endswith(
             f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
         self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
@@ -3553,15 +3554,17 @@ class ShareTests(unittest.TestCase):
         self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
         args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
         for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
-            commands = []
+            commands, options_seen = [], []
             with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
                     mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
-                                      (commands.append(c), 1 if "share_have" in c else 0)[1]):
+                                      (commands.append(c), options_seen.extend(options),
+                                       1 if "share_have" in c else 0)[2]):
                 ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
             self.assertTrue(ok, thing)
             recv = next(c for c in commands if "share_recv" in c)
             self.assertIn(gate + "share_recv " + thing, recv, thing)
             self.assertTrue(remote_call(commands[-1]).startswith(gate + "share_finish " + thing), (thing, remote_call(commands[-1])))
+            self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
         # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
         for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
             seen = []
