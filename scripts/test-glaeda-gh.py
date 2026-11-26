@@ -27233,8 +27233,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
-                                                   "--class", "block", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:14], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "result", "--within", "60s", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -27245,15 +27245,29 @@ class LandTest(Base):
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
 
-    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
-        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
-        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+    def test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute(self):
+        # LAND_MERGED_CLASS: its own merge asks nothing of the requester, so it is a result, never a [blocker]
+        # (lw#11661 and #11593, 2026-11-26), and --within still wakes an idle lane within a minute.
         self.pr(LA)
         self.land()
         self.w.answers.append(ok_answer(LA))
         self.tick()
         sent = self.w.sent()[-1]
-        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
+        self.assertEqual(sent[sent.index("--within") + 1], "60s")
+        self.assertIn("merged", sent[-1])
+
+    def test_a_merged_notice_to_an_acpmux_without_within_is_sent_again_without_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--within' found\n")
+        real = self.q.call
+        self.q.call = lambda argv, *a, **k: (refused if "--within" in argv else real(argv, *a, **k))  # type: ignore
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertNotIn("--within", sent)
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
         self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
@@ -35208,8 +35222,8 @@ class LandTest(Base):
             [said] = [c for c in self.w.sent() if "merged" in c[-1]]
             return said[said.index("--class") + 1]
 
-        self.assertEqual(told("merged pinned"), gg.LAND_NOTICE_CLASS)
-        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("merged pinned"), gg.LAND_MERGED_CLASS)
+        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_MERGED_CLASS)
         self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
         self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
 
@@ -38292,6 +38306,76 @@ class LandTest(Base):
         e = self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)
         self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_green_rollup_judges_a_checks_wait_whose_copy_still_shows_a_check_running(self):
+        """LAND_ROLLUP_READY. manaflow-ai/cmuxterm-hq#28474, 2026-11-26: judged checks_running at 09:49Z, every check
+        green by 10:06Z (the last a commit status), the copy starved of reads still showing one running, merged by
+        hand at 10:13Z. The controller's green rollup, asked once the feed shows anything for the PR, judges the row
+        at once, on that rollup; a quiet feed asks nothing; a second green within LAND_VERDICT_KEEP asks nothing."""
+        events = self.feed()
+        green: list = [None]
+        asked: list[str] = []
+
+        def nodes(key: str, sha: str):
+            asked.append(sha)
+            return green[0]
+        self.q.rollup_nodes = nodes
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "IN_PROGRESS", None)])  # the copy's next read
+        asked.clear()  # (the first judgment's snapshot asked it once)
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual((len(self.w.judgments()), asked), (1, []))  # a quiet feed: nothing to ask about
+        events.append(self.t)  # the last check (a status) went green; the copy (re-read, unchanged) still shows it running
+        for _ in range(3):
+            e = self.tick(1)
+        self.assertEqual((len(self.w.judgments()), len(asked)), (1, 1),
+                         [h.get("event") for h in e["history"]])  # the rollup is not green yet; asked once per TTL
+        green[0] = [{"__typename": "CheckRun", "name": "ci", "conclusion": "SUCCESS", "status": "COMPLETED"}]
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_ROLLUP_SEEN_TTL)
+        for _ in range(2):
+            if len(self.w.judgments()) < 2:
+                e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2, [h.get("event") for h in e["history"]])
+        self.assertIn("rollup_ready", [h.get("event") for h in e["history"]])
+        self.assertEqual([h for h in e["history"] if h.get("event") == "judged"][-1].get("why"), "rollup_ready")
+        self.assert_merged_at(LA)
+
+    def test_a_green_rollup_whose_judgment_still_waits_is_not_asked_again_before_the_verdict_keep(self):
+        """A rollup_ready judgment land_judge answers with the same wait (a status the rollup did not know of) asks no
+        more until LAND_VERDICT_KEEP; then a still-green rollup judges once more."""
+        events = self.feed()
+        self.q.rollup_nodes = lambda key, sha: [{"__typename": "CheckRun", "name": "ci", "conclusion": "SUCCESS"}]
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        events.append(self.t + 1)
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        for _ in range(3):
+            e = self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2, [h.get("event") for h in e["history"]])
+        events.append(self.t + 1)
+        for _ in range(5):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.t += gg.LAND_VERDICT_KEEP
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])  # read again, still behind
+        events.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(3):
+            if len(self.w.judgments()) < 3:
+                e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 3, [h.get("event") for h in e["history"]])
 
     def test_a_re_request_of_a_waiting_checks_row_judges_it_again(self):
         """glaeda#2744: two same-pin re-requests left the waiting row on its hour wake."""
