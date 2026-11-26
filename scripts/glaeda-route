@@ -1015,9 +1015,14 @@ def pool_jobs(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
 
     A job's wait counts from the latest of its creation, the reservation, and the first time the
     agent saw it waiting, so a job created before its `needs` finished never counts as late.
+
+    A run with any job that holds a runner (assigned or running, on any label: the pool, overflow,
+    Blacksmith) is never stuck: cancelling it would throw away work that is under way. Run
+    45823199209 (cmux, 2026-11-26) was cancelled at 12:55:30Z six minutes into a Blacksmith macOS
+    compile and re-run whole as attempt 2.
     """
-    jobs = [job for job in run_jobs(api, entry["repo"], entry["run_id"], entry["run_attempt"])
-            if entry["pool"] in job_labels(job)]
+    every = run_jobs(api, entry["repo"], entry["run_id"], entry["run_attempt"])
+    jobs = [job for job in every if entry["pool"] in job_labels(job)]
     started = sum(1 for job in jobs if job.get("runner_name"))
     waiting = [job for job in jobs if job.get("status") in ("queued", "waiting") and not job.get("runner_name")]
     for job in waiting:
@@ -1028,9 +1033,16 @@ def pool_jobs(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
         since = max(parse_utc(job.get("created_at")) or now, seen.get(f"job:{job.get('id')}", now), reserved_at)
         return now - since
 
+    if any(holds_runner(job) for job in every):
+        return started, waiting, [], []
     stuck = [job for job in waiting if queued_for(job) >= rescue_seconds]
     refused = [job for job in jobs if refused_at_start(job)]
     return started, waiting, stuck, refused
+
+
+def holds_runner(job: dict[str, Any]) -> bool:
+    """A job a runner has taken and not finished, whatever its label."""
+    return bool(job.get("runner_name") or job.get("runner_id")) and job.get("status") != "completed"
 
 
 def stuck_reason(entry: dict[str, Any], stuck: list[dict[str, Any]], refused: list[dict[str, Any]],
