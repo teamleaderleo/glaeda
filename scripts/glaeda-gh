@@ -38066,6 +38066,17 @@ GH_SWEEP_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({N
                          r"(?:runs/(\d+)(?:/attempts/\d+)?/jobs|jobs/(\d+))/?(?:\?.*)?$")
 GH_SWEEP_MAX = 30
 GH_SWEEP_WINDOW = 600.0
+# Named budgets: a caller whose question the runner list cannot answer ("which jobs wait, on what label, since when":
+# a queued job has no runner) names one in GLAEDA_GH_SWEEP_BUDGET. Its targets count against one host-wide bucket
+# (`budget:NAME`, every caller naming it together), not the caller's own GH_SWEEP_MAX, so a coordinator's session
+# reads and its queue-why pass no longer share 30 between them, and the bucket's ceiling is the most that purpose
+# can spend on this host however many sessions run it. An unknown name counts as the caller's own, as before.
+# queue-why (cmuxterm-hq tools/fleet-reconcilers ci_queue_why.py and queue_why_auto.py): its REST fallback, read
+# only while the controller's feed is down, is one listing per status and the jobs of at most 20 runs a pass
+# (queue_why_auto.REST_MAX_RUNS), each answer shared through this cache. 2026-11-26 12:15Z: session
+# interim-coord-2 held 27 of its 30 and the pass was refused on its first jobs read while the feed answered 503,
+# exactly when the verdict was needed.
+GH_SWEEP_BUDGETS = {"queue-why": 60}
 GH_SWEEP_EXIT = 2
 
 
@@ -38086,7 +38097,10 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
     target = gh_sweep_target(words, method)
     if target is None or os.environ.get("GLAEDA_GH_SWEEP_OK") == "1":
         return None
-    caller = broker_caller()
+    budget = os.environ.get("GLAEDA_GH_SWEEP_BUDGET") or ""
+    cap = GH_SWEEP_BUDGETS.get(budget)
+    caller = f"budget:{budget}" if cap else broker_caller()
+    cap = cap or GH_SWEEP_MAX
     path = BASE / "broker-sweeps.json"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with bounded_lock(BASE / ".broker-sweeps.lock") as held:
@@ -38101,8 +38115,12 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
                 if kept:
                     callers[str(who)] = kept
         mine = callers.setdefault(caller, {})
-        if target not in mine and len(mine) >= GH_SWEEP_MAX:
+        if target not in mine and len(mine) >= cap:
             owner = target.split("/")[0]
+            if caller.startswith("budget:"):
+                return (f"glaeda-gh: refused: the host's {budget} budget read the jobs of {len(mine)} different runs "
+                        f"or jobs in the last {int(GH_SWEEP_WINDOW // 60)} minutes (GH_SWEEP_BUDGETS); answers read "
+                        f"already come from the cache, and the bucket frees as the window passes.")
             return (f"glaeda-gh: refused: this caller read the jobs of {len(mine)} different runs or jobs in the last "
                     f"{int(GH_SWEEP_WINDOW // 60)} minutes, which is a runner-occupancy sweep and spends a REST request "
                     f"each from the quota every session shares. `glaeda-gh runners {owner}` answers which runners are "

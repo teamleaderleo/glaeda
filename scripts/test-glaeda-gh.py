@@ -22713,6 +22713,21 @@ class BrokerSweepTest(BrokerBase):
             later = time.time() + gg.GH_SWEEP_WINDOW + 1
             self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/jobs/4"], "GET", later))
 
+    def test_a_named_budget_is_one_host_bucket_apart_from_the_callers_own(self) -> None:
+        # 2026-11-26: a coordinator session's own reads filled its 30, and its queue-why pass was refused while the
+        # controller feed was down.
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 1), mock.patch.dict(gg.GH_SWEEP_BUDGETS, {"queue-why": 2}):
+            self.run_gh(["api", "repos/o/r/actions/jobs/1"])
+            self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/2"])[3])
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "queue-why"}):
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/10/jobs"])[3])
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/runs/11/jobs"])[3])
+                code, _out, err, passed = self.run_gh(["api", "repos/o/r/actions/runs/12/jobs"])
+            self.assertEqual((code, passed), (gg.GH_SWEEP_EXIT, None))
+            self.assertIn("queue-why budget", err)
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_BUDGET": "no-such-budget"}):
+                self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/3"])[3])
+
     def test_what_is_a_sweep_target(self) -> None:
         for path, want in (("repos/O/R/actions/runs/5/jobs?per_page=100", "o/r run 5"),
                            ("/repos/o/r/actions/runs/5/attempts/2/jobs", "o/r run 5"),
