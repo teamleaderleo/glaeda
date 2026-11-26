@@ -46467,6 +46467,42 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertEqual(gg.load_full_pr_secs(path), {})
 
 
+class PendingRowsConfirmByProbe(unittest.TestCase):
+    """The land host, 2026-11-26: a queued PR with running checks moved its check counts every few minutes and each
+    move was a 4.4 s full read. Only the counts moving, rollup still pending, is confirmed by the probe."""
+    def fp(self):
+        return json.dumps(["OPEN", False, False, "MERGEABLE", "BLOCKED", "a" * 40, None, "PENDING", 10,
+                           [["IN_PROGRESS", 3]], [], 4])
+
+    def check(self, old, new, age=100.0, queued=True):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 5000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"} if queued else ())
+        real = gg.pr_fingerprint
+        gg.pr_fingerprint = lambda node: new
+        try:
+            return d.pending_counts_only({"key": "pr:o/r#1", "cache": {"fp": old, "fullAt": d.now - age}}, {})
+        finally:
+            gg.pr_fingerprint = real
+
+    def test_counts_moving_is_confirmed(self):
+        moved = json.loads(self.fp())[:8] + [11, [["IN_PROGRESS", 2]], [], 4]
+        self.assertTrue(self.check(self.fp(), json.dumps(moved)))
+
+    def test_everything_else_is_read(self):
+        new = json.loads(self.fp())
+        for idx, val in ((0, "MERGED"), (4, "CLEAN"), (5, "b" * 40), (6, "APPROVED"), (7, "SUCCESS"), (7, "FAILURE")):
+            n = list(new)
+            n[idx] = val
+            self.assertFalse(self.check(self.fp(), json.dumps(n)), (idx, val))
+        self.assertFalse(self.check(self.fp(), self.fp(), age=gg.PR_FULL_PENDING_EVERY + 1))
+        self.assertFalse(self.check(self.fp(), self.fp(), queued=False))
+        settled = json.loads(self.fp())
+        settled[7] = "SUCCESS"
+        self.assertFalse(self.check(json.dumps(settled), json.dumps(settled)))
+        self.assertFalse(self.check("junk", self.fp()))
+
+
 class FullPrReadFoldsItsHead(unittest.TestCase):
     """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s
     reading their heads again, the same commit's same rollup. A whole full read now stores the head entry too."""

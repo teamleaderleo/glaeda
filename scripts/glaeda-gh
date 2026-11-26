@@ -1489,6 +1489,13 @@ PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs 
 # host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
 # then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
 FULL_PR_SECS_FILE = "full-pr-secs.json"
+# A land-queue PR whose checks are still running changes its fingerprint (the counts by state) every time one check
+# finishes, and every change was a full read: 160+ checks of a cmux PR, ~4.4 s of GitHub's time, for a row that cannot
+# merge yet. The land host, 2026-11-26 02:39-03:39Z: 470 queued rows, 262 gated, PR data p50 4,580 s, GraphQL in stop
+# mode. Such a row (same head, state, mergeability and review, a rollup still PENDING, only the counts moved) is
+# confirmed by its probe and read in full at most this often; a rollup that settles, a new head or a
+# changed merge state is read at once.
+PR_FULL_PENDING_EVERY = 900
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -12112,12 +12119,31 @@ class Daemon:
         for i, e in enumerate(entries):
             node = (data.get(f"p{i}") or {}).get("pullRequest")
             if f"p{i}" in failed or pr_fingerprint(node) != (e.get("cache") or {}).get("fp"):
-                changed.append(e)
-                continue
+                if f"p{i}" in failed or not self.pending_counts_only(e, node):
+                    changed.append(e)
+                    continue
+                # (the fingerprint stays the cached one, so the next probe asks again until PR_FULL_PENDING_EVERY)
+                log({"event": "pr-pending-confirmed", "key": e["key"]})
             self.reads.append((self.now, "pr", "graphql"))
             self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe",
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
+
+    def pending_counts_only(self, e: dict, node: dict | None) -> bool:
+        """Whether E, a land-queue PR, differs from its cached answer only in the counts of its running checks: the
+        same head, state, mergeability and review, a rollup that was and is PENDING, and its last full read within
+        PR_FULL_PENDING_EVERY."""
+        cache = e.get("cache") or {}
+        full = cache.get("fullAt")
+        if e["key"] not in self.rollup_wanted() or not isinstance(full, (int, float)) \
+                or self.now - full >= PR_FULL_PENDING_EVERY:
+            return False
+        try:
+            old, new = json.loads(cache.get("fp") or "null"), json.loads(pr_fingerprint(node) or "null")
+        except (TypeError, ValueError):
+            return False
+        return (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == 12
+                and old[:8] == new[:8] and old[0] == "OPEN" and old[7] in ("PENDING", "EXPECTED"))
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
