@@ -17556,6 +17556,18 @@ LAND_FORWARD_ASK_EVERY = 600.0
 LAND_FORWARD_LOST_ASKS = 2
 LAND_FORWARD_READ_WAIT = 900.0
 LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "waiting", LAND_FORWARDED, "requested"})
+# A far answer holding a row open (forwardHeld) restarted its give-up clock on every ask, so a row its far queue kept
+# open never reached the give-up: whatever loop held it there held it here too, with no verdict and nobody told.
+# 2026-11-26: cmux#56127, #56200, #56556 and #56603 sat forwarded 62-112 min, then 16 h; the far queue (land-judge's
+# merge train, fixed in leo-workspace#12255) re-judged each every 5 min and answered "waiting" each time. Now a
+# forwarded row has a bound of its own, counted from its first hand-off at its head (forwardBound: a re-send, a far
+# rearm or a far answer never restarts it, only a new head): past it the row is taken back (forward_settle: landed
+# again here, pinned, its requester told as an fyi naming the far row's last state), and LAND_FORWARD_GIVE_UP after
+# that take-back with still no outcome it stops forward_no_outcome. The value is the far queue's own hand-off to
+# merge time: 67 merges among the forwarded cmux rows it held at least 12 h (2026-11-25 23Z to 11-26 18Z) took p50
+# 8.8 h, p90 15.5 h, p95 15.7 h, max 18.5 h; 45 of those 193 rows were still open. A shorter bound takes back rows
+# the far queue merges later (2 h would have taken back 87 % of those merges).
+LAND_FORWARD_HELD_BOUND = 16 * 3600.0
 
 
 # The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
@@ -20188,6 +20200,50 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
+    def forward_bound_at(self, e: dict) -> float:
+        """Under the lock. When forwarded E was first handed off at its head (LAND_FORWARD_HELD_BOUND), kept on the
+        row as forwardBound {at, head}: started at its first forward, restarted (at its newest hand-off) only by a
+        new head, never by a far answer holding it open, a re-send, a far rearm or a take-back at the same head."""
+        head = str(e.get("pinSha") or (e.get("handedOff") or {}).get("head") or e.get("head") or "").lower()
+        b = e.get("forwardBound") if isinstance(e.get("forwardBound"), dict) else {}
+        at = float(b.get("at") or 0)
+        if at > 0 and not land_head_moved(str(b.get("head") or ""), head) \
+                and not land_head_moved(head, str(b.get("head") or "")):
+            if head and not b.get("head"):
+                e["forwardBound"] = {**b, "head": head}  # a head learned later is the same hand-off's
+            return at
+        start = (self.forwarded_since(e) if at > 0 else self.forwarded_at(e)) or self.now
+        e["forwardBound"] = {"at": min(start, self.now), "head": head}
+        return e["forwardBound"]["at"]
+
+    def forward_over(self, e: dict) -> bool:
+        """Under the lock. Whether forwarded E is past its own bound (LAND_FORWARD_HELD_BOUND), whatever its far host
+        answers: past it from its first hand-off at this head and not yet taken back at it, or taken back at it
+        LAND_FORWARD_GIVE_UP ago with still no outcome."""
+        at = self.forward_bound_at(e)
+        if self.now - at <= LAND_FORWARD_HELD_BOUND:
+            return False
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        if float(back.get("at") or 0) >= at:
+            return self.now - float(back["at"]) > LAND_FORWARD_GIVE_UP
+        return True
+
+    def forward_bound_hit(self, e: dict, host: str) -> None:
+        """Under the lock. Log once per bound that forwarded E passed it, with its far host's last word on it."""
+        b = e.get("forwardBound") or {}
+        if b.get("hit"):
+            return
+        held = e.get("forwardHeld") or {}
+        far = str(held.get("state") or "") or ("error: " + str((e.get("forwardAsk") or {}).get("error") or "")
+                                               if (e.get("forwardAsk") or {}).get("error") else "no answer")
+        age = round(self.now - float(b.get("at") or self.now))
+        e["forwardBound"] = {**b, "hit": self.now, "far": far, "heldAt": float(held.get("at") or 0) or None}
+        self.history(e, "forward_bound", to=host, far=far, held=age, head=str(b.get("head") or "")[:12])
+        log({"event": "land-forward-bound", "key": e["key"], "to": host, "far": far, "held": age,
+             "head": str(b.get("head") or "")[:12], "farAnsweredAt": utc_clock(float(held["at"])) if held.get("at")
+             else None, "resends": int((e.get("forwardResent") or {}).get("n") or 0)})
+        self.save(e)
+
     def silent_peers(self) -> dict[str, str]:
         """Under the lock. The far hosts that take forwarded rows and answer none (LAND_PEER_SILENT's comment), each to
         why, from this queue's own rows (no read, no call), at most once per LAND_FORWARD_LOOK_EVERY. Also notes the
@@ -20302,7 +20358,8 @@ class LandQueue:
         since = self.forwarded_since(e)
         first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
         held = float((e.get("forwardHeld") or {}).get("at") or 0)
-        past = self.now - max(first, held) > LAND_FORWARD_GIVE_UP
+        over = self.forward_over(e)  # its own bound, which no far answer restarts (LAND_FORWARD_HELD_BOUND)
+        past = self.now - max(first, held) > LAND_FORWARD_GIVE_UP or over
         if state not in ("MERGED", "CLOSED") and read_at < since:
             # No copy, or one older than the hand-off: ask the daemon to read it (its read scheduler paces and bounds
             # the read), so the far host's merge ends this row merged instead of forward_no_outcome. 2026-11-23
@@ -20332,8 +20389,9 @@ class LandQueue:
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
         if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
-        if isinstance(answer, dict) and self.forward_answered(e, answer, host, since, c, executor):
-            return False
+        if isinstance(answer, dict) and self.forward_answered(e, answer, host, since, c, executor) \
+                and not (over and e["state"] == LAND_FORWARDED and e.get("forwardHeld")):
+            return False  # ended, re-sent, or held open inside its bound; past it a hold holds nothing
         if e.get("forwardMissing") and self.forward_lost(e, host, c, since):
             return False  # the GitHub read a lost row waited for has landed: stopped on this look, not the next ask's
         last = e.get("forwardResent") or {}
@@ -20348,8 +20406,10 @@ class LandQueue:
             self.save(e)
         if not past and self.forward_state_wanted(e):
             return True  # read live before the give-up (forward_state_wanted)
-        if held >= since and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY:
+        if not over and held >= since and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY:
             return False  # the far host holds it open: its own queue's bounds end it, and it tells the requester
+        if over:
+            self.forward_bound_hit(e, host)
         if past:
             head = str(data.get("headRefOid") or "").lower()
             if state == "OPEN" and self.now - read_at <= LAND_FORWARD_STATE_FRESH and SHA40.fullmatch(head):
@@ -20527,7 +20587,8 @@ class LandQueue:
         e["stopReadAt"] = self.now  # a stop it makes now is not read again (LAND_STOP_SETTLE)
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         held = float((e.get("forwardHeld") or {}).get("at") or 0)  # the far host's last answer holding it open
-        if self.now - max(first, held) <= LAND_FORWARD_GIVE_UP:  # read early (forward_state_wanted): an end ends it, as the cache's
+        over = self.forward_over(e)  # past its own bound a far hold holds nothing (LAND_FORWARD_HELD_BOUND)
+        if self.now - max(first, held) <= LAND_FORWARD_GIVE_UP and not over:  # read early (forward_state_wanted): an end ends it, as the cache's
             if state == "MERGED":
                 self.merged(e, merge_sha or e.get("mergeSha") or "", f"forwarded to {host}: {how} merged")
                 return
@@ -20551,14 +20612,16 @@ class LandQueue:
                       f"merged", "", tell="quiet")
             log({"event": "land-forward-settled", "key": e["key"], "state": "closed", "how": how})
             return
-        if state == "OPEN" and not e.get("forwardRelanded"):
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        taken = float(back.get("at") or 0) >= float((e.get("forwardBound") or {}).get("at") or 0) > 0
+        if state == "OPEN" and (not e.get("forwardRelanded") or (over and not taken)):
             pin = str(e.get("pinSha") or "").lower()
             if SHA40.fullmatch(pin) and SHA40.fullmatch(head or "") and land_head_moved(pin, head):
                 self.stop(e, "head_moved", land_moved_clause(head, pin),
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}", tell="fyi")
                 return
             if SHA40.fullmatch(head or ""):
-                self.forward_reland(e, head, host, executor)
+                self.forward_reland(e, head, host, executor, bound=over)
                 return
             state, why = "", why or "the read named no head to pin it at"
         if state == "OPEN":
@@ -20577,10 +20640,15 @@ class LandQueue:
             self.forward_give_up(e, "", host, executor, f"its state could not be read {fails} times: "
                                  f"{land_trim(why, 160)}")
 
-    def forward_reland(self, e: dict, head: str, host: str, executor: bool) -> None:
+    def forward_reland(self, e: dict, head: str, host: str, executor: bool, bound: bool = False) -> None:
         """Under the lock. E's PR is still open at HEAD past its give-up: this host lands it again itself, pinned at
         HEAD, as a fresh request from E's own requester (a new request id, so a far queue that holds the old one
-        applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request)."""
+        applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request).
+        BOUND: taken back past its own bound (LAND_FORWARD_HELD_BOUND) while its far host held it open; kept as
+        forwardTakenBack (land status says it) and its requester is told as an fyi, naming the far row's last state."""
+        b = dict(e.get("forwardBound") or {})
+        held_s = round(self.now - float(b.get("at") or self.now))
+        far = str(b.get("far") or (e.get("forwardHeld") or {}).get("state") or "no answer")
         n = int((e.get("forwardRelanded") or {}).get("n") or 0) + 1
         # the row's gen in the id: a re-land after a repair that cleared forwardRelanded (n back to 1) is a new request,
         # never the id an earlier re-land used. cosmic-gray, 2026-11-25 08:15Z: 20 reopened rows re-landed under their
@@ -20600,11 +20668,24 @@ class LandQueue:
         self.apply(req, e["key"], e["repo"], int(e["number"]))
         e = self.entries[e["key"]]
         e["forwardRelanded"] = {"at": self.now, "head": head, "n": n, "from": host}
-        self.history(e, "forward_relanded", head=head[:12], was=host,
-                     why=f"still open with no outcome from {host} past the give-up: landed here again, pinned")
+        why = f"still open with no outcome from {host} past the give-up: landed here again, pinned"
+        if bound:
+            e["forwardBound"] = b
+            e["forwardTakenBack"] = {"at": self.now, "head": head, "from": host, "far": far, "held": held_s}
+            why = (f"{host} held it open ({far}) {held_s / 3600:.1f} h after its first hand-off at this head, past "
+                   f"its {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound: taken back, landed here again, pinned")
+        self.history(e, "forward_relanded", head=head[:12], was=host, why=why)
         self.save(e)
         log({"event": "land-forward-relanded", "key": e["key"], "head": head[:12], "was": host,
-             "executor": executor})
+             "executor": executor, **({"bound": True, "far": far, "held": held_s} if bound else {})})
+        if bound:
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} was handed to {host} {held_s / 3600:.1f} h ago and {host} still "
+                        f"holds it open ({far}) with no verdict, past the {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound "
+                        f"of a forwarded land: taken back and landed again, pinned at {head[:12]}. `glaeda-gh land "
+                        f"status {key_name(e['key'])}` follows it; if it again gets no verdict within "
+                        f"{LAND_FORWARD_GIVE_UP / 3600:.0f} h it stops forward_no_outcome",
+                        cls=LAND_FORWARD_FYI_CLASS)  # an inbox fyi, never a blocker (notice-flood.md rule 1)
 
     def forward_give_up(self, e: dict, state: str, host: str, executor: bool, why: str) -> None:
         """Under the lock. A forwarded E nothing could end or land again (forward_settle) stops forward_no_outcome,
@@ -20627,6 +20708,15 @@ class LandQueue:
             cause += f"; this host has no way to ask {host}"
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
+        back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+        bound = float(back.get("at") or 0) >= float((e.get("forwardBound") or {}).get("at") or 0) > 0
+        if bound:  # its own bound ran out twice: say what the far host last said, and tell the requester
+            first = min(first, float((e.get("forwardBound") or {}).get("at") or first))
+            far = str((e.get("forwardHeld") or {}).get("state") or back.get("far") or "no answer")
+            cause += (f"; {host} held it open ({far}) past its {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound "
+                      f"(LAND_FORWARD_HELD_BOUND), it was taken back at {utc_clock(float(back['at']))} and that "
+                      f"got no verdict in {LAND_FORWARD_GIVE_UP / 3600:.0f} h either")
+            told = False
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
@@ -27838,6 +27928,20 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
                     f"{land_trim(str((e.get('refresh') or {}).get('error') or '?'), 120)}")
     if e["state"] == "merged" and e.get("mergeSha"):
         bits.append(f"merge {e['mergeSha'][:12]}")
+    fb = e.get("forwardBound") if isinstance(e.get("forwardBound"), dict) else {}
+    back = e.get("forwardTakenBack") if isinstance(e.get("forwardTakenBack"), dict) else {}
+    if e["state"] == LAND_FORWARDED and _finite(fb.get("at")):
+        # a forwarded row's own bound (LAND_FORWARD_HELD_BOUND): where it went, what the far host last said, and
+        # when it is taken back whatever that host answers
+        far = str((e.get("forwardHeld") or {}).get("state") or "")
+        taken = _finite(back.get("at")) and float(back["at"]) >= float(fb["at"])
+        due = float(back["at"]) + LAND_FORWARD_GIVE_UP if taken else float(fb["at"]) + LAND_FORWARD_HELD_BOUND
+        bits.append(f"handed to {e.get('forwardedTo') or 'another host'} {max(0.0, now - float(fb['at'])) / 3600:.1f} h ago"
+                    + (f", held {far} there" if far else "")
+                    + (f"; {'stops' if taken else 'taken back'} {'by' if due > now else 'past'} {utc_clock(due)}"))
+    if _finite(back.get("at")) and e["state"] != "stopped":
+        bits.append(f"taken back from {back.get('from')} {utc_clock(float(back['at']))} after "
+                    f"{float(back.get('held') or 0) / 3600:.1f} h held {back.get('far') or 'open'} there")
     if e["state"] == "stopped":
         st = e.get("stop") or {}
         bits.append(f"{st.get('code')}: {land_reason(st.get('reason'), 160)}")

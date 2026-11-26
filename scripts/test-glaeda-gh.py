@@ -42309,6 +42309,60 @@ class LandForwardTest(Base):
         self.assertGreater(len(self.asks), 10)
         self.assertFalse([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
 
+    def hold_forwarded_for(self, seconds: float) -> dict:
+        """Tick the forwarding host, the executor holding o/r#1 open the whole while, for SECONDS."""
+        e, end = self.q.entries[self.KEY], self.t + seconds
+        while self.t < end:
+            e = self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        return e
+
+    def test_a_forward_held_open_past_its_bound_is_taken_back_then_stops_with_the_far_state_said(self):
+        # 2026-11-26: cmux#56127, 56200, 56556 and 56603 sat forwarded 62-112 min, then hours, with no verdict while
+        # the far land queue held each open (its merge-train loop): every "still open" answer reset the give-up
+        # clock (forwardHeld), so no row ever ended. The bound counts from the first hand-off at the head.
+        self.forwarded_to_executor()
+        self.w.view_head = LA
+        first = self.sent_batches[0]["requests"][0]["id"]
+        told = len(self.w.sent())
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_HELD_BOUND - 3600)
+        self.assertEqual((e["state"], e["forwardHeld"]["state"], len(self.sent_batches)), ("forwarded", "requested", 1))
+        self.assertNotIn("forwardTakenBack", e)
+        self.assertIn("handed to big-exec", gg.land_line(e, self.t))
+        self.assertIn("held requested there", gg.land_line(e, self.t))
+        e = self.hold_forwarded_for(3600 + gg.LAND_FORWARD_ASK_EVERY + 2)
+        self.assertEqual((e["state"], e["pinSha"]), ("forwarded", LA))
+        self.assertEqual(e["forwardTakenBack"]["far"], "requested")
+        self.assertGreater(e["forwardTakenBack"]["held"], gg.LAND_FORWARD_HELD_BOUND)
+        events = [h.get("event") for h in e["history"]]
+        self.assertEqual((events.count("forward_bound"), events.count("forward_relanded")), (1, 1))
+        self.assertEqual(len(self.sent_batches), 2)
+        self.assertNotEqual(self.sent_batches[-1]["requests"][0]["id"], first)
+        self.assertEqual(self.sent_batches[-1]["requests"][0]["sha"], LA)
+        [fyi] = self.w.sent()[told:]
+        self.assertIn("16 h bound", fyi[-1])
+        self.assertEqual(fyi[fyi.index("--class") + 1], "fyi")
+        self.assertIn("taken back", gg.land_line(e, self.t))
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_GIVE_UP / 2)  # the take-back once, not every tick
+        self.assertEqual((e["state"], len(self.sent_batches)), ("forwarded", 2))
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_GIVE_UP / 2 + gg.LAND_FORWARD_ASK_EVERY + 2)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("requested", e["stop"]["reason"])
+        self.assertIn("16 h bound", e["stop"]["reason"])
+        self.assertTrue([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
+
+    def test_a_forward_bound_counts_from_the_first_hand_off_at_its_head_and_a_new_head_starts_it_again(self):
+        self.forwarded_to_executor()
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            self.q.now = self.t
+            began = self.q.forward_bound_at(e)
+            e["forwardHeld"] = {"at": self.t + 5000, "state": "waiting"}  # a hold is no new start
+            self.q.now = self.t + 9000
+            self.assertEqual(self.q.forward_bound_at(e), began)
+            e["pinSha"] = LB  # pushed: a new head is a new hand-off
+            e["handedOff"] = {**(e.get("handedOff") or {}), "at": self.t + 9000, "head": LB}
+            self.assertEqual(self.q.forward_bound_at(e), self.t + 9000)
+
     def test_a_forward_the_executor_never_got_is_sent_again_then_stops_lost_within_minutes(self):
         self.forwarded_to_executor()
         serve = self.q.forward
