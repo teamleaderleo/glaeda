@@ -32622,6 +32622,40 @@ class LandTest(Base):
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
 
+    def test_land_override_pinned_row_merges_at_its_pin_past_the_merge_trains_retry(self):
+        # manaflow-ai/cmux#58296, 2026-11-26: queued pinned at 30061064 with an override at 12:11:43Z, judged
+        # red_not_excused step=retry (train=boarded) at 12:16:04Z and woken for another retry, never merged. The merge
+        # train's retry stands in for an update_branch, which a pinned override row merges past at its pin.
+        cases = (("boarded", {"kind": "retry", "after_s": 300, "train": "boarded"}),
+                 ("boarding", {"kind": "retry", "after_s": 300,
+                               "board_train": {"label": "merge-train", "repo": "o/r", "number": "1"}}))
+        for name, act in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("pr pipeline / linux", "COMPLETED", "FAILURE")])
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+                self.w.answers.append(refusal("red_not_excused", LA, act))
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                self.assertEqual((self.w.gh_calls("pr", "update-branch"), self.w.gh_calls("run", "rerun")), ([], []))
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]),
+                                 ("red_not_excused", "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_still_waits_on_a_retry_that_is_not_the_trains(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.answers.append(refusal("explain_failed", LA, {"kind": "retry", "after_s": 300}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"))
+        self.assertFalse(gg.land_train_retry({"kind": "retry", "after_s": 300}))
+        self.assertTrue(gg.land_train_retry({"kind": "retry", "train": "pending"}))
+
     def test_land_override_pinned_row_that_finds_every_worker_busy_is_the_next_one_judged(self):
         # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy. Its one at-once judgment
         # was gated, the mark said it was spent, and the next pass put the row in wait_running with an hour-long wake on
