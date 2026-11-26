@@ -29523,6 +29523,30 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop")), ("merged", None))
         self.assert_merged_at(LA)
 
+    def test_a_pr_that_never_syncs_to_its_branch_at_the_pin_stops_pr_head_unsynced_naming_the_reopen(self):
+        # manaflow-ai/cmux#53968, 2026-11-26: the branch at the pin from 06:23Z, GitHub's PR still at the older commit
+        # at 07:59Z, kept (stale_head_kept) every LAND_HEAD_TIMEOUT with no end and no notice (LAND_PR_UNSYNCED).
+        self.pinned_and_waiting()
+        self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        e = self.tick(30)
+        kept = 0
+        for _ in range(int(gg.LAND_PR_SYNC_MAX // gg.LAND_HEAD_TIMEOUT) + 4):
+            if e["state"] == "stopped":
+                break
+            self.assertIsNone(e.get("stop"))
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+            kept = sum(h["event"] == gg.LAND_STALE_LIVE for h in e["history"])
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_unsynced", LA))
+        self.assertGreaterEqual(kept, 1)
+        self.assertIn("has not synced the PR", e["stop"]["reason"])
+        self.assertIn("gh pr reopen", e["stop"]["next"])
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])  # the pin, never the older head the copy shows
+        self.assertNotIn(self.LE, e["stop"]["next"])
+        self.assertNotIn("prUnsynced", e)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
