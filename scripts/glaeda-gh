@@ -15626,6 +15626,14 @@ LAND_OWNER_REMIND_CAP = 2
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+
+# LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
+# reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
+# lw#9376's reminder said 4a7ee5cb2b6a, and re-queued there the row stopped again at 0d18d91f773a. 53 of this host's
+# 110 live stopped rows quote their own stop's head that way, and 3 of 9 head_moved reminders acted on 2026-11-25
+# pointed at state the PR had already moved past. The read LAND_OWNER_REMIND_READ already asks gives the head now for
+# free: when it moved, the reminder dates the stop and names the re-queue at the head now. Detector: test-glaeda-gh.py
+# test_a_reminder_names_the_head_now_when_the_stop_head_moved.
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -19653,7 +19661,7 @@ class LandQueue:
         n = int(r.get("n") or 0) if r.get("day") == day else 0
         if n >= LAND_REARM_CAP:
             return False
-        e["rearms"] = {"day": day, "n": n + 1}
+        e["rearms"] = {"day": day, "n": n + 1, "at": self.now, "code": code}  # attributable to the stop it answered
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
         if latched:
@@ -19691,20 +19699,34 @@ class LandQueue:
             return False
         if self.remind_read_pending(e, last):
             return False
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        cache = self.cache_of(e["key"]) or {}
+        data = cache.get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
             return False  # the read it waited for shows the PR over
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
+        read_at = [t for t in (cache.get("dataAt"), cache.get("updatedAtAt"), cache.get("fetchedAt")) if _finite(t)]
+        head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
+        was = str(st.get("head") or "").lower()
+        moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
+        e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
+                        **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
         if st.get("next"):
             msg += f" next: {land_trim(str(st['next']), 300)}"
+        if moved:
+            # The stop is evidence at a commit the PR has moved past, so its one step names a sha that is no longer the
+            # head: the re-queue at the head now comes first, and the stop's own sha is dated.
+            msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
+                    f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
+        elif not head and was:
+            msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
-        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
+        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
+                     **({"moved": head[:12]} if moved else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1)})
+             "hours": round(hours, 1), "moved": moved})
         self.save(e)
         self.notify(e, to, msg)
         return True

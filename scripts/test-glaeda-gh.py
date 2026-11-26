@@ -30204,6 +30204,33 @@ class LandTest(Base):
         e = self.tick(60)
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
 
+    def test_a_reminder_names_the_head_now_when_the_stop_head_moved(self):
+        # LAND_OWNER_REMIND_MOVED: lw#9376's reminder quoted 4a7ee5cb2b6a, the head its stop was read at; re-queued
+        # there it stopped again at 0d18d91f773a. The read the reminder already asks for gives the head now for free.
+        e = self.conflict_stop()
+        self.assertEqual(e["stop"]["head"], LA)
+        self.fresh_head = LB  # pushed since the stop: its reason and its one step are evidence at LA
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        said = self.w.sent()[-1][-1]
+        self.assertEqual((e["state"], e["reminds"]["n"], e["reminds"]["head"]), ("stopped", 1, LB))
+        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, still said
+        self.assertIn(LA[:12], said)  # dated at the head it was read at
+        self.assertIn(f"--pin {LB}", said)  # and the step that judges the head now
+        reminded = [h for h in e["history"] if h.get("event") == "reminded"]
+        self.assertEqual([h.get("moved") for h in reminded], [LB[:12]])
+
+    def test_a_reminder_on_an_unread_copy_dates_the_stop_instead_of_naming_a_head(self):
+        # The wait ran out with no read (LAND_OWNER_REMIND_READ_WAIT): the copy's head may be as old as the stop, so
+        # the reminder names no head now and says the stop's sha is dated.
+        self.conflict_stop()
+        self.fresh_head = None  # every read fails
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        said = self.w.sent()[-1][-1]
+        self.assertEqual((e["reminds"]["n"], e["reminds"].get("head")), (1, None))
+        self.assertIn("could not be read just now", said)
+        self.assertNotIn("--pin", said)
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
