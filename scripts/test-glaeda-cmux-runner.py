@@ -23706,6 +23706,90 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.path_file.read_text(), "")
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
 
+    def hq_checkout_fixture(self, *, refused_socket: bool = False) -> tuple[dict, Path]:
+        # Replace only the network peers: curl reports the tunnel result, and git's
+        # HTTPS helper records its effective config and serves a real local upstream.
+        url = "https://github.com/manaflow-ai/cmuxterm-hq"
+        proxy = "http://127.0.0.1:18434"
+        if refused_socket:
+            sock = socket.socket()
+            self.addCleanup(sock.close)
+            sock.bind(("127.0.0.1", 0))  # reserved for this test, never listens
+            proxy = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        self.gitconfig.write_text(f'[http "https://github.com/"]\n\tproxy = {proxy}\n')
+        self.git(self.ws, "remote", "set-url", "origin", url)
+        self.git(self.github, "config", "uploadpack.allowFilter", "true")
+        (self.mirror / "glaeda-repair-pending").touch()
+        self.assertIn("HQ checkout", self.install(hook.HQ_DISPATCH_REPO))
+        shim_dir = Path(self.path_file.read_text().strip())
+        shim = shim_dir / "git"
+        if refused_socket:
+            shim.write_text(shim.read_text().replace("http://127.0.0.1:18434", proxy))
+        else:
+            curl = self.dir / "curl"
+            curl.write_text('#!/bin/sh\nprintf "%s" "$TEST_CONNECT"\nexit "$TEST_CURL_EXIT"\n')
+            curl.chmod(0o755)
+            shim.write_text(shim.read_text().replace("/usr/bin/curl", shlex.quote(str(curl))))
+        git_exec = self.git(self.ws, "--exec-path")
+        helper = self.dir / "git-remote-https"
+        receipt = self.dir / "transport"
+        helper.write_text(
+            '#!/bin/sh\n'
+            f'/usr/bin/git config --get-urlmatch http.proxy "$2" >> {shlex.quote(str(receipt))}\n'
+            '/usr/bin/git config --get test.checkout-header >/dev/null || exit 17\n'
+            f'cd {shlex.quote(str(self.github))} || exit 1\n'
+            f'exec {shlex.quote(git_exec)}/git-remote-ext "$1" "git-upload-pack ."\n')
+        helper.chmod(0o755)
+        env = {**self.job_env, "PATH": f"{shim_dir}:/usr/bin:/bin", "GIT_EXEC_PATH": str(self.dir),
+               "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "test.checkout-header", "GIT_CONFIG_VALUE_0": "kept",
+               "GITHUB_ACTION_REPOSITORY": "actions/checkout", "TEST_CONNECT": "000", "TEST_CURL_EXIT": "7"}
+        return env, receipt
+
+    def test_hq_actions_checkout_recovers_fetch_and_lazy_blobs_without_cmux_mirror(self) -> None:
+        env, receipt = self.hq_checkout_fixture(refused_socket=True)
+        original = self.gitconfig.read_bytes()
+        ref = "refs/remotes/origin/main"
+        cmds = (["-c", "protocol.version=2", "fetch", "--no-tags", "--prune", "--no-recurse-submodules",
+                 "--filter=blob:none", "--depth=1", "origin", f"+{self.pr_sha}:{ref}"],
+                ["checkout", "--force", "--detach", ref])
+        for args in cmds:
+            result = subprocess.run(["git", *args], cwd=self.ws, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("using direct HTTPS", result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "HEAD"), self.pr_sha)
+        self.assertEqual((self.ws / "b.txt").read_text(), "b\n")
+        self.assertEqual(receipt.read_text().splitlines(), ["", ""])
+        self.assertEqual(self.gitconfig.read_bytes(), original)
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "")
+
+    def test_hq_keeps_configured_proxy_on_connect_response_or_override(self) -> None:
+        env, receipt = self.hq_checkout_fixture()
+        fleet = "http://127.0.0.1:18434"
+        custom = "http://configured.example:8118"
+        for status, rc, options, expected in (
+                ("200", "0", [], fleet), ("403", "56", [], fleet), ("407", "56", [], fleet),
+                ("200", "60", [], fleet), ("000", "7", ["-c", f"http.https://github.com/.proxy={custom}"], custom),
+                ("000", "7", ["-c", f"remote.origin.proxy={custom}"], fleet)):
+            with self.subTest(status=status, rc=rc, options=options):
+                receipt.write_text("")
+                # A branch name requires a fresh advertisement on every subcase.
+                # Fetching the same object ID again can succeed entirely locally.
+                result = subprocess.run(["git", *options, "fetch", "--no-tags", "origin", "refs/heads/main"],
+                                        cwd=self.ws, env={**env, "TEST_CONNECT": status, "TEST_CURL_EXIT": rc},
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("using direct HTTPS", result.stderr)
+                self.assertEqual(receipt.read_text().splitlines(), [expected])
+
+    def test_hq_later_steps_use_git_without_checkout_recovery(self) -> None:
+        env, receipt = self.hq_checkout_fixture()
+        env.pop("GITHUB_ACTION_REPOSITORY")
+        result = subprocess.run(["git", "fetch", "origin", self.pr_sha], cwd=self.ws, env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("using direct HTTPS", result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(), ["http://127.0.0.1:18434"])
+
     def test_a_commit_the_mirror_holds_comes_from_the_mirror_with_no_github_fetch(self) -> None:
         self.install()
         shutil.rmtree(self.github)  # github.com is unreachable: only the mirror can serve it

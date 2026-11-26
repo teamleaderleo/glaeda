@@ -6237,9 +6237,7 @@ GIT_SHIM_STALL_S = 60
 GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
 GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
 GIT_SHIM_PROXY_PROBE_S = 10  # one CONNECT to github.com through the configured proxy; no answer in this long: go direct
-GIT_SHIM_BODY = r'''
-say() { echo "glaeda git shim: $*" >&2; }
-[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+GIT_SHIM_COMMAND = r'''
 orig=("$@")
 globals=()
 while [ $# -gt 0 ]; do
@@ -6250,6 +6248,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 sub=$1
+'''
+GIT_SHIM_BODY = r'''
+say() { echo "glaeda git shim: $*" >&2; }
+[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
 normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
 sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
   for d in "$submodules"/*.git; do
@@ -6512,32 +6515,66 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
     return head + GIT_SHIM_BODY
 
 
+# The HQ checkout can also fetch blobs during checkout after a filtered fetch. Test the
+# fleet tunnel for each of those commands. A CONNECT response (including a denial) is
+# authoritative. Only a transport failure before a response selects direct HTTPS.
+HQ_GIT_SHIM_BODY = r'''
+[ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
+''' + GIT_SHIM_COMMAND + r'''
+passthrough() { exec "$real" "${orig[@]}"; }
+case "$sub" in fetch|checkout) ;; *) passthrough ;; esac
+url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
+case "$url" in
+  https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
+  *) passthrough ;;
+esac
+"$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
+proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
+[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
+          --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
+case "$?:$connect" in
+  7:000|28:000|52:000|55:000|56:000)
+    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
+    exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
+esac
+passthrough
+'''
+
+
 def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None) -> str:
-    """job-started: put the git shim first on a cmux job's PATH when the mirror is usable. Returns a note, or "".
-    Never raises."""
+    """Install the repository's job-local git wrapper and return a diagnostic note. Never raises."""
     env = os.environ if environ is None else environ
     try:
-        if (repo or "").lower() != GIT_SHIM_REPO or env.get("GLAEDA_GIT_SHIM") == "0":
+        repository = (repo or "").lower()
+        if repository not in (GIT_SHIM_REPO, HQ_DISPATCH_REPO) or env.get("GLAEDA_GIT_SHIM") == "0":
             return ""
         temp, path_file = env.get("RUNNER_TEMP"), env.get("GITHUB_PATH")
         if not temp or not path_file:
             return ""
-        if mirror_identity(mirror) is None:
+        if repository == GIT_SHIM_REPO and mirror_identity(mirror) is None:
             return f"git shim: off, the mirror at {mirror} is not verified or has a repair pending"
-        shim_dir = Path(temp) / GIT_SHIM_DIR
+        shim_dir = Path(temp) / (GIT_SHIM_DIR if repository == GIT_SHIM_REPO else "glaeda-hq-git-shim")
         search = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p) != shim_dir)
         real = shutil.which("git", path=search)
         if not real:
             return "git shim: off, no git on PATH"
         shim_dir.mkdir(parents=True, exist_ok=True)
-        log = Path(temp) / GIT_SHIM_LOG
+        real = os.path.realpath(real)
+        if repository == HQ_DISPATCH_REPO:
+            script = f"#!/bin/bash\nreal={shlex.quote(real)}\n" + HQ_GIT_SHIM_BODY
+            note = "git shim: HQ checkout checks the fleet Git proxy"
+        else:
+            log = Path(temp) / GIT_SHIM_LOG
+            script = git_shim_script(real, mirror, log)
+            note = f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
         tmp = shim_dir / f".git.{os.getpid()}"
-        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log), encoding="utf-8")
+        tmp.write_text(script, encoding="utf-8")
         tmp.chmod(0o755)
         os.replace(tmp, shim_dir / "git")
         with open(path_file, "a", encoding="utf-8") as fh:
             fh.write(f"{shim_dir}\n")
-        return f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
+        return note
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"git shim: {type(error).__name__}"
 

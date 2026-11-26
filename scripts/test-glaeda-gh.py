@@ -17700,6 +17700,26 @@ class PostTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             self.queue("comment", "o/r#7", "--needs-newer-base", "A", "--body", "x")
 
+    def test_a_queued_update_branch_carries_land_and_force_to_the_broker(self) -> None:
+        """2026-11-26 06-14Z, 15 of 35 paced refusals fleet-wide were `gh pr update-branch N --force R` (and --land),
+        the queue having no form for either: the broker's not-landing gate words (cmuxterm-hq#16488), carried as is."""
+        sha = "d" * 40
+        item = self.queue("update-branch", "o/r#9", "--sha", sha, "--land", "--force", "base reds outside it",
+                          "--needs-newer-base", "ci", stdin="")
+        self.assertEqual((item["forceReason"], item["landAsks"]), ("base reds outside it", True))
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9, "expected_head_sha": sha,
+                                                 "needs_newer_base": ["ci"], "land": True,
+                                                 "force": "base reds outside it"})
+        plain = self.queue("update-branch", "o/r#10", "--sha", sha, stdin="")
+        self.assertNotIn("forceReason", plain)
+        self.assertNotIn("landAsks", plain)
+        self.assertEqual(gg.post_request(item), ("PUT", "/repos/o/r/pulls/9/update-branch", {"expected_head_sha": sha}))
+        for flags in (["--force", "x"], ["--land"]):
+            with self.assertRaises(gg.WatchError):
+                self.queue("comment", "o/r#7", *flags, "--body", "x")
+
     def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
         """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
         login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
@@ -28170,8 +28190,11 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((self.w.explains(), e["snapshotWait"]["sha"]), ([], LA))
 
-    def test_a_merge_goes_out_while_the_logins_create_pause_is_on(self):
-        # The pause holds the outbox's creates only: the land queue never asks it, and its merge goes out.
+    def test_a_merge_waits_out_the_logins_create_pause_and_goes_after(self):
+        # #2139 (2026-11-18) sent the land queue's merge through the pause: the shim did not pace merges then. It does
+        # now, so a merge sent into the pause is refused for certain (gcp-agent-lane-4 2026-11-26 13:08Z and 13:23Z:
+        # `gh pr merge 46857 ... --match-head-commit` refused "content writes are paced until reset (896s ...)"). The
+        # shim's `content-pause` is asked before it: the merge is held unsent, and goes out after the pause.
         root = Path(self.tmp.name) / "pause"
         root.mkdir()
         cmd = root / "content-pause-cmd"
@@ -28182,9 +28205,13 @@ class LandTest(Base):
             self.pr(LA)
             self.land()
             self.w.answers.append(ok_answer(LA))
-            self.tick()
+            e = self.tick()
+            self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+            self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+            self.assertIn("content-pause", (root / "calls").read_text())
+            self.w.answers.append(ok_answer(LA))
+            self.tick(e["wakeAt"] - self.t + 1)
             self.assert_merged_at(LA)
-        self.assertFalse((root / "calls").exists())
 
     def test_wait_pr_then_merge(self):
         self.pr(LA)
@@ -33136,6 +33163,40 @@ class LandTest(Base):
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
 
+    def test_land_override_pinned_row_merges_at_its_pin_past_the_merge_trains_retry(self):
+        # manaflow-ai/cmux#58296, 2026-11-26: queued pinned at 30061064 with an override at 12:11:43Z, judged
+        # red_not_excused step=retry (train=boarded) at 12:16:04Z and woken for another retry, never merged. The merge
+        # train's retry stands in for an update_branch, which a pinned override row merges past at its pin.
+        cases = (("boarded", {"kind": "retry", "after_s": 300, "train": "boarded"}),
+                 ("boarding", {"kind": "retry", "after_s": 300,
+                               "board_train": {"label": "merge-train", "repo": "o/r", "number": "1"}}))
+        for name, act in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("pr pipeline / linux", "COMPLETED", "FAILURE")])
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+                self.w.answers.append(refusal("red_not_excused", LA, act))
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                self.assertEqual((self.w.gh_calls("pr", "update-branch"), self.w.gh_calls("run", "rerun")), ([], []))
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]),
+                                 ("red_not_excused", "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_still_waits_on_a_retry_that_is_not_the_trains(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.answers.append(refusal("explain_failed", LA, {"kind": "retry", "after_s": 300}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"))
+        self.assertFalse(gg.land_train_retry({"kind": "retry", "after_s": 300}))
+        self.assertTrue(gg.land_train_retry({"kind": "retry", "train": "pending"}))
+
     def test_land_override_pinned_row_that_finds_every_worker_busy_is_the_next_one_judged(self):
         # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy. Its one at-once judgment
         # was gated, the mark said it was spent, and the next pass put the row in wait_running with an hour-long wake on
@@ -37017,6 +37078,48 @@ class LandTest(Base):
             self.assertEqual(gg.land_create_pause_until(self.t), 0.0, doc)
         gate.write_text(json.dumps({"blocked_until": self.t + 10 ** 9}))
         self.assertEqual(gg.land_create_pause_until(self.t), self.t + gg.LAND_CREATE_PAUSE_MAX)
+
+    def test_a_pause_only_the_authority_knows_holds_a_step_too(self):
+        # 2026-11-26 06-14Z, after #2856: 16 of 35 paced refusals were this executor's steps, each refused "from the
+        # broker (primary content_pause)": another host's pause, not yet in this host's content-gate.json. With no
+        # pause in the file the shim's `content-pause` is asked; its answer holds the step.
+        tmp = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-pause-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        answer, calls = root / "answer", root / "calls"
+        cmd = root / "pause"
+        cmd.write_text(f'#!/bin/sh\necho "$*" >> {shlex.quote(os.fspath(calls))}\n'
+                       f'cat {shlex.quote(os.fspath(answer))}\n')
+        cmd.chmod(0o755)
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}):
+            answer.write_text(json.dumps({"blocked_until": self.t + 40, "level": 0}))
+            self.assertEqual(gg.land_create_pause_until(self.t), self.t + 40)
+            self.assertEqual(calls.read_text().split(), ["content-pause"])
+            # the authority's answer is capped like the file's
+            answer.write_text(json.dumps({"blocked_until": self.t + 10 ** 9}))
+            self.assertEqual(gg.land_create_pause_until(self.t), self.t + gg.LAND_CREATE_PAUSE_MAX)
+            # none, past, garbled, or a failed ask: nothing held (the shim judges the send)
+            for text in (json.dumps({"blocked_until": 0}), json.dumps({"blocked_until": self.t - 1}), "x", "[]", ""):
+                answer.write_text(text)
+                self.assertEqual(gg.land_create_pause_until(self.t), 0.0, text)
+            # a pause in the file is enough: nothing is asked
+            calls.unlink()
+            self.latch_dir.mkdir(parents=True, exist_ok=True)
+            (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": self.t + 20}))
+            self.assertEqual(gg.land_create_pause_until(self.t), self.t + 20)
+            self.assertFalse(calls.exists())
+            # through the queue: an update-branch is held unsent on the authority's pause
+            (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": 0}))
+            answer.write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+            e = self.tick()
+            self.assertEqual(self.w.gh_calls("api"), [])
+            self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+            self.assertIn("step_held", [h["event"] for h in e["history"]])
+        # no shim command here: nothing asked, nothing held
+        self.assertEqual(gg.land_create_pause_until(self.t), 0.0)
 
     def refuse_merges(self, text: str) -> list:
         """Every `gh pr merge` the queue sends is refused with TEXT (exit 1); the list of those sent."""
