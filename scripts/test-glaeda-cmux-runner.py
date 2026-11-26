@@ -23809,7 +23809,7 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("asking github.com (try 1 of 3; at most 2 s;", result.stderr)
         self.assertIn("github.com did not finish within 2 s; stopped it", result.stderr)
         self.assertIn("no try left in the shim's 4 s budget", result.stderr)
-        self.assertIn("-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60", argv.read_text())
+        self.assertIn("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60", argv.read_text())
         self.assertEqual(self.log(), ["github"])
 
 
