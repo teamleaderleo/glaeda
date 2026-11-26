@@ -46841,6 +46841,94 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertEqual(gg.load_full_pr_secs(path), {})
 
 
+class HeadReadsSizedByMeasuredCost(unittest.TestCase):
+    """The land host, 2026-11-26 02:47-07:02Z: head batches of 6 to 13 cmux heads were cut by GitHub at 10.6-32.4 s
+    tick after tick (the head batch restarts at 10 on every reexec and grows back between halvings), and ticks spent
+    250-263 s of each 600 s in "read head" while waited PR data aged past 3,000 s."""
+    REPO = "manaflow-ai/cmux"
+
+    def daemon(self, per_head: float, fail_on: int | None = None):
+        """A daemon whose head read costs PER_HEAD seconds a head, cut by GitHub at 10.5 s (and query FAIL_ON fails)."""
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 1000.0
+        d.reads, d.spill, d.gql_limited, d.sent, d.stored, d.refunded_keys = [], [], False, [], [], []
+        d.fail = lambda entries, message: None
+        d.refund = d.refunded_keys.append
+        d.head_answered = lambda key: None
+        d.suite_runs = lambda *a, **k: ({}, None)
+        d.head_pages = lambda sha, sources, extra=(): {"sha": sha}
+        d.store = lambda key, cache, **kw: d.stored.append(key)
+        clock, calls = [0.0], [0]
+
+        def graphql(query, variables):
+            n = len(re.findall(r"\bh\d+: ", query))
+            d.sent.append(n)
+            calls[0] += 1
+            clock[0] += min(10.5, n * per_head)
+            if n * per_head > 10 or calls[0] == fail_on:
+                return None, "graphql: timed out (GitHub answered 502 after 10.5s)"
+            commit = {"checkSuites": {"nodes": []}, "statusCheckRollup": {"contexts": {"nodes": []}}}
+            return {"data": {f"h{i}": {"object": commit} for i in range(n)}}, None
+        d.graphql = graphql
+        return d, clock
+
+    def entries(self, n):
+        return [{"key": f"head:{self.REPO}@{i:040x}", "cache": {}} for i in range(1, n + 1)]
+
+    def test_a_slow_repos_heads_go_few_to_a_query_after_one_timeout(self):
+        d, clock = self.daemon(2.5)
+        lines = []
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lines.append):
+            self.assertIsNotNone(d.fetch_heads(self.entries(10)))  # nothing measured yet: the whole chunk, cut
+            self.assertEqual(d.sent, [10])
+            self.assertEqual(lines[-1]["event"], "head-seconds")
+            d.sent.clear()
+            d.now += 600
+            self.assertIsNone(d.fetch_heads(self.entries(10)))
+        self.assertEqual(d.sent, [4, 4, 2])  # every query under GitHub's cut, none sent twice
+        self.assertEqual(len(d.stored), 10)
+
+    def test_a_fast_repo_keeps_its_batch(self):
+        d, clock = self.daemon(0.3)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_heads(self.entries(10)))
+            d.now += 600
+            self.assertIsNone(d.fetch_heads(self.entries(10)))
+        self.assertEqual(d.sent, [10, 10])
+
+    def test_a_restarted_daemon_starts_from_the_measure_it_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.HEAD_SECS_FILE
+            d, clock = self.daemon(2.5)
+            d.head_secs_path = path
+            with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lambda e: None):
+                d.fetch_heads(self.entries(10))  # learns cmux's cost per head from one 10.5 s cut
+            self.assertIn(self.REPO, gg.load_full_pr_secs(path))
+            fresh, clock2 = self.daemon(2.5)
+            fresh.head_secs = gg.load_full_pr_secs(path)  # what __init__ reads after a reexec
+            with mock.patch.object(gg.time, "monotonic", lambda: clock2[0]):
+                self.assertIsNone(fresh.fetch_heads(self.entries(10)))
+            self.assertLessEqual(max(fresh.sent), 4)  # no 10.5 s cut first
+
+    def test_heads_an_earlier_query_stored_are_not_read_again_when_a_later_one_fails(self):
+        d, clock = self.daemon(1.0, fail_on=2)
+        d.head_secs = {self.REPO: 3.0}  # two heads a query
+        heads = self.entries(6)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lambda e: None):
+            self.assertIsNotNone(d.fetch_heads(heads))
+            self.assertEqual(d.sent, [2, 2])
+            self.assertEqual(d.stored, [e["key"] for e in heads[:2]])
+            # the unsent ones are refunded like the failed query's, for batched() to split and retry
+            self.assertEqual(sorted(d.refunded_keys), sorted(e["key"] for e in heads[2:]))
+            d.sent.clear()
+            self.assertIsNone(d.fetch_heads(heads))  # batched()'s retry of the chunk, the same tick
+            self.assertEqual(sum(d.sent), 4)
+            d.now += 600
+            d.sent.clear()
+            self.assertIsNone(d.fetch_heads(heads))  # a later tick reads all of them again
+            self.assertEqual(sum(d.sent), 6)
+
+
 class PendingRowsConfirmByProbe(unittest.TestCase):
     """The land host, 2026-11-26: a queued PR with running checks moved its check counts every few minutes and each
     move was a 4.4 s full read. Only the counts moving, rollup still pending, is confirmed by the probe."""
