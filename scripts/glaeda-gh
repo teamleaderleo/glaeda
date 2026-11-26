@@ -15736,6 +15736,24 @@ LAND_FEED_QUIET_MAX = 1800.0
 # the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
 # never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
 LAND_TIMER_HELD = frozenset({"checks_running"})
+# A row whose PR the daemon's cache holds no copy of (the no-data path) was judged again LAND_NO_DATA_AFTER after
+# every answer, whatever wait that answer named: with no copy there is no fingerprint to wait on, so nothing held it.
+# no_data_backoff covered only answers that judged nothing. cmux-cp-1, 24 h to 2026-11-26 10:13Z: 24,322 judgments,
+# 9,521 at the same head with the same code as the row's previous one; why=no_data repeats came a median 135 s apart
+# for checks_running (966, of a 1,800 s wait), 95 s for webview (659), 107 s for base_update (376), and 1,800 of them
+# within 300 s of the last. Leo (c-d1b15a2876): "go bring some more analysis into what agents have been doing and what
+# we can do better, then keep trying to improve stuff". Now the wait holds (no_data_wait_holds): to its wake while the
+# feed says nothing happened to the PR since the verdict (bounded by LAND_FEED_QUIET_MAX), else LAND_VERDICT_KEEP, the
+# bound a copy's fingerprint change is held to. The daemon's first copy is still judged at once (data_seen).
+LAND_NO_DATA_WAIT = frozenset({"pr", "retry"})
+# Waits that end on a commit status (a ws-check posting), which the controller's feed carries no event for
+# (land_pending_status's comment): a quiet feed says nothing about them. Before, a ws_check_missing verdict was held
+# by feed_holds (the copy showing the status posted was not judged) and, on a host with its own login, its copy was
+# not re-read at all (refresh_due's recovery covered checks_running only), so a PR green on its ws-check sat unmerged
+# until its owner cancelled and re-landed (the coordinator, 2026-11-26, from the mirror-fetch lane). Now such a
+# verdict is never feed-held, its copy is re-read every LAND_OWN_REFRESH_AFTER under the host's refresh cap, and the
+# status post in that copy judges the row at once (the fingerprint moved).
+LAND_STATUS_WAIT = frozenset({"ws_check_missing", "ws_check_not_run"})
 # The check-completed event judges a wait on the PR's checks at once (LandQueue.checks_done_event, why=checks_done):
 # when the feed delivers a completed run or check suite for the head after the wait's verdict and the controller's
 # rollup of the head (no GitHub request) shows every check run there completed, land_judge is asked now, on its own
@@ -21316,6 +21334,8 @@ class LandQueue:
             self.nudge(e["key"])
             if self.no_data_backoff(e, woke):
                 return  # the last no-data judgment judged nothing: its retry's backoff, not LAND_NO_DATA_AFTER again
+            if self.no_data_wait_holds(e, woke):
+                return  # LAND_NO_DATA_WAIT: the wait its last judgment named, not LAND_NO_DATA_AFTER again
             # land_judge reads the head; a full pin (land_full_pin) is judged at once on the caller's own read
             if (self.now - since >= LAND_NO_DATA_AFTER or land_full_pin(e)) and self.judge(e, "", fp, why="no_data"):
                 e.pop("noDataSince", None)
@@ -21680,6 +21700,9 @@ class LandQueue:
         at = started if isinstance(started, (int, float)) and not isinstance(started, bool) else self.now
         if not answer.get("ok") and act.get("kind") in LAND_WAIT_KINDS and SHA40.fullmatch(head or ""):
             e["feedVerdict"] = {"head": head, "at": at, "code": code, "kind": act.get("kind")}
+            shape = land_wait_shape(self.cache_of(e["key"]), head)
+            if shape[0]:
+                e["feedVerdict"]["shape"] = list(shape)  # what the checks looked like: feed_holds' copy check
         else:
             e.pop("feedVerdict", None)
 
@@ -21701,6 +21724,31 @@ class LandQueue:
             return False
         wake = e.get("wakeAt")
         return isinstance(wake, (int, float)) and not isinstance(wake, bool) and wake - self.now <= LAND_RETRY_MAX
+
+    def no_data_wait_holds(self, e: dict, woke: bool) -> bool:
+        """True while E, whose PR the daemon's cache holds no copy of, waits on the wait its last judgment named
+        (LAND_NO_DATA_WAIT's comment): a wait on the PR or a retry, not woken, after a verdict at a head. Held to the
+        wait's own wake while the webhook feed says nothing happened to the PR or that head since the verdict
+        (feed_quiet), else (an event, or a feed that cannot say) for LAND_VERDICT_KEEP from the verdict, as a copy's
+        own fingerprint change is (verdict_holds). Noted once per verdict (history "no_data_held")."""
+        w = e.get("wait") or {}
+        wake = e.get("wakeAt")
+        if woke or e["state"] != "waiting" or w.get("kind") not in LAND_NO_DATA_WAIT                 or not isinstance(wake, (int, float)) or isinstance(wake, bool) or wake <= self.now:
+            return False
+        x = e.get("explain") or {}
+        at, head = x.get("at"), str(x.get("head") or "").lower()
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or not head:
+            return False
+        if self.now - at >= LAND_VERDICT_KEEP and not (self.now - at < LAND_FEED_QUIET_MAX
+                                                       and self.feed_quiet(e["key"], head, at)):
+            return False
+        if x.get("noDataHeld") != at:
+            x["noDataHeld"] = at
+            self.count("no_data_held")
+            self.history(e, "no_data_held", head=head[:12], code=x.get("code"), age=round(self.now - at),
+                         wake=round(wake - self.now))
+            self.save(e)
+        return True
 
     def checks_done_event(self, e: dict, head: str) -> bool:
         """True when E, waiting on its checks at HEAD with the copy still showing one running, has had a check-completed
@@ -21734,8 +21782,8 @@ class LandQueue:
         v = e.get("feedVerdict") or {}
         at = v.get("at")
         if not head or v.get("head") != head or not isinstance(at, (int, float)) or isinstance(at, bool) \
-                or self.now - at >= LAND_FEED_QUIET_MAX:
-            return False
+                or self.now - at >= LAND_FEED_QUIET_MAX or v.get("code") in LAND_STATUS_WAIT:
+            return False  # LAND_STATUS_WAIT: what ends that wait is a commit status, which the feed never carries
         if v.get("code") in LAND_TIMER_HELD:
             # A checks_running verdict whose checks the cache shows finished, in a read made since it (a commit status
             # going green: the feed carries no event for it): the wait is over, whatever the feed did not say.
@@ -21746,6 +21794,15 @@ class LandQueue:
                     and data.get("state") == "OPEN" and data.get("headRefOid") == head \
                     and not land_checks_running(data, head):
                 return False
+        c = self.cache_of(e["key"]) or {}
+        read = c.get("dataAt")
+        if isinstance(read, (int, float)) and not isinstance(read, bool) and read >= at \
+                and str((c.get("data") or {}).get("headRefOid") or "").lower() == head \
+                and isinstance(v.get("shape"), list) and len(v["shape"]) == 2 \
+                and ((now := land_wait_shape(c, head))[0] != v["shape"][0] or now[1] > int(v["shape"][1] or 0)):
+            # A copy read since the verdict shows the checks it waited on changed (one finished, a status posted,
+            # one appeared) where the feed said nothing: the copy is the event, so the verdict does not hold.
+            return False
         if not self.feed_quiet(e["key"], head, at):
             return False
         if not v.get("noted"):  # counted once per verdict held, not per pass
@@ -21802,9 +21859,11 @@ class LandQueue:
             head = str(wait.get("sha") or "")
             checks_wait = (e["state"] == "waiting" and not self.due(e) and wait.get("kind") == "pr"
                            and not wait.get("rerun") and self.now - at >= LAND_OWN_REFRESH_AFTER
-                           and (wait.get("why") == "checks running"
-                                or (e.get("explain") or {}).get("code") == "checks_running")
-                           and land_checks_running(c.get("data") or {}, head))
+                           and ((wait.get("why") == "checks running"
+                                 or (e.get("explain") or {}).get("code") == "checks_running")
+                                and land_checks_running(c.get("data") or {}, head)
+                                # LAND_STATUS_WAIT: a status the feed never carries is read for, not waited out
+                                or (e.get("explain") or {}).get("code") in LAND_STATUS_WAIT))
             # A PR read after enqueue can still be the last copy we have of a running head. A quiet webhook
             # feed does not establish that it is still running. The recovery sweep shares the usual read budget.
             self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]

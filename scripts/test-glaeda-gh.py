@@ -37668,6 +37668,50 @@ class LandTest(Base):
         self.assertLessEqual(max(gaps), gg.LAND_RETRY_MAX + 20, gaps)  # never stranded: bounded
         self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
 
+    def no_data_waits(self, n: int, code: str = "checks_running") -> None:
+        for _ in range(n):
+            self.w.answers.append(refusal(code, LA, {"v": 1, "kind": "wait_pr", "sha": LA, "timeout_s": 1800}))
+
+    def test_a_pr_the_daemon_cannot_read_keeps_the_wait_its_judgment_named(self):
+        """Leo (c-d1b15a2876): "go bring some more analysis into what agents have been doing and what we can do better,
+        then keep trying to improve stuff". cmux-cp-1, 24 h to 2026-11-26 10:13Z: why=no_data repeats of the same code
+        at the same head came a median 135 s apart for checks_running (966) and 95 s for webview (659), each wait 1800 s:
+        the no-data path judged again after LAND_NO_DATA_AFTER whatever wait the answer named. With no feed here to say
+        nothing happened, the wait now holds LAND_VERDICT_KEEP from each verdict (LAND_NO_DATA_WAIT)."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_waits(40)
+        at = self.no_data_judgments(2 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        # before: one every ~130 s (about 55 in 2 h); now one per LAND_VERDICT_KEEP
+        self.assertLessEqual(len(at), 2 * 3600 // gg.LAND_VERDICT_KEEP + 1, at)
+        self.assertGreaterEqual(min(gaps), gg.LAND_VERDICT_KEEP, gaps)
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e.get("stop")), ("waiting", None))
+        self.assertIn("no_data_held", [h["event"] for h in e["history"]])
+
+    def test_a_pr_the_daemon_cannot_read_with_a_quiet_feed_waits_to_its_wake(self):
+        """The feed says nothing happened to the PR since the verdict: held to the wait's own wake (1800 s here)."""
+        self.nudge_reads = False
+        self.q.feed_quiet = lambda key, sha, since: True
+        self.land()
+        self.no_data_waits(10, code="webview")
+        at = self.no_data_judgments(2 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        self.assertGreaterEqual(min(gaps), 1800, gaps)
+        self.assertLessEqual(len(at), 5, at)
+
+    def test_a_pr_the_daemon_cannot_read_is_judged_on_its_first_copy_while_a_wait_holds(self):
+        self.nudge_reads = False
+        self.land()
+        self.no_data_waits(2)
+        at = self.no_data_judgments(300)
+        self.assertEqual(len(at), 1, at)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.insert(0, ok_answer(LA))
+        e = self.tick(2)
+        self.assertEqual(e["state"], "merged")
+
     def test_the_daemons_first_copy_after_a_no_data_judgment_is_judged_at_once(self):
         """The backoff waits for nothing but its wake or the PR's first copy: the read the daemon could not do arrives
         and the land is judged on it that pass, pinned to the head it shows."""
@@ -38949,6 +38993,65 @@ class LandTest(Base):
         self.q.tick(self.t + 1, dirty=set())
         self.assert_merged_at(LA)
         self.assertEqual((len(self.w.explains()), self.w.refreshed), (1, [self.KEY]))
+
+    def test_a_ws_check_posted_after_ws_check_missing_is_read_and_merges_with_a_quiet_feed(self):
+        # The coordinator, 2026-11-26 (from the mirror-fetch lane): a ws-check success posted right after a
+        # ws_check_missing verdict did not wake the row; it sat green and unmerged until `land cancel` and a re-land.
+        # The feed carries no commit status, so its quiet says nothing (LAND_STATUS_WAIT): the copy is re-read on the
+        # recovery sweep and the posted status judges the row at once, well before the wait's own timeout.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 3600}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
+        self.w.cache[self.KEY]["dataAt"] = self.t + 1
+        original_wake = e["wakeAt"]
+        self.q.feed_quiet = lambda *args: True
+
+        def posted(key):
+            self.w.refreshed.append(key)
+            self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.q.refresh = posted
+        self.t += gg.LAND_OWN_REFRESH_AFTER + gg.LAND_RECOVERY_SWEEP
+        self.assertLess(self.t, original_wake)
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.w.answers.append(ok_answer(LA))
+        self.q.tick(self.t + 1, dirty=set())
+        self.assert_merged_at(LA)
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_a_ws_check_posted_after_ws_check_missing_is_judged_on_the_copy_with_a_quiet_feed(self):
+        # The same status post, reaching the copy by any read: the feed's quiet no longer holds the verdict
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 3600}))
+        self.tick()
+        self.q.feed_quiet = lambda *args: True
+        self.t += gg.LAND_VERDICT_KEEP + 1
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_check_finishing_in_the_copy_judges_a_feed_held_wait(self):
+        # Any check finishing is an event, whatever the feed said: a webview wait on a running check, the copy since
+        # the verdict showing it done, is judged on that copy (feed_holds' copy check), not held to LAND_FEED_QUIET_MAX
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("webview", "IN_PROGRESS", None)])
+        self.land()
+        self.w.answers.append(refusal("webview", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                      "timeout_s": 1800}))
+        e = self.tick()
+        self.assertIsInstance((e.get("feedVerdict") or {}).get("shape"), list)
+        self.q.feed_quiet = lambda *args: True
+        self.t += gg.LAND_VERDICT_KEEP + 1
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("webview", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual(len(self.w.explains()), 2)
 
     def test_land_check_event_on_a_stale_running_pin_shares_the_host_read_budget(self):
         # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
