@@ -15653,6 +15653,19 @@ LAND_NOTIFY_RETRY_S = 5.0
 LAND_NOTIFY_GONE = re.compile(r"\bno_session:")
 LAND_NOTIFY_BUSY = re.compile(r"\b(?:429|503)\b|mesh\.rate_limited|mesh\.unavailable")
 LAND_NOTIFY_BUSY_RETRY_S = 30.0
+# Every notice was its own thread running its own acpmux at once, so a pass that told many rows in one minute opened
+# more pipes than the daemon may hold (ulimit -n 1024 on cmux-cp-1) and ran more sends than acpmux answers in
+# LAND_NOTIFY_DEADLINE. cmux-cp-1, 2026-11-26 04:44Z, the minute after the GraphQL window reset: 2,078 reminders
+# (land-owner-reminded) fell due together; 1,433 ended land-notify-failed "OSError" and 516 "timed out after 30s",
+# so 1,949 of 2,078 (94%) reached nobody, and each had already spent one of its row's LAND_OWNER_REMIND_MAX. At most
+# LAND_NOTIFY_PARALLEL sends run at a time; the rest wait their turn in their threads, which hold no file.
+LAND_NOTIFY_PARALLEL = 8
+LAND_NOTIFY_SLOTS = threading.BoundedSemaphore(LAND_NOTIFY_PARALLEL)
+# A session acpmux said is gone (LAND_NOTIFY_GONE) is not asked again for LAND_NOTIFY_GONE_KEEP: the same 24 h on
+# cmux-cp-1 logged 2,114 land-notify-no-session to 146 names, 1,572 of them to one ended session (a coordinator's
+# helpers had queued hundreds of lands under it), each a whole acpmux send that held a slot a live requester's
+# notice waited for. The skipped notice is logged as the others are ("memo": the seconds since acpmux said so).
+LAND_NOTIFY_GONE_KEEP = 900.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
@@ -15983,6 +15996,31 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
         return (f"{what} was built on {ref} at {then[:12]} ({created}); {ref} has changed the CI path {hits[0]}{more} "
                 "since, and a rerun replays the merge without it")
     return ""
+# One base merge per land (Leo, 2026-11-25: "de facto, im asking for 99% fewer minutes of ci time, period."). A
+# second update-branch at a head this land's own update made (update_again) starts the whole CI again: on one land
+# host, 11-25, 183 update_branch steps for 137 merges (1.34 a merge, 0.83 on 11-23), and of 120 update_branch steps in
+# the 24 h to 11-26 10:50Z, 43 were update_again. So at its own head the queue sends another only when a check is
+# named as needing the newer base (land_judge's needs_newer_base, a force) or GitHub's refusal of a step named it:
+#   - a rerun whose only staleness is the base's age (stale_replay_why's "commits behind", no CI path changed) is the
+#     rerun, at that head, not a new base merge: the run's merge is this land's own, its red judged like any other;
+#   - an update land_judge names with no needs_newer_base (not_run's "one base merge") stops the row by name
+#     (update_again_unnamed) instead of a second merge.
+# The merge gate is unchanged: every merge still passes land_judge at the head it merges. Undo:
+# GLAEDA_LAND_UPDATE_ONCE=0 in the daemon's environment restores the second update.
+def land_update_once() -> bool:
+    return os.environ.get("GLAEDA_LAND_UPDATE_ONCE", "1").strip() != "0"
+
+
+def land_stale_named(why: str) -> bool:
+    """Whether a stale_replay_why answer names a base change a rerun lacks (a CI path), not only the base's age."""
+    return "has changed the CI path" in str(why or "")
+
+
+def land_own_update_head(e: dict, head: str) -> bool:
+    """Whether HEAD is the head this land's own base merge made (update_again's test)."""
+    return bool(head) and str(e.get("updatedHead") or "").lower() == str(head).lower()
+
+
 # A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (land_judge could not judge:
 # an old land_judge checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
 # 5xx, LAND_STEP_TRANSIENT) and review_cannot_start (router-review is not on this host, or would not exec: a link or
@@ -16062,13 +16100,16 @@ LAND_OWNER_REMIND_MAX = 4
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_MAX a row in all. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
-# LAND_OWNER_REMIND_UNREAD_ONCE: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
+# LAND_OWNER_REMIND_UNREAD: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
 # repeats a copy from before the stop. cmux16, 2026-11-26 09:30Z: one requester got 20 "still stopped after 46-88 h"
 # reminders in an hour; 16 of those 20 PRs had merged or closed days before, but cmux16's reads of them never landed, so
-# each was told on its old OPEN copy. A stop now gets at most one reminder on a copy no read refreshed (the head moving
-# since the stop is new evidence and starts it again); past it, the row stays stopped and says nothing until a read
-# lands (history remind_held). LAND_OWNER_REMIND_MAX stays the one bound on how many in all. Detector:
-# test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_told_once_per_stop.
+# each was told on its old OPEN copy. One such reminder a stop (the rule this replaces, UNREAD_ONCE) still sent one
+# nag per merged or closed PR: cmux#50122 MERGED, #49693 and #47641 CLOSED, lw#7977 and #7724 MERGED were each told
+# "still stopped" 44-95 h on (sr2-coord, 2026-11-26). "Still stopped" is a claim about the PR now, so it is made only
+# on a read newer than the row's last word (the stop or the last reminder); with none, the row stays stopped and says
+# nothing (history remind_held, once a stop) until a read lands, and then it ends (merged, closed) or is told. The
+# requester was told at the stop with its one step, so holding costs nobody a step. LAND_OWNER_REMIND_MAX stays the
+# one bound on how many in all. Detector: test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_never_told.
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -16342,6 +16383,13 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # `gh pr ready` that is itself refused. A hold is not a draft's job here: [hold-own-pr] is a HOLD: line or a hold
 # label, which land_judge refuses before any merge is sent.
 LAND_READY_ONCE = "readySent"
+# LAND_READY_AT_READ: land_ready_at_request readies a draft only when this host's cache read it within LAND_DRAFT_AGE,
+# so a land queued on a cold or stale copy met the draft only at the merge, after its whole CI wait and judgment
+# (gcp-agent-lane-2, 2026-11-26: teamleaderleo/leo-workspace#11870 stopped merge_draft at e09b2017 that way). So the
+# daemon's first copy read after the request that shows an open draft takes the same mark_ready step (once per head,
+# under LAND_READY_ONCE), and a refused `gh pr ready` stops merge_draft as at the merge. Same bounds as the request's
+# check: a copy read before the request, or shadowed by a later write, readies nothing. Detector: test-glaeda-gh.py
+# test_a_draft_queued_on_a_cold_cache_is_marked_ready_at_the_queues_first_read.
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
 # push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
@@ -20338,7 +20386,7 @@ class LandQueue:
         every = LAND_OWNER_REMIND_EVERY * (2 ** n)
         if self.now - last < every:
             return False
-        if self.remind_read_pending(e, last, every):
+        if self.remind_read_pending(e, last):
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
@@ -20351,7 +20399,7 @@ class LandQueue:
         life = e.get("remindLife") or {}
         if life.get("stopAt") != at or (moved and life.get("head") != head):
             life = {"stopAt": at, "unread": 0, **({"head": head} if moved else {})}
-        if not head and int(life.get("unread") or 0) >= 1:  # LAND_OWNER_REMIND_UNREAD_ONCE
+        if not head:  # LAND_OWNER_REMIND_UNREAD: never told on a copy no read refreshed since its last word
             # its next due pass asks a fresh read first (remind_read_pending), so a merge, a close or a push still ends
             # or restarts it; the reminder itself stays quiet and spends none of LAND_OWNER_REMIND_MAX
             e["reminds"] = {**r, "n": n, "at": self.now, "code": code}
@@ -20374,8 +20422,6 @@ class LandQueue:
             # head: the re-queue at the head now comes first, and the stop's own sha is dated.
             msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
                     f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
-        elif not head and was:
-            msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
         if n + 1 < LAND_OWNER_REMIND_MAX:
@@ -20406,18 +20452,20 @@ class LandQueue:
             return True
         return False
 
-    def remind_read_pending(self, e: dict, last: float, every: float = LAND_OWNER_REMIND_EVERY) -> bool:
+    def remind_read_pending(self, e: dict, last: float) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
         (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
-        LAND_OWNER_REMIND_READ_WAIT past due (EVERY after LAST, LAND_OWNER_REMIND_BACKOFF)."""
+        LAND_OWNER_REMIND_READ_WAIT after asking it. The wait counts from the ask, not from due: a pass that comes
+        late (a held reminder moves LAST to its pass) still asks, so an unread stop whose PR merged ends on a read."""
         def read_since() -> list[float]:
             c = self.cache_of(e["key"]) or {}
             return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
         reads = read_since()
-        if (reads and max(reads) > last) or self.now - (last + every) >= LAND_OWNER_REMIND_READ_WAIT:
+        if reads and max(reads) > last:
             return False
-        if float(e.get("remindReadAt") or 0) > last:
-            return True  # asked since the last word: told on the pass after it lands
+        asked = float(e.get("remindReadAt") or 0)
+        if asked > last:
+            return self.now - asked < LAND_OWNER_REMIND_READ_WAIT  # told (or held) on the pass after it lands
         if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
             return True  # asked on a later pass
         e["remindReadAt"] = self.now
@@ -21332,6 +21380,11 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
+        if self.ready_due(e, c or {}, data, head):
+            # LAND_READY_AT_READ: a draft the request could not see is marked ready on this first read, through the
+            # merge step's own path (mark_ready, once per head), not after its checks are waited out
+            self.submit(e["key"], self.mark_ready, e, head, "on the queue's first read after the request")
+            return
         if e.get("pinSha") and not e.get("pinSeen"):
             if e.get("infraRetry") and e["state"] == "waiting" and float(e.get("wakeAt") or 0) > self.now:
                 return  # pin_unread's backoff (infra_read_stop): no read of the pin before it runs out
@@ -23726,6 +23779,12 @@ class LandQueue:
                               land_trim(answer.get("next")))
                 return
             stale = {r: why for r in runs if (why := self.stale_replay(e, gh, r))}  # STALE_REPLAY_BEHIND's comment
+            if stale and land_update_once() and land_own_update_head(e, head) and not any(
+                    land_stale_named(w) for w in stale.values()):
+                with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
+                    first = next(iter(stale.values()))
+                    self.history(e, "stale_replay_own_head", head=head[:12], why=land_trim(first, 200))
+                stale = {}
             with self.lock:
                 self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
                 sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
@@ -23750,7 +23809,7 @@ class LandQueue:
                     checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
                     marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
             if stale:
-                self.update_branch(e, head)
+                self.update_branch(e, head, named=True)
                 return
             # A whole rerun ("all": land_command_rerun), never --failed, when the step's point is that the run's own
             # path routing must route again: its jobs did not fail, they were never run.
@@ -23921,6 +23980,10 @@ class LandQueue:
             elif touched := [f for f in files if not land_path_inert(f, rule)]:
                 take, why = False, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
         stale = self.stale_replay(e, gh, run) if take and gh is not None else ""  # STALE_REPLAY_BEHIND's comment
+        if stale and land_update_once() and land_own_update_head(e, head) and not land_stale_named(stale):
+            with self.lock:  # LAND_UPDATE_ONCE's comment: an age-only replay at our own merge is the rerun
+                self.history(e, "stale_replay_own_head", run=run, head=head[:12], why=land_trim(stale, 200))
+            stale = ""
         with self.lock:
             self.check(e)
             if not take:
@@ -23936,7 +23999,7 @@ class LandQueue:
             else:
                 self.claim(e, "rerun_failed", runs=[run], unrelated=True)
         if stale:
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
             return True
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
@@ -24016,7 +24079,7 @@ class LandQueue:
         if named == "hand_off":
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
         elif named == "union_merge":
             self.union_merge(e, head)
 
@@ -24527,7 +24590,7 @@ class LandQueue:
             else:
                 named = self.step_refused(e, "label", head, got)
         if named == "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
@@ -24586,7 +24649,7 @@ class LandQueue:
             else:
                 named = self.step_refused(e, "fetch", head, got)
         if named == "update_branch":
-            self.update_branch(e, head)
+            self.update_branch(e, head, named=True)
 
     def fetch_once(self) -> str:
         """git-fetch-once to run a git-form fetch step through: land.json's gitFetchOnce, LAND_FETCH_ONCE, PATH's; ""
@@ -24808,7 +24871,8 @@ class LandQueue:
         tried = e.get("unionMerge") or {}
         return not (tried.get("head") == head and tried.get("tried"))
 
-    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
+    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "",
+                      named: bool = False) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -24880,6 +24944,18 @@ class LandQueue:
                              why=f"checks still running {LAND_WAIT_DEFAULT:.0f} s after the update was deferred")
         e.pop("updateDeferred", None)
         if head and head == e.get("updatedHead"):
+            if land_update_once() and not needs and not force and not named:
+                # LAND_UPDATE_ONCE's comment: this land's one base merge is spent and no check is named as needing a
+                # newer one
+                with self.lock:
+                    self.count("update_again_unnamed")
+                    self.stop(e, "update_again_unnamed",
+                              f"land_judge named a second base merge at {head[:12]}, the head this land's own update "
+                              "made, and named no check that needs a newer base; one base merge per land",
+                              f"glaeda-gh status pr {repo}#{number} (a check still to report: glaeda-gh land "
+                              f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr "
+                              f"update-branch {number} -R {repo}, then land the new head)")
+                return
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
         self.push_step(e, "update_branch", head,
@@ -25332,13 +25408,31 @@ class LandQueue:
         if named == "hand_off":
             self.hand_off(e, sha)
         elif named == "update_branch":
-            self.update_branch(e, sha)
+            self.update_branch(e, sha, named=True)
         elif named == "union_merge":
             self.union_merge(e, sha)
         elif named == "ready":
             self.mark_ready(e, sha)
 
-    def mark_ready(self, e: dict, head: str) -> None:
+    def ready_due(self, e: dict, c: dict, data: dict, head: str) -> bool:
+        """Under the lock. Whether E's PR is to be marked ready now (LAND_READY_AT_READ): the daemon's copy, read since
+        E's last land request and shadowed by no later write that could have marked it ready, shows an open draft at a
+        full HEAD the queue has not readied yet (LAND_READY_ONCE), and no job of E's is running. A cache read only."""
+        if e.get("state") in LAND_DONE or e["key"] in self.jobs or not SHA40.fullmatch(head or "") \
+                or data.get("isDraft") is not True or data.get("merged") or str(data.get("state") or "") != "OPEN":
+            return False
+        if (e.get(LAND_READY_ONCE) or {}).get("head") == head:
+            return False  # readied once at this head: a draft again is someone's hold, the merge step stops it
+        at = c.get("dataAt")
+        since = max(float(e["requestedAt"]) if _finite(e.get("requestedAt")) else 0.0,
+                    float(e["created"]) if _finite(e.get("created")) else 0.0)
+        if not _finite(at) or at < since or at > self.now + 60:
+            return False  # a copy from before the request may predate a `gh pr ready`; one from the future is no read
+        repo, number = str(e.get("repo") or ""), str(e.get("number") or "")
+        writes = gh_cache_writes()
+        return not any(writes.get(stamp, 0.0) >= at for stamp in gh_cache_stamps(["pr", repo, number], repo) or [])
+
+    def mark_ready(self, e: dict, head: str, where: str = "at the merge") -> None:
         """The merge at HEAD was refused because the PR is a draft: mark it ready (LAND_READY_ONCE's comment), once per
         head, and judge it again soon. A refused `gh pr ready` stops the entry merge_draft, as every draft did before.
         e[LAND_READY_ONCE] is written before the send, so a restart mid-send counts it as sent."""
@@ -25359,12 +25453,13 @@ class LandQueue:
                 e.pop("stepTransient", None)
                 self.history(e, "readied", head=head[:12])
                 self.nudge(e["key"])
-                self.wait(e, {"kind": "retry", "why": f"{name} was a draft at the merge; marked it ready (gh pr "
-                              "ready): the merge is taken next"}, float(NUDGE_MIN))
+                self.wait(e, {"kind": "retry", "why": f"{name} was a draft {where}; marked it ready (gh pr "
+                              "ready): it is judged next"}, float(NUDGE_MIN))
                 return
             said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
-            self.stop(e, "merge_draft", f"the merge at {head[:12]} was refused while the PR is a draft, and marking "
-                      f"it ready was refused too: {said}",
+            what = (f"the merge at {head[:12]} was refused while the PR is a draft" if where == "at the merge" else
+                    f"the PR was a draft at {head[:12]} {where}")
+            self.stop(e, "merge_draft", f"{what}, and marking it ready was refused too: {said}",
                       f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
@@ -25606,6 +25701,13 @@ class LandQueue:
                             f"{e.get('queuedBy') or 'an unnamed caller'} with no --notify)",
                             {"pr": self.url(e), "queuedBy": e.get("queuedBy") or ""})
             return
+        gone = self.__dict__.setdefault("notify_gone", {})  # {HOST/SESSION: when acpmux said no_session}
+        said = gone.get(to)
+        if said is not None and 0 <= time.time() - said < LAND_NOTIFY_GONE_KEEP:
+            # LAND_NOTIFY_GONE_KEEP's comment: acpmux said minutes ago that this session has ended
+            log({"event": "land-notify-no-session", "key": e["key"], "to": to, "tries": 0,
+                 "why": "not sent: acpmux said no_session for it", "memo": round(time.time() - said)})
+            return
         acpmux = self.path("acpmux", Path(shutil.which("acpmux", path=self.env()["PATH"]) or "acpmux"))
         # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
         # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
@@ -25616,10 +25718,15 @@ class LandQueue:
                 "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
+            with LAND_NOTIFY_SLOTS:  # LAND_NOTIFY_PARALLEL's comment: a burst waits its turn, it does not fail
+                deliver()
+
+        def deliver() -> None:
             whys: list[str] = []
             for tried in range(1, LAND_NOTIFY_TRIES + 1):
                 got = self.call(argv, LAND_NOTIFY_DEADLINE)
                 if got.returncode == 0:
+                    gone.pop(to, None)
                     if whys:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
                     # every delivered notice, so a flood is counted from this log, not only from its receiver's
@@ -25629,6 +25736,7 @@ class LandQueue:
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
                 if LAND_NOTIFY_GONE.search(whys[-1]):
                     # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
+                    gone[to] = time.time()
                     log({"event": "land-notify-no-session", "key": e["key"], "to": to, "why": whys[-1],
                          "tries": tried})
                     return
