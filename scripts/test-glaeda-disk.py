@@ -9642,10 +9642,15 @@ class VolumeCensusTest(unittest.TestCase):
 
     def test_open_deleted_counts_a_held_file_once(self) -> None:
         held = self.write("held", 4096 * 8)
+        dev = self.root.stat().st_dev
+        # The runner's process may already hold other deleted files on this fs (an earlier test's
+        # temp file not yet collected): measure the change this file makes, not the absolute total.
+        before, _ = gd.open_deleted_local(dev)
         with open(held, "rb") as one, open(held, "rb") as two:
             held.unlink()
-            got, _ = gd.open_deleted_local(self.root.stat().st_dev)
-        self.assertEqual(got.get(str(os.getpid())), 4096 * 8)
+            got, _ = gd.open_deleted_local(dev)
+        pid = str(os.getpid())
+        self.assertEqual(got.get(pid, 0) - before.get(pid, 0), 4096 * 8)
 
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent
