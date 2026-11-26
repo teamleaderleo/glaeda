@@ -23762,6 +23762,50 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.gitconfig.read_bytes(), original)
         self.assertEqual(hook.git_fetch_summary(self.job_env), "")
 
+    def test_hq_later_checkout_commands_go_direct_once_the_proxy_failed(self) -> None:
+        # run 45860743368 (2026-11-26): the dead fleet proxy was skipped for the fetch and the checkout, then
+        # actions/checkout's "Removing auth" ran `git submodule foreach`, which lazily fetched .gitmodules (outside the
+        # sparse paths) through 127.0.0.1:18434 and failed the job
+        src = self.dir / "src"
+        (src / "tools" / "fleet").mkdir(parents=True)
+        (src / "tools" / "fleet" / "probe.py").write_text("p\n")
+        (src / "other").mkdir()
+        (src / "other" / "notes.txt").write_text("outside the sparse paths\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "sparse paths and a file outside them")
+        sha = self.git(src, "rev-parse", "HEAD")
+        self.git(src, "push", "-q", os.fspath(self.github), "HEAD:refs/heads/main")
+        env, receipt = self.hq_checkout_fixture(refused_socket=True)
+        self.assertTrue(env.get("RUNNER_TEMP"))
+        real_exec = Path(self.git(self.ws, "--exec-path"))
+        for tool in real_exec.iterdir():  # the fake HTTPS helper's exec path also serves `git submodule`
+            if not (self.dir / tool.name).exists():
+                (self.dir / tool.name).symlink_to(tool)
+        ref = "refs/remotes/origin/main"
+        run = lambda *args: subprocess.run(["git", *args], cwd=self.ws, env=env, capture_output=True, text=True,
+                                           timeout=30)
+        result = run("-c", "protocol.version=2", "fetch", "--no-tags", "--prune", "--no-recurse-submodules",
+                     "--filter=blob:none", "--depth=1", "origin", f"+{sha}:{ref}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(run("config", "core.sparseCheckout", "true").returncode, 0)
+        (self.ws / ".git" / "info" / "sparse-checkout").write_text("/tools/fleet/\n")
+        result = run("checkout", "--progress", "--force", "-B", "main", ref)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.ws / "tools" / "fleet" / "probe.py").read_text(), "p\n")
+        self.assertFalse((self.ws / "other").exists())
+        # git 2.56's `submodule foreach` read HEAD:.gitmodules there; any command reading a blob the sparse
+        # checkout left out fetches it lazily the same way
+        result = run("cat-file", "-p", "HEAD:other/notes.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "outside the sparse paths\n")
+        self.assertIn("failed earlier in this job", result.stderr)
+        self.assertEqual([line for line in receipt.read_text().splitlines() if line], [])
+        # a step after actions/checkout keeps the configured proxy: the mark is for the checkout's own commands
+        env.pop("GITHUB_ACTION_REPOSITORY")
+        result = run("fetch", "--no-tags", "origin", "refs/heads/main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("direct HTTPS", result.stderr)
+
     def test_hq_keeps_configured_proxy_on_connect_response_or_override(self) -> None:
         env, receipt = self.hq_checkout_fixture()
         fleet = "http://127.0.0.1:18434"

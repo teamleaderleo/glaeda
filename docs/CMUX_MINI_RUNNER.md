@@ -91,6 +91,10 @@ What `--apply` does:
      CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
      An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
      `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     That failure is marked in `RUNNER_TEMP`, so every later git command of the same
+     `actions/checkout` (its `Removing auth` `git submodule foreach` reads `.gitmodules`
+     lazily outside the sparse paths) also goes direct, logged as `the fleet proxy failed
+     earlier in this job`.
      The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
      disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),

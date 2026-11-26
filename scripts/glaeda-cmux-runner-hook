@@ -6517,12 +6517,17 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 
 # The HQ checkout can also fetch blobs during checkout after a filtered fetch. Test the
 # fleet tunnel for each of those commands. A CONNECT response (including a denial) is
-# authoritative. Only a transport failure before a response selects direct HTTPS.
+# authoritative. Only a transport failure before a response selects direct HTTPS, and a
+# mark in RUNNER_TEMP keeps the rest of actions/checkout's commands direct: its "Removing
+# auth" `git submodule foreach` lazily fetched .gitmodules (outside the sparse paths)
+# through the dead proxy and failed the job (run 45860743368, 2026-11-26).
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
 ''' + GIT_SHIM_COMMAND + r'''
+rest=("$@")
 passthrough() { exec "$real" "${orig[@]}"; }
-case "$sub" in fetch|checkout) ;; *) passthrough ;; esac
+mark="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/glaeda-hq-git-shim.direct"
+case "$sub" in fetch|checkout) ;; *) [ -s "$mark" ] || passthrough ;; esac
 url=$("$real" "${globals[@]}" remote get-url origin 2>/dev/null) || passthrough
 case "$url" in
   https://github.com/manaflow-ai/cmuxterm-hq|https://github.com/manaflow-ai/cmuxterm-hq.git) ;;
@@ -6531,12 +6536,18 @@ esac
 "$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
 proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
 [ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+direct() {  # $1: why. An empty per-URL proxy reaches the lazy fetches this command starts.
+  echo "glaeda git shim: $1; using direct HTTPS for this HQ command" >&2
+  exec "$real" "${globals[@]}" -c "http.$url.proxy=" ${rest[@]+"${rest[@]}"}
+}
+[ -s "$mark" ] && direct "the fleet proxy failed earlier in this job ($(tail -1 "$mark"))"
 connect=$(/usr/bin/curl -q --silent --output /dev/null --head --max-time 5 --noproxy '' --proxy "$proxy" \
           --write-out '%{http_connect}' https://github.com/ 2>/dev/null)
-case "$?:$connect" in
+rc=$?
+case "$rc:$connect" in
   7:000|28:000|52:000|55:000|56:000)
-    echo 'glaeda git shim: fleet proxy returned no CONNECT response; using direct HTTPS for this HQ command' >&2
-    exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;;
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) no CONNECT response from $proxy (curl exit $rc)" >> "$mark" 2>/dev/null
+    direct 'fleet proxy returned no CONNECT response' ;;
 esac
 passthrough
 '''
