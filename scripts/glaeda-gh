@@ -12133,7 +12133,7 @@ class Daemon:
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"
-        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e) or self.queued_red(e)
                                       else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY):
             return "full-due"
         if any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []):
@@ -12315,16 +12315,29 @@ class Daemon:
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
-    def queued_pending(self, e: dict) -> bool:
-        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
-        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+    def queued_rollup(self, e: dict) -> str | None:
+        """The cached rollup state of E when E is a land-queue PR, open, with a whole fingerprint; else None."""
         if e["key"] not in self.rollup_wanted():
-            return False
+            return None
         try:
             fp = json.loads((e.get("cache") or {}).get("fp") or "null")
         except (TypeError, ValueError):
-            return False
-        return isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and fp[7] in ("PENDING", "EXPECTED")
+            return None
+        return fp[7] if isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and isinstance(fp[7], str) else None
+
+    def queued_pending(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
+        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+        return self.queued_rollup(e) in ("PENDING", "EXPECTED")
+
+    def queued_red(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is FAILURE or ERROR: not near merging either (it
+        waits for a new head or a rerun, and both move the probe's fingerprint: head, rollup state or counts), so a
+        probe stands in for a full read up to PR_FULL_PENDING_EVERY as for a pending one. Only a moved fingerprint is
+        read in full (no counts-only confirm: which check is red is what its judgment reads). The land host, 2026-11-26
+        09:03-09:35Z: 39 of 172 batched land rows went to a full read as full-due, and a 50-row batch's full reads
+        (about 11 s a PR) ran out its LAND_REFRESH_BATCH_BUDGET with 15-24 rows unread."""
+        return self.queued_rollup(e) in ("FAILURE", "ERROR")
 
     def pending_counts_only(self, e: dict, node: dict | None) -> bool:
         """Whether E, a queued_pending PR, differs from its cached answer only in the counts of its running checks:
@@ -14942,6 +14955,9 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 log({"event": "land-probe-split", "n": len(entries), "probed": len(probe), "confirmed": confirmed,
                      "pending": sum(1 for e in entries if daemon.queued_pending(e)),
                      "refused": dict(Counter(r for r in refused.values() if r)),
+                     # the rollup of each full-due row: which kind of row the age bound still sends to a full read
+                     "fullDue": dict(Counter(str(daemon.queued_rollup(e)) for e in entries
+                                             if refused[e["key"]] == "full-due")),
                      "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)

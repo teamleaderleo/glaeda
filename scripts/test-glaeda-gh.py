@@ -47652,6 +47652,31 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         e["cache"].update(fp=json.dumps(settled), fullAt=d.now - gg.PR_FULL_BEHIND_EVERY - 600)
         self.assertFalse(d.probe_ok(e))
 
+    def test_probe_stands_in_for_a_queued_red_row_past_an_hour_but_its_counts_moving_are_read(self):
+        """The land host, 2026-11-26 09:03-09:35Z: 39 of 172 batched land rows read in full as full-due, and a 50-row
+        batch's full reads ran out its budget with 15-24 unread. A red queued row is not near merging: probed."""
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 20000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"})
+        d.pr_behind = lambda c: True
+        d.rollup_stale = lambda key, c: False
+        for rollup in ("FAILURE", "ERROR"):
+            red = json.loads(self.fp())
+            red[7] = rollup
+            e = {"key": "pr:o/r#1", "cache": {"fp": json.dumps(red), "via": "graphql",
+                                              "data": {"state": "OPEN", "checks": []},
+                                              "fullAt": d.now - gg.PR_FULL_BEHIND_EVERY - 600}}
+            self.assertTrue(d.probe_ok(e), rollup)
+            self.assertFalse(d.queued_pending(e))
+            e["cache"]["fullAt"] = d.now - gg.PR_FULL_PENDING_EVERY
+            self.assertEqual(d.probe_refusal(e), "full-due")
+        moved = json.loads(self.fp())
+        moved[7] = "FAILURE"
+        red_counts = moved[:8] + [11, [["IN_PROGRESS", 2]], [], 4]
+        self.assertFalse(self.check(json.dumps(moved), json.dumps(red_counts)), "a red row's counts moving is read")
+        d.rollup_wanted = lambda: frozenset()
+        self.assertFalse(d.probe_ok(e), "not queued: the usual bound")
+
 
 class FullPrReadFoldsItsHead(unittest.TestCase):
     """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s
