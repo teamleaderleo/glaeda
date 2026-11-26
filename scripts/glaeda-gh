@@ -15616,17 +15616,16 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
-# A stopped row reads nothing (the pass's live list leaves LAND_DONE out), so its cache entry and its seenHead are
-# frozen at the stop, and a reminder written from them tells its requester about a PR that may have merged, closed or
-# moved on hours ago. gcp-agent-lane-3, 2026-11-26: 8 reminders in one hour, every one for a PR already MERGED (cmux
-# #49097 among them, its cache still holding the pre-merge head). 53 of this host's 110 stopped rows quote their stop's
-# own head in the text, and 3 of 9 head_moved reminders acted on 2026-11-25 pointed at a head the PR had moved past.
-# So the PR's state and head are read once before the reminder (remind_reads, the forwarded row's precedent at
-# LAND_FORWARD_STATE_READS): merged or closed ends the row instead of reminding it, and a head that moved is named
-# beside the stop's own, dated. Detectors: test-glaeda-gh.py
-# test_a_reminder_reads_the_pr_first_so_a_row_that_merged_ends_instead,
-# test_a_reminder_names_the_head_now_when_the_stop_head_moved.
-LAND_OWNER_REMIND_READS = 4  # PR state reads one pass spends on reminders (a row is read at most CAP times a day)
+# LAND_OWNER_REMIND_READ: "a PR that is over owes nothing" was decided on whatever copy the cache held, and a stopped row
+# is unwatched, so that copy is the one from before the stop or none at all (a lane VM keeps no copy of an unwatched PR).
+# gcp-agent-lane-2, 2026-11-26 04:42Z: cmux#55358 stopped update_branch_refused at 03:08Z on 11-25, merged at 07:56Z by
+# another host's queue, and was reminded "still stopped after 26 h" -- this host's cache held no file for it. A due
+# reminder whose copy is missing or older than its last word (the stop, or the last reminder) first asks one direct
+# read (refresh_job, as after_blind_read does) and is decided on the pass after it lands. Bounded: past
+# LAND_OWNER_REMIND_READ_WAIT beyond due with no read (a hold, a full pool, a failed read) it is told on the copy there
+# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
+# test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
+LAND_OWNER_REMIND_READ_WAIT = 1800.0
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -17540,7 +17539,6 @@ class LandQueue:
         self.forward_reading: set[str] = set()
         self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
-        self.remind_state_thread: threading.Thread | None = None
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.peer_quiet: dict[str, str] = {}  # silent peers, each to why (silent_peers, LAND_PEER_SILENT)
         self.peer_quiet_at = float("-inf")  # silent_peers reads the rows again after this
@@ -18013,7 +18011,6 @@ class LandQueue:
         live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs
                 and k not in self.overflowing]
         unlabel: list[str] = []  # ended lands that take their ready-to-land off (LAND_UNLABEL)
-        remind: list[str] = []  # stopped rows owed their one step again, their PRs read first (LAND_OWNER_REMIND)
         for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
@@ -18023,13 +18020,12 @@ class LandQueue:
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
-                        if not self.rearm(e) and self.remind_due(e):  # judged from the next pass
-                            remind.append(key)  # a stop that never re-arms still reaches its owner, its PR read first
+                        if not self.rearm(e):  # judged from the next pass
+                            self.remind(e)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
-        self.remind_reads(remind)
         self.unlabel_start(unlabel)
         if dirty is not None and not recovery and latch is None and ended is None:
             # The daemon tells us when a PR cache write or webhook changes a waiting head. A quiet CI wait
@@ -19657,7 +19653,7 @@ class LandQueue:
         n = int(r.get("n") or 0) if r.get("day") == day else 0
         if n >= LAND_REARM_CAP:
             return False
-        e["rearms"] = {"day": day, "n": n + 1, "at": self.now, "code": code}  # attributable to the stop it answered
+        e["rearms"] = {"day": day, "n": n + 1}
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
         if latched:
@@ -19669,100 +19665,72 @@ class LandQueue:
         self.save(e)
         return True
 
-    def remind_due(self, e: dict) -> bool:
-        """Under the lock. Whether a stopped E owes its requester its one step again (LAND_OWNER_REMIND's comment),
-        before its PR is read: that read decides whether the row is reminded or is over (remind_reads)."""
+    def remind(self, e: dict) -> bool:
+        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
         if e.get("state") != "stopped":
             return False
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
         if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
             return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
-        if not str(e.get("requester") or ""):
+        to = str(e.get("requester") or "")
+        if not to:
             return False  # notify's land-unnotified already said it at the stop
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
-            return False  # a PR the cache already shows over owes its requester nothing, and owes no read either
+            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0
         if n >= LAND_OWNER_REMIND_CAP:
             return False
-        last = float(r.get("at") or 0) or float(st.get("at") or 0)
-        return self.now - last >= LAND_OWNER_REMIND_EVERY
-
-    def remind_reads(self, due: list[str]) -> None:
-        """The PR behind each row in DUE read once (forward_read_state) and then reminded or ended, off the tick: a
-        stopped row's own cache is frozen at its stop (LAND_OWNER_REMIND's comment), so no reminder can be written
-        from it. Outside the lock; each row settled under the lock, at the stop it was picked for."""
-        if not due or (self.remind_state_thread is not None and self.remind_state_thread.is_alive()):
-            return
-        picked = [k for k in due[:LAND_OWNER_REMIND_READS] if k in self.entries]
-        # the row as picked: one re-armed, re-queued or stopped again while its PR was read is not reminded on it
-        token = {k: (self.entries[k].get("gen"), float((self.entries[k].get("stop") or {}).get("at") or 0))
-                 for k in picked}
-
-        def read_all() -> None:
-            for key in picked:
-                try:
-                    e = self.entries.get(key)
-                    if e is None:
-                        continue
-                    state, merge_sha, head, why = self.forward_read_state(e)
-                    with self.lock:
-                        e = self.entries.get(key)
-                        if e is None or (e.get("gen"), float((e.get("stop") or {}).get("at") or 0)) != token[key]:
-                            continue
-                        if state and self.ended(e, state, merge_sha, "a reminder's state read shows it"):
-                            continue  # over since the stop: the row ends, and nobody is reminded of a dead stop
-                        self.remind(e, head=head, unread="" if state else why)
-                except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
-                    log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
-
-        if self.inline:
-            read_all()
-        else:
-            self.remind_state_thread = threading.Thread(target=read_all, name="land-remind-state", daemon=True)
-            self.remind_state_thread.start()
-
-    def remind(self, e: dict, head: str = "", unread: str = "") -> bool:
-        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
-        (LAND_OWNER_REMIND's comment). Under the lock, after remind_reads read the PR: HEAD is the head that read
-        gave, UNREAD why it gave none. Judges nothing: the row stays stopped, at the same gen."""
-        if not self.remind_due(e):
-            return False
-        st = e.get("stop") or {}
-        code = str(st.get("code") or "")
-        to = str(e.get("requester") or "")
-        day = land_day(self.now)
-        r = e.get("reminds") or {}
-        n = int(r.get("n") or 0) if r.get("day") == day else 0
         at = float(st.get("at") or 0)
-        was = str(st.get("head") or "").lower()
-        moved = bool(head) and bool(was) and head != was
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
-                        **({"head": head} if head else {}), **({"unread": land_tail(unread, 120)} if unread else {})}
+        last = float(r.get("at") or 0) or at
+        if self.now - last < LAND_OWNER_REMIND_EVERY:
+            return False
+        if self.remind_read_pending(e, last):
+            return False
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return False  # the read it waited for shows the PR over
+        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
         if st.get("next"):
             msg += f" next: {land_trim(str(st['next']), 300)}"
-        if moved:
-            # The stop's evidence is at a commit the PR has moved past, so its one step names a sha that is no longer
-            # the head: the re-queue at the head now comes first, and the stop's own sha is dated.
-            msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
-                    f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
-        elif unread:
-            msg += f"\nthe PR could not be read just now ({land_tail(unread, 120)}): that stop is {hours:.0f} h old"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
-        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
-                     **({"moved": head[:12]} if moved else {}))
+        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1), "moved": moved})
+             "hours": round(hours, 1)})
         self.save(e)
         self.notify(e, to, msg)
         return True
+
+    def remind_read_pending(self, e: dict, last: float) -> bool:
+        """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
+        (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
+        LAND_OWNER_REMIND_READ_WAIT past due."""
+        def read_since() -> list[float]:
+            c = self.cache_of(e["key"]) or {}
+            return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
+        reads = read_since()
+        if (reads and max(reads) > last) or self.now - (last + LAND_OWNER_REMIND_EVERY) >= LAND_OWNER_REMIND_READ_WAIT:
+            return False
+        if float(e.get("remindReadAt") or 0) > last:
+            return True  # asked since the last word: told on the pass after it lands
+        if e["key"] in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return True  # asked on a later pass
+        e["remindReadAt"] = self.now
+        age = round(self.now - max(reads)) if reads else None
+        self.history(e, "remind_read", age=age)
+        log({"event": "land-remind-read", "key": e["key"], "age": age})
+        self.save(e)
+        self.submit(e["key"], self.refresh_job, e["key"])
+        after = read_since()
+        return not (after and max(after) > last)  # a read that already landed (an inline pool) decides it now
 
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
@@ -25617,11 +25585,14 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
     of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}."""
+    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
+    clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
+    queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
     judged = 0
     for e in entries:
-        if e.get("state") in LAND_DONE:
+        if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
         x = e.get("explain") or {}
         data = (cache_of(e["key"]) or {}).get("data") or {}
