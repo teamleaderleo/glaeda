@@ -25608,11 +25608,14 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
     of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}."""
+    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
+    clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
+    queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
     judged = 0
     for e in entries:
-        if e.get("state") in LAND_DONE:
+        if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
         x = e.get("explain") or {}
         data = (cache_of(e["key"]) or {}).get("data") or {}
