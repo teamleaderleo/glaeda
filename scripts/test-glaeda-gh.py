@@ -46388,6 +46388,28 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(10)))
         self.assertEqual(d.sent, [10, 10])
 
+    def test_a_restarted_daemon_starts_from_the_measure_it_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            d, clock = self.daemon(5.0)
+            d.full_pr_secs_path = path
+            with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lambda e: None):
+                d.fetch_prs(self.entries(3))  # learns cmux's cost from one 10.5 s cut
+            self.assertIn("manaflow-ai/cmux", gg.load_full_pr_secs(path))
+            fresh, clock2 = self.daemon(5.0)
+            fresh.full_pr_secs = gg.load_full_pr_secs(path)  # what __init__ reads after a reexec
+            with mock.patch.object(gg.time, "monotonic", lambda: clock2[0]):
+                self.assertIsNone(fresh.fetch_prs(self.entries(3)))
+            self.assertEqual(fresh.sent, [1, 1, 1])  # no 10.5 s cut first
+
+    def test_an_unreadable_measure_file_is_no_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            path.write_text('{"manaflow-ai/cmux": "x", "a/b": -1, "c/d": true, "e/f": 2.5}')
+            self.assertEqual(gg.load_full_pr_secs(path), {"e/f": 2.5})
+            path.write_text("not json")
+            self.assertEqual(gg.load_full_pr_secs(path), {})
+
 
 class FullPrReadFoldsItsHead(unittest.TestCase):
     """The land host, 2026-11-26 01:09-02:02Z: each 600 s of ticks spent ~330 s reading land PRs in full and ~350 s

@@ -1485,6 +1485,10 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
+# The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
+# host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
+# then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
+FULL_PR_SECS_FILE = "full-pr-secs.json"
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -2293,6 +2297,13 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+
+
+def load_full_pr_secs(path: Path) -> dict[str, float]:
+    """The seconds per full PR read a daemon measured before its reexec (FULL_PR_SECS_FILE); {} when none is readable."""
+    saved = read_json(path)
+    return {str(k): float(v) for k, v in (saved.items() if isinstance(saved, dict) else ())
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 3600}
 
 
 def read_cache(key: str) -> dict | None:
@@ -6427,7 +6438,9 @@ class Daemon:
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
         self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
-        self.full_pr_secs: dict[str, float] = {}  # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs)
+        # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
+        self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
+        self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -11923,6 +11936,10 @@ class Daemon:
                 measured[repo] = floor
                 log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
                      "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, "full_pr_secs_path", None)
+        if path is not None and measured.get(repo) != known:
+            with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
+                write_json(path, {k: round(v, 3) for k, v in measured.items()})
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
