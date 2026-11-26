@@ -46933,6 +46933,38 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         self.assertFalse(self.check(json.dumps(settled), json.dumps(settled)))
         self.assertFalse(self.check("junk", self.fp()))
 
+    def test_merge_state_flips_while_checks_run_are_confirmed(self):
+        old = json.loads(self.fp())
+        old[4] = "UNKNOWN"
+        old[3] = "UNKNOWN"
+        for state, mergeable in (("UNSTABLE", "MERGEABLE"), ("BLOCKED", "UNKNOWN"), ("UNKNOWN", "MERGEABLE")):
+            new = json.loads(self.fp())
+            new[4], new[3] = state, mergeable
+            self.assertTrue(self.check(json.dumps(old), json.dumps(new)), state)
+        for state, mergeable in (("BEHIND", "MERGEABLE"), ("DIRTY", "CONFLICTING"), ("CLEAN", "MERGEABLE")):
+            new = json.loads(self.fp())
+            new[4], new[3] = state, mergeable
+            self.assertFalse(self.check(self.fp(), json.dumps(new)), state)
+        moved = json.loads(self.fp())
+        moved[5] = "b" * 40
+        self.assertEqual(gg.pending_fp_moved(json.loads(self.fp()), moved), ["headRefOid"])
+
+    def test_probe_refusal_names_the_condition(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 20000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"})
+        d.pr_behind = lambda c: True
+        d.rollup_stale = lambda key, c: False
+        e = {"key": "pr:o/r#1", "cache": {"fp": self.fp(), "via": "graphql", "data": {"state": "OPEN", "checks": []},
+                                          "fullAt": d.now - 60}}
+        self.assertIsNone(d.probe_refusal(e))
+        e["cache"]["source"] = "upstream"
+        self.assertEqual(d.probe_refusal(e), "upstream")
+        del e["cache"]["source"]
+        d.rollup_stale = lambda key, c: True
+        self.assertEqual(d.probe_refusal(e), "rollup-stale")
+        self.assertFalse(d.probe_ok(e))
+
     def test_probe_stands_in_for_a_queued_pending_row_past_an_hour(self):
         d = gg.Daemon.__new__(gg.Daemon)
         d.now = 20000.0

@@ -340,7 +340,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
-from collections import deque
+from collections import Counter, deque
 import contextlib
 import datetime as dt
 import errno
@@ -5496,6 +5496,30 @@ def confirmed_updated(cache: dict | None, node: dict | None, now: float) -> dict
     if data.get("updatedAt") != upd:
         fields["data"] = {**data, "updatedAt": upd}
     return fields
+
+
+PR_FP_FIELDS = ("state", "isDraft", "merged", "mergeable", "mergeStateStatus", "headRefOid", "reviewDecision",
+                "rollup", "contexts", "checkRuns", "statuses", "suites")
+# What GitHub answers for mergeStateStatus while a PR's checks run: it flips between these from one read to the next
+# (manaflow-ai/cmux#49086 and #57841, 2026-11-26 07:3xZ: UNKNOWN with 3 checks queued or pending, read between
+# BLOCKED and UNSTABLE answers), so a pending PR's probe compares it as one value. BEHIND, DIRTY and CLEAN are not here.
+PENDING_MERGE_STATES = frozenset({"UNKNOWN", "BLOCKED", "UNSTABLE", "HAS_HOOKS", None})
+
+
+def pending_fp_moved(old: Any, new: Any) -> list[str]:
+    """The fingerprint fields (PR_FP_FIELDS) that moved between OLD and NEW, two pr_fingerprint lists of a PR whose
+    rollup is pending, ignoring the check counts and what GitHub flips while checks run: mergeable UNKNOWN on either
+    side, mergeStateStatus within PENDING_MERGE_STATES. Empty: only the counts moved."""
+    if not (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == len(PR_FP_FIELDS)):
+        return ["unreadable"]
+    moved = []
+    for i, name in enumerate(PR_FP_FIELDS[:8]):
+        a, b = old[i], new[i]
+        if a == b or (name == "mergeable" and "UNKNOWN" in (a, b)) \
+                or (name == "mergeStateStatus" and a in PENDING_MERGE_STATES and b in PENDING_MERGE_STATES):
+            continue
+        moved.append(name)
+    return moved
 
 
 def pr_fingerprint(node: dict | None) -> str | None:
@@ -12027,17 +12051,31 @@ class Daemon:
         (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY (PR_FULL_BEHIND_EVERY while
         PR reads are behind, pr_behind), still open, and every
         failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
+        return self.probe_refusal(e) is None
+
+    def probe_refusal(self, e: dict) -> str | None:
+        """Why probe_ok refuses E a probe (the first condition it fails, a short name), or None when it takes one."""
         c = e.get("cache") or {}
         data = c.get("data")
+        if not isinstance(c.get("fp"), str):
+            return "no-fp"
+        if c.get("via") not in ("graphql", "graphql-probe") or c.get("error"):
+            return "not-graphql"
         # (an answer from an upstream keeps this host's old fp: never confirmed against it)
-        return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
-                and c.get("source") != "upstream"
-                and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
-                and isinstance(c.get("fullAt"), (int, float))
-                and self.now - c["fullAt"] < (PR_FULL_PENDING_EVERY if self.queued_pending(e)
-                                              else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
-                and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
-                and not self.rollup_stale(e["key"], c))
+        if c.get("source") == "upstream":
+            return "upstream"
+        if not isinstance(data, dict) or data.get("checksPageError") or data.get("state") != "OPEN":
+            return "not-open-whole"
+        if not isinstance(c.get("fullAt"), (int, float)):
+            return "no-full"
+        if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+                                      else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY):
+            return "full-due"
+        if any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []):
+            return "steps"
+        if self.rollup_stale(e["key"], c):
+            return "rollup-stale"
+        return None
 
     def pr_behind(self, cache: dict) -> bool:
         """Whether PR reads are behind, so probe_ok lets a probe stand in for a full read up to PR_FULL_BEHIND_EVERY:
@@ -12195,6 +12233,8 @@ class Daemon:
             node = (data.get(f"p{i}") or {}).get("pullRequest")
             if f"p{i}" in failed or pr_fingerprint(node) != (e.get("cache") or {}).get("fp"):
                 if f"p{i}" in failed or not self.pending_counts_only(e, node):
+                    if f"p{i}" not in failed and self.queued_pending(e):
+                        self.note_probe_moved(e, node)
                     changed.append(e)
                     continue
                 # (the fingerprint stays the cached one, so the next probe asks again until PR_FULL_PENDING_EVERY)
@@ -12227,7 +12267,21 @@ class Daemon:
             old, new = json.loads(cache.get("fp") or "null"), json.loads(pr_fingerprint(node) or "null")
         except (TypeError, ValueError):
             return False
-        return isinstance(new, list) and len(new) == 12 and old[:8] == new[:8]
+        return isinstance(new, list) and len(new) == 12 and not pending_fp_moved(old, new)
+
+    def note_probe_moved(self, e: dict, node: dict | None) -> None:
+        """Count, for land_direct_read_many's summary, what moved in a queued_pending PR's probe that sent it to a full
+        read: the fingerprint fields (pending_fp_moved) or the age bound."""
+        moved = getattr(self, "probe_moved", None)
+        if moved is None:
+            moved = self.probe_moved = Counter()
+        try:
+            new = json.loads(pr_fingerprint(node) or "null")
+            old = json.loads((e.get("cache") or {}).get("fp") or "null")
+        except (TypeError, ValueError):
+            new = old = None
+        fields = pending_fp_moved(old, new) if isinstance(new, list) and len(new) == 12 else ["unreadable"]
+        moved.update(fields or ["age"])
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
@@ -14667,8 +14721,11 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
             with daemon.calling(*caller_of(todo[0]), "tool:glaeda-gh land (batched refresh)"):
                 daemon.gql_reason = "pr-land-batch"
                 # the probes first, LAND_REFRESH_BATCH a query: the PRs whose fingerprint held are confirmed by it
-                probe = [e for e in entries if daemon.probe_ok(e)]
-                full = [e for e in entries if not daemon.probe_ok(e)]
+                refused = {e["key"]: daemon.probe_refusal(e) for e in entries}
+                probe = [e for e in entries if refused[e["key"]] is None]
+                full = [e for e in entries if refused[e["key"]] is not None]
+                daemon.probe_moved = Counter()
+                confirmed = 0
                 for i in range(0, len(probe), LAND_REFRESH_BATCH):
                     part = probe[i:i + LAND_REFRESH_BATCH]
                     changed, error = daemon.probe_prs(part)
@@ -14676,6 +14733,13 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                         errors.update({e["key"]: error for e in part})
                         continue
                     full += part if error else changed
+                    confirmed += 0 if error else len(part) - len(changed)
+                # why each row was or was not read in full: the land host's cache is not readable from elsewhere, and
+                # #2853 and its follow-up confirmed no row there for an hour with nothing to say which check refused it
+                log({"event": "land-probe-split", "n": len(entries), "probed": len(probe), "confirmed": confirmed,
+                     "pending": sum(1 for e in entries if daemon.queued_pending(e)),
+                     "refused": dict(Counter(r for r in refused.values() if r)),
+                     "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
                 left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
