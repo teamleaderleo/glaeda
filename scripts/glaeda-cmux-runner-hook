@@ -6162,12 +6162,75 @@ while [ $# -gt 0 ]; do
   esac
 done
 sub=$1
-case $sub in fetch|ls-remote) ;; *) exec "$real" "${orig[@]}" ;; esac
+normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
+sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
+  for d in "$submodules"/*.git; do
+    [ -f "$d/HEAD" ] || continue
+    u=$("$real" --git-dir="$d" config --get glaeda.url 2>/dev/null) || continue
+    [ "$(normurl "$u")" = "$1" ] && { printf '%s' "$d"; return 0; }
+  done
+  return 1
+}
+case $sub in fetch|ls-remote|submodule) ;; *) exec "$real" "${orig[@]}" ;; esac
 shift
 args=("$@")
-remote=; have_remote=; dd=; plain=1; refspecs=()
+kind=cmux
+if [ "$sub" = submodule ]; then
+  # `git submodule update` (actions/checkout's submodules: true, scripts/ci/init-submodule.sh): every submodule
+  # whose pin the mirror pass holds is cloned from file://<its mirror> (-c reaches git's own submodule clone and
+  # fetch, which never run this shim); a pin it lacks goes to github.com and is counted.
+  case " $* " in *" update "*) ;; *) exec "$real" "${orig[@]}" ;; esac
+  top=$("$real" "${globals[@]}" rev-parse --show-toplevel 2>/dev/null) || exec "$real" "${orig[@]}"
+  gd=$("$real" "${globals[@]}" rev-parse --absolute-git-dir 2>/dev/null) || exec "$real" "${orig[@]}"
+  targets=(); dd=; skip=; seen=
+  for a in "$@"; do
+    if [ -n "$skip" ]; then skip=; continue; fi
+    if [ -z "$seen" ]; then [ "$a" = update ] && seen=1; continue; fi
+    if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then targets+=("${a%/}"); continue; fi
+    case $a in --) dd=1 ;; --reference|--depth|--jobs|-j|--filter) skip=1 ;; esac
+  done
+  rules=(); served=(); misses=()
+  while read -r key path; do
+    [ -n "$path" ] || continue
+    name=${key#submodule.}; name=${name%.path}
+    if [ ${#targets[@]} -gt 0 ]; then
+      want=; for t in "${targets[@]}"; do [ "$t" = "$path" ] && want=1; done
+      [ -n "$want" ] || continue
+    fi
+    pin=$("$real" -C "$top" ls-tree HEAD -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3 }')
+    [ -n "$pin" ] || continue
+    "$real" --git-dir="$gd/modules/$name" cat-file -e "$pin^{commit}" 2>/dev/null && continue  # here already
+    url=$("$real" -C "$top" config -f .gitmodules --get "submodule.$name.url" 2>/dev/null)
+    case $url in https://github.com/*) ;; *) continue ;; esac
+    d=$(sm_for "$(normurl "$url")")
+    if [ -n "$d" ] && "$real" --git-dir="$d" cat-file -e "$pin^{commit}" 2>/dev/null; then
+      for u in "$url" "$("$real" "${globals[@]}" config --get "submodule.$name.url" 2>/dev/null)"; do
+        [ -n "$u" ] && rules+=(-c "url.file://$d.insteadOf=$u")
+      done
+      served+=("$name")
+    else
+      misses+=("$name")
+    fi
+  done < <("$real" -C "$top" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+  [ ${#served[@]} -gt 0 ] || [ ${#misses[@]} -gt 0 ] || exec "$real" "${orig[@]}"
+  log_line() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git submodule $2" >> "$log" 2>/dev/null; }
+  count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
+  if [ ${#served[@]} -gt 0 ]; then
+    if "$real" "${globals[@]}" -c protocol.file.allow=always "${rules[@]}" "${orig[@]:${#globals[@]}}"; then
+      for n in "${served[@]}"; do log_line mirror "$n"; done
+      for n in ${misses[@]+"${misses[@]}"}; do log_line github "$n"; done
+      say "submodules ${served[*]} from the mirror${misses[*]:+, ${misses[*]} from github.com}; github.com git fetches this job: $(count)"
+      exit 0
+    fi
+    say "the mirror submodule update failed; asking github.com"
+    misses=("${served[@]}" ${misses[@]+"${misses[@]}"})
+  fi
+  kind=submodule; remote=submodule; refspecs=("${misses[@]}")
+fi
+[ "$kind" = submodule ] || { remote=; have_remote=; dd=; plain=1; refspecs=(); }
 n=$#
 i=0
+[ "$kind" = submodule ] && n=0
 while [ $i -lt $n ]; do
   a=${args[$i]}
   if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then
@@ -6183,18 +6246,28 @@ while [ $i -lt $n ]; do
   fi
   i=$((i + 1))
 done
-[ -n "$have_remote" ] || remote=origin
-case $remote in
-  */*|*:*) url=$remote ;;
-  *) url=$("$real" "${globals[@]}" config --get "remote.$remote.url" 2>/dev/null) ;;
-esac
-norm=$(printf '%s' "$url" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]')
-[ "$norm" = "https://github.com/manaflow-ai/cmux" ] || exec "$real" "${orig[@]}"
+if [ "$kind" != submodule ]; then
+  [ -n "$have_remote" ] || remote=origin
+  case $remote in
+    */*|*:*) url=$remote ;;
+    *) url=$("$real" "${globals[@]}" config --get "remote.$remote.url" 2>/dev/null) ;;
+  esac
+  norm=$(normurl "$url")
+  if [ "$norm" != "https://github.com/manaflow-ai/cmux" ]; then
+    # a fetch inside a submodule (a retry, or a pin the clone did not bring) reads that submodule's mirror
+    case $norm in https://github.com/*) ;; *) exec "$real" "${orig[@]}" ;; esac
+    mirror=$(sm_for "$norm") || exec "$real" "${orig[@]}"
+    kind=pins
+  fi
+fi
 note() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git $sub ${remote} ${refspecs[*]}" >> "$log" 2>/dev/null; }
 count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
-mirror_ok() { [ -f "$mirror/glaeda-verified" ] && [ ! -e "$mirror/glaeda-repair-pending" ] && [ ! -e "$mirror/shallow" ]; }
+mirror_ok() {
+  if [ "$kind" = pins ]; then [ -f "$mirror/HEAD" ]; return; fi
+  [ -f "$mirror/glaeda-verified" ] && [ ! -e "$mirror/glaeda-repair-pending" ] && [ ! -e "$mirror/shallow" ]
+}
 ids_only=
-if [ "$sub" = fetch ] && [ -n "$plain" ] && [ ${#refspecs[@]} -gt 0 ]; then
+if [ "$kind" != submodule ] && [ "$sub" = fetch ] && [ -n "$plain" ] && [ ${#refspecs[@]} -gt 0 ]; then
   ids_only=1
   for r in "${refspecs[@]}"; do
     printf '%s\n' "$r" | grep -Eq '^\+?([0-9a-f]{40}|[0-9a-f]{64})(:refs/[^:*]+)?$' || { ids_only=; break; }
@@ -6208,7 +6281,7 @@ has_all() {
   done
 }
 from_mirror() {
-  if "$real" "${globals[@]}" -c "url.$mirror.insteadOf=$url" fetch "${args[@]}"; then
+  if "$real" "${globals[@]}" -c protocol.file.allow=always -c "url.file://$mirror.insteadOf=$url" fetch "${args[@]}"; then
     note mirror
     say "served from the mirror ($mirror); github.com git fetches this job: $(count)"
     exit 0
@@ -6217,8 +6290,8 @@ from_mirror() {
 }
 if [ -n "$ids_only" ]; then
   if has_all; then from_mirror; fi
-  case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
-    pull_request*|merge_group*) ;;
+  case "$kind:${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+    pins:*|*:pull_request*|*:merge_group*) ;;
     *:refs/heads/main|*:refs/heads/feat-cmux-next|*:refs/heads/nightly-next)
       if mirror_ok; then
         until=$((SECONDS + ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s}))
@@ -6265,6 +6338,7 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
     """The shim's text: the values the hook resolved, then GIT_SHIM_BODY. /bin/bash, so 3.2 on a mini."""
     head = (f"#!/bin/bash\n# glaeda-cmux-runner-hook GIT_SHIM: written at job-started; see the hook.\n"
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
+            f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
             f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\n")
     return head + GIT_SHIM_BODY
 

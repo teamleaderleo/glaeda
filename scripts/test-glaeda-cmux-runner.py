@@ -23656,5 +23656,114 @@ class GitShimTest(unittest.TestCase):
         self.assertEqual(self.log(), ["mirror"])
 
 
+class SubmoduleShimTest(unittest.TestCase):
+    """GIT_SHIM for submodules: a cold cmux checkout's `git submodule update` clones each submodule from the
+    mirror pass's submodule mirror (glaeda-git-mirror SUBMODULES), so it sends github.com no git fetch."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.gitconfig = self.dir / "gitconfig"
+        # no protocol.file.allow here: git refuses file:// inside a submodule unless the shim allows it
+        self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n')
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.fspath(self.gitconfig), "TMPDIR": os.fspath(self.dir),
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com", "GLAEDA_GIT_SHIM_POLL_S": "1",
+                    "GLAEDA_GIT_SHIM_BACKOFF_S": "1", "GLAEDA_GIT_SHIM_WAIT_S": "0"}
+        self.url = "https://github.com/manaflow-ai/ghostty.git"
+        src = self.dir / "ghostty-src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        (src / "build.zig").write_text("zig\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "ghostty")
+        self.pin = self.git(src, "rev-parse", "HEAD")
+        self.github = self.dir / "github" / "manaflow-ai" / "ghostty.git"
+        self.github.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.github))
+        self.git(self.github, "config", "uploadpack.allowAnySHA1InWant", "true")
+        fleet = self.dir / "fleet" / "git"
+        self.mirror = fleet / "cmux.git"
+        self.mirror.mkdir(parents=True)
+        self.git(self.mirror, "init", "-q", "--bare")
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        self.sm = fleet / "submodules" / "ghostty.git"
+        self.sm.mkdir(parents=True)
+        self.git(self.sm, "init", "-q", "--bare")
+        self.git(self.sm, "config", "glaeda.url", self.url)
+        self.git(self.sm, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.ws = self.dir / "work" / "cmux"
+        self.ws.mkdir(parents=True)
+        self.git(self.ws, "init", "-q", "-b", "main")
+        (self.ws / ".gitmodules").write_text(f'[submodule "ghostty"]\n\tpath = ghostty\n\turl = {self.url}\n')
+        self.git(self.ws, "update-index", "--add", "--cacheinfo", f"160000,{self.pin},ghostty")
+        self.git(self.ws, "add", ".gitmodules")
+        self.git(self.ws, "commit", "-qm", "cmux")
+        self.git(self.ws, "remote", "add", "origin", "https://github.com/manaflow-ai/cmux")
+        self.temp = self.dir / "runner-temp"
+        self.temp.mkdir()
+        self.path_file = self.dir / "github_path"
+        self.path_file.write_text("")
+        self.job_env = {**self.env, "RUNNER_TEMP": os.fspath(self.temp), "GITHUB_PATH": os.fspath(self.path_file)}
+        self.assertIn("read", hook.install_git_shim("manaflow-ai/cmux", self.mirror, self.job_env))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def shim(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([os.fspath(self.temp / hook.GIT_SHIM_DIR / "git"), *args], cwd=self.ws,
+                              env={**self.job_env, **(env or {})}, capture_output=True, text=True, timeout=60)
+
+    def log(self) -> list[str]:
+        path = self.temp / hook.GIT_SHIM_LOG
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def warm_mirror(self) -> None:
+        self.git(self.sm, "fetch", "-q", "--depth=1", self.url, f"+{self.pin}:refs/heads/main")
+
+    def test_a_cold_checkout_s_submodules_come_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)  # github.com is gone: only the mirror can serve it
+        self.shim("submodule", "sync", "--recursive")
+        done = self.shim("-c", "protocol.version=2", "submodule", "update", "--init", "--force", "--depth=1",
+                         "--recursive")  # actions/checkout v6, submodules: true
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["mirror"])
+        self.assertIn("github.com git fetches: 0 (the mirror served 1)", hook.git_fetch_summary(self.job_env))
+        again = self.shim("-C", "ghostty", "fetch", "--depth=1", "origin", self.pin)  # a fetch inside it
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.log(), ["mirror", "mirror"])
+
+    def test_init_submodule_s_named_path_comes_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)
+        done = self.shim("-c", "http.lowSpeedLimit=1000", "submodule", "update", "--init", "--depth", "1", "--",
+                         "ghostty")  # scripts/ci/init-submodule.sh
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_pin_the_mirror_lacks_goes_to_github_and_is_counted(self) -> None:
+        allow = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+        done = self.shim("submodule", "update", "--init", "--depth=1", env=allow)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_submodule_already_here_sends_nothing_anywhere(self) -> None:
+        self.warm_mirror()
+        self.assertEqual(self.shim("submodule", "update", "--init", "--depth=1").returncode, 0)
+        shutil.rmtree(self.github)
+        shutil.rmtree(self.sm)
+        done = self.shim("submodule", "update", "--init", "--force", "--depth=1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+
 if __name__ == "__main__":
     unittest.main()
