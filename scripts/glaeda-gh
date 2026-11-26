@@ -15653,6 +15653,19 @@ LAND_NOTIFY_RETRY_S = 5.0
 LAND_NOTIFY_GONE = re.compile(r"\bno_session:")
 LAND_NOTIFY_BUSY = re.compile(r"\b(?:429|503)\b|mesh\.rate_limited|mesh\.unavailable")
 LAND_NOTIFY_BUSY_RETRY_S = 30.0
+# Every notice was its own thread running its own acpmux at once, so a pass that told many rows in one minute opened
+# more pipes than the daemon may hold (ulimit -n 1024 on cmux-cp-1) and ran more sends than acpmux answers in
+# LAND_NOTIFY_DEADLINE. cmux-cp-1, 2026-11-26 04:44Z, the minute after the GraphQL window reset: 2,078 reminders
+# (land-owner-reminded) fell due together; 1,433 ended land-notify-failed "OSError" and 516 "timed out after 30s",
+# so 1,949 of 2,078 (94%) reached nobody, and each had already spent one of its row's LAND_OWNER_REMIND_MAX. At most
+# LAND_NOTIFY_PARALLEL sends run at a time; the rest wait their turn in their threads, which hold no file.
+LAND_NOTIFY_PARALLEL = 8
+LAND_NOTIFY_SLOTS = threading.BoundedSemaphore(LAND_NOTIFY_PARALLEL)
+# A session acpmux said is gone (LAND_NOTIFY_GONE) is not asked again for LAND_NOTIFY_GONE_KEEP: the same 24 h on
+# cmux-cp-1 logged 2,114 land-notify-no-session to 146 names, 1,572 of them to one ended session (a coordinator's
+# helpers had queued hundreds of lands under it), each a whole acpmux send that held a slot a live requester's
+# notice waited for. The skipped notice is logged as the others are ("memo": the seconds since acpmux said so).
+LAND_NOTIFY_GONE_KEEP = 900.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
@@ -16310,8 +16323,8 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 # stop named no step. efficiency-standing-lane, 2026-11-21: leo-workspace#7087 was pushed as a draft by the
 # PreCompact checkpoint hook (tools/wip_checkpoint.py opens one), and `land` reported merge_refused after six identical
 # refusals with the GraphQL pool at its floor. Stopping at the first one names `gh pr ready`, the step that clears it.
-# Nothing here marks a PR ready: that is a state change on someone's PR (a teammate's included), so it stays the
-# requester's call.
+# The merge step's draft refusal now marks it ready first, once per head (LAND_READY_ONCE's comment), and stops here
+# only when that was refused or the PR went back to a draft after it.
 LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request is in draft state\b"
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
 # The other half of the same answer: *when* it is given. Stopping at the first merge refusal still spends the whole
@@ -16328,9 +16341,25 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
 #   that is not an answer anything may refuse on, and a write that could have marked the PR ready (gh_cache_writes,
 #   stamped by the brokered `gh pr ready` itself) after the read drops it too.
 # - the merge-time check above stays: a PR can be converted back to a draft after its request, and this one answers
-#   only the rows where the cache already knew. Nothing here marks a PR ready either -- `gh pr ready` is the
-#   requester's call, as it is above, and [hold-own-pr] exists so a draft can be a deliberate hold.
+#   only the rows where the cache already knew. A draft the request knows of is marked ready there instead
+#   (land_ready_at_request, LAND_READY_ONCE's comment); only a refused `gh pr ready` is still refused.
 LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cycle is 60 s)
+# A land is its requester's intent to merge, so a draft is no longer a stop of its own (2026-11-26: cmux#58227 and
+# cmuxterm-hq#28522 each stopped merge_draft after a passing judgment, and their requesters had to `gh pr ready` and
+# re-queue, one wasted land cycle each, with two more queued drafts waiting to stop the same way). The queue now marks
+# it ready itself: at the request when this host's cache already knows it is a draft (land_ready_at_request), and at
+# the merge's draft refusal otherwise (LandQueue.mark_ready), which covers lands queued by any tool. Once per head:
+# a PR converted back to a draft after that is someone's deliberate hold, and stops merge_draft as before; so does a
+# `gh pr ready` that is itself refused. A hold is not a draft's job here: [hold-own-pr] is a HOLD: line or a hold
+# label, which land_judge refuses before any merge is sent.
+LAND_READY_ONCE = "readySent"
+# LAND_READY_AT_READ: land_ready_at_request readies a draft only when this host's cache read it within LAND_DRAFT_AGE,
+# so a land queued on a cold or stale copy met the draft only at the merge, after its whole CI wait and judgment
+# (gcp-agent-lane-2, 2026-11-26: teamleaderleo/leo-workspace#11870 stopped merge_draft at e09b2017 that way). So the
+# daemon's first copy read after the request that shows an open draft takes the same mark_ready step (once per head,
+# under LAND_READY_ONCE), and a refused `gh pr ready` stops merge_draft as at the merge. Same bounds as the request's
+# check: a copy read before the request, or shadowed by a later write, readies nothing. Detector: test-glaeda-gh.py
+# test_a_draft_queued_on_a_cold_cache_is_marked_ready_at_the_queues_first_read.
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
 # push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
@@ -16339,9 +16368,9 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
 # names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases a conflict away or
-# force-pushes over one: that is a write on someone's branch, so it stays the requester's call, as the draft case
-# stays theirs. The pushes are LAND_UNION's (the base merge update-branch would have made, when git merges the base
-# into the head cleanly) and LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
+# force-pushes over one: that is a write on someone's branch, so it stays the requester's call. The pushes are
+# LAND_UNION's (the base merge update-branch would have made, when git merges the base into the head cleanly) and
+# LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
 # which changes no line of the PR's own diff).
 # A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
 # update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
@@ -21321,6 +21350,11 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
+        if self.ready_due(e, c or {}, data, head):
+            # LAND_READY_AT_READ: a draft the request could not see is marked ready on this first read, through the
+            # merge step's own path (mark_ready, once per head), not after its checks are waited out
+            self.submit(e["key"], self.mark_ready, e, head, "on the queue's first read after the request")
+            return
         if e.get("pinSha") and not e.get("pinSeen"):
             if e.get("infraRetry") and e["state"] == "waiting" and float(e.get("wakeAt") or 0) > self.now:
                 return  # pin_unread's backoff (infra_read_stop): no read of the pin before it runs out
@@ -24927,6 +24961,8 @@ class LandQueue:
         if LAND_STEP_DRAFT.search(out):
             # Permanent until someone marks it ready (LAND_STEP_DRAFT's comment): one refusal, one named step.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="draft", n=1)
+            if kind == "merge" and (e.get(LAND_READY_ONCE) or {}).get("head") != head:
+                return "ready"  # the queue marks it ready itself, once per head (LAND_READY_ONCE's comment)
             name = key_name(e["key"])
             repo, _, number = name.partition("#")
             self.stop(e, f"{kind}_draft", f"the {kind} at {head[:12]} was refused while the PR is a draft: "
@@ -25322,6 +25358,56 @@ class LandQueue:
             self.update_branch(e, sha)
         elif named == "union_merge":
             self.union_merge(e, sha)
+        elif named == "ready":
+            self.mark_ready(e, sha)
+
+    def ready_due(self, e: dict, c: dict, data: dict, head: str) -> bool:
+        """Under the lock. Whether E's PR is to be marked ready now (LAND_READY_AT_READ): the daemon's copy, read since
+        E's last land request and shadowed by no later write that could have marked it ready, shows an open draft at a
+        full HEAD the queue has not readied yet (LAND_READY_ONCE), and no job of E's is running. A cache read only."""
+        if e.get("state") in LAND_DONE or e["key"] in self.jobs or not SHA40.fullmatch(head or "") \
+                or data.get("isDraft") is not True or data.get("merged") or str(data.get("state") or "") != "OPEN":
+            return False
+        if (e.get(LAND_READY_ONCE) or {}).get("head") == head:
+            return False  # readied once at this head: a draft again is someone's hold, the merge step stops it
+        at = c.get("dataAt")
+        since = max(float(e["requestedAt"]) if _finite(e.get("requestedAt")) else 0.0,
+                    float(e["created"]) if _finite(e.get("created")) else 0.0)
+        if not _finite(at) or at < since or at > self.now + 60:
+            return False  # a copy from before the request may predate a `gh pr ready`; one from the future is no read
+        repo, number = str(e.get("repo") or ""), str(e.get("number") or "")
+        writes = gh_cache_writes()
+        return not any(writes.get(stamp, 0.0) >= at for stamp in gh_cache_stamps(["pr", repo, number], repo) or [])
+
+    def mark_ready(self, e: dict, head: str, where: str = "at the merge") -> None:
+        """The merge at HEAD was refused because the PR is a draft: mark it ready (LAND_READY_ONCE's comment), once per
+        head, and judge it again soon. A refused `gh pr ready` stops the entry merge_draft, as every draft did before.
+        e[LAND_READY_ONCE] is written before the send, so a restart mid-send counts it as sent."""
+        gh = self.gh()
+        repo, number = e["repo"], str(e["number"])
+        name = key_name(e["key"])
+        with self.lock:
+            self.claim(e, "ready", sha=head)
+            e[LAND_READY_ONCE] = {"head": head, "at": self.now}
+            self.history(e, "ready_sent", head=head[:12])
+            self.save(e)
+        got = self.call([gh, "pr", "ready", number, "-R", repo], LAND_GH_DEADLINE, e) if gh is not None else \
+            subprocess.CompletedProcess([], 1, "", f"no gh-quota shim at {self.path('gh', LAND_GH)}")
+        with self.lock:
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.history(e, "readied", head=head[:12])
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"{name} was a draft {where}; marked it ready (gh pr "
+                              "ready): it is judged next"}, float(NUDGE_MIN))
+                return
+            said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+            what = (f"the merge at {head[:12]} was refused while the PR is a draft" if where == "at the merge" else
+                    f"the PR was a draft at {head[:12]} {where}")
+            self.stop(e, "merge_draft", f"{what}, and marking it ready was refused too: {said}",
+                      f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
         """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
@@ -25562,6 +25648,13 @@ class LandQueue:
                             f"{e.get('queuedBy') or 'an unnamed caller'} with no --notify)",
                             {"pr": self.url(e), "queuedBy": e.get("queuedBy") or ""})
             return
+        gone = self.__dict__.setdefault("notify_gone", {})  # {HOST/SESSION: when acpmux said no_session}
+        said = gone.get(to)
+        if said is not None and 0 <= time.time() - said < LAND_NOTIFY_GONE_KEEP:
+            # LAND_NOTIFY_GONE_KEEP's comment: acpmux said minutes ago that this session has ended
+            log({"event": "land-notify-no-session", "key": e["key"], "to": to, "tries": 0,
+                 "why": "not sent: acpmux said no_session for it", "memo": round(time.time() - said)})
+            return
         acpmux = self.path("acpmux", Path(shutil.which("acpmux", path=self.env()["PATH"]) or "acpmux"))
         # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
         # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
@@ -25572,10 +25665,15 @@ class LandQueue:
                 "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
+            with LAND_NOTIFY_SLOTS:  # LAND_NOTIFY_PARALLEL's comment: a burst waits its turn, it does not fail
+                deliver()
+
+        def deliver() -> None:
             whys: list[str] = []
             for tried in range(1, LAND_NOTIFY_TRIES + 1):
                 got = self.call(argv, LAND_NOTIFY_DEADLINE)
                 if got.returncode == 0:
+                    gone.pop(to, None)
                     if whys:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
                     # every delivered notice, so a flood is counted from this log, not only from its receiver's
@@ -25585,6 +25683,7 @@ class LandQueue:
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
                 if LAND_NOTIFY_GONE.search(whys[-1]):
                     # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
+                    gone[to] = time.time()
                     log({"event": "land-notify-no-session", "key": e["key"], "to": to, "why": whys[-1],
                          "tries": tried})
                     return
@@ -27167,8 +27266,26 @@ def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple
     pinned = f" --match-head-commit {pin}" if pin else ""
     return (f"{name} is a draft ({int(now - at)} s ago, by this host's last read of it): GitHub refuses every merge "
             f'on a draft ("Pull Request is still a draft"), so the land would wait out its checks, judge them, and '
-            f"stop at the merge. Nothing here marks a PR ready: a draft can be a deliberate hold, so it stays yours",
+            f"stop at the merge",
             f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}{pinned}")
+
+
+def land_ready_at_request(key: str, repo: str, number: int, pin: str = "") -> tuple[str, tuple[str, str] | None]:
+    """(a note, a refusal) for a land request on a PR this host already knows is a draft (land_draft_refusal): the
+    request is the intent to merge it, so it is marked ready here (LAND_READY_ONCE's comment) and queued, with a note
+    saying so. ("", None) when the cache knows no draft; a refusal, as before, only when `gh pr ready` is refused."""
+    draft = land_draft_refusal(key, repo, number, pin)
+    if draft is None:
+        return "", None
+    try:
+        got = run_bounded(["gh", "pr", "ready", str(number), "-R", repo], timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as err:
+        got = subprocess.CompletedProcess([], 1, "", str(err) or type(err).__name__)
+    if got.returncode == 0:
+        return (f"{repo}#{number} was a draft; marked it ready (gh pr ready {number} -R {repo}): a land is the "
+                "intent to merge it, and GitHub refuses every merge on a draft"), None
+    said = land_trim(land_tail(f"{got.stderr or ''}\n{got.stdout or ''}"), 200)
+    return "", (f"{draft[0]}; marking it ready here was refused: {said}", draft[1])
 
 
 def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool) -> int:
@@ -27304,11 +27421,14 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         # First of the pin answers, before the draft read and before check_land_pin's two git calls: no head, cache
         # or checkout is needed to know this sha names no commit, so the refusal costs nothing at all.
         return land_request_refused(key, "land_pin_null", *null, as_json=as_json)
-    draft = land_draft_refusal(key, repo, number, sha)
+    readied, draft = land_ready_at_request(key, repo, number, sha)
     if draft is not None:
         # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
-        # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment).
+        # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment). Only a
+        # refused `gh pr ready` gets here: a draft this host knows of is marked ready (LAND_READY_ONCE's comment).
         return land_request_refused(key, "land_draft", *draft, as_json=as_json)
+    if readied and not as_json:
+        say_waiting(f"glaeda-gh land: {readied}")
     # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
@@ -27395,6 +27515,8 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         out["laneWarning"] = no_lane
     if unchecked:
         out["pinUnchecked"] = unchecked
+    if readied:
+        out["draftReadied"] = readied
     if replaced:
         out["pinReplaced"] = replaced
     if not running:
@@ -27601,7 +27723,7 @@ def cmd_land_serve(text: str) -> int:
         except (WatchError, TypeError):
             key = repo = pin = ""  # land_serve_one below answers a target or pin this host cannot read
             number = 0
-        draft = land_draft_refusal(key, repo, number, pin) if key else None
+        draft = land_ready_at_request(key, repo, number, pin)[1] if key else None
         if draft is not None:
             print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": draft[0], "next": draft[1],
                               "host": policy_host()}, sort_keys=True))
