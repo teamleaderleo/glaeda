@@ -27720,6 +27720,30 @@ class LandTest(Base):
         self.q.refill(self.t + 1)
         self.assertEqual(pool.keys(), ["pr:o/r#9"])
 
+    def test_a_repin_wait_is_due_and_takes_a_freed_worker_in_its_turn(self):
+        """A repin wait has no wake, and read as never due: sorted behind every due row and skipped by refill, it got a
+        worker only when one was free during a pass. cmux-cp-1, 2026-11-26: hq#28360, green and CLEAN, sat 97 min in
+        its repin wait under a full pool (~300 rows gated). It is due since its pin verdict, in turn with the rest."""
+        self.five_snapped()
+        pool = self.pooled(1)
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 1)
+        repin = next(f"pr:o/r#{n}" for n in (5, 4) if f"pr:o/r#{n}" not in self.q.jobs)
+        e = self.q.entries[repin]
+        e.update(state="waiting", wait={"kind": "repin", "sha": LA}, wakeAt=None,
+                 explain={"at": self.t - 3600, "ok": False, "code": "pin", "head": LA})
+        e.pop("dueAt", None)  # judge() drops it: the pin verdict's judgment ran
+        self.q.save(e)
+        self.assertTrue(self.q.due(e))
+        self.assertTrue(gg.land_due_now(e, self.t))
+        self.tick()  # the one worker still busy: every row waits for it
+        self.assertEqual(self.q.next_up[0], repin, "due since its pin verdict an hour ago: first in line")
+        pool.handed[0][1].finished = True
+        self.q.refill(self.t + 1)
+        self.assertEqual(pool.handed[-1][0], repin)
+
     def test_refill_frees_the_worker_of_a_finished_job_with_no_row_listed(self):
         """A refill with no row left for a worker still reaps: the land-pool line and the refresh reads count the
         workers that are judging, not the jobs that ended since the last pass."""
@@ -33068,6 +33092,27 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def test_a_lane_push_s_auto_opened_draft_is_queued_readied_at_the_merge_and_merged(self):
+        """The commonest source of these drafts: `lane-gh push` opens a draft PR for every new lane/ branch
+        ("note: opened draft .../pull/N for lane/NAME ... PR_AUTO_DRAFT=0 turns this off"), and only a later
+        `gh pr create` fills it in and marks it ready. A lane that queues `glaeda-gh land` straight after its push
+        skips that step, and its PR is still the auto-opened draft. The request holds no fresh read of it (a PR opened
+        seconds ago), so it is queued; the merge meets the draft and the queue readies it, with no re-queue."""
+        self.pr(LA, draft=True)  # the daemon's own read: a draft from the start, never readied by anyone
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1))  # no read on disk at the request
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "ready"), [["pr", "ready", "1", "-R", "o/r"]])
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.w.gh_rc["merge"] = 0
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(e["state"], "merged", e.get("stop"))
+        self.assertFalse(any("stopped" in str(m) for m in self.w.sent()), self.w.sent())  # nobody was asked to act
+
     def test_a_draft_stops_merge_draft_when_marking_it_ready_is_refused_or_it_is_a_draft_again(self):
         """The stop stays for the two cases the queue cannot answer: `gh pr ready` itself refused, and a PR converted
         back to a draft after the queue readied it at that head (someone's deliberate hold). One refusal each, and the
@@ -33151,6 +33196,92 @@ class LandTest(Base):
         doc = json.loads(out.getvalue())
         self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
         self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+
+    def test_ready_sent_is_recorded_only_after_gh_pr_ready_answers_ok_so_a_restart_mid_send_sends_it_again(self):
+        """F3 of glaeda#2902's review: LAND_READY_ONCE was written before the send, so a restart while `gh pr ready`
+        ran counted it as sent, and the next draft refusal at that head stopped merge_draft with the PR never readied.
+        It is written only once the send answered OK; a restart mid-send re-judges and sends it again."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        path = gg.LandQueue.entries_dir() / gg.file_name(self.KEY)
+        on_disk: list[dict] = []
+        run = self.w.run
+
+        def sending(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if "ready" in argv:
+                on_disk.append(gg.read_json(path))  # what a restart at this instant would load
+            return run(argv, timeout, env)
+
+        self.q.run = sending
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(on_disk), 1)
+        self.assertNotIn(gg.LAND_READY_ONCE, on_disk[0])
+        self.assertEqual(((on_disk[0].get("action") or {}).get("kind"), on_disk[0]["state"]), ("ready", "acting"))
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)  # recorded once it answered OK
+        # The daemon restarts mid-send: the entry on disk is the one taken while `gh pr ready` ran.
+        gg.write_json(path, on_disk[0])
+        self.q = self.queue()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["history"][-1]["event"], e["history"][-1].get("claimed")), ("restart", "ready"))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "ready")), 2)  # sent again, not counted as sent
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"), e.get("stop"))
+        self.assertEqual(e[gg.LAND_READY_ONCE]["head"], LA)
+
+    def test_a_refused_ready_send_records_nothing_sent(self):
+        """A `gh pr ready` that failed is not a ready sent: the entry stops merge_draft without LAND_READY_ONCE, so a
+        re-queue after the requester readies or fixes access is met by a fresh send, not a 'draft again' stop."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.gh_rc["ready"] = 1
+        self.w.gh_err["ready"] = "gh-quota: no answer within 120s"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertNotIn(gg.LAND_READY_ONCE, e)
+
+    def test_the_request_time_ready_is_bounded_and_land_serve_never_waits_for_it(self):
+        """F1 of glaeda#2902's review: the request-time `gh pr ready` ran with a 60 s bound inside `land serve`,
+        whose answer the forwarding host's land_forward_loop waits on one request at a time. `land` now bounds it at
+        LAND_READY_REQUEST_DEADLINE and queues on no answer (the merge step readies it), and `land serve` starts it
+        detached and answers at once."""
+        self.pr(LA, draft=True)
+        self.store_pr(land_pr(LA, draft=True))
+        argv = ["gh", "pr", "ready", "1", "-R", "o/r"]
+        # `land`, its caller's own process: bounded, and no answer in time is not a refusal.
+        with mock.patch.object(gg, "run_bounded",
+                               side_effect=subprocess.TimeoutExpired(argv, gg.LAND_READY_REQUEST_DEADLINE)) as run:
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1)
+        self.assertIsNone(refusal)
+        self.assertEqual(run.call_args.kwargs["timeout"], gg.LAND_READY_REQUEST_DEADLINE)
+        self.assertLess(gg.LAND_READY_REQUEST_DEADLINE, 60)
+        self.assertIn("did not answer within 20 s", note)
+        self.assertIn("the merge step marks it ready", note)
+        # wait=False (land serve): started detached, never waited on, and a refusal cannot be given here.
+        with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("serve must not wait")), \
+                mock.patch.object(gg, "spawn_detached") as spawn:
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1, wait=False)
+        self.assertIsNone(refusal)
+        self.assertEqual(spawn.call_args.args, (argv, gg.LAND_GH_DEADLINE))
+        self.assertIn("started `gh pr ready 1 -R o/r`", note)
+        with mock.patch.object(gg, "spawn_detached", side_effect=OSError("no gh")):
+            note, refusal = gg.land_ready_at_request(self.KEY, "o/r", 1, wait=False)
+        self.assertIsNone(refusal)
+        self.assertIn("could not start here (no gh)", note)
+        # and `land serve` is the caller that passes wait=False
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_ready_at_request", return_value=("", ("why", "nxt"))) as ready, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1", "sha": LA}))
+        self.assertEqual(json.loads(out.getvalue())["code"], "land_draft")
+        self.assertIs(ready.call_args.kwargs["wait"], False)
 
     def test_a_pin_this_queue_already_followed_forward_leaves_the_live_row_alone(self):
         """A land the queue already followed forward is answered with the pin the row holds, never re-pinned backwards.
@@ -37984,6 +38115,7 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 1)
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(gg.LAND_FEED_QUIET_MAX)
+        self.tick(1)  # a ws-check wait's copy, older than LAND_OWN_REFRESH_AFTER, is read first (LAND_STATUS_WAIT)
         self.assertEqual(len(self.w.explains()), 2)
 
     def test_an_unparked_entry_keeps_its_wait_while_the_feed_is_quiet(self):
@@ -38086,6 +38218,50 @@ class LandTest(Base):
         self.assertTrue(all(b >= a for a, b in zip(gaps, gaps[1:])), gaps)  # never faster than the one before
         self.assertLessEqual(max(gaps), gg.LAND_RETRY_MAX + 20, gaps)  # never stranded: bounded
         self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+    def no_data_waits(self, n: int, code: str = "checks_running") -> None:
+        for _ in range(n):
+            self.w.answers.append(refusal(code, LA, {"v": 1, "kind": "wait_pr", "sha": LA, "timeout_s": 1800}))
+
+    def test_a_pr_the_daemon_cannot_read_keeps_the_wait_its_judgment_named(self):
+        """Leo (c-d1b15a2876): "go bring some more analysis into what agents have been doing and what we can do better,
+        then keep trying to improve stuff". cmux-cp-1, 24 h to 2026-11-26 10:13Z: why=no_data repeats of the same code
+        at the same head came a median 135 s apart for checks_running (966) and 95 s for webview (659), each wait 1800 s:
+        the no-data path judged again after LAND_NO_DATA_AFTER whatever wait the answer named. With no feed here to say
+        nothing happened, the wait now holds LAND_VERDICT_KEEP from each verdict (LAND_NO_DATA_WAIT)."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_waits(40)
+        at = self.no_data_judgments(2 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        # before: one every ~130 s (about 55 in 2 h); now one per LAND_VERDICT_KEEP
+        self.assertLessEqual(len(at), 2 * 3600 // gg.LAND_VERDICT_KEEP + 1, at)
+        self.assertGreaterEqual(min(gaps), gg.LAND_VERDICT_KEEP, gaps)
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e.get("stop")), ("waiting", None))
+        self.assertIn("no_data_held", [h["event"] for h in e["history"]])
+
+    def test_a_pr_the_daemon_cannot_read_with_a_quiet_feed_waits_to_its_wake(self):
+        """The feed says nothing happened to the PR since the verdict: held to the wait's own wake (1800 s here)."""
+        self.nudge_reads = False
+        self.q.feed_quiet = lambda key, sha, since: True
+        self.land()
+        self.no_data_waits(10, code="webview")
+        at = self.no_data_judgments(2 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        self.assertGreaterEqual(min(gaps), 1800, gaps)
+        self.assertLessEqual(len(at), 5, at)
+
+    def test_a_pr_the_daemon_cannot_read_is_judged_on_its_first_copy_while_a_wait_holds(self):
+        self.nudge_reads = False
+        self.land()
+        self.no_data_waits(2)
+        at = self.no_data_judgments(300)
+        self.assertEqual(len(at), 1, at)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.insert(0, ok_answer(LA))
+        e = self.tick(2)
+        self.assertEqual(e["state"], "merged")
 
     def test_the_daemons_first_copy_after_a_no_data_judgment_is_judged_at_once(self):
         """The backoff waits for nothing but its wake or the PR's first copy: the read the daemon could not do arrives
@@ -39368,6 +39544,49 @@ class LandTest(Base):
         self.q.tick(self.t + 1, dirty=set())
         self.assert_merged_at(LA)
         self.assertEqual((len(self.w.explains()), self.w.refreshed), (1, [self.KEY]))
+
+    def test_a_ws_check_posted_after_ws_check_missing_is_read_and_merges_with_a_quiet_feed(self):
+        # The coordinator, 2026-11-26 (from the mirror-fetch lane): a ws-check success posted right after a
+        # ws_check_missing verdict did not wake the row; it sat green and unmerged until `land cancel` and a re-land.
+        # The feed carries no commit status, so its quiet says nothing (LAND_STATUS_WAIT): the copy is re-read on the
+        # recovery sweep and the posted status judges the row at once, well before the wait's own timeout.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 3600}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
+        self.w.cache[self.KEY]["dataAt"] = self.t + 1
+        original_wake = e["wakeAt"]
+        self.q.feed_quiet = lambda *args: True
+
+        def posted(key):
+            self.w.refreshed.append(key)
+            self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS", "passed")])
+        self.q.refresh = posted
+        self.t += gg.LAND_OWN_REFRESH_AFTER + gg.LAND_RECOVERY_SWEEP
+        self.assertLess(self.t, original_wake)
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.w.answers.append(ok_answer(LA))
+        self.q.tick(self.t + 1, dirty=set())
+        self.assert_merged_at(LA)
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_a_ws_check_posted_after_ws_check_missing_is_judged_on_the_copy_with_a_quiet_feed(self):
+        # The same status post, reaching the copy by any read: the feed's quiet no longer holds the verdict; a check
+        # run catching up in the copy still does (test_a_wait_verdict_the_feed_shows_nothing_against_is_not_judged_again)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 3600}))
+        self.tick()
+        self.q.feed_quiet = lambda *args: True
+        self.t += gg.LAND_VERDICT_KEEP + 1
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS", "passed")])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
 
     def test_land_check_event_on_a_stale_running_pin_shares_the_host_read_budget(self):
         # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
