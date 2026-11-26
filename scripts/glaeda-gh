@@ -19059,12 +19059,8 @@ class LandQueue:
         return latch
 
     def due(self, e: dict) -> bool:
-        """Whether E is owed a judgment now: queued, or waiting past its wake (any kind, a park's too)."""
-        if e["state"] == "queued":
-            return True
-        wake = e.get("wakeAt")
-        return e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool) \
-            and wake <= self.now
+        """Whether E is owed a judgment now (land_due_now)."""
+        return land_due_now(e, self.now)
 
     def due_since(self, e: dict) -> float:
         """When E became due: its wake, else (queued) its last judgment, else when it was queued."""
@@ -26333,10 +26329,19 @@ def land_queue_parked(now: float) -> dict | None:
 
 
 def land_due_now(e: dict, now: float) -> bool:
-    """Whether E is owed a judgment at NOW, as LandQueue.due reads it: queued, or waiting past its wake."""
-    wake = e.get("wakeAt")
+    """Whether E is owed a judgment at NOW (LandQueue.due): queued, waiting past its wake (any kind, a park's too), or
+    in a repin wait. A repin wait has no wake (take: land_judge named the head to judge next, and consider judges it on
+    the pass that finds it; LAND_JUDGE_DUE counts it as a bound run out), so it read as never due: judge_order sorted it
+    behind every due row, refill (which hands only due rows a freed worker) skipped it, and under a full pool it got a
+    worker only when one happened to be free during a pass. cmux-cp-1, 2026-11-26 10:31-11:04Z, 580 open rows, ~300
+    gated each pass: pin to repin judgment p50 648 s, max 1394 s; manaflow-ai/cmuxterm-hq#28360, green and CLEAN at
+    003525fe, sat in its repin wait 97 min ("green PRs wait to merge: p50 17m, p95 97m") until 10:59:29Z judged it
+    ok/merge from=repin:pin. Due since its pin verdict (due_since: explain.at), with the rest of the due rows."""
     if e.get("state") == "queued":
         return True
+    if e.get("state") == "waiting" and (e.get("wait") or {}).get("kind") == "repin":
+        return True
+    wake = e.get("wakeAt")
     return e.get("state") == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool) \
         and wake <= now
 

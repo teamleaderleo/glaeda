@@ -27720,6 +27720,30 @@ class LandTest(Base):
         self.q.refill(self.t + 1)
         self.assertEqual(pool.keys(), ["pr:o/r#9"])
 
+    def test_a_repin_wait_is_due_and_takes_a_freed_worker_in_its_turn(self):
+        """A repin wait has no wake, and read as never due: sorted behind every due row and skipped by refill, it got a
+        worker only when one was free during a pass. cmux-cp-1, 2026-11-26: hq#28360, green and CLEAN, sat 97 min in
+        its repin wait under a full pool (~300 rows gated). It is due since its pin verdict, in turn with the rest."""
+        self.five_snapped()
+        pool = self.pooled(1)
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 1)
+        repin = next(f"pr:o/r#{n}" for n in (5, 4) if f"pr:o/r#{n}" not in self.q.jobs)
+        e = self.q.entries[repin]
+        e.update(state="waiting", wait={"kind": "repin", "sha": LA}, wakeAt=None,
+                 explain={"at": self.t - 3600, "ok": False, "code": "pin", "head": LA})
+        e.pop("dueAt", None)  # judge() drops it: the pin verdict's judgment ran
+        self.q.save(e)
+        self.assertTrue(self.q.due(e))
+        self.assertTrue(gg.land_due_now(e, self.t))
+        self.tick()  # the one worker still busy: every row waits for it
+        self.assertEqual(self.q.next_up[0], repin, "due since its pin verdict an hour ago: first in line")
+        pool.handed[0][1].finished = True
+        self.q.refill(self.t + 1)
+        self.assertEqual(pool.handed[-1][0], repin)
+
     def test_refill_frees_the_worker_of_a_finished_job_with_no_row_listed(self):
         """A refill with no row left for a worker still reaps: the land-pool line and the refresh reads count the
         workers that are judging, not the jobs that ended since the last pass."""
