@@ -355,7 +355,22 @@ class HookTest(unittest.TestCase):
         self.dir = Path(self.tmp.name)
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        # job-started and job-completed leave a detached disk pass (disk_pressure_detached) that outlives the hook and
+        # writes its trigger, lock and log under HOME/.cache/glaeda-disk: a cleanup that races it fails with
+        # "Directory not empty: 'glaeda-disk'" (runner-tests shard 2, glaeda#2876, 2026-11-26). Wait, bounded, for the
+        # pass lock to be let go, then retry the removal of what the pass wrote meanwhile.
+        lock = self.dir / ".cache" / "glaeda-disk" / hook.DISK_PASS_LOCK
+        deadline = time.monotonic() + 10
+        while lock.exists() and hook.disk_pass_running(lock) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for attempt in range(20):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.ENOENT) or attempt == 19:
+                    raise
+                time.sleep(0.1)
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:

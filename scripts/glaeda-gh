@@ -1398,6 +1398,9 @@ PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in ful
 # from the rollup; the probe at 2026-11-25 00:15Z found all 57 of the most recently updated open cmux and cmuxterm-hq
 # heads' rollups complete.
 PR_REST_SUITES_FROM_CONTROLLER = True
+# The REST PR read's pulls/N comes from the controller's webhook-fed PR row when it is seeded and fresh
+# (Daemon.controller_pull): glaeda-upstream asked pulls/{n} 567 and issues/{n} 214 times an hour (2026-11-26).
+PR_PULL_FROM_CONTROLLER = True
 CONTROLLER_ROLLUP_TIMEOUT = 2.0  # a complete rollup answers in 0.05-1.4 s; a cold one is seeding from GitHub
 CONTROLLER_ROLLUP_SLOW_SKIP = 15.0  # a head whose rollup timed out is not asked again for this long
 CONTROLLER_ROLLUP_DOWN = 30.0  # a controller that failed otherwise is not asked for a rollup for this long
@@ -2517,6 +2520,15 @@ def iso_epoch(text: str | None) -> float | None:
         return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def github_time(text: Any) -> str | None:
+    """A Go RFC 3339 time (the controller's rows) as GitHub's REST API writes it, 2026-11-26T07:00:00Z, so a
+    controller answer and GitHub's compare equal; the text itself when it does not parse."""
+    at = iso_epoch(stream_time(text)) if isinstance(text, str) else None
+    if at is None:
+        return text
+    return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def stream_time(text: Any) -> str | None:
@@ -10540,6 +10552,28 @@ class Daemon:
             reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
+    def land_ingest_idle(self) -> int:
+        """From the forward scheduler's thread, every TICK, on a host that executes its own lands: apply the requests
+        that came since the last pass (LandQueue.ingest_between), so a `land` is a row in seconds. land_refill does it
+        only between two of this login's own requests, and a host that reads through an upstream makes none: there a
+        request waited for the next whole pass, once a tick (a lane VM, 2026-11-26: passes ~5 min apart, and `land
+        status` showed no row meanwhile). Never inside a pass or a refill (land_pass_lock); refill stays the tick's."""
+        q = self.land_queue
+        if q is None or self.reexec_waiting or getattr(self, "in_land", False) or not getattr(q, "executes", False):
+            return 0
+        d = q.requests_dir()
+        if not d.is_dir() or not any(d.glob("*.json")):
+            return 0
+        if not self.land_pass_lock.acquire(blocking=False):
+            return 0
+        try:
+            if land_executor(q.config()) is not None:
+                return 0
+            q.now = time.time() if getattr(self, "clock_real", True) else self.now
+            return q.ingest_between()
+        finally:
+            self.land_pass_lock.release()
+
     def land_tick(self, forward_only: bool = False) -> None:
         """The forward scheduler and read tick share one queue, including when its executor changes at runtime."""
         if not self.land_pass_lock.acquire(blocking=False):
@@ -12129,10 +12163,16 @@ class Daemon:
             return keys
         q = self.land_queue
         if q is None:
-            keys = frozenset()
-        else:
-            with q.lock:
-                keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
+            # A process with no land queue (a wait's direct read, a free reading): the PRs the serving daemon's queue
+            # holds, from its entries on disk, so a full read of one here keeps its snapshot too. It never sweeps:
+            # its queue is not the queue. The land host, 2026-11-26 07:47-08:07Z: of 55 batched land refreshes, 32
+            # were refused a probe as rollup-stale, because each such process's first read swept with an empty set
+            # and removed every PR's rollup snapshot (and the land queue's per-judgment copies).
+            keys = land_queue_keys_on_disk()
+            self.rollup_keys = (self.now, keys)
+            return keys
+        with q.lock:
+            keys = frozenset(k for k, e in q.entries.items() if e.get("state") not in LAND_DONE)
         self.rollup_keys = (self.now, keys)
         if self.now - self.rollup_swept >= ROLLUP_SWEEP_EVERY:
             self.rollup_swept = self.now
@@ -13317,6 +13357,13 @@ class Daemon:
         manaflow-ai/cmux#44595), so a 304 on it means unchanged since that pull. A failed issue read falls back to
         reading the pull. Raises WatchError (the pull's), OutOfTime."""
         path, gate = f"{root}/pulls/{number}", f"{root}/issues/{number}"
+        row = self.controller_pull(root, number) if reuse else None
+        if row is not None:  # the controller's webhook-fed row answers: no issues/N, no pulls/N
+            parts[path] = row
+            if gate not in parts and not self.etags:
+                parts[gate] = {"doc": slim_issue_gate(row["doc"])}
+            # reused: when every check settles and something changed, fetch_pr_rest reads GitHub's merge state
+            return row["doc"], True
         kept = old.get(path) or {}
         at = kept.get("at")
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
@@ -13349,6 +13396,50 @@ class Daemon:
         if (parts.get(gate) or {}).get("doc", {}).get("updated_at") != pull.get("updated_at"):
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
+
+    def controller_pull(self, root: str, number: Any) -> dict | None:
+        """GET pulls/N's part (slim_pull) from the controller's webhook-fed PR row (/v1/github/prs/N/verdict), else
+        None (off, out, slow, failed, not seeded, or an open row whose mergeability is unknown or was stored
+        PULL_REUSE_MAX ago or more: the bound a kept pull has). A closed or merged row answers at any age: that
+        state is final until a reopen, which the controller's delivery moves. No GitHub request. Why
+        (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 23:15Z-11-26 05:15Z): glaeda-upstream, every lane
+        VM's direct reads, asked pulls/{n} 567 and issues/{n} 214 times an hour while the controller held each row."""
+        if not PR_PULL_FROM_CONTROLLER:
+            return None
+        own = self.controller is not None
+        get = getattr(self.controller if own else self.rollup_controller, "get", None)
+        if (not callable(get) or (own and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT))
+                or self.now < self.rollup_down_until or not str(number).isdigit()):
+            return None
+        repo = root.removeprefix("/repos/")
+        try:
+            body = get(f"/v1/github/prs/{int(number)}/verdict?repo=" + urllib.parse.quote(repo, safe="/"),
+                       timeout=CONTROLLER_ROLLUP_TIMEOUT)
+        except (ControllerTimeout, NoReceiver):  # slow, or no such route or row: GitHub answers
+            return None
+        except WatchError:
+            self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
+            return None
+        row = body.get("pr") if isinstance(body, dict) and body.get("found") is True \
+            and body.get("seeded") is True else None
+        if (not isinstance(row, dict) or row.get("number") != int(number)
+                or str(row.get("repo") or "").lower() != repo.lower()
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", str(row.get("head_sha") or ""))
+                or row.get("state") not in ("open", "closed") or not row.get("updated_at")):
+            return None
+        stored = iso_epoch(stream_time(row.get("received_at")))
+        if row["state"] == "open" and (not isinstance(row.get("mergeable"), bool) or stored is None
+                                       or self.now - stored >= PULL_REUSE_MAX):
+            return None
+        doc = slim_pull({"number": row["number"], "html_url": row.get("url"), "title": row.get("title"),
+                         "state": row["state"], "draft": bool(row.get("draft")), "merged": bool(row.get("merged")),
+                         "merged_at": github_time(row.get("merged_at")) if row.get("merged") else None,
+                         "mergeable": row.get("mergeable"),
+                         "mergeable_state": row.get("mergeable_state") or None,
+                         "updated_at": github_time(row["updated_at"]),
+                         "head": {"sha": str(row["head_sha"]).lower(), "ref": row.get("head_ref")},
+                         "base": {"ref": row.get("base_ref")}})
+        return {"doc": doc, "at": min(self.now, stored or self.now), "via": "controller"}
 
     def issue_vouches(self, held: dict) -> bool:
         """Whether HELD, a kept GET issues/N answer, can say a PR has not changed (issue_same): its ETag, or with no
@@ -14675,6 +14766,14 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
+def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
+    """The gh argv that takes LAND_UNLABEL off REPO#NUMBER: the broker's `pr edit --remove-label` form (BROKER, a lane
+    VM: the broker sends no REST DELETE), else GitHub's REST DELETE of the issue label."""
+    if broker:
+        return ["pr", "edit", number, "-R", repo, "--remove-label", LAND_UNLABEL]
+    return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
+
+
 def land_own_token_pool(now: float | None = None) -> bool:
     """Whether this host can get a GitHub token of its own for a judgment: any App role of the read chain held here,
     as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
@@ -14766,6 +14865,20 @@ def land_direct_read(key: str) -> str | None:
 # that follows reads the daemon's copy instead of GitHub.
 LAND_REFRESH_BATCH = 50  # PRs per batched refresh (one probe query of ~3 requests a PR: 50 is about 2 points)
 LAND_REFRESH_BATCH_BUDGET = 180.0  # seconds one batch's reads may take (a single read's is DIRECT_READ_BUDGET)
+
+
+def land_queue_keys_on_disk() -> frozenset[str]:
+    """The keys of the land queue's entries on disk that are not done (LandQueue.load's view, read only): the PRs
+    whose full reads keep a rollup snapshot, for a process that holds no land queue of its own."""
+    d = LandQueue.entries_dir()
+    keys = set()
+    with contextlib.suppress(OSError):
+        for p in d.glob("*.json"):
+            e = read_json(p)
+            if isinstance(e, dict) and isinstance(e.get("key"), str) and e.get("state") in LAND_STATES \
+                    and e.get("state") not in LAND_DONE:
+                keys.add(e["key"])
+    return frozenset(keys)
 
 
 def land_read_keeps_rollups(daemon: "Daemon", keys: list[str]) -> None:
@@ -15525,6 +15638,18 @@ LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
+# shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
+# another commit, the PR object is what lags, not the branch: GitHub made the branch's new head (someone's update-branch, a
+# push) and has not synchronized the PR to it, so no further update-branch can succeed and none is counted toward
+# LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_SYNC_STUCK it stops pr_head_unsynced, naming the
+# one step that made GitHub read the branch again: closing and reopening the PR (a new commit pushed at 08:02Z did
+# not; the reopen at 08:08Z read head 1fd256a5 at once). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
+# own update-branch made 40818337 (07:28:42Z, committer web-flow), and 30 min later pulls/56682 still read head
+# 54746b5f, updated_at 06:06Z, with no check run at 40818337; this queue sent update-branch at 54746b5f five times
+# (07:29-07:41Z), each refused for the head mismatch and counted as a refusal of the PR.
+LAND_HEAD_MISMATCH = re.compile(r"expected head sha|head sha didn.?t match|head branch was modified", re.I)
+LAND_PR_SYNC_STUCK = 1200.0
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
 LAND_PIN_PARENT_WAIT = 300.0
@@ -15928,7 +16053,10 @@ LAND_OWNER_REMIND_READ_WAIT = 1800.0
 # Taken off: a `cancelled` entry, a `closed` stop at once, and any other stop LAND_UNLABEL_AFTER after it when it will
 # not re-arm by itself (rearm: not a LAND_REARM_CODES code, or today's LAND_REARM_CAP spent). Never: full-ci (a person
 # or agent set that on purpose), a teammate's PR (a `teammate` stop in the history: their label is their opt-in), a
-# forwarded row (its executor's own loop takes it off), a broker client (no GitHub login of its own). One REST DELETE
+# forwarded row or one handed to the broker host's queue (that executor's own loop takes it off). A broker client (a
+# lane VM, no GitHub login of its own) sends it as the broker's `gh pr edit N --remove-label ready-to-land`
+# (land_unlabel_args): until 2026-11-26 it skipped, and lane VMs' queues never took a label off, so 998 open cmux PRs
+# still carried it (ci-min-per-pr-30). One REST DELETE (or broker pr edit)
 # per ended land (e["unlabeled"]), a 404 counting as gone, at most LAND_UNLABEL_BATCH a pass, off the pass thread;
 # a refused one is retried after LAND_UNLABEL_AFTER, LAND_UNLABEL_TRIES times. Detector: test-glaeda-gh.py -k unlabel.
 LAND_UNLABEL = "ready-to-land"
@@ -20217,8 +20345,10 @@ class LandQueue:
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
         state = e.get("state")
-        if state not in ("stopped", "cancelled") or e.get("unlabeled") or self.broker_client():
+        if state not in ("stopped", "cancelled") or e.get("unlabeled"):
             return False
+        if self.broker_client() and e.get("handedOff"):
+            return False  # its host's queue owns the row and takes the label off itself
         if any(h.get("code") == "teammate" for h in e.get("history") or []):
             return False  # a teammate's label is their opt-in
         fail = e.get("unlabelFail") or {}
@@ -20263,8 +20393,8 @@ class LandQueue:
                 e = self.entries.get(key)
                 if e is None:
                     continue
-                path = f"repos/{e['repo']}/issues/{e['number']}/labels/{LAND_UNLABEL}"
-                got = self.call([gh, "api", "-X", "DELETE", path], LAND_GH_DEADLINE, None)
+                argv = land_unlabel_args(str(e["repo"]), str(e["number"]), self.broker_client())
+                got = self.call([gh, *argv], LAND_GH_DEADLINE, None)
                 said = f"{got.stderr or ''} {got.stdout or ''}"
                 gone = got.returncode == 0 or "404" in said or "Label does not exist" in said
                 with self.lock:
@@ -23746,6 +23876,11 @@ class LandQueue:
                 self.save(e)
         got = self.call([gh, *args], LAND_GH_DEADLINE, e)
         named = None
+        ref = ""
+        if kind == "update_branch" and got.returncode not in (0, 124) \
+                and LAND_HEAD_MISMATCH.search(f"{got.stderr or ''}\n{got.stdout or ''}"):
+            # off the lock: one read of the branch ref, only for this refusal
+            ref = self.update_live_tip(e, (self.cache_of(e["key"]) or {}).get("data") or {})[0]
         with self.lock:
             if kind == "update_branch" and got.returncode not in (0, 124):
                 # refused: not sent; step_refused counts and backs off its retries. A timeout (124) may have reached
@@ -23769,7 +23904,7 @@ class LandQueue:
                 # Refused at this head (moved, nothing to update, or a broker that cannot run this form): the refusal's
                 # own next step, else a backoff that doubles, and a stop at LAND_STEP_STOP (step_refused).
                 self.nudge(e["key"])
-                named = self.step_refused(e, kind, head, got)
+                named = self.step_refused(e, kind, head, got, branch_ref=ref)
         if named == "hand_off":
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
@@ -24569,7 +24704,34 @@ class LandQueue:
         self.push_step(e, "update_branch", head,
                        land_update_branch_args(repo, number, head, list(needs or []), self.broker_client(), force))
 
-    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
+    def branch_ahead(self, e: dict, head: str, ref: str, out: str) -> None:
+        """Under the lock. The update-branch at HEAD was refused for the head mismatch and the branch ref reads REF, not
+        HEAD: GitHub's PR has not followed its branch (LAND_HEAD_MISMATCH's comment). Not counted; a wait for the PR
+        to show the new head, or a stop naming the resync once LAND_PR_SYNC_STUCK has passed."""
+        w = e.get("branchAhead")
+        if not isinstance(w, dict) or w.get("head") != head or w.get("ref") != ref:
+            w = e["branchAhead"] = {"head": head, "ref": ref, "since": self.now}
+        waited = self.now - float(w.get("since") or self.now)
+        self.history(e, "branch_ahead_of_pr", head=head[:12], ref=ref[:12], waited=round(waited))
+        e.pop("updateSent", None)
+        if waited >= LAND_PR_SYNC_STUCK:
+            name = key_name(e["key"])
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            branch = str(data.get("headRefName") or "the branch")
+            self.stop(e, "pr_head_unsynced",
+                      f"GitHub's PR still reads head {head[:12]} {waited / 60:.0f} min after its branch {branch} moved "
+                      f"to {ref[:12]}: GitHub has not synchronized the PR to its branch, so update-branch at "
+                      f"{head[:12]} is refused ({land_trim(land_tail(out), 160)})",
+                      f"close and reopen the PR so GitHub reads its branch again (gh pr close {e['number']} -R "
+                      f"{e['repo']} && gh pr reopen {e['number']} -R {e['repo']}; nothing in {branch} changes), then "
+                      f"glaeda-gh land {name} --sha <the head it then reads>")
+            return
+        self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
+                      "why": f"the branch is at {ref[:12]}; GitHub's PR still reads {head[:12]}"},
+                  min(LAND_HEAD_TIMEOUT, max(60.0, LAND_PR_SYNC_STUCK - waited)))
+
+    def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess,
+                     branch_ref: str = "") -> str | None:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
@@ -24624,6 +24786,10 @@ class LandQueue:
             self.history(e, "step_closed", kind=kind, head=head[:12], why=land_step_class(out))
             self.wait(e, {"kind": "retry", "why": f"{kind} refused: GitHub says the PR is closed; its state is read "
                           "next"}, float(NUDGE_MIN))
+            return None
+        if kind == "update_branch" and SHA40.fullmatch(branch_ref or "") and branch_ref != str(head or "").lower() \
+                and LAND_HEAD_MISMATCH.search(out):
+            self.branch_ahead(e, str(head or "").lower(), branch_ref, out)
             return None
         cls = land_step_class(out)
         if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):
@@ -26051,15 +26217,54 @@ def land_override_history(e: dict) -> dict:
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
 
 
+# A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only
+# then a row in entries/. `land status` read entries/ alone, so for that window a land that had answered "requested"
+# showed no row and "nothing queued" (exit 1): a lane VM, 2026-11-26 07:47Z, cmuxterm-hq#28163 pinned 3f3a3c12 read as
+# dropped, and was queued again by hand from another directory (its history: "queued" then "updated" in the same
+# pass, 07:47:56Z, both requests applied). On a host whose daemon reads through an upstream, the pass ran once a tick,
+# every ~5 min, so the window was minutes. Now status lists what still waits in requests/ (land_pending_requests).
+def land_pending_requests(target_key: str | None = None) -> list[dict]:
+    """What waits in requests/ for the daemon's next pass, oldest first: {key, op, requester, sha, at, id}. Files only."""
+    d = LandQueue.requests_dir()
+    out: list[dict] = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        req = read_json(p)
+        if not isinstance(req, dict) or not isinstance(req.get("key"), str):
+            continue
+        if target_key and req["key"] != target_key:
+            continue
+        at = req.get("at")
+        out.append({"key": req["key"], "op": str(req.get("op") or ""), "requester": str(req.get("requester") or ""),
+                    "sha": str(req.get("sha") or ""), "id": str(req.get("id") or ""),
+                    "at": float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0})
+    return out
+
+
+def land_pending_line(req: dict, now: float) -> str:
+    """One `land status` line for a request not yet applied: it is accepted, and not a row yet."""
+    what = "cancel requested" if req.get("op") == LAND_WITHDRAW else "requested"
+    bits = [key_name(req["key"]), what]
+    if req.get("sha"):
+        bits.append(f"pin {req['sha'][:12]}")
+    age = f" {int(max(0.0, now - req['at']))}s ago" if req.get("at") else ""
+    bits.append(f"written{age}, not applied yet: the daemon applies requests/ on its next land pass")
+    if req.get("requester"):
+        bits.append(f"for {req['requester']}")
+    return "  ".join(bits)
+
+
 def land_status_doc(target: str | None) -> dict:
-    """What `land status` shows of this host's queue (`land serve`'s status answer too)."""
+    """What `land status` shows of this host's queue (`land serve`'s status answer too), with the requests still
+    waiting in requests/ for the daemon (pending, land_pending_requests)."""
     entries = land_entries()
-    if target:
-        key = land_key(target)[0]
+    key = land_key(target)[0] if target else None
+    if key:
         entries = [e for e in entries if e.get("key") == key]
+    pending = land_pending_requests(key)
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
-    return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
+    return {"ok": True, "entries": entries, "pending": pending, "steps": land_counts(),
+            "refused": refused if isinstance(refused, dict)
             else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries),
             "greenWait": land_green_waits(entries, read_cache, time.time())}
@@ -26276,17 +26481,20 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         try:
             remote = land_forward(executor, {"op": "status", "target": target})
             remote_entries = [e for e in remote.get("entries") or [] if isinstance(e, dict)]
-            doc = {**remote, "entries": mine + remote_entries, "executor": name}
+            remote_pending = [r for r in remote.get("pending") or [] if isinstance(r, dict) and r.get("key")]
+            doc = {**remote, "entries": mine + remote_entries, "executor": name,
+                   "pending": doc["pending"] + remote_pending}
         except WatchError as error:
             doc = {**doc, "entries": mine, "executor": name, "executorError": str(error)}
         d = LandQueue.requests_dir()
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
     entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
+    pending = [r for r in doc.get("pending") or [] if isinstance(r, dict) and r.get("key")]
     doc["stoppedByCause"] = land_stopped_by_cause(entries)
     if as_json:
         print(json.dumps(doc, sort_keys=True))
-        return EXIT_OK if entries or not target else EXIT_FAIL
+        return EXIT_OK if entries or pending or not target else EXIT_FAIL
     now = time.time()
     if executor is not None:
         print(f"glaeda land: this host forwards its lands to {doc['executor']}"
@@ -26332,7 +26540,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
             st = e.get("stop") or {}
             if e.get("state") == "stopped" and st.get("next"):
                 print(f"next: {st['next']}")
-    if not entries:
+    for r in pending:
+        print(land_pending_line(r, now))
+    if not entries and not pending:
         print("glaeda land: nothing queued" + (f" for {target}" if target else ""))
     today = counts.get(land_day(now)) or {}
     week = {}
@@ -26353,7 +26563,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
               f"{split['redundant']} on a change the verdict does not depend on"
               + (f" ({why}): that share alone is skippable" if why else ": none skippable"))
     print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
-    if target and not entries:
+    if target and not entries and not pending:
         return EXIT_FAIL
     return EXIT_OK
 
@@ -27010,7 +27220,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if as_json:
         print(json.dumps(out, sort_keys=True))
     else:
-        print(land_line(entry, time.time()) if picked else f"{key_name(key)} requested; the daemon takes it next tick")
+        print(land_line(entry, time.time()) if picked else
+              f"{key_name(key)} requested; the daemon takes it next tick (a request in requests/, not a row yet: "
+              f"glaeda-gh land status {key_name(key)} shows it as requested until the daemon applies it)")
         if not running:
             say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
             say_waiting("next: glaeda-gh restart")
@@ -27045,6 +27257,24 @@ def cmd_land_cancel(target: str, as_json: bool) -> int:
                 say_waiting(f"glaeda land: {land_trim(got.get('reason') or got.get('code'), 200)}; the cancel waits "
                             "here and is forwarded when it answers")
     else:
+        # The queue applies a withdraw only to a row it can cancel (apply): one open, or stopped. Any other answered
+        # "cancel requested" and changed nothing, so a cancel of a PR this host never queued (or already merged or
+        # cancelled) read as done. Said here instead, with nothing written.
+        e = read_json(LandQueue.entries_dir() / file_name(key))
+        live = isinstance(e, dict) and (e.get("state") not in LAND_DONE or e.get("state") == "stopped")
+        waiting = any(r["op"] == "land" for r in land_pending_requests(key))
+        if executor is None and not live and not waiting:  # a forwarding host's row is the executor's to judge
+            state = e.get("state") if isinstance(e, dict) else None
+            why = (f"{key_name(key)} is {state} in this host's land queue, so there is nothing to cancel" if state
+                   else f"{key_name(key)} is not in this host's land queue ({LandQueue.entries_dir()}), so there "
+                        "is nothing to cancel")
+            nxt = "glaeda-gh land status, to see what this host holds"
+            if as_json:
+                print(json.dumps({"ok": False, "key": key, "code": "land_cancel_nothing", "reason": why,
+                                  "next": nxt, "state": state}, sort_keys=True))
+            else:
+                say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
+            return EXIT_FAIL
         land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
         print(json.dumps({"ok": True, "key": key, "state": "cancel requested"}))
@@ -27986,6 +28216,7 @@ def land_forward_loop(daemon: Daemon, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             daemon.land_tick(forward_only=True)
+            daemon.land_ingest_idle()
         except Exception as error:  # noqa: BLE001  retry on the next pass; requests remain on disk
             log({"event": "land-error", "error": describe(error), "site": error_site(error)})
         stop.wait(TICK)
