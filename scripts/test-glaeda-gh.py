@@ -26984,7 +26984,8 @@ class LandWorld:
         Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
         self.config = {"gh": os.fspath(self.gh), "landJudge": self.mh, "acpmux": "/fake/acpmux",
                        "python": "/fake/python3", "routerReview": "/fake/router-review", "git": "/fake/git",
-                       "laneGh": "/fake/lane-gh", "gitFetchOnce": "/fake/git-fetch-once"}
+                       "laneGh": "/fake/lane-gh", "gitFetchOnce": "/fake/git-fetch-once",
+                       "cmuxCi": "/fake/cmux-ci"}
         # A fetch step's mirror: a real (empty) directory, its origin what the fake git config answers.
         self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
         Path(self.mirror).mkdir(parents=True, exist_ok=True)
@@ -27027,6 +27028,9 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/cmux-ci":  # a compile check sent to the controller (do_compile_check)
+            rc = self.gh_rc.get("compile", 0)
+            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else "cmux-ci: controller unreachable")
         if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
             return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=timeout,
@@ -28190,6 +28194,68 @@ class LandTest(Base):
         for _ in range(3):
             e = self.tick(gg.NUDGE_MIN * 3 + 1)
         self.assertEqual(len(self.w.gh_calls("api")), 1)
+
+    def compile_refusal(self, head: str, sha: str | None = None, code: str = "compile_missing") -> tuple[int, dict]:
+        nxt = f"cmux-ci compile-check --ref {sha or head} --app --release"
+        return refusal(code, head, {"kind": "command", "text": nxt}, nxt,
+                       f"land-judge: refused: no compile-check receipt for {head[:12]}")
+
+    def compiles(self) -> list[list[str]]:
+        return [c[1:] for c in self.w.calls if c[0] == "/fake/cmux-ci"]
+
+    def test_a_missing_compile_check_is_sent_by_the_queue_and_the_row_waits_on_it(self):
+        # cmux#57574 and cmux#56907, 2026-11-26: stopped compile_missing on a compile-check command nobody ran.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.compile_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.compiles(), [["compile-check", "--ref", LA, "--app", "--release", "--background",
+                                            "--reason", "glaeda land o/r#1"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "compile_check", 0))
+        self.assertEqual(e["compileSent"], {"head": LA, "n": 1, "at": e["compileSent"]["at"]})
+        self.assertIn("compile_sent", [h["event"] for h in e["history"]])
+        # still missing once the wait is over: sent once more, urgent, and the row waits again
+        self.w.answers.append(self.compile_refusal(LA))
+        for _ in range(4):
+            e = self.tick(gg.LAND_COMPILE_WAIT / 4 + 1)
+            if len(self.compiles()) > 1:
+                break
+        self.assertEqual(self.compiles()[1][-1], "--urgent")
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        # still missing after both sends: it stops as compile_missing, naming the check
+        self.w.answers.append(self.compile_refusal(LA))
+        for _ in range(4):
+            e = self.tick(gg.LAND_COMPILE_WAIT / 4 + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual(len(self.compiles()), 2)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "compile_missing"))
+
+    def test_a_compile_check_the_controller_will_not_take_stops_as_before(self):
+        self.w.gh_rc["compile"] = 1
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.compile_refusal(LA))
+        e = self.tick()
+        self.assertEqual(len(self.compiles()), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "compile_missing"))
+
+    def test_only_compile_missings_own_compile_check_at_the_head_is_taken(self):
+        for code, sha, text in (
+            ("red_not_excused", LA, None),
+            ("compile_missing", "b" * 40, None),
+            ("compile_missing", LA, f"cmux-ci compile-check --ref {LA} --app --release; rm -rf /"),
+            ("compile_missing", LA, f"cmux-ci compile-check --ref {LA}"),
+        ):
+            text = text or f"cmux-ci compile-check --ref {sha} --app --release"
+            act = gg.land_action({"ok": False, "code": code, "repo": "o/r", "number": "1", "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text}}, LA)
+            self.assertEqual(act["kind"], "command", (code, text))
+        text = f"cmux-ci compile-check --ref {LA} --app --release"
+        act = gg.land_action({"ok": False, "code": "compile_missing", "repo": "o/r", "number": "1", "next": text,
+                              "action": {"v": 1, "kind": "command", "text": text}}, LA)
+        self.assertEqual((act["kind"], act["head"]), ("compile_check", LA))
 
     def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
         self.broker = True
