@@ -6181,7 +6181,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
-               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "PassKit", "tidy-branches", "CloudKit",
+               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "cmux-perf-bench", "PassKit", "tidy-branches", "CloudKit",
                      "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
@@ -6237,6 +6237,30 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                  build_output=True, min_idle_hours=JOURNEY_IDLE_HOURS, owner="cmux scripts/journeys (build_cache.py)",
                  rebuild_minutes=3, pressure_only=role == "devbox", platform=host_cache_platform())
           for sub in JOURNEY_SUBDIRS),
+        # cmux's perf bench (scripts/perf-bench: xbench.py, rivals.py, fetch_browsers.py) keeps vendor-signed app copies
+        # in ~/Library/Caches/cmux-perf-bench/apps/<app>/<version> (fetch_browsers downloads them again) and one
+        # throwaway cp -R copy per rival session in rivals-copies/<app>-<round>-<pid> (never reused, never removed by
+        # the bench). On cmux20 (2026-11-26) the two held 18.8 GiB that no family reached: the bundles are too deep for
+        # the git search, so library-caches read them "unchecked", and bench steps queued for disk. Both are build output.
+        # Apps go once unused PERF_BENCH_APPS_IDLE_HOURS (a bench run opens them; a live one keeps its copy), copies
+        # after PERF_BENCH_COPIES_IDLE_HOURS: the session that made one is long over.
+        Family(PERF_BENCH_APPS, HOME / PERF_BENCH_CACHE / "apps", True, "fetch_browsers.py downloads the vendor copy again",
+               depth=2, build_output=True, min_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, max_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, owner="cmux scripts/perf-bench (fetch_browsers.py)",
+               rebuild_minutes=3, platform="macos"),
+        Family(PERF_BENCH_COPIES, HOME / PERF_BENCH_CACHE / "rivals-copies", True, "the next rival session copies the app again",
+               build_output=True, min_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, max_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, owner="cmux scripts/perf-bench (rivals.py)",
+               rebuild_minutes=1, platform="macos"),
+        # cmux's CEF runtimes (~/Library/Caches/cmux/cef/cef-<version>[-<arch>]): one per CEF release the app or a
+        # tagged build ever ran, downloaded again on demand. cmux20 held ten, 5.9 GiB, the oldest from October. Only the
+        # cef-* runtimes: the helper and shim folders beside them are small and in step with the running app.
+        Family(CMUX_CEF_RUNTIMES, HOME / "Library/Caches/cmux/cef", True, "cmux downloads the CEF runtime again",
+               include=("cef-",), build_output=True, min_idle_hours=CMUX_CEF_IDLE_HOURS, max_idle_hours=CMUX_CEF_IDLE_HOURS, owner="cmux (CEF runtime download)",
+               rebuild_minutes=5, platform="macos"),
+        # vphone-cli's IPSW downloads (~/.vphone/ipsws: Apple's restore image, 11.5 GiB, and its .partial resume file).
+        # A public download, only read when a VM is created. Not the rest of ~/.vphone: the local cloudos image and
+        # the *-parts folders are not provably re-downloadable, so they stay (report only, unchecked).
+        Family(VPHONE_IPSWS, HOME / ".vphone/ipsws", True, "vphone-cli downloads the restore image again",
+               files=True, min_idle_hours=VPHONE_IPSW_IDLE_HOURS, max_idle_hours=VPHONE_IPSW_IDLE_HOURS, owner="vphone-cli", rebuild_minutes=30, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -7127,6 +7151,14 @@ def _ended_step_checkout(path: Path) -> str:
 # cmux's journey cache (scripts/journeys/build_cache.py): its builds and fetch scratch, an entry per job.
 JOURNEY_CACHE = Path(".cache/cmux-journeys")  # under HOME
 JOURNEY_SUBDIRS = ("builds", "fetch")
+PERF_BENCH_CACHE = Path("Library/Caches/cmux-perf-bench")  # under HOME: scripts/perf-bench's --cache default
+PERF_BENCH_APPS, PERF_BENCH_COPIES = "perf-bench-apps", "perf-bench-rivals-copies"
+PERF_BENCH_APPS_IDLE_HOURS = 3 * 24.0
+PERF_BENCH_COPIES_IDLE_HOURS = 2.0
+CMUX_CEF_RUNTIMES = "cmux-cef-runtimes"
+CMUX_CEF_IDLE_HOURS = 7 * 24.0
+VPHONE_IPSWS = "vphone-ipsws"
+VPHONE_IPSW_IDLE_HOURS = 14 * 24.0
 JOURNEY_IDLE_HOURS = 3 * 24.0
 
 # --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
@@ -8618,6 +8650,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "user-cache",          # ~/.cache
     "cua-cache",
     "cmux-ghosttykit-cache",
+    PERF_BENCH_APPS, PERF_BENCH_COPIES, CMUX_CEF_RUNTIMES, VPHONE_IPSWS,  # re-downloadable caches no job owns
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
     "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
     "lume-bench-images",   # LUME_BENCH_IMAGES: a pulled bench image; a lume command or open disk.img still keeps it
