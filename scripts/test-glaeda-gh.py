@@ -3622,6 +3622,88 @@ class UpstreamTest(Base):
             with self.assertRaises(gg.WatchError, msg=bad):
                 gg.read_request(bad)
 
+    def upstream_read(self, req: str) -> dict:
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(req), 0)
+        return json.loads(out.getvalue())["entries"]
+
+    def test_a_sixty_key_read_of_unchanged_files_parses_none_again_and_locks_once(self) -> None:
+        # The broker's `read` reparsed every key's watch and cache file (the cache twice) and opened the register lock
+        # once per key: 60 keys were about 180 opens, 124 json decodes and 16 ms of CPU, measured.
+        then = time.time() - 30
+        lines = []
+        for i in range(60):
+            key = (f"pr:o/r#{i + 1}", f"run:o/r/{1000 + i}", f"head:o/r@{i:040x}")[i % 3]
+            self.daemon.store(key, None, data={"n": i}, dataAt=NOW)
+            line = {"key": key, "jobs": False, "touched": then, "asked": then, "reader": "h/session:x"}
+            lines.append({**line, "consumer": "lane-x"} if key.startswith("head:") else line)
+        req = json.dumps({"keys": lines})
+        first = self.upstream_read(req)
+        parsed, locks = [], []
+        real_read, real_lock = gg.read_json, gg.bounded_lock
+
+        def read_json(path):
+            parsed.append(Path(path).parent.name)
+            return real_read(path)
+
+        def bounded_lock(path, *a, **kw):
+            locks.append(Path(path).name)
+            return real_lock(path, *a, **kw)
+        # the files were all written moments ago; a negative STABLE_RACY lets this test count without waiting it out
+        with mock.patch.object(gg, "STABLE_RACY", -1.0):
+            self.upstream_read(req)
+            with mock.patch.object(gg, "read_json", read_json), mock.patch.object(gg, "bounded_lock", bounded_lock):
+                again = self.upstream_read(req)
+        self.assertEqual(again, first)
+        self.assertEqual([p for p in parsed if p in ("watch", "cache")], [], "no unchanged file is parsed again")
+        self.assertEqual(locks, [".register.lock"], "one hold of the register lock for the whole read")
+        for line in lines:
+            path = gg.watch_dir() / gg.file_name(line["key"])
+            self.assertAlmostEqual(path.stat().st_mtime, then, places=3)
+
+    def test_a_read_sees_another_processs_write_to_a_remembered_file(self) -> None:
+        key = "pr:o/r#7"
+        self.daemon.store(key, None, data={"number": 7, "title": "old"}, dataAt=NOW)
+        req = json.dumps({"keys": [{"key": key, "jobs": False}]})
+        with mock.patch.object(gg, "STABLE_RACY", -1.0):  # remembered at once
+            self.assertEqual(self.upstream_read(req)[key]["data"]["title"], "old")
+            self.assertIn(os.fspath(gg.cache_dir() / gg.file_name(key)), gg._STABLE_DOCS)
+            path = gg.cache_dir() / gg.file_name(key)
+            doc = gg.read_json(path)
+            doc["data"]["title"] = "new"
+            subprocess.run([sys.executable, "-I", "-c", "import json, os, sys; p = sys.argv[1]; "
+                            "open(p + '.w', 'w').write(sys.argv[2]); os.replace(p + '.w', p)",
+                            os.fspath(path), json.dumps(doc)], check=True)
+            self.assertEqual(self.upstream_read(req)[key]["data"]["title"], "new")
+            path.unlink()
+            self.assertIsNone(self.upstream_read(req)[key])
+
+    def test_a_file_written_within_stable_racy_is_never_remembered(self) -> None:
+        # A rewrite in place, the same size, mtime set back: on a filesystem whose timestamps are coarser than the
+        # gap (HFS+ seconds, Linux's tick), even the ctime can match. Only a file settled STABLE_RACY is remembered.
+        key = "pr:o/r#7"
+        self.daemon.store(key, None, data={"title": "aaa"}, dataAt=NOW)
+        path = gg.cache_dir() / gg.file_name(key)
+        req = json.dumps({"keys": [{"key": key, "jobs": False}]})
+        self.assertEqual(self.upstream_read(req)[key]["data"]["title"], "aaa")
+        st = path.stat()
+        body = path.read_bytes().replace(b'"aaa"', b'"bbb"')
+        with open(path, "r+b") as f:
+            f.write(body)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(self.upstream_read(req)[key]["data"]["title"], "bbb")
+
+    def test_outside_a_read_every_caller_gets_its_own_parse(self) -> None:
+        key = "pr:o/r#7"
+        self.daemon.store(key, None, data={"title": "t"}, dataAt=NOW)
+        with mock.patch.object(gg, "STABLE_RACY", -1.0):
+            self.assertIsNot(gg.read_cache(key), gg.read_cache(key))
+            with gg.stable_reads():
+                self.assertIs(gg.read_cache(key), gg.read_cache(key))
+            self.assertIsNot(gg.read_cache(key), gg.read_cache(key))
+
 
 class TransportErrorTest(unittest.TestCase):
     """glaeda-gh's http() helper shadows the `http` package. An except clause naming
@@ -17637,6 +17719,22 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW + 1000)
         self.assertEqual(json.loads(ran[1][4]), {"repo": "o/r", "number": 9, "expected_head_sha": "d" * 40})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
+
+    def test_a_broker_pacing_refusal_holds_a_queued_update_branch_instead_of_retiring_it_as_closed(self) -> None:
+        """cmux#57987, 2026-11-26: a queued base merge ended "superseded: the pull request is closed or merged" with
+        the PR open, because the broker's pacing refusal ends "nothing was merged". It waits out the pace instead."""
+        sha = "f" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        said = ("refused: content writes are paced for 30s more; not sent, retry after 13:46Z: o/r had 8 base merges "
+                "in the last 600 s (at most 8; each reruns the whole suite), so PR 7 waits its turn; nothing was merged")
+        d, ran = self.lane_vm((1, {"ok": False, "error": said}))
+        self.step(d, NOW)
+        self.assertEqual(len(ran), 1)
+        held = json.loads((gg.outbox_dir() / f"{item['id']}.json").read_text())
+        self.assertIn("limit", held["lastError"])
+        for text in ["nothing was merged", "8 base merges", said]:
+            with self.subTest(text=text):
+                self.assertIsNone(gg.update_branch_retired(422, text))
 
     def test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_broker_call(self) -> None:
         """glaeda-lane 2026-11-25: every `gh pr update-branch N -R manaflow-ai/cmux` gh-quota queued on the login's
