@@ -17193,6 +17193,25 @@ def land_step_failed(e: dict, head: str) -> str:
     return f" (its {fail.get('kind') or 'step'} was refused {int(fail['count'])} times in a row at {head[:12]}{why})"
 
 
+LAND_CREATE_PAUSE_MAX = 3600.0  # gh_quota's CONTENT_HOLD_MAX_S: a later blocked_until is a wrong clock
+
+
+def land_create_pause_until(now: float) -> float:
+    """When the login's create pause the gh-quota shim holds ends (its $GH_QUOTA_STATE/content-gate.json
+    blocked_until), or 0.0: none, or no shim state here. The shim refuses every content write (merge, update-branch)
+    before that time, and its ask of the authority only ever extends the file, never shortens it, so a step sent
+    before then is refused for certain. The land queue's own steps were: gcp-agent-lane-4 2026-11-25 17:11Z, five
+    `gh pr update-branch N --land ...` from this executor refused "content writes are paced until reset (60s ...)",
+    each one a refusal row on the fleet's paced count (cmuxterm-hq goal github-writes-never-pause; Leo, 2026-11-23:
+    "never pause. if you have to pause, it means we have to fix things")."""
+    state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+    doc = read_json(state / "content-gate.json")
+    until = doc.get("blocked_until") if isinstance(doc, dict) else None
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or not math.isfinite(until) or until <= now:
+        return 0.0
+    return min(float(until), now + LAND_CREATE_PAUSE_MAX)
+
+
 def land_quota_said(text: str, now: float) -> float | None:
     """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
     NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
@@ -17491,7 +17510,10 @@ class LandQueue:
                  read_room: Callable[[], int | None] | None = None,
                  feed_done: Callable[[str, str], float | None] | None = None,
                  checks_done: Callable[[str, str], bool | None] | None = None,
-                 rollup_nodes: Callable[[str, str], list[dict] | None] | None = None) -> None:
+                 rollup_nodes: Callable[[str, str], list[dict] | None] | None = None,
+                 create_pause: Callable[[float], float] = land_create_pause_until) -> None:
+        # NOW -> when the login's create pause the shim holds ends (0: none): a content step waits it out unsent
+        self.create_pause = create_pause
         # (key, head) -> the controller's green rollup of the head as land_judge's nodes, else None (LAND_ROLLUP_JUDGE)
         self.rollup_nodes = rollup_nodes or (lambda key, sha: None)
         self.rollup_seen: dict[tuple[str, str], tuple[float, list[dict] | None]] = {}
@@ -23163,6 +23185,21 @@ class LandQueue:
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
+    def held_by_create_pause(self, e: dict, kind: str, head: str) -> bool:
+        """Whether the login's create pause holds KIND at HEAD now (create_pause): then E is parked until it ends, as
+        the shim's own refusal would park it (park_quota on its words), and nothing is sent. Never counted toward a
+        stop, nor is the judgment after it (stepQuotaParked)."""
+        until = self.create_pause(self.now)
+        if until <= self.now:
+            return False
+        with self.lock:
+            self.history(e, "step_held", kind=kind, head=head[:12], why="the login's create pause")
+            self.park_quota(e, f"content writes are paced for {math.ceil(until - self.now):.0f}s more (the login's "
+                               f"create pause, read before the {kind}: not sent)")
+            e["stepQuotaParked"] = True
+            self.save(e)
+        return True
+
     def push_step(self, e: dict, kind: str, head: str, args: list[str], **extra: Any) -> None:
         """A step that makes GitHub change the PR (update-branch, a base change): run it, then wait for the cache to
         show a head other than the one before it."""
@@ -23171,6 +23208,8 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; {kind} is not sent around it",
                           "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
+            return
+        if self.held_by_create_pause(e, kind, head):
             return
         with self.lock:
             self.claim(e, kind, before=head, **extra)  # may raise LandCancelled (draining, a newer land): nothing sent
@@ -24352,6 +24391,9 @@ class LandQueue:
                           "~/.config/glaeda/land.json")
             return
         repo, number = e["repo"], str(e["number"])
+        if not self.broker_client() and self.held_by_create_pause(e, "merge", sha):
+            # before the lease, so none is held while it waits; the broker's land is not the shim's and is not paced
+            return
         lease = self.merge_lease(e, sha)
         if lease is False:
             return

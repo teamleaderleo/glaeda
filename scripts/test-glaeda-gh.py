@@ -34975,6 +34975,46 @@ class LandTest(Base):
         self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
                                                     "have been met, add the --auto flag"))
 
+    def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
+        # gcp-agent-lane-4 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
+        # "content writes are paced until reset (60s ...)", each a refusal row on the fleet's paced count (goal
+        # github-writes-never-pause). The pause the shim holds (content-gate.json) is read first: nothing is sent
+        # into it, the row waits it out, and the step goes after it.
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        gate = self.latch_dir / "content-gate.json"
+        self.pr(LA)
+        self.land()
+        gate.write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+        self.assertGreaterEqual(e["wakeAt"], self.t + 45)
+        self.assertTrue(e.get("stepQuotaParked"))
+        self.assertIn("step_held", [h["event"] for h in e["history"]])
+        self.assertNotIn("stepFail", e)
+        # past the pause: the update is sent
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick(e["wakeAt"] - self.t + 1)
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                   f"expected_head_sha={LA}"]])
+        # a merge is held the same way, unsent, and goes after
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gate.write_text(json.dumps({"blocked_until": self.t + 30, "level": 1}))
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(1)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+        self.w.answers.append(ok_answer(LB))
+        self.tick(e["wakeAt"] - self.t + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        # no pause, a past one, a garbled file: nothing held
+        for doc in ({"blocked_until": 0}, {"blocked_until": self.t - 5}, {"blocked_until": "x"}, []):
+            gate.write_text(json.dumps(doc))
+            self.assertEqual(gg.land_create_pause_until(self.t), 0.0, doc)
+        gate.write_text(json.dumps({"blocked_until": self.t + 10 ** 9}))
+        self.assertEqual(gg.land_create_pause_until(self.t), self.t + gg.LAND_CREATE_PAUSE_MAX)
+
     def refuse_merges(self, text: str) -> list:
         """Every `gh pr merge` the queue sends is refused with TEXT (exit 1); the list of those sent."""
         real, refused = self.q.run, []
