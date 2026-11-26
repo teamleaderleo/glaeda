@@ -14949,6 +14949,12 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")
+                # A row batched() deferred (the GraphQL pace, the tick's share or budget, a split limit) waits for a
+                # next tick this throwaway Daemon never has: name the limit that held it. The land host, 2026-11-26
+                # 08:41-09:03Z: 69 batched rows ended "no data stored", about half of each 50-row batch, with no reason.
+                miss = getattr(daemon, "miss_why", None) or {}
+                for k in daemon.deferred:
+                    errors.setdefault(k, "not read: deferred, " + (miss.get(k) or "no reason kept"))
         except OutOfTime as stop:
             why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
             errors.update({k: why for k in todo if k not in errors})

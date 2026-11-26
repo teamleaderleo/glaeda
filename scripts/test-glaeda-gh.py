@@ -25452,6 +25452,19 @@ class StaleDataTest(Base):
               f"unchanged PRs {single_probe} one at a time, {batched_probe} batched")
         self.assertEqual(batched_probe, 2)
 
+    def test_a_batched_land_refresh_names_why_a_deferred_row_was_not_read(self) -> None:
+        """The land host, 2026-11-26 08:41-09:03Z: 69 batched land rows ended "no data stored", with no reason. A row
+        batched() defers waits for a next tick the refresh's Daemon never has; its error now names the limit."""
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        with mock.patch.object(gg.Daemon, "gql_room", lambda self, cost=1: False):
+            _, out = self.land_refresh_reads(["pr:o/r#1", "pr:o/r#2", "pr:o/r#3"], batched=True)
+        self.assertEqual(len(out), 3)
+        for key, error in out.items():
+            self.assertIsNotNone(error, key)
+            self.assertTrue(error.startswith("not read: deferred, "), error)
+            self.assertNotIn("no data stored", error)
+
     def test_a_land_refresh_keeps_the_rollup_snapshot_its_judgment_is_handed(self) -> None:
         """A land refresh's own Daemon had no land queue, so its full read moved the cache's fingerprint and wrote no
         rollup snapshot: the snapshot stopped matching and the judgment read the head from GitHub itself (cmux-cp-1,
