@@ -28526,6 +28526,32 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
         self.assertEqual([h for h in e["history"] if h["event"] == "stale_replay"], [])
 
+    def stale_at_own_head(self, files: list[str], ahead: int) -> dict:
+        """A land whose own update at LA made LB; a rerun of run 5 at LB is stale by STALE_API(files, ahead)."""
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.stale_api(5, files, ahead=ahead)
+        self.w.answers.append(refusal("cancelled", LB, {"kind": "rerun_failed", "runs": [5]}))
+        return self.tick()
+
+    def test_an_age_only_stale_rerun_at_this_lands_own_head_is_the_rerun(self):
+        # LAND_UPDATE_ONCE's comment: the run's merge is this land's own; only the base's age makes it stale
+        e = self.stale_at_own_head(["src/a.ts"], ahead=gg.STALE_REPLAY_BEHIND + 30)
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"]])
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}"])
+        self.assertIn("stale_replay_own_head", [h["event"] for h in e["history"]])
+
+    def test_a_stale_rerun_the_base_fixed_at_this_lands_own_head_is_still_a_base_merge(self):
+        e = self.stale_at_own_head(["scripts/ci/api_call_log/env.sh"], ahead=3)
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}", f"expected_head_sha={LB}"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
     def test_a_fresh_run_is_rerun_as_before(self):
         self.stale_api(5, ["src/a.ts"])  # the base moved, off the CI paths and under STALE_REPLAY_BEHIND
         self.assert_rerun_as_before()
@@ -31727,6 +31753,7 @@ class LandTest(Base):
                           seconds=gg.LAND_HEAD_TIMEOUT + 300, step=30.0)
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
 
+    @mock.patch.dict(os.environ, {"GLAEDA_LAND_UPDATE_ONCE": "0"})  # the undo: a second unnamed update, as before
     def test_an_update_at_a_new_head_is_sent_again(self):
         # once per head: the update's own head, judged stale again (the base moved during its CI), takes its own
         self.pr(LA)
@@ -31739,6 +31766,37 @@ class LandTest(Base):
         updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
         self.assertEqual(updates, [f"expected_head_sha={LA}", f"expected_head_sha={LB}"])
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
+    def test_a_second_unnamed_update_at_this_lands_own_head_stops_by_name(self):
+        # LAND_UPDATE_ONCE's comment: one base merge per land; a second, at the head the first made, naming no check
+        # that needs a newer base, stops the row instead of starting the whole CI again
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB)
+        self.w.answers.append(refusal("stale_green", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}"])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_again_unnamed"))
+        self.assertIn(LB[:12], e["stop"]["reason"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_second_update_naming_a_check_is_still_sent(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB)
+        self.w.answers.append(refusal("red_not_excused", LB, {"kind": "update_branch", "expected_head_sha": LB,
+                                                              "needs_newer_base": ["ci"]}))
+        e = self.tick()
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}", f"expected_head_sha={LB}"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.assertIn("update_again", [h["event"] for h in e["history"]])
 
     def test_an_update_interrupted_by_a_restart_is_not_sent_again_at_that_head(self):
         self.pr(LA)
@@ -31997,6 +32055,7 @@ class LandTest(Base):
         self.assertIn("git commit --allow-empty", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    @mock.patch.dict(os.environ, {"GLAEDA_LAND_UPDATE_ONCE": "0"})  # the undo: a second unnamed update, as before
     def test_no_update_branch_while_the_heads_checks_run(self):
         self.pr(LA)
         self.land()
