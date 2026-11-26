@@ -18009,9 +18009,15 @@ class LandQueue:
                     del self.entries[key]
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
+                    due = False
                     with self.lock:
                         if not self.rearm(e):  # judged from the next pass
-                            self.remind(e)  # a stop that never re-arms still reaches its owner
+                            due = self.remind_due(e)
+                    if due:  # the PR's live state first, outside the lock: its cached copy may be long stale
+                        state, merge_sha, _why = self.read_state(e)
+                        with self.lock:
+                            self.check(e)
+                            self.remind(e, (state, merge_sha) if state else None)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
@@ -19655,9 +19661,27 @@ class LandQueue:
         self.save(e)
         return True
 
-    def remind(self, e: dict) -> bool:
+    def remind_due(self, e: dict) -> bool:
+        """Under the lock. Whether remind would tell E's requester now (it judges nothing and changes nothing): the
+        pass reads the PR's live state first, outside the lock, for exactly these rows."""
+        if e.get("state") != "stopped":
+            return False
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code) or not e.get("requester"):
+            return False
+        r = e.get("reminds") or {}
+        n = int(r.get("n") or 0) if r.get("day") == land_day(self.now) else 0
+        last = float(r.get("at") or 0) or float(st.get("at") or 0)
+        return n < LAND_OWNER_REMIND_CAP and self.now - last >= LAND_OWNER_REMIND_EVERY
+
+    def remind(self, e: dict, seen: tuple[str, str] | None = None) -> bool:
         """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
-        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen.
+        SEEN is the PR's live (state, merge commit) read just before, when the pass made one. A stopped row's PR is
+        no longer watched, so its cached copy can still read OPEN long after the PR was merged or closed (lw#9791,
+        lw#9792, cmux#56641, cmux#47889 each got "still stopped after N h" for a PR that was already over): a live
+        MERGED or CLOSED ends the row here, with no reminder."""
         if e.get("state") != "stopped":
             return False
         st = e.get("stop") or {}
@@ -19670,6 +19694,9 @@ class LandQueue:
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
             return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        if seen and seen[0] in ("MERGED", "CLOSED"):
+            self.ended(e, seen[0], seen[1], "a state read before its reminder shows it")
+            return False
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0

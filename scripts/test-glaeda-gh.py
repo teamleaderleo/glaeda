@@ -30179,6 +30179,28 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
 
+    def test_a_stopped_row_whose_cached_pr_still_reads_open_but_is_over_is_not_reminded(self):
+        # lw#9791, lw#9792, cmux#56641, cmux#47889: a stopped row's PR is no longer watched, so its cache stayed OPEN
+        # after the PR was merged or closed, and "still stopped after N h" kept coming. The live read ends the row.
+        for state, row in (("MERGED", "merged"), ("CLOSED", "stopped")):
+            with self.subTest(state=state):
+                self.setUp()
+                self.conflict_stop()
+                sent = len(self.w.sent())
+                self.w.view_state = state  # GitHub says over; the cache (conflict_stop's OPEN PR) is not told
+                e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+                self.assertEqual((e["state"], e.get("reminds")), (row, None))
+                if state == "CLOSED":
+                    self.assertEqual(e["stop"]["code"], "closed")  # closed unmerged: skipped by every later pass
+                e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # (the row's own ended notice is no reminder)
+                self.assertEqual(e.get("reminds"), None)
+                self.assertFalse([m for m in self.w.sent()[sent:] if "still stopped" in m[-1]])
+
+    def test_a_stopped_row_whose_live_pr_is_open_is_still_reminded(self):
+        self.conflict_stop()
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["n"]), ("stopped", 1))
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
