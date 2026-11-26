@@ -30603,8 +30603,11 @@ class LandTest(Base):
         held = [h for h in e["history"] if h.get("event") == "remind_held"]
         self.assertEqual([h.get("why") for h in held], ["unread"])  # said once in history, not once a pass
         self.fresh_head = LA  # a read lands: the PR is unchanged and still stopped, told on the copy now
-        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
-        self.assertEqual(len(self.w.sent()), sent + 1)
+        for _ in range(4):  # the next due pass asks the read, and the pass after it lands is told
+            e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+            if len(self.w.sent()) > sent:
+                break
+        self.assertEqual((len(self.w.sent()), e["reminds"]["n"], e["reminds"].get("head")), (sent + 1, 1, LA))
         self.assertNotIn("could not be read", self.w.sent()[-1][-1])
 
     def test_an_unread_stop_whose_pr_merged_ends_when_a_read_lands(self):
