@@ -27334,6 +27334,7 @@ class RunReadOnceTest(unittest.TestCase):
 # ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
 
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
+LD = "d" * 40  # a resync commit (pr_resync): LB's tree, on LB
 
 
 def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
@@ -27390,6 +27391,7 @@ class LandWorld:
         self.watched: list[str] = []
         self.notices: list[tuple] = []
         self.session_info: dict | None = None  # what `acpmux session info --json` answers (None: nothing printed)
+        self.resync_sha = LD  # the commit pr_resync's commit_create (or POST git/commits) makes
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
@@ -27479,12 +27481,39 @@ class LandWorld:
                     "ok": True, "merged": True}}, indent=1) + "\n", "")
             err = self.gh_err.get("merge", "merge refused")
             return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": err}, indent=1) + "\n", "")
+        if argv[0] == "/fake/lane-gh" and argv[1:3] in (["call", "commit_create"], ["call", "ref_update"]):
+            # the broker's git data writes (pr_resync): a commit, then a fast-forward that moves the branch ref read
+            tool, args = argv[2], json.loads(argv[4])
+            rc = self.gh_rc.get("commit" if tool == "commit_create" else "ref", 0)
+            if rc:
+                return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": self.gh_err.get(
+                    "ref", f"refused: {tool}: lane/x is nobody's by the broker's owner record")}, indent=1), "")
+            if tool == "ref_update":
+                self.api[f"repos/{argv[3]}/git/ref/heads/{args['branch']}"] = args["sha"]
+            sha = self.resync_sha if tool == "commit_create" else args["sha"]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 201, "data": {
+                "sha": sha}}, indent=1) + "\n", "")
         if argv[0] in ("/fake/git", "/fake/lane-gh", "/fake/git-fetch-once"):
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
                 return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
+            if words[:1] == ["api"] and len(words) > 3 and words[2:4] == ["-X", "POST"] \
+                    and words[1].endswith("/git/commits"):  # pr_resync's commit on a host with its own login
+                rc = self.gh_rc.get("commit", 0)
+                return subprocess.CompletedProcess(argv, rc, self.resync_sha + "\n" if rc == 0 else "",
+                                                   "" if rc == 0 else "HTTP 422: Tree SHA does not exist")
+            if words[:1] == ["api"] and len(words) > 3 and words[2:4] == ["-X", "PATCH"] and "/git/refs/heads/" in words[1]:
+                rc = self.gh_rc.get("ref", 0)
+                sha = next(w[4:] for w in words if w.startswith("sha="))
+                if rc == 0:  # the branch ref read (git/ref/heads/B) says the fast-forward from now on
+                    self.api[words[1].replace("/git/refs/heads/", "/git/ref/heads/")] = sha
+                return subprocess.CompletedProcess(argv, rc, sha + "\n" if rc == 0 else "",
+                                                   "" if rc == 0 else "HTTP 422: Update is not a fast forward")
+            if words[:1] == ["api"] and len(words) > 1 and "/git/commits/" in words[1] \
+                    and not any(words[1].startswith(p) for p in self.api):
+                return subprocess.CompletedProcess(argv, 0, "e" * 40 + "\n", "")  # a commit's tree (pr_resync)
             if words[:1] == ["api"] and len(words) > 1:
                 for prefix, out in self.api.items():
                     if words[1].startswith(prefix):
@@ -31701,6 +31730,9 @@ class LandTest(Base):
         self.assertEqual((e["stop"]["code"], len(self.unlabels())), ("closed", 1))
 
     def test_unlabel_a_rearming_stop_waits_for_its_rearms_and_a_refusal_retries_then_gives_up(self):
+        # 2026-11-26: the five ticks below cover ~10 h, so from about 14:00Z on the wall clock they crossed midnight,
+        # the day's re-arm count reset and the entry re-armed instead of unlabeling (2 != 3). Start just after midnight.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
         self.stopped_on("own_red")
         self.tick(gg.LAND_UNLABEL_AFTER + 1)  # re-armed, not unlabeled
         self.assertEqual(self.unlabels(), [])
@@ -32521,11 +32553,13 @@ class LandTest(Base):
                 self.assertEqual(self.w.gh_calls("pr", "merge"), [])
                 # a tip that is not only the update's own clean base merge is never synced into the land by a reopen
                 self.assertEqual((self.w.gh_calls("pr", "close"), self.w.gh_calls("pr", "reopen")), ([], []))
+                self.assertFalse((e.get("prResync") or {}).get("carry"))
 
     def test_a_clean_update_tip_the_pr_never_shows_stops_naming_what_syncs_it(self):
         # GitHub's PR for cmux#53921 still said 52aafe8c 2 h after its ref went to the update's ccc62452: a re-pin
-        # cannot help there. The queue closes and reopens the PR once (LAND_PR_REOPEN_AFTER); when even that does not
-        # sync it, past LAND_PR_SYNC_MAX the stop says so, naming the reopen it made and the sha to re-pin to.
+        # cannot help there. The queue pushes a resync commit (LAND_PR_RESYNC_AFTER), then on a host with its own login
+        # closes and reopens the PR once (LAND_PR_REOPEN_AFTER later); when even that does not sync it, past
+        # LAND_PR_SYNC_MAX the stop says so, naming both and the resync commit to re-pin to.
         self.update_tip_pr([LA, LC])
         start = self.t
         e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
@@ -32535,23 +32569,90 @@ class LandTest(Base):
         self.assertLess(self.t - start, gg.LAND_PR_SYNC_MAX + 2 * gg.LAND_HEAD_TIMEOUT)
         self.assertEqual((len(self.w.gh_calls("pr", "close")), len(self.w.gh_calls("pr", "reopen"))), (1, 1))
         self.assertIn("closed and reopened it", e["stop"]["reason"])
-        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertIn(f"this queue pushed {LD[:12]}, a resync commit on {LB[:12]}", e["stop"]["reason"])
+        self.assertIn(f"--sha {LD}", e["stop"]["next"])
+        self.assertNotIn("gh pr close", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(self.w.api["repos/o/r/git/ref/heads/lane/x"], LD)  # the fast-forward moved the branch
 
-    def test_a_clean_update_tip_the_pr_lags_on_is_synced_by_a_reopen_and_lands(self):
-        # manaflow-ai/cmux#57070 (3309 s) and #54988 (4896 s), 2026-11-25: stopped pr_head_unsynced, and a person's
-        # `gh pr close && gh pr reopen` synced each PR within ~25 s. The queue does that itself past
-        # LAND_PR_REOPEN_AFTER, once, and the land goes on: the pin follows the new head (its first parent is the pin)
-        # and land_judge judges it there.
+    def test_a_clean_update_tip_the_pr_lags_on_is_synced_by_a_resync_commit_and_lands(self):
+        # manaflow-ai/cmux#56127, 2026-11-26 15:22Z: GitHub's PR read 8c1ad9cb for 47 min while lane/x was at the
+        # update's da6fd637; a commit with da6fd637's tree on da6fd637, fast-forwarded onto the branch, synced the PR
+        # to it (6b8f24a8) in under 20 s. The queue does that itself past LAND_PR_RESYNC_AFTER: the pin carries to
+        # the resync commit (the update's clean base merge plus a commit that changes no file) and it lands there.
         self.update_tip_pr([LA, LC])
         start = self.t
         e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
-                          seconds=gg.LAND_PR_REOPEN_AFTER + 3 * gg.LAND_HEAD_TIMEOUT, step=30.0)
+                          seconds=gg.LAND_PR_RESYNC_AFTER + 2 * gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stop")), ("waiting", "head_change", None))
+        posts = [c for c in self.w.gh_calls("api") if c[1].endswith("/git/commits") and "POST" in c]
+        self.assertEqual(len(posts), 1)
+        self.assertIn(f"parents[]={LB}", posts[0])
+        self.assertIn("tree=" + "e" * 40, posts[0])
+        patches = [c for c in self.w.gh_calls("api") if "/git/refs/heads/lane/x" in c[1]]
+        self.assertEqual(len(patches), 1)
+        self.assertIn(f"sha={LD}", patches[0])
+        self.assertIn("force=false", patches[0])
+        self.assertEqual(self.w.api["repos/o/r/git/ref/heads/lane/x"], LD)
+        resynced = [h for h in e["history"] if h["event"] == "pr_resynced"]
+        self.assertEqual(len(resynced), 1)
+        self.assertEqual((self.w.gh_calls("pr", "close"), self.w.gh_calls("pr", "reopen")), ([], []))
+        self.assertLess(e["prResync"]["at"] - start, gg.LAND_PR_RESYNC_AFTER + gg.LAND_HEAD_TIMEOUT + 60)
+        self.assertEqual((e["pinSha"], self.w.gh_calls("pr", "merge")), (LA, []))
+        # GitHub's PR shows the resync commit (parent LB, the update's merge): the pin carries to it, it merges there.
+        self.pr(LD, parent=LB)
+        self.w.answers[:] = [ok_answer(LD)]
+        e = self.run_hour(lambda: ok_answer(LD), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LD))
+        self.assertIn("pr_resync", [h.get("step") for h in e["history"] if h["event"] == "pin_followed"])
+        self.assert_merged_at(LD)
+
+    def test_on_a_lane_vm_the_resync_goes_through_the_broker_and_never_closes_the_pr(self):
+        # cmux#55880, 2026-11-26 11:40Z: the stop said close+reopen, the broker refused the reopen (the lane had not
+        # pushed the branch) and the PR was left closed. On a broker client the resync is commit_create + ref_update
+        # (fast-forward, expected = the tip), and no close or reopen is ever sent.
+        self.broker = True
+        self.update_tip_pr([LA, LC])
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_SYNC_MAX * 2, step=30.0)
+        lane = [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:2] == ["call"]
+                and c[2] in ("commit_create", "ref_update")]
+        self.assertEqual([c[2] for c in lane], ["commit_create", "ref_update"])
+        self.assertEqual(json.loads(lane[0][4])["parents"], [LB])
+        self.assertEqual(json.loads(lane[1][4]), {"branch": "lane/x", "expected": LB, "sha": LD})
+        self.assertEqual((self.w.gh_calls("pr", "close"), self.w.gh_calls("pr", "reopen")), ([], []))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pr_head_unsynced"))
+        self.assertNotIn("reopen", e["stop"]["next"])
+        self.assertIn(f"--sha {LD}", e["stop"]["next"])
+
+    def test_a_resync_the_broker_refuses_stops_naming_the_resync_by_hand(self):
+        self.broker = True
+        self.update_tip_pr([LA, LC])
+        self.w.gh_rc["ref"] = 1
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_SYNC_MAX * 2, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_unsynced", LA))
+        self.assertIn("this queue's resync failed", e["stop"]["reason"])
+        self.assertIn("git commit-tree", e["stop"]["next"])
+        self.assertNotIn("reopen", e["stop"]["next"])
+        self.assertEqual(self.w.api["repos/o/r/git/ref/heads/lane/x"], LB)  # nothing moved
+        failed = [h for h in e["history"] if h["event"] == "pr_resync_failed"]
+        self.assertEqual(len(failed), 1)
+
+    def test_a_clean_update_tip_the_resync_does_not_sync_is_synced_by_a_reopen_and_lands(self):
+        # manaflow-ai/cmux#56682, 2026-11-26: a pushed commit at 08:02Z did not sync the PR; the reopen at 08:08Z did.
+        # On a host with its own login the queue's close+reopen stays as the fallback LAND_PR_REOPEN_AFTER past the
+        # resync, once, and the pin carries to the resync commit the reopened PR shows.
+        self.update_tip_pr([LA, LC])
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_RESYNC_AFTER + gg.LAND_PR_REOPEN_AFTER + 2 * gg.LAND_HEAD_TIMEOUT,
+                          step=30.0)
         self.assertEqual((e["state"], e["wait"]["kind"], e.get("stop")), ("waiting", "head_change", None))
         self.assertEqual((self.w.gh_calls("pr", "close"), self.w.gh_calls("pr", "reopen")),
                          ([["pr", "close", "1", "-R", "o/r"]], [["pr", "reopen", "1", "-R", "o/r"]]))
         reopened = [h for h in e["history"] if h["event"] == "pr_reopened"]
-        self.assertEqual([(h["head"], h["tip"]) for h in reopened], [(LA[:12], LB[:12])])
+        self.assertEqual([h["head"] for h in reopened], [LA[:12]])
         self.assertLess(self.t - start, gg.LAND_PR_SYNC_MAX)
         self.assertEqual((e["pinSha"], self.w.gh_calls("pr", "merge")), (LA, []))
         # A copy read just after the queue's own close (GitHub's reads lag) says CLOSED: not a person's close.
@@ -32559,24 +32660,25 @@ class LandTest(Base):
         self.w.cache[self.KEY]["dataAt"] = e["selfReopen"]["at"] + 1
         e = self.tick(30)
         self.assertNotEqual(e["state"], "stopped", e.get("stop"))
-        # GitHub's PR shows the update's commit after the reopen: the pin follows it and it merges there.
-        self.pr(LB, parent=LA)
-        self.w.answers[:] = [ok_answer(LB)]
-        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
-        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
-        self.assert_merged_at(LB)
+        # GitHub's PR shows the resync commit after the reopen: the pin carries to it and it merges there.
+        self.pr(LD, parent=LB)
+        self.w.answers[:] = [ok_answer(LD)]
+        e = self.run_hour(lambda: ok_answer(LD), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LD))
+        self.assert_merged_at(LD)
 
     def test_a_reopen_that_fails_stops_naming_the_closed_pr(self):
         # The close went through and every reopen failed: the PR is left closed, and the stop says so first.
         self.update_tip_pr([LA, LC])
         self.w.gh_rc["reopen"] = 1
         e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
-                          seconds=gg.LAND_PR_REOPEN_AFTER + 3 * gg.LAND_HEAD_TIMEOUT, step=30.0)
+                          seconds=gg.LAND_PR_RESYNC_AFTER + gg.LAND_PR_REOPEN_AFTER + 3 * gg.LAND_HEAD_TIMEOUT,
+                          step=30.0)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pr_reopen_failed"))
         self.assertEqual(len(self.w.gh_calls("pr", "reopen")), gg.LAND_PR_REOPEN_TRIES)
         self.assertIn("The PR is closed", e["stop"]["reason"])
-        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])
-        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])  # reopening a PR this queue closed, not a sync step
+        self.assertIn(f"--sha {LD}", e["stop"]["next"])
 
     def test_a_close_that_fails_keeps_the_old_wait_and_stop(self):
         self.update_tip_pr([LA, LC])
@@ -32586,7 +32688,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pr_head_unsynced"))
         self.assertEqual((len(self.w.gh_calls("pr", "close")), self.w.gh_calls("pr", "reopen")), (1, []))
         self.assertIn("close-and-reopen failed", e["stop"]["reason"])
-        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])
+        self.assertNotIn("gh pr reopen", e["stop"]["next"])
+        self.assertIn(f"--sha {LD}", e["stop"]["next"])
 
     def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
         # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
@@ -32886,11 +32989,15 @@ class LandTest(Base):
             rounds += 1
         self.assertEqual(e["stop"]["code"], "pr_head_unsynced", e.get("stop"))
         self.assertIsNone(e.get("stepFail"))  # never counted toward LAND_STEP_STOP
-        self.assertIn("gh pr close 1 -R o/r && gh pr reopen 1 -R o/r", e["stop"]["next"])
+        self.assertNotIn("reopen", e["stop"]["next"])
+        self.assertIn(f"--sha {LD}", e["stop"]["next"])  # the queue's own resync commit, past LAND_PR_RESYNC_AFTER
         self.assertIn("branch_ahead_of_pr", [h["event"] for h in e["history"]])
-        # one branch read per refused send, and no read on any other step
+        self.assertEqual([h["event"] for h in e["history"]].count("pr_resynced"), 1)
+        self.assertEqual(self.w.api["repos/o/r/git/ref/heads/lane/x"], LD)
+        self.assertEqual((self.w.gh_calls("pr", "close"), self.w.gh_calls("pr", "reopen")), ([], []))
+        # one branch read per refused send (the resync re-reads the tip once), and no read on any other step
         reads = [c for c in self.w.gh_calls("api") if "git/ref/heads/lane/x" in c[1]]
-        self.assertEqual(len(reads), rounds + 1)
+        self.assertEqual(len(reads), rounds + 2)
 
     def test_an_update_refused_for_the_mismatch_with_the_branch_at_the_pr_head_counts_as_before(self):
         self.pr(LA)

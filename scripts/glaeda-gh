@@ -15063,6 +15063,38 @@ def land_own_token_pool(now: float | None = None) -> bool:
     return False
 
 
+def land_broker_sha(got: subprocess.CompletedProcess, field: str) -> tuple[str, str]:
+    """(sha, "") from a `lane-gh call` whose envelope says ok and whose data's FIELD is a full sha, else ("", why)."""
+    envelope: Any = None
+    with contextlib.suppress(ValueError):
+        envelope = json.loads(got.stdout or "")
+    doc = envelope.get("data") if isinstance(envelope, dict) else None
+    sha = str((doc or {}).get(field) or "").lower() if isinstance(doc, dict) else ""
+    if got.returncode == 0 and isinstance(envelope, dict) and envelope.get("ok") is True and SHA40.fullmatch(sha):
+        return sha, ""
+    why = envelope.get("error") if isinstance(envelope, dict) else ""
+    return "", land_trim(land_tail("\n".join(str(w).strip() for w in (got.stderr, why) if str(w or "").strip())
+                                   or f"exit {got.returncode}"), 160)
+
+
+def land_resync_said(rs: dict, head: str) -> str:
+    """What this queue's resync (pr_resync) at HEAD did, for a pr_head_unsynced stop's reason."""
+    if rs.get("head") != head:
+        return "no resync was sent"
+    if rs.get("sha"):
+        return f"this queue pushed {str(rs['sha'])[:12]}, a resync commit on {str(rs.get('tip') or '')[:12]}"
+    return f"this queue's resync failed: {rs.get('why') or '?'}"
+
+
+def land_resync_hint(repo: str, branch: str, tip: str, name: str) -> str:
+    """A pr_head_unsynced stop's next step: the resync by hand (a commit with TIP's tree on TIP, pushed to BRANCH),
+    then the land re-pinned. Never close and reopen: the broker refuses a lane's reopen of a branch it did not push."""
+    return (f"push a commit with {tip[:12]}'s tree on it to {branch}, which makes GitHub read the branch again (git "
+            f"fetch origin {branch} && git push origin \"$(git commit-tree {tip}^{{tree}} -p {tip} -m 'Resync PR "
+            f"head')\":refs/heads/{branch}; or lane-gh call commit_create {repo} then ref_update with expected {tip}), "
+            f"then glaeda-gh land {name} --sha <that commit>")
+
+
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
                             force: str = "") -> list[str]:
     """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
@@ -15992,9 +16024,10 @@ LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the 
 # shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
 # another commit, the PR object is what lags, not the branch: GitHub made the branch's new head (someone's update-branch, a
 # push) and has not synchronized the PR to it, so no further update-branch can succeed and none is counted toward
-# LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_SYNC_STUCK it stops pr_head_unsynced, naming the
-# one step that made GitHub read the branch again: closing and reopening the PR (a new commit pushed at 08:02Z did
-# not; the reopen at 08:08Z read head 1fd256a5 at once). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
+# LAND_STEP_STOP. The row waits for the PR to follow; past LAND_PR_RESYNC_AFTER it resyncs the PR itself (pr_resync:
+# a commit with the tip's tree, fast-forwarded onto the branch), and past LAND_PR_SYNC_STUCK it stops
+# pr_head_unsynced naming that commit, never close and reopen (the broker refuses a lane's reopen and left cmux#55880
+# closed; on #56682 a reopen at 08:08Z synced it after a push at 08:02Z had not). manaflow-ai/cmux#56682, 2026-11-26: GitHub's
 # own update-branch made 40818337 (07:28:42Z, committer web-flow), and 30 min later pulls/56682 still read head
 # 54746b5f, updated_at 06:06Z, with no check run at 40818337; this queue sent update-branch at 54746b5f five times
 # (07:29-07:41Z), each refused for the head mismatch and counted as a refusal of the PR.
@@ -16009,13 +16042,26 @@ LAND_PIN_PARENT_WAIT = 300.0
 # (2026-11-25 17:12Z-19:59Z, manaflow-ai/cmux#53399, #55811, #53921, #53968: 3 update_head_unread stops asked for a
 # re-pin, and each re-pin stopped head_moved 300 s later, the PR still at the old head).
 LAND_PR_SYNC_MAX = 1800.0
-# How long that same wait goes before the daemon closes and reopens the PR itself (LandQueue.pr_reopen), once per
-# update: GitHub syncs a PR's head to its branch on reopen. 2026-11-25: manaflow-ai/cmux#57070 (3309 s) and #54988
-# (4896 s) stopped pr_head_unsynced within one hour; each time a person ran `gh pr close && gh pr reopen` and the PR
-# showed the update's commit within ~25 s. Only for the queue's own clean base merge (update_tip_clean), with the
-# branch ref read again just before the close; the pin then follows the new head only through pin_follow (its first
-# parent is the pin the update was sent at), so a foreign push is never carried and land_judge judges the new head.
-LAND_PR_REOPEN_AFTER = 600.0
+# How long a PR whose head GitHub has not synced to its branch (an own update's tip unread, or an update-branch
+# refused for the head mismatch: branch_ahead) waits before the daemon resyncs it itself (LandQueue.pr_resync), once
+# per head: one commit with the branch tip's tree, parented on the tip, fast-forwarded onto the branch (git data API:
+# commit_create, then ref_update pinned to the tip). A new push makes GitHub read the branch again, and the commit
+# changes no file. manaflow-ai/cmux#56127, 2026-11-26 15:22Z: the PR read 8c1ad9cb, its branch da6fd637 (a base
+# merge at 14:35Z); that commit (6b8f24a8) synced the PR in under 20 s; #47299 (09:58Z) the same way. The step a stop
+# named before, close and reopen, is refused to a lane VM that did not push the branch (the broker's pr_reopen):
+# cmux#55880 was left closed at 11:40Z. The pin is carried to that commit only when the tip it copies is the pin
+# merged with its base (update_tip_clean); any other tip is resynced and then judged head_moved, as a push is.
+LAND_PR_RESYNC_AFTER = 600.0
+LAND_PR_RESYNC_MESSAGE = ("Resync PR #{number}'s head to {branch}\n\nGitHub stopped syncing the PR's head to its branch at "
+                          "{tip}; this commit changes no file (glaeda-gh land: pr_resync).")
+# On a host with its own login (not a broker client), how long after a resync that GitHub's PR still does not show
+# the queue closes and reopens the PR itself (LandQueue.pr_reopen), once per update: GitHub syncs a PR's head on
+# reopen. 2026-11-25: manaflow-ai/cmux#57070 (3309 s) and #54988 (4896 s) stopped pr_head_unsynced within one hour;
+# each time a person ran `gh pr close && gh pr reopen` and the PR showed the update's commit within ~25 s
+# (cmux#56682, 2026-11-26 08:02Z: a pushed commit did not sync it; the reopen at 08:08Z did). Only for the queue's own
+# clean base merge (update_tip_clean), with the branch ref read again just before the close. Never on a lane VM: the
+# broker refuses its reopen of a branch it did not push, and the PR is left closed.
+LAND_PR_REOPEN_AFTER = 300.0
 # A copy of the PR reading CLOSED that was read before a reopen of the daemon's own, or this soon after it (GitHub's
 # reads lag), is that close's, not a person's: it does not end the row (retire_from_cache).
 LAND_PR_REOPEN_LAG = 120.0
@@ -22146,7 +22192,9 @@ class LandQueue:
         if kind == "head_change":
             # After a push-making step: never judge (or pin) a head read before it.
             if head and head != w.get("before"):
-                if (e.get("lastAction") or {}).get("kind") == "update_branch":
+                if self.pin_resynced(e, head):
+                    pass  # this queue's own resync commit of the pin's clean base merge: the pin is carried to it
+                elif (e.get("lastAction") or {}).get("kind") == "update_branch":
                     # this queue's own base merge made it (update_again); the time it was read is when this land is
                     # known to have made that head (land_own_head_at).
                     e["updatedHead"], e["updatedHeadAt"] = head, self.now
@@ -24978,7 +25026,22 @@ class LandQueue:
         if kind == "update_branch" and got.returncode not in (0, 124) \
                 and LAND_HEAD_MISMATCH.search(f"{got.stderr or ''}\n{got.stdout or ''}"):
             # off the lock: one read of the branch ref, only for this refusal
-            ref = self.update_live_tip(e, (self.cache_of(e["key"]) or {}).get("data") or {})[0]
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            ref = self.update_live_tip(e, data)[0]
+            if ref and ref != head and self.branch_resync_due(e, head, ref):
+                # GitHub's PR has not followed its branch for LAND_PR_RESYNC_AFTER: resync it (pr_resync), carrying
+                # the pin only to a tip that is the pin merged with its base.
+                base = str(data.get("baseRefName") or "")
+                carry = bool(base) and self.update_tip_clean(e, head, ref, base)
+                if self.pr_resync(e, head, ref, data, carry=carry):
+                    with self.lock:
+                        e.pop("updateSent", None)
+                        self.finish(e, got)
+                        self.nudge(e["key"])
+                        self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
+                                      "why": f"resynced: the branch was at {ref[:12]}, GitHub's PR read {head[:12]}"},
+                                  LAND_HEAD_TIMEOUT)
+                    return
         with self.lock:
             if kind == "update_branch" and got.returncode not in (0, 124):
                 # refused: not sent; step_refused counts and backs off its retries. A timeout (124) may have reached
@@ -25734,8 +25797,18 @@ class LandQueue:
         # nothing". One REST read of the branch ref tells the two apart (update_live_tip).
         tip, branch = self.update_live_tip(e, data) if behind else ("", "")
         if tip and tip != head:
-            # Read on the second look only (the first waits, and most reads catch up by then).
-            clean = (e.get("updateUnread") or {}).get("head") == head and self.update_tip_clean(e, head, tip, base)
+            # Read on the second look only (the first waits, and most reads catch up by then). A tip that is this
+            # queue's own resync commit of the update's clean tip (pr_resync) is that same tip, unread.
+            rs = e.get("prResync") or {}
+            mine = rs.get("head") == head and rs.get("sha") == tip and bool(rs.get("carry"))
+            clean = (e.get("updateUnread") or {}).get("head") == head \
+                and (mine or self.update_tip_clean(e, head, tip, base))
+            if clean and not mine and self.pr_resync_due(e, head) \
+                    and self.pr_resync(e, head, tip, data, carry=True, own=True):
+                with self.lock:
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                return True
             if clean and self.pr_reopen_due(e, head) and self.pr_reopen(e, head, tip, data):
                 return True
             with self.lock:
@@ -25762,22 +25835,21 @@ class LandQueue:
                     return True
                 if clean:
                     tried = u.get("reopen") or {}
-                    if tried.get("reopened"):
-                        self.stop(e, "pr_head_unsynced",
-                                  f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with "
-                                  f"{base}, GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
-                                  f"{self.now - since:.0f} s, {self.now - float(tried.get('at') or self.now):.0f} s "
-                                  "after this queue closed and reopened it: GitHub has not synced the PR to its branch",
-                                  f"gh pr view {number} -R {repo} --json headRefOid (when it shows {tip[:12]}: "
-                                  f"glaeda-gh land {name} --sha {tip})")
-                        return True
+                    made = f"{head[:12]} merged with {base}" if not mine else \
+                        f"this queue's resync of {str(rs.get('tip') or '')[:12]}, {head[:12]} merged with {base}"
+                    did = land_resync_said(rs, head) + (
+                        f"; closed and reopened it {self.now - float(tried.get('at') or self.now):.0f} s ago"
+                        if tried.get("reopened") else
+                        f"; its close-and-reopen failed: {tried['why']}" if tried.get("why") else "")
+                    if mine or tried.get("reopened"):
+                        nxt = (f"gh pr view {number} -R {repo} --json headRefOid (when it shows {tip[:12]}: "
+                               f"glaeda-gh land {name} --sha {tip})")
+                    else:
+                        nxt = land_resync_hint(repo, branch, tip, name)
                     self.stop(e, "pr_head_unsynced",
-                              f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with {base}, "
-                              f"GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
-                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch"
-                              + (f" (this queue's close-and-reopen failed: {tried['why']})" if tried.get("why") else ""),
-                              f"gh pr close {number} -R {repo} && gh pr reopen {number} -R {repo} (GitHub syncs the "
-                              f"PR's head on reopen), then glaeda-gh land {name} --sha {tip}")
+                              f"the update-branch sent at {head[:12]} made {tip[:12]} ({made}, GitHub's {branch} ref), "
+                              f"but GitHub's PR still shows {head[:12]} after {self.now - since:.0f} s: GitHub has not "
+                              f"synced the PR to its branch ({did})", nxt)
                     return True
                 self.stop(e, "update_head_unread",
                           f"the update-branch sent at {head[:12]} {waited:.0f} s ago made {tip[:12]} (GitHub's {branch} "
@@ -25811,12 +25883,108 @@ class LandQueue:
         return True
 
     def pr_reopen_due(self, e: dict, head: str) -> bool:
-        """Whether the queue closes and reopens E's PR now (LAND_PR_REOPEN_AFTER): its own update at HEAD made a clean
-        base merge GitHub's PR has not shown for that long, and no close-and-reopen was tried for this update yet."""
-        u = e.get("updateUnread") or {}
-        if u.get("head") != head or u.get("reopen"):
+        """Whether the queue closes and reopens E's PR now (LAND_PR_REOPEN_AFTER), the second step after a resync: on a
+        host with its own login only (never a broker client), its own update at HEAD made a clean base merge GitHub's PR
+        has not shown, this queue's resync of it failed or was not shown for LAND_PR_REOPEN_AFTER, and no
+        close-and-reopen was tried for this update yet."""
+        u, rs = e.get("updateUnread") or {}, e.get("prResync") or {}
+        if u.get("head") != head or u.get("reopen") or rs.get("head") != head or self.broker_client():
             return False
-        return self.now - float(u.get("at") or self.now) >= LAND_PR_REOPEN_AFTER
+        return not rs.get("sha") or self.now - float(rs.get("at") or self.now) >= LAND_PR_REOPEN_AFTER
+
+    def pr_resync_due(self, e: dict, head: str) -> bool:
+        """Whether the queue resyncs E's PR now (LAND_PR_RESYNC_AFTER): GitHub's PR has read HEAD for that long while
+        its branch is past it (updateUnread), and no resync was tried at HEAD yet."""
+        u = e.get("updateUnread") or {}
+        if u.get("head") != head or (e.get("prResync") or {}).get("head") == head:
+            return False
+        return self.now - float(u.get("at") or self.now) >= LAND_PR_RESYNC_AFTER
+
+    def pr_resync(self, e: dict, head: str, tip: str, data: dict, carry: bool, own: bool = False) -> bool:
+        """Off the lock. Make GitHub sync E's PR (which reads HEAD) to its branch, at TIP: one commit with TIP's tree on
+        TIP, fast-forwarded onto the branch (LAND_PR_RESYNC_AFTER's comment). A broker client (a lane VM) sends the
+        broker's commit_create and ref_update (expected: TIP, so a push since is never overwritten); a host with its own
+        login GitHub's REST POST git/commits and PATCH git/refs (force false). The ref is read again first: a tip that
+        moved sends nothing. CARRY: TIP is the pin merged with its base (update_tip_clean), and the pin follows the new
+        commit once GitHub's PR shows it (pin_resynced); OWN: that merge is this queue's own update. Recorded in
+        e["prResync"] either way, once per HEAD; True when the commit is on the branch (the caller waits for the head)."""
+        repo, number, gh = e["repo"], str(e["number"]), self.gh()
+        if gh is None:
+            return False
+        now_tip, branch = self.update_live_tip(e, data)
+        if not now_tip or now_tip != tip:
+            return False
+        pin = str(e.get("pinSha") or "").lower()
+        got = self.call([gh, "api", f"repos/{repo}/git/commits/{tip}", "--jq", ".tree.sha"], LAND_GH_DEADLINE)
+        tree = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
+        new, why = "", ""
+        if not SHA40.fullmatch(tree):
+            why = "the tip's tree: " + land_trim(land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip()
+                                                           or f"exit {got.returncode}"), 160)
+        else:
+            message = LAND_PR_RESYNC_MESSAGE.format(number=number, branch=branch, tip=tip)
+            if self.broker_client():
+                lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
+                made = self.call([lane_gh, "call", "commit_create", repo, json.dumps(
+                    {"tree": tree, "parents": [tip], "message": message}, sort_keys=True)], LAND_GH_DEADLINE, e)
+                new, why = land_broker_sha(made, "sha")
+                if new:
+                    moved = self.call([lane_gh, "call", "ref_update", repo, json.dumps(
+                        {"branch": branch, "sha": new, "expected": tip}, sort_keys=True)], LAND_GH_DEADLINE, e)
+                    at, why = land_broker_sha(moved, "sha")
+                    why = "the ref_update: " + why if why else "" if at == new else f"the ref_update answered {at!r}"
+                else:
+                    why = "the commit_create: " + why
+            else:
+                made = self.call([gh, "api", f"repos/{repo}/git/commits", "-X", "POST", "-f", f"message={message}",
+                                  "-f", f"tree={tree}", "-f", f"parents[]={tip}", "--jq", ".sha"], LAND_GH_DEADLINE, e)
+                new = (made.stdout or "").strip().lower() if made.returncode == 0 else ""
+                if not SHA40.fullmatch(new):
+                    why = "the commit: " + land_trim(land_tail(f"{made.stderr or ''} {made.stdout or ''}".strip()
+                                                              or f"exit {made.returncode}"), 160)
+                    new = ""
+                else:
+                    moved = self.call([gh, "api", f"repos/{repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}",
+                                       "-X", "PATCH", "-f", f"sha={new}", "-F", "force=false", "--jq", ".object.sha"],
+                                      LAND_GH_DEADLINE, e)
+                    at = (moved.stdout or "").strip().lower() if moved.returncode == 0 else ""
+                    why = "" if at == new else "the ref update: " + land_trim(land_tail(
+                        f"{moved.stderr or ''} {moved.stdout or ''}".strip() or f"answered {at!r}"), 160)
+        with self.lock:
+            rec = {"head": head, "tip": tip, "branch": branch, "at": self.now, "carry": bool(carry and pin == head),
+                   "own": own, "pin": pin}
+            if why or not new:
+                rec["why"] = why or "no commit was made"
+                e["prResync"] = rec
+                self.history(e, "pr_resync_failed", head=head[:12], tip=tip[:12], why=land_trim(rec["why"], 200))
+                self.save(e)
+                return False
+            rec["sha"] = new
+            e["prResync"] = rec
+            self.history(e, "pr_resynced", head=head[:12], tip=tip[:12], sha=new[:12],
+                         why=f"GitHub's PR read {head[:12]} while {branch} was at {tip[:12]}: pushed {new[:12]} "
+                             f"(its tree, on it) so GitHub syncs the PR" + (", the pin follows it" if rec["carry"]
+                                                                           else ""))
+            log({"event": "land-pr-resynced", "key": e["key"], "head": head, "tip": tip, "sha": new,
+                 "carry": rec["carry"]})
+            self.save(e)
+            return True
+
+    def pin_resynced(self, e: dict, head: str) -> bool:
+        """Under the lock. E's pin follows HEAD when HEAD is the commit this queue's own pr_resync made of a tip that
+        was the pin merged with its base (carry): the same tree, its only parent that tip. True when it followed."""
+        rs = e.get("prResync") or {}
+        pin = str(e.get("pinSha") or "").lower()
+        if not rs.get("carry") or rs.get("sha") != head or not pin or rs.get("pin") != pin:
+            return False
+        e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
+        e.pop("pinFollow", None)
+        if rs.get("own"):
+            e["updatedHead"], e["updatedHeadAt"] = head, self.now
+        self.history(e, "pin_followed", was=pin[:12], head=head[:12], parent=str(rs.get("tip") or "")[:12],
+                     step="pr_resync")
+        self.save(e)
+        return True
 
     def pr_reopen(self, e: dict, head: str, tip: str, data: dict) -> bool:
         """Close and reopen E's PR so GitHub syncs its head to TIP, the branch ref this queue's own update-branch at
@@ -26001,8 +26169,11 @@ class LandQueue:
         HEAD: GitHub's PR has not followed its branch (LAND_HEAD_MISMATCH's comment). Not counted; a wait for the PR
         to show the new head, or a stop naming the resync once LAND_PR_SYNC_STUCK has passed."""
         w = e.get("branchAhead")
-        if not isinstance(w, dict) or w.get("head") != head or w.get("ref") != ref:
+        rs = e.get("prResync") or {}
+        resynced = rs.get("head") == head and rs.get("sha") == ref  # the branch is at this queue's own resync commit
+        if not isinstance(w, dict) or w.get("head") != head or (w.get("ref") != ref and not resynced):
             w = e["branchAhead"] = {"head": head, "ref": ref, "since": self.now}
+        w["ref"] = ref
         waited = self.now - float(w.get("since") or self.now)
         self.history(e, "branch_ahead_of_pr", head=head[:12], ref=ref[:12], waited=round(waited))
         e.pop("updateSent", None)
@@ -26010,17 +26181,25 @@ class LandQueue:
             name = key_name(e["key"])
             data = (self.cache_of(e["key"]) or {}).get("data") or {}
             branch = str(data.get("headRefName") or "the branch")
+            nxt = (f"gh pr view {e['number']} -R {e['repo']} --json headRefOid (when it shows {ref[:12]}: glaeda-gh "
+                   f"land {name} --sha {ref})") if resynced else land_resync_hint(e["repo"], branch, ref, name)
             self.stop(e, "pr_head_unsynced",
                       f"GitHub's PR still reads head {head[:12]} {waited / 60:.0f} min after its branch {branch} moved "
                       f"to {ref[:12]}: GitHub has not synchronized the PR to its branch, so update-branch at "
-                      f"{head[:12]} is refused ({land_trim(land_tail(out), 160)})",
-                      f"close and reopen the PR so GitHub reads its branch again (gh pr close {e['number']} -R "
-                      f"{e['repo']} && gh pr reopen {e['number']} -R {e['repo']}; nothing in {branch} changes), then "
-                      f"glaeda-gh land {name} --sha <the head it then reads>")
+                      f"{head[:12]} is refused ({land_trim(land_tail(out), 160)}; {land_resync_said(rs, head)})", nxt)
             return
         self.wait(e, {"kind": "head_change", "before": head, "since": self.now,
                       "why": f"the branch is at {ref[:12]}; GitHub's PR still reads {head[:12]}"},
                   min(LAND_HEAD_TIMEOUT, max(60.0, LAND_PR_SYNC_STUCK - waited)))
+
+    def branch_resync_due(self, e: dict, head: str, ref: str) -> bool:
+        """Whether an update-branch at HEAD refused for the head mismatch, with the branch at REF, resyncs the PR now:
+        GitHub's PR has read HEAD past its branch for LAND_PR_RESYNC_AFTER (branchAhead) and no resync was tried at
+        HEAD yet (pr_resync, once per head)."""
+        w = e.get("branchAhead") or {}
+        if w.get("head") != head or (e.get("prResync") or {}).get("head") == head:
+            return False
+        return self.now - float(w.get("since") or self.now) >= LAND_PR_RESYNC_AFTER
 
     def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess,
                      branch_ref: str = "") -> str | None:
