@@ -2564,6 +2564,48 @@ class GraphqlDietTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 2)  # its check event re-read it at once
         self.assertTrue(gg.read_cache(key)["data"]["settled"])
 
+    @mock.patch.object(gg, "HEAD_QUIET_FED_TTL", 400)  # under HEAD_INTEREST: register() stamps the wall clock
+    def test_a_running_head_the_feed_is_quiet_about_is_read_at_the_quiet_ttl(self) -> None:
+        # HEAD_QUIET_FED_TTL: the glaeda land host, 2026-11-26, spent 274 of each 600 s reading heads.
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        read_at = gg.read_cache(key)["dataAt"]
+        t = NOW + gg.TICK
+        while t < read_at + gg.HEAD_QUIET_FED_TTL - gg.HEAD_ALIGN - gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertGreater(t - read_at, gg.HEAD_PENDING_FED_TTL)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # quiet past the fed TTL: not polled
+        while t < read_at + gg.HEAD_QUIET_FED_TTL + gg.TICK:
+            t += gg.TICK
+            gg.register(key, consumer="merge-guard")
+            self.daemon.tick(t)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # the quiet TTL: read once more (a lost delivery's bound)
+
+    def test_a_running_head_read_before_the_feed_went_live_keeps_the_fed_ttl(self) -> None:
+        sha = "a" * 40
+        self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        key = gg.parse_key("head", f"o/r@{sha}")
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        gg.register(key, consumer="merge-guard")
+        self.daemon.tick(NOW + gg.TICK)
+        e = {"key": key, "cache": gg.read_cache(key)}
+        self.assertTrue(self.daemon.head_feed_quiet(e))
+        self.daemon.feed_live_since = e["cache"]["dataAt"] + 1  # a gap after the read: what came in it is unknown
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+        self.assertEqual(self.daemon.head_ttl(e), gg.HEAD_PENDING_FED_TTL)
+        self.daemon.feed_live_since = e["cache"]["dataAt"] - 1
+        self.daemon.feed_marks[f"sha:o/r@{sha}"] = e["cache"]["dataAt"] + 1  # an event on the commit since its read
+        self.assertFalse(self.daemon.head_feed_quiet(e))
+
     def test_a_check_event_inside_the_retry_gate_is_kept_until_the_head_is_read(self) -> None:
         sha = "a" * 40
         self.gh.heads[("o", "r", sha)] = [check_run("CI / build", "IN_PROGRESS", None)]

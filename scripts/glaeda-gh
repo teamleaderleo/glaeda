@@ -951,6 +951,12 @@ DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may 
 RECENT_ERRORS_KEEP = 3600  # daemon.json's recentErrors: the distinct errors of this long, newest first
 COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
 HEAD_PENDING_FED_TTL = 180  # a running head on such a repository: its check events re-read it sooner
+# ... and one the feed has said nothing about since its last read: the feed answered without a gap from before that
+# read (feed_live_since) and delivered no run, suite or status for the commit since (feed_marks). Its next check event
+# nudges it and it is read at once (nudge, NUDGE_MIN), so the 180 s poll only re-read an unchanged rollup. The glaeda
+# land host, 2026-11-26: the read loop spent 581 of each 600 s reading, 274 of them on heads, and waited PR copies aged
+# a median 2,538 s behind them. A quiet head is re-read at the settled TTL, the bound for a lost delivery.
+HEAD_QUIET_FED_TTL = 600
 HEAD_ALIGN = 30  # a head read also takes the heads due within this long, so they share one query
 CONTROLLER_FRESH = 60  # the controller's feed answered this recently: its webhooks are flowing
 FED_REPO_KEEP = 3600  # a repository the feed delivered an event for this recently is one the controller covers
@@ -9830,7 +9836,22 @@ class Daemon:
         data = (e["cache"] or {}).get("data") or {}
         if data.get("settled"):
             return HEAD_SETTLED_TTL
-        return HEAD_PENDING_FED_TTL if self.fed(e["key"]) else HEAD_PENDING_TTL
+        if not self.fed(e["key"]):
+            return HEAD_PENDING_TTL
+        return HEAD_QUIET_FED_TTL if self.head_feed_quiet(e) else HEAD_PENDING_FED_TTL
+
+    def head_feed_quiet(self, e: dict) -> bool:
+        """Whether the feed has followed this head's repository without a gap since before its last read and delivered
+        no run, suite or status for the commit since then (HEAD_QUIET_FED_TTL)."""
+        at = (e["cache"] or {}).get("dataAt")
+        since = getattr(self, "feed_live_since", None)
+        if not isinstance(at, (int, float)) or since is None or since > at:
+            return False
+        try:
+            _, owner, repo, sha = split_key(e["key"])
+        except ValueError:
+            return False
+        return getattr(self, "feed_marks", {}).get(f"sha:{owner}/{repo}@{sha}".lower(), float("-inf")) < at
 
     def write_consumers(self) -> None:
         policy = consumer_policy()
