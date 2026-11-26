@@ -16333,7 +16333,9 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
 LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cycle is 60 s)
 # A land is its requester's intent to merge, so a draft is no longer a stop of its own (2026-11-26: cmux#58227 and
 # cmuxterm-hq#28522 each stopped merge_draft after a passing judgment, and their requesters had to `gh pr ready` and
-# re-queue, one wasted land cycle each, with two more queued drafts waiting to stop the same way). The queue now marks
+# re-queue, one wasted land cycle each, with two more queued drafts waiting to stop the same way). Their common
+# source: `lane-gh push` auto-opens a draft for every new lane/ branch, and only a later `gh pr create` readies it, a
+# step a lane that queues its land straight after the push skips. The queue now marks
 # it ready itself: at the request when this host's cache already knows it is a draft (land_ready_at_request), and at
 # the merge's draft refusal otherwise (LandQueue.mark_ready), which covers lands queued by any tool. Once per head:
 # a PR converted back to a draft after that is someone's deliberate hold, and stops merge_draft as before; so does a
