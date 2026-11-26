@@ -15,7 +15,8 @@ fetch from GitHub never happens during a build.
 - The mirror is bare and has full history and blobs: never shallow (a `shallow.lock` directory makes
   any depth-limited fetch into it fail) and never partial. It holds refs/heads/{main, feat-cmux-next,
   nightly-next}, forced to GitHub's, and nothing else. Measured 2026-10-27: 2.21 GiB, 760k objects.
-- Every LaunchAgent pass (StartInterval 60) fetches those three refs from GitHub. A pass with nothing
+- Every LaunchAgent pass (StartInterval 60) fetches those three refs through the controller's git proxy, from
+  GitHub directly only when the proxy fails (the record's fetch.via says which). A pass with nothing
   new takes under a second. Each try has a time limit (FETCH_TIMEOUT) and git's low-speed abort (under
   1 KiB/s for 60 s); there are FETCH_TRIES tries with backoff.
 - A missing or broken mirror is seeded from the R2 git bundle that cmux's git-mirror-bundle.yml
@@ -40,7 +41,9 @@ fetch from GitHub never happens during a build.
 
 It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and a mirror
 source is configured (SOURCE_CONFIG), and is a no-op anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
-the bucket are public. Prints one JSON line; the last pass's record is GIT_DIR/cmux.json.
+the bucket are public, and every fetch asks the build controller's git proxy first (PROXY_DEFAULT), which
+fetches with a token, so the office's shared address sends GitHub no anonymous poll. Prints one JSON line;
+the last pass's record is GIT_DIR/cmux.json.
 """
 
 from __future__ import annotations
@@ -67,6 +70,18 @@ GIT_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git")
 MIRROR = GIT_DIR / "cmux.git"
 RECORD = GIT_DIR / "cmux.json"
 REPO_URL = os.environ.get("GLAEDA_GIT_MIRROR_REPO", "https://github.com/manaflow-ai/cmux.git")
+# The build controller's read-only git proxy (cmuxterm-hq build-fleet/cmd/controller/git_proxy.go): it fetches
+# from GitHub with an App read token and caches the packs, so a pass that goes through it is authenticated and
+# N minis' polls cost GitHub at most one fetch. 23 office Macs share one NAT address and this tool polled
+# github.com anonymously from each of them once a minute (about 1,400 fetches an hour); on 2026-11-26 GitHub
+# started answering every anonymous request from that address with 403 (Leo: "why are we getting 403 on
+# github?"). So each fetch asks the proxy first and GitHub directly only when the proxy fails.
+# GLAEDA_GIT_MIRROR_PROXY: a base URL, or "off"; else $CMUX_CI_CONTROLLER, the cmux-ci client config, the default.
+PROXY_DEFAULT = "http://100.89.225.106:18765"
+PROXY_CONFIG = ".local/share/cmux-fleet-client/client.json"
+PROXY_REPOS = frozenset({"manaflow-ai/cmux", "manaflow-ai/ghostty", "manaflow-ai/ghostty-next",
+                         "manaflow-ai/homebrew-cmux"})  # the proxy's gitProxyRepos
+GITHUB_REPO = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?")
 # cmux's NEXT cache bucket (public reads; cmux git-mirror-bundle.yml writes it).
 BUCKET_URL = os.environ.get("GLAEDA_GIT_MIRROR_BUCKET_URL", "https://ci-cache-next.cmux.com")
 BUNDLE_PREFIX = "git-mirror-cmux-"
@@ -351,6 +366,39 @@ def refspecs() -> list[str]:
     return [f"+refs/heads/{branch}:refs/heads/{branch}" for branch in BRANCHES]
 
 
+def proxy_base(home: Path | None = None) -> str | None:
+    """The controller whose git proxy this pass fetches through, or None (off, or no usable URL)."""
+    base = os.environ.get("GLAEDA_GIT_MIRROR_PROXY", "").strip() or os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if not base:
+        try:
+            doc = json.loads(((home or Path.home()) / PROXY_CONFIG).read_text())
+            base = doc.get("controller") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            base = None
+        base = base or PROXY_DEFAULT
+    return base.rstrip("/") if isinstance(base, str) and base.startswith(("http://", "https://")) else None
+
+
+def proxied(url: str, home: Path | None = None) -> str | None:
+    """`url` (a github.com repository the proxy serves) as the controller proxy's URL, else None."""
+    match = GITHUB_REPO.fullmatch(url)
+    if not match or match.group(1) not in PROXY_REPOS:
+        return None
+    base = proxy_base(home)
+    return f"{base}/v1/git/{match.group(1)}.git" if base else None
+
+
+def fetch_via_proxy(mirror: Path, url: str, *, proxy: str | None, **kwargs) -> dict:
+    """fetch() from the controller proxy (one try), then, only if that fails, from `url` itself."""
+    if proxy:
+        through = fetch(mirror, proxy, **{**kwargs, "tries": 1})
+        if through["ok"]:
+            return {**through, "via": "proxy"}
+        direct = fetch(mirror, url, **kwargs)
+        return {**direct, "via": "github", "proxy_errors": through["errors"]}
+    return {**fetch(mirror, url, **kwargs), "via": "github"}
+
+
 def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = FETCH_TIMEOUT,
           runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
           sleep: Callable[[float], None] = time.sleep, extra: Sequence[str] = ()) -> dict:
@@ -412,7 +460,7 @@ def has_commit(repo: Path, sha: str) -> bool:
         return False
 
 
-def submodule_pass(mirror: Path, *, root: Path | None = None,
+def submodule_pass(mirror: Path, *, root: Path | None = None, home: Path | None = None,
                    runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
                    sleep: Callable[[float], None] = time.sleep) -> dict:
     """Keep root/<name>.git holding every submodule pin on the mirror's tips; GitHub only for a missing pin."""
@@ -426,16 +474,25 @@ def submodule_pass(mirror: Path, *, root: Path | None = None,
         for key, value in SUBMODULE_CONFIG.items():
             git(repo, "config", key, value, timeout=30)
         git(repo, "config", "glaeda.url", entry["url"], timeout=30)  # the runner hook's shim matches on it
-        fetched, errors = [], []
+        fetched, errors, via = [], [], {}
         for pin in entry["pins"]:
             if has_commit(repo, pin):
                 continue
-            command = [GIT, *LOW_SPEED, "-C", os.fspath(repo), "fetch", "--quiet", "--no-tags", "--depth=1",
-                       entry["url"], f"+{pin}:refs/pins/{pin}"]
-            for attempt in range(1, SUBMODULE_TRIES + 1):
-                status, err = runner(command, SUBMODULE_TIMEOUT)
+            def command(url: str) -> list[str]:
+                return [GIT, *LOW_SPEED, "-C", os.fspath(repo), "fetch", "--quiet", "--no-tags", "--depth=1",
+                        url, f"+{pin}:refs/pins/{pin}"]
+            if proxy := proxied(entry["url"], home):
+                status, err = runner(command(proxy), SUBMODULE_TIMEOUT)
                 if status == 0:
                     fetched.append(pin)
+                    via["proxy"] = via.get("proxy", 0) + 1
+                    continue
+                drop_leftovers(repo)
+            for attempt in range(1, SUBMODULE_TRIES + 1):
+                status, err = runner(command(entry["url"]), SUBMODULE_TIMEOUT)
+                if status == 0:
+                    fetched.append(pin)
+                    via["github"] = via.get("github", 0) + 1
                     break
                 drop_leftovers(repo)
                 if attempt == SUBMODULE_TRIES:
@@ -450,7 +507,7 @@ def submodule_pass(mirror: Path, *, root: Path | None = None,
             git(repo, "update-ref", "refs/heads/main", held_pins[0], timeout=30)
             git(repo, "symbolic-ref", "HEAD", "refs/heads/main", timeout=30)
         report[name] = {"pins": len(entry["pins"]), "held": len(held_pins), "fetched": len(fetched),
-                        **({"errors": errors} if errors else {})}
+                        **({"via": via} if via else {}), **({"errors": errors} if errors else {})}
     return report
 
 
@@ -592,7 +649,7 @@ def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Pa
         extra = ["--refetch"]
         if (repo / "shallow").exists():
             extra.append("--unshallow")
-        result = fetch(repo, REPO_URL, extra=extra, timeout=DOWNLOAD_TIMEOUT)
+        result = fetch_via_proxy(repo, REPO_URL, proxy=proxied(REPO_URL), extra=extra, timeout=DOWNLOAD_TIMEOUT)
         if not result["ok"]:
             raise RuntimeError(f"R2 bundle: {type(error).__name__}; GitHub: {result['errors'][-1]}") from error
         return f"github (bundle: {type(error).__name__})"
@@ -859,7 +916,7 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             # A repair in place runs for up to DOWNLOAD_TIMEOUT under the flock, so no later pass fetches until it
             # ends: fetch the new commits first (a fetch only adds objects) and record them, so the mirror's tips
             # stay current while it repairs. Jobs still wait for the repair (the runner hook reads REPAIR_PENDING).
-            early = fetch(MIRROR, REPO_URL, tries=1)
+            early = fetch_via_proxy(MIRROR, REPO_URL, proxy=proxied(REPO_URL, home), tries=1)
             if early["ok"]:
                 early_heads = heads(MIRROR)
             previous = write_record({**record, "fetch": early, "state": "repairing"}, previous)
@@ -868,7 +925,7 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             if problem:
                 record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
             configure(MIRROR)
-            result = fetch(MIRROR, REPO_URL)
+            result = fetch_via_proxy(MIRROR, REPO_URL, proxy=proxied(REPO_URL, home))
         finally:
             if not result["ok"]:
                 # The bundle set the branches to its own (older) tips, and nothing fetched since: put back what the
@@ -881,7 +938,7 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
                             pass  # the next pass fetches the tips again
         record["fetch"] = result
         try:
-            record["submodules"] = submodule_pass(MIRROR)
+            record["submodules"] = submodule_pass(MIRROR, home=home)
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             record["submodules"] = {"error": f"{type(error).__name__}: {str(error)[:300]}"}
         folded = fold_packs(MIRROR)

@@ -14436,6 +14436,15 @@ LAND_REFRESH_BROKER = re.compile(r"^no answer within \d|\bdirect: (?:busy\b|.*\b
 LAND_REFRESH_BROKER_HOLD = 30.0
 LAND_REFRESH_BROKER_HOLD_MAX = 600.0
 LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land status` names the entry's (count, error)
+
+
+def land_refresh_last_error(e: dict) -> dict:
+    """The error E's last refresh ended with, kept on the record a new refresh starts ({"error": ...}, else {}), so
+    `land status` names it while that refresh runs. gcp-agent-lane-14, 2026-11-26 07:29Z: "refresh unanswered 4x: ?"
+    on cmux#54723, #54705 and #54158, each refused by the broker's commit-checks sweep count every time, because each
+    start replaced the record and dropped the error the refresh before it had answered."""
+    error = (e.get("refresh") or {}).get("error") if int(e.get("refreshUnanswered") or 0) else None
+    return {"error": error} if error else {}
 # A host with its own login (the broker host) reads its landing PRs in the daemon's waited pass, and the land worker's
 # nudge only marks the PR waited there. With hundreds of waited PRs that pass ran hours behind, and nothing else read a
 # due entry's PR: 2026-11-22 01:00Z, a PR (157/157 green, three pinned land requests at one head) sat on a copy
@@ -14710,6 +14719,19 @@ LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land wai
 # Past it the row stops head_moved as before, so a real force-push back to the replaced head still stops it.
 LAND_REPLACED_HEAD_WAIT = 300.0
 LAND_MOVED_NEXT = re.compile(r"--(?:sha|match-head-commit) ([0-9a-f]{40})\b")
+
+
+# leo-workspace tools/wip_checkpoint.py's own words for the PRs it opens: the body line and the title's start (today's
+# CHECKPOINT_TITLE and the earlier "... of a gone session, do not land"). Copied, since this file imports nothing of it.
+CHECKPOINT_MARK = "HOLD: machine-made checkpoint"
+CHECKPOINT_TITLE_PREFIX = "WIP (machine checkpoint"
+
+
+def land_machine_hold(reason: str, data: dict) -> bool:
+    """Whether a `hold` stop is a machine-made checkpoint's (LAND_OWNER_REMIND_BACKOFF's comment): land_judge quotes
+    the body's CHECKPOINT_MARK in its reason, or the cached PR's title is a checkpoint's (CHECKPOINT_TITLE_PREFIX)."""
+    title = str(data.get("title") or "") if isinstance(data, dict) else ""
+    return CHECKPOINT_MARK in (reason or "") or title.startswith(CHECKPOINT_TITLE_PREFIX)
 
 
 def land_replaced_head(e: dict, head: str, now: float) -> bool:
@@ -15866,14 +15888,24 @@ LAND_REARM_CAP = 3
 # work, so the drain is work, not garbage. Re-judging them would be wrong (land_judge's conflicts_base: "no retry or
 # fetch clears a conflict, only a merge of the base into the head", guarded by its test_land_judge_no_spiral), so the
 # reminder judges nothing: the row stays stopped at the same gen and its requester gets the stop's own one step again,
-# with its age, every LAND_OWNER_REMIND_EVERY, at most LAND_OWNER_REMIND_CAP a UTC day. The precedent is in this file:
+# with its age, on LAND_OWNER_REMIND_BACKOFF's schedule. The precedent is in this file:
 # a *forwarded* stopped row's far host is re-asked every LAND_FORWARD_STOPPED_ASK_EVERY; the local owner had no
 # equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
 # the requester's to act on. Detector: test-glaeda-gh.py
 # test_a_stop_that_never_rearms_still_reaches_its_owner.
-LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate|machine_hold)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
-LAND_OWNER_REMIND_CAP = 2
+# LAND_OWNER_REMIND_BACKOFF: "2 a UTC day" never ended, so a row nobody acts on was reminded for as long as LAND_KEEP
+# kept it. gcp-codex-lane-11, 2026-11-26 04:43Z, its first night: four rows that could never land were reminded, among
+# them hq#18246, a wip_checkpoint PR whose body holds it as a machine-made checkpoint (stopped `hold` 90 h). Two rules:
+# - the n-th reminder comes LAND_OWNER_REMIND_EVERY * 2**(n-1) after the one before it (6, 12, 24, 48 h), at most
+#   LAND_OWNER_REMIND_MAX in all (never more than 2 in any 24 h, so it replaces the daily cap), each saying "reminder
+#   n of 4" and when the next is due; past the last the row is still listed by `land status`;
+# - a `hold` whose reason or title is a machine-made checkpoint's (CHECKPOINT_MARK, CHECKPOINT_TITLE_PREFIX) stops
+#   `machine_hold`: said once at the stop, never re-armed or reminded, since nobody is meant to clear it.
+# Detectors: test-glaeda-gh.py test_a_stop_that_never_rearms_still_reaches_its_owner,
+# test_a_machine_checkpoint_hold_is_said_once_and_never_reminded.
+LAND_OWNER_REMIND_MAX = 4
 # LAND_OWNER_REMIND_READ: "a PR that is over owes nothing" was decided on whatever copy the cache held, and a stopped row
 # is unwatched, so that copy is the one from before the stop or none at all (a lane VM keeps no copy of an unwatched PR).
 # gcp-agent-lane-2, 2026-11-26 04:42Z: cmux#55358 stopped update_branch_refused at 03:08Z on 11-25, merged at 07:56Z by
@@ -15881,7 +15913,7 @@ LAND_OWNER_REMIND_CAP = 2
 # reminder whose copy is missing or older than its last word (the stop, or the last reminder) first asks one direct
 # read (refresh_job, as after_blind_read does) and is decided on the pass after it lands. Bounded: past
 # LAND_OWNER_REMIND_READ_WAIT beyond due with no read (a hold, a full pool, a failed read) it is told on the copy there
-# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
+# is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_MAX a row in all. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
 
@@ -20108,16 +20140,16 @@ class LandQueue:
             return False  # notify's land-unnotified already said it at the stop
         if self.remind_ended(e):
             return False  # a PR that is over owes its requester nothing: its row ends, quietly
-        day = land_day(self.now)
         r = e.get("reminds") or {}
-        n = int(r.get("n") or 0) if r.get("day") == day else 0
-        if n >= LAND_OWNER_REMIND_CAP:
-            return False
+        n = int(r.get("n") or 0)
+        if n >= LAND_OWNER_REMIND_MAX:
+            return False  # LAND_OWNER_REMIND_BACKOFF: the last was said; `land status` still lists the row
         at = float(st.get("at") or 0)
         last = float(r.get("at") or 0) or at
-        if self.now - last < LAND_OWNER_REMIND_EVERY:
+        every = LAND_OWNER_REMIND_EVERY * (2 ** n)
+        if self.now - last < every:
             return False
-        if self.remind_read_pending(e, last):
+        if self.remind_read_pending(e, last, every):
             return False
         if self.remind_ended(e):
             return False  # the read it waited for shows the PR over
@@ -20127,7 +20159,7 @@ class LandQueue:
         head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
         was = str(st.get("head") or "").lower()
         moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
-        e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
+        e["reminds"] = {"n": n + 1, "at": self.now, "code": code,
                         **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
@@ -20143,6 +20175,11 @@ class LandQueue:
             msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
+        if n + 1 < LAND_OWNER_REMIND_MAX:
+            msg += (f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}; the next in "
+                    f"{LAND_OWNER_REMIND_EVERY * 2 ** (n + 1) / 3600.0:.0f} h if it still sits)")
+        else:
+            msg += f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}, the last; `glaeda-gh land status` still lists it)"
         self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
                      **({"moved": head[:12]} if moved else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
@@ -20166,15 +20203,15 @@ class LandQueue:
             return True
         return False
 
-    def remind_read_pending(self, e: dict, last: float) -> bool:
+    def remind_read_pending(self, e: dict, last: float, every: float = LAND_OWNER_REMIND_EVERY) -> bool:
         """Under the lock. Whether E's due reminder waits for a read of its PR newer than LAST, its last word
         (LAND_OWNER_REMIND_READ): asks that read once (refresh_job) when free to, and stops waiting
-        LAND_OWNER_REMIND_READ_WAIT past due."""
+        LAND_OWNER_REMIND_READ_WAIT past due (EVERY after LAST, LAND_OWNER_REMIND_BACKOFF)."""
         def read_since() -> list[float]:
             c = self.cache_of(e["key"]) or {}
             return [t for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt")) if _finite(t)]
         reads = read_since()
-        if (reads and max(reads) > last) or self.now - (last + LAND_OWNER_REMIND_EVERY) >= LAND_OWNER_REMIND_READ_WAIT:
+        if (reads and max(reads) > last) or self.now - (last + every) >= LAND_OWNER_REMIND_READ_WAIT:
             return False
         if float(e.get("remindReadAt") or 0) > last:
             return True  # asked since the last word: told on the pass after it lands
@@ -21361,7 +21398,7 @@ class LandQueue:
                 # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
-                                **self.refresh_starting(e["key"])}
+                                **self.refresh_starting(e["key"]), **land_refresh_last_error(e)}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
@@ -21594,7 +21631,8 @@ class LandQueue:
         if not joins and self.busy() + self.refresh_batches() >= self.workers():
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
-        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
+        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"]),
+                        **land_refresh_last_error(e)}
         if own:
             self.own_refreshed.append(self.now)
         self.save(e)
@@ -22171,6 +22209,24 @@ class LandQueue:
         repo_n = f"{e['repo']}#{e['number']}"
         if live == pin:
             e.pop("baseMergeUnread", None)
+            kept = e.get("staleLive") if isinstance(e.get("staleLive"), dict) else {}
+            if kept.get("head") != head or kept.get("pin") != pin:
+                kept = {"head": head, "pin": pin, "since": self.now, "n": 0}
+            kept["n"] = int(kept.get("n") or 0) + 1
+            e["staleLive"] = kept
+            if self.now - float(kept["since"]) >= LAND_STALE_LIVE_MAX:
+                # LAND_STALE_LIVE_MAX: GitHub's PR has shown HEAD that long while its branch is at the pin; no read
+                # here catches it up, so the requester is told what does (a push of the branch) instead of a wait
+                e.pop("staleLive", None)
+                e.pop("oldPinWait", None)
+                self.stop(e, "pr_head_lags_branch",
+                          f"GitHub's PR still shows {head[:12]}, an older commit of the pin, while its branch ref is "
+                          f"at the pin {pin[:12]} ({kept['n']} reads of the branch over "
+                          f"{int((self.now - float(kept['since'])) // 60)} min): GitHub has not synced the PR to its "
+                          "branch, so no merge at the pin can pass --match-head-commit",
+                          f"push the branch again so GitHub re-syncs the PR (an empty commit on {pin[:12]}), then "
+                          f"glaeda-gh land {repo_n} --sha NEW_HEAD")
+                return True
             e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
             self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
                          why="an older commit of the pin; GitHub's branch is at the pin")
@@ -22565,6 +22621,7 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
+        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()
@@ -25146,6 +25203,12 @@ class LandQueue:
         TELL "quiet" not at all (a line in the log and E's history only). DETAIL (a conflict's hunks) follows the
         message's `next:` and is kept on the stop, so `land status` shows it too."""
         self.check(e)
+        if code == "hold" and land_machine_hold(reason, (self.cache_of(e["key"]) or {}).get("data") or {}):
+            # LAND_OWNER_REMIND_BACKOFF: a machine-made checkpoint's HOLD is nobody's to clear, so the row is
+            # dropped: said once here, never re-armed or reminded.
+            code = "machine_hold"
+            nxt = ("none: a machine-made checkpoint never lands; land the PR that finishes its work instead"
+                   + (f" ({land_trim(nxt, 120)})" if nxt else ""))
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
             return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
@@ -25776,6 +25839,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
 # and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
+# LAND_STALE_LIVE_MAX: how long stale_live keeps the pin while GitHub's PR shows the same older commit of it. Past it
+# the copy is no lag a read waits out: GitHub's PR itself is behind its branch ref, and the land stops
+# pr_head_lags_branch naming the push that re-syncs it. gcp-agent-lane-14, 2026-11-25 23:55Z to 2026-11-26 07:28Z:
+# cmux#54723's branch ref at the pin 7a36daca, pulls/54723 at 1e7bbef5 (65 commits behind) for 7.5 h; stale_head_kept
+# 33 times, the row requeued after each and read "due since 00:42:40Z: every worker busy" in `land status` throughout.
+LAND_STALE_LIVE_MAX = 1800.0
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 
@@ -26119,6 +26188,23 @@ def land_green_since(e: dict, head: str) -> float:
     return float(first) if isinstance(first, (int, float)) and not isinstance(first, bool) else 0.0
 
 
+def land_green_at_pin(e: dict, data: dict, head: str, now: float) -> bool:
+    """Whether the land row E is green at HEAD (the cache's DATA): its queued pin, when it has one, is HEAD, and either
+    it carries a logged override (reason and receipt, both required to queue one) or every check the cache shows at
+    HEAD is green (check_verdict EXIT_OK; a partial or truncated read with a red, running or unread context is not).
+    A judgment's ok alone is not this: on 2026-11-26 rows paged "one merge away" from cmux-cp-1, cmux-cp-2 and
+    fs-agent-lane-3 while their heads showed reds (cmux#49990: Swift packages on Linux and react-apps-check failed;
+    cmux#57722: fast gates and pr pipeline / linux; cmuxterm-hq#27545: tests and polling-guard). Such a row waits on
+    its owner, who fixes the checks or overrides and merges, not on the queue."""
+    pin = str(e.get("pinSha") or "").lower()
+    if pin and not (head.startswith(pin) or pin.startswith(head)):
+        return False  # the head moved past the pin: the requester re-pins, the queue cannot merge it
+    o = e.get("override")
+    if isinstance(o, dict) and o.get("reason") and o.get("receipt"):
+        return True
+    return check_verdict(data, "green", now) == EXIT_OK
+
+
 def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | None], now: float) -> dict:
     """The land queue's wait clock (LAND_GREEN_WAIT_PAGE): the open rows that could merge now, and how long each has
     waited since it could. A row counts when its last judgment was ok with the merge step next at the head the cache
@@ -26126,13 +26212,13 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
     CLEAN and no check running at its head though no ok judgment is on record there (judge_order's "one merge away"),
     from when it was queued (dueAt, else created). The second half is most of the backlog: huge-blue 2026-11-22
     08:15Z had 653 rows queued and never judged, and only 5 judged ok at their head. Returns {"rows", "judged" (rows
-    of the first kind), "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest",
-    "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
+    of the first kind), "red" (rows not green at their pin, land_green_at_pin: never counted, whatever was judged),
+    "p50S", "p95S" (nearest rank; None with no row), "past" (rows past the page line), "oldest", "oldestS", "at"}. A waiting_after row is not counted: it waits, as its requester asked, on a PR the queue does not
     hold to merge first (`land X --after Y`), and once Y merges after_wait queues it again with dueAt now, so its
     clock starts then. fs-agent-lane-2, 2026-11-26 04:00Z: the one row the clock counted was leo-workspace#11577,
     queued --after cmuxterm-hq#27498 (still open), and it paged Leo's chat "green PRs wait to merge: p50 88m"."""
     waits: list[tuple[float, str]] = []
-    judged = 0
+    judged = red = 0
     for e in entries:
         if e.get("state") in LAND_DONE or e.get("state") == "waiting_after":
             continue
@@ -26140,6 +26226,9 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         data = (cache_of(e["key"]) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "").lower()
         if not head:
+            continue
+        if not land_green_at_pin(e, data, head, now):
+            red += 1  # its owner's to fix, re-pin or override (Leo: "fix the checks or ignore and just merge")
             continue
         if x.get("ok") and (x.get("action") or {}).get("kind") == "merge" and str(x.get("head") or "").lower() == head:
             judged += 1
@@ -26155,7 +26244,7 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
         waits.append((max(0.0, now - since), e["key"]))
     waits.sort()
     rank = lambda q: int(waits[max(0, math.ceil(q * len(waits)) - 1)][0]) if waits else None  # noqa: E731
-    return {"rows": len(waits), "judged": judged, "p50S": rank(0.5), "p95S": rank(0.95),
+    return {"rows": len(waits), "judged": judged, "red": red, "p50S": rank(0.5), "p95S": rank(0.95),
             "past": sum(1 for w, _ in waits if w > LAND_GREEN_WAIT_PAGE),
             "oldest": key_name(waits[-1][1]) if waits else None, "oldestS": int(waits[-1][0]) if waits else None,
             "at": now}
@@ -26163,11 +26252,12 @@ def land_green_waits(entries: Iterable[dict], cache_of: Callable[[str], dict | N
 
 def land_green_line(g: dict) -> str:
     """`land status`'s line for the wait clock (land_green_waits)."""
+    red = f"; {g['red']} not green at their pin (their owners' to fix or override)" if g.get("red") else ""
     if not g.get("rows"):
-        return "glaeda land: green waits: no row is one merge away"
+        return f"glaeda land: green waits: no row is one merge away{red}"
     return (f"glaeda land: green waits: {g['rows']} row(s) one merge away ({g.get('judged', 0)} judged ok), p50 {land_span(g['p50S'])}, "
             f"p95 {land_span(g['p95S'])}, {g['past']} past {land_span(LAND_GREEN_WAIT_PAGE)}; oldest {g['oldest']} "
-            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}")
+            f"({land_span(g['oldestS'])}); pages past {land_span(LAND_GREEN_WAIT_PAGE)}{red}")
 
 
 def land_green_alarm(g: dict | None, host: str, open_rows: int | None = None) -> tuple[str, str, dict] | None:
