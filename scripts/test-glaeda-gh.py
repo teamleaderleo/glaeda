@@ -17558,25 +17558,60 @@ class PostTest(unittest.TestCase):
         self.assertEqual(t.calls, [("PUT", "/repos/o/r/pulls/8/update-branch", {})])
 
     def test_a_queued_update_branch_that_can_mean_nothing_more_is_finished_with_a_reason_and_never_retried(self) -> None:
+        opened, closed = {"state": "open", "merged": False}, {"state": "closed", "merged": False}
         cases = [
-            (422, {"message": "There are no new commits on the base branch."}, "posted", "up to date"),
+            (422, {"message": "There are no new commits on the base branch."}, [], "posted", "up to date"),
             (422, {"message": "Validation Failed", "errors": ["expected head sha didn't match current head ref."]},
-             "superseded", "head moved"),
-            (422, {"message": "Cannot update a closed pull request"}, "superseded", "closed or merged"),
-            (404, {"message": "Not Found"}, "superseded", "not found"),
-            (422, {"message": "merge conflict between base and head"}, "failed", None),
+             [], "superseded", "head moved"),
+            (422, {"message": "Cannot update a closed pull request"}, [closed], "superseded", "is closed"),
+            (422, {"message": "Validation Failed"}, [{"state": "closed", "merged": True}], "superseded", "is merged"),
+            (404, {"message": "Not Found"}, [], "superseded", "not found"),
+            (422, {"message": "merge conflict between base and head"}, [opened], "failed", None),
         ]
-        for status, doc, state, word in cases:
+        for status, doc, reads, state, word in cases:
             with self.subTest(doc=doc):
                 item = self.queue("update-branch", "o/r#7", stdin="")
-                d, t = self.daemon((status, {}, doc))
+                d, t = self.daemon((status, {}, doc), *[(200, {}, pr) for pr in reads])
                 self.step(d, NOW)
                 done = gg.post_state(item["id"])
                 self.assertEqual(done["state"], state, done)
                 if word:
                     self.assertIn(word, done["note"])
                 self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])  # finished, not waiting for a retry
-                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(t.calls[0][0], "PUT")
+                self.assertEqual(t.calls[1:], [("GET", "/repos/o/r/pulls/7", None)] * len(reads))
+
+    def test_an_open_prs_update_branch_refusal_that_says_merged_or_closed_is_never_retired_as_closed(self) -> None:
+        """2026-11-26: queued update-branches on OPEN manaflow-ai/cmux#57082 and #57087 ended "superseded, not sent:
+        the pull request is closed or merged", because any 422 matching `\\b(closed|merged)\\b` retired the write.
+        Closed or merged is now the PR's own state, read after the refusal: an open PR's refusal fails with GitHub's or
+        the broker's own words, and an unread state retires nothing."""
+        opened = {"state": "open", "merged": False, "head": {"sha": "f" * 40}}
+        said = "Head branch was not merged: the base has a commit the pull request has not merged"
+        item = self.queue("update-branch", "o/r#7", stdin="")
+        d, t = self.daemon((422, {}, {"message": said}), (200, {}, opened))
+        self.step(d, NOW)
+        done = gg.post_state(item["id"])
+        self.assertEqual(done["state"], "failed", done)
+        self.assertNotIn("closed or merged", json.dumps(done))
+        self.assertIn("not merged", done["error"])
+        item = self.queue("update-branch", "o/r#8", stdin="")
+        d, t = self.daemon((422, {}, {"message": "Pull request is closed or merged?"}), (502, {}, {"message": "x"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(gg.post_state(item["id"])["state"], "failed")  # unread: never retired on the words
+        for refusal, pr, state in (("refused: PR 7 is closed or its head is not a branch of o/r", opened, "failed"),
+                                   ("refused: PR 7 is closed or its head is not a branch of o/r",
+                                    {"state": "closed", "merged_at": "2026-11-26T00:00:00Z"}, "superseded")):
+            with self.subTest(pr=pr):
+                item = self.queue("update-branch", "o/r#7", "--sha", "f" * 40, stdin="")
+                d, ran = self.lane_vm((1, {"ok": False, "error": refusal}), (0, {"ok": True, "data": pr}))
+                self.step(d, NOW + 5000)
+                self.assertEqual([r[2] for r in ran], ["update_branch", "get"])
+                self.assertEqual(json.loads(ran[1][4]), {"path": "pulls/7"})
+                done = gg.post_state(item["id"])
+                self.assertEqual(done["state"], state, done)
+                if state == "failed":
+                    self.assertIn("is closed or its head is not a branch", done["error"])
 
     def test_post_update_branch_takes_no_body_and_only_a_full_sha(self) -> None:
         with self.assertRaises(gg.WatchError):
@@ -17597,7 +17632,8 @@ class PostTest(unittest.TestCase):
         self.assertEqual(d.transport.calls, [])
         item = self.queue("update-branch", "o/r#9", stdin="")
         d, ran = self.lane_vm((0, {"ok": True, "data": {"state": "closed", "head": {"sha": "D" * 40}}}),
-                              (1, {"ok": False, "error": "pull request 9 is closed"}))
+                              (1, {"ok": False, "error": "pull request 9 is closed"}),
+                              (0, {"ok": True, "data": {"state": "closed", "head": {"sha": "D" * 40}}}))
         self.step(d, NOW + 1000)
         self.assertEqual(json.loads(ran[1][4]), {"repo": "o/r", "number": 9, "expected_head_sha": "d" * 40})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
@@ -33101,6 +33137,40 @@ class LandTest(Base):
                 self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_merges_at_its_pin_past_the_merge_trains_retry(self):
+        # manaflow-ai/cmux#58296, 2026-11-26: queued pinned at 30061064 with an override at 12:11:43Z, judged
+        # red_not_excused step=retry (train=boarded) at 12:16:04Z and woken for another retry, never merged. The merge
+        # train's retry stands in for an update_branch, which a pinned override row merges past at its pin.
+        cases = (("boarded", {"kind": "retry", "after_s": 300, "train": "boarded"}),
+                 ("boarding", {"kind": "retry", "after_s": 300,
+                               "board_train": {"label": "merge-train", "repo": "o/r", "number": "1"}}))
+        for name, act in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=[("pr pipeline / linux", "COMPLETED", "FAILURE")])
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+                self.w.answers.append(refusal("red_not_excused", LA, act))
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                self.assertEqual((self.w.gh_calls("pr", "update-branch"), self.w.gh_calls("run", "rerun")), ([], []))
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]),
+                                 ("red_not_excused", "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_still_waits_on_a_retry_that_is_not_the_trains(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.answers.append(refusal("explain_failed", LA, {"kind": "retry", "after_s": 300}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "retry"))
+        self.assertFalse(gg.land_train_retry({"kind": "retry", "after_s": 300}))
+        self.assertTrue(gg.land_train_retry({"kind": "retry", "train": "pending"}))
 
     def test_land_override_pinned_row_that_finds_every_worker_busy_is_the_next_one_judged(self):
         # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy. Its one at-once judgment
