@@ -30178,7 +30178,34 @@ class LandTest(Base):
         sent = len(self.w.sent())
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        # LAND_STOPPED_OVER: never reminded, and the row ends, quietly
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("merged", None, sent))
+
+    def test_a_stopped_row_whose_pr_merged_or_closed_elsewhere_is_read_and_ends(self):
+        # LAND_STOPPED_OVER: gcp-agent-lane-11, 2026-11-26: cmux#52553 merged 11-24 and cmux#54984 closed unmerged
+        # 11-25 sat stopped in the queue (no copy of an unwatched PR) until a lane cancelled them by hand.
+        for state, ended in (("CLOSED", ("stopped", "closed")), ("MERGED", ("merged", "conflict"))):
+            with self.subTest(state=state):
+                self.setUp()
+                e = self.conflict_stop()
+                sent = len(self.w.sent())
+                self.w.cache.pop(self.KEY, None)  # a lane VM keeps no copy of an unwatched PR
+                self.q.refresh = lambda key, state=state: (
+                    self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA, state=state), self.t))[1]
+                e = self.tick(gg.LAND_STOPPED_READ_EVERY - 60)
+                self.assertEqual((e["state"], self.w.refreshed), ("stopped", []))  # not before the cadence
+                e = self.tick(60)
+                self.assertEqual(self.w.refreshed, [self.KEY])  # one read, shared with the due reminder
+                e = self.tick(1)
+                self.assertEqual((e["state"], e["stop"]["code"] if e["state"] == "stopped" else "conflict"), ended)
+                self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+
+    def test_a_stopped_row_still_open_is_read_once_a_cadence(self):
+        e = self.conflict_stop()
+        self.q.refresh = lambda key: (self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA), self.t))[1]
+        for _ in range(6):
+            e = self.tick(gg.LAND_STOPPED_READ_EVERY / 6)
+        self.assertEqual((e["state"], len(self.w.refreshed)), ("stopped", 1))
 
     def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
         # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
@@ -30191,7 +30218,8 @@ class LandTest(Base):
         self.assertEqual(self.w.refreshed, [self.KEY])  # one read, asked by the due reminder
         self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)),
+                         ("merged", None, sent, 1))  # and the row ends (LAND_STOPPED_OVER)
 
     def test_a_reminder_whose_read_never_comes_is_still_told(self):
         e = self.conflict_stop()
