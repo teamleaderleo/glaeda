@@ -40006,6 +40006,15 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     raise WatchError(f"unknown write kind {item['kind']!r}")
 
 
+# GitHub's and the broker's words for a closed or merged pull request, never a bare "merged": the broker's pacing
+# refusal ends "...waits its turn; nothing was merged", which once retired an open PR's queued base merge as closed
+# (cmux#57987, 2026-11-26 13:50Z).
+CLOSED_PR = re.compile(r"closed pull request|pull request(?: #?\d+)? (?:is|was|has been) (?:already )?(?:closed|merged)"
+                       r"|\bpr (?:is|was) (?:already )?(?:closed|merged)|already merged")
+# The broker's own pacing refusal: nothing was sent, and it names when it may go (a limit, not an answer).
+BROKER_PACED = re.compile(r"\bnot sent, retry after\b|\bwrites are paced\b|\bwaits its turn\b")
+
+
 def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
     """How a queued update-branch ends on a 404/422 that is no limit: ("done", why) when the branch needs nothing,
     ("retired", why) when the write can no longer mean anything (the PR is gone or closed, or its head moved past the
@@ -40018,7 +40027,7 @@ def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
         return "done", "the branch was already up to date with its base"
     if re.search(r"expected head sha|head sha didn.?t match|head branch was modified", low):
         return "retired", "the pull request head moved past the pinned sha; the pin no longer describes it"
-    if re.search(r"\b(closed|merged)\b", low):
+    if CLOSED_PR.search(low):
         return "retired", "the pull request is closed or merged"
     return None
 
@@ -40450,7 +40459,7 @@ def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool
     if not said:
         lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
         said = lines[-1] if lines else "no answer"
-    if done.returncode == BROKER_RATE_LIMITED_EXIT:
+    if done.returncode == BROKER_RATE_LIMITED_EXIT or BROKER_PACED.search(f"{said} {done.stderr or ''}"):
         wait = None
         for source in (answer.get("data") if isinstance(answer, dict) else None, answer):
             if isinstance(source, dict) and isinstance(source.get("retry_after"), (int, float)) \
@@ -40458,8 +40467,8 @@ def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool
                 wait = float(source["retry_after"])
                 break
         if wait is None:
-            found = re.search(r"retry after (\d+)s", f"{said} {done.stderr or ''}")
-            wait = float(found.group(1)) if found else float(POST_BACKOFF)
+            found = re.search(r"retry after (\d+)s|paced for (\d+)s more", f"{said} {done.stderr or ''}")
+            wait = float(found.group(1) or found.group(2)) if found else float(POST_BACKOFF)
         return "limited", max(float(POST_SPACING), wait)
     return "refused", str(said)[:300]
 
