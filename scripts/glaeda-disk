@@ -1389,6 +1389,11 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "16b54de696ace2e9396c3ac8ddb093559a73763942a5c26460667a04d977f212",
     "8e8442f48250b370e63348fb2a49dc4334feb70371020f9a3c1b597622d4ef3c",
     "7a855efe64dfc1ba89f04b452aa998c5de4326ff14b7ad23f5031a93ea8d05da",
+    "4567868bceeae5751670caf375230bce235a1f5a90eea903aa18e66256109087",
+    "2839c8e6956ffc6776f3553b4e2a4774459075b568437957a3a10f1eeef735e2",
+    "63aba53442d623bb33e68927897a84cdda307baffd294383123bfc73a9d5bbe3",
+    "f349a345e89a2cc7e2984b50cd7c05c8ed4be5470124f21e4f418db42e04a8ef",
+    "2ed5b420a0f3d5259e7174c26a4a458febc6d158b2eb9d89a01df80477c6d780",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -6180,7 +6185,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
-               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "PassKit", "tidy-branches", "CloudKit",
+               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "cmux-perf-bench", "PassKit", "tidy-branches", "CloudKit",
                      "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
@@ -6236,6 +6241,30 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                  build_output=True, min_idle_hours=JOURNEY_IDLE_HOURS, owner="cmux scripts/journeys (build_cache.py)",
                  rebuild_minutes=3, pressure_only=role == "devbox", platform=host_cache_platform())
           for sub in JOURNEY_SUBDIRS),
+        # cmux's perf bench (scripts/perf-bench: xbench.py, rivals.py, fetch_browsers.py) keeps vendor-signed app copies
+        # in ~/Library/Caches/cmux-perf-bench/apps/<app>/<version> (fetch_browsers downloads them again) and one
+        # throwaway cp -R copy per rival session in rivals-copies/<app>-<round>-<pid> (never reused, never removed by
+        # the bench). On cmux20 (2026-11-26) the two held 18.8 GiB that no family reached: the bundles are too deep for
+        # the git search, so library-caches read them "unchecked", and bench steps queued for disk. Both are build output.
+        # Apps go once unused PERF_BENCH_APPS_IDLE_HOURS (a bench run opens them; a live one keeps its copy), copies
+        # after PERF_BENCH_COPIES_IDLE_HOURS: the session that made one is long over.
+        Family(PERF_BENCH_APPS, HOME / PERF_BENCH_CACHE / "apps", True, "fetch_browsers.py downloads the vendor copy again",
+               depth=2, build_output=True, min_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, max_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, owner="cmux scripts/perf-bench (fetch_browsers.py)",
+               rebuild_minutes=3, platform="macos"),
+        Family(PERF_BENCH_COPIES, HOME / PERF_BENCH_CACHE / "rivals-copies", True, "the next rival session copies the app again",
+               build_output=True, min_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, max_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, owner="cmux scripts/perf-bench (rivals.py)",
+               rebuild_minutes=1, platform="macos"),
+        # cmux's CEF runtimes (~/Library/Caches/cmux/cef/cef-<version>[-<arch>]): one per CEF release the app or a
+        # tagged build ever ran, downloaded again on demand. cmux20 held ten, 5.9 GiB, the oldest from October. Only the
+        # cef-* runtimes: the helper and shim folders beside them are small and in step with the running app.
+        Family(CMUX_CEF_RUNTIMES, HOME / "Library/Caches/cmux/cef", True, "cmux downloads the CEF runtime again",
+               include=("cef-",), build_output=True, min_idle_hours=CMUX_CEF_IDLE_HOURS, max_idle_hours=CMUX_CEF_IDLE_HOURS, owner="cmux (CEF runtime download)",
+               rebuild_minutes=5, platform="macos"),
+        # vphone-cli's IPSW downloads (~/.vphone/ipsws: Apple's restore image, 11.5 GiB, and its .partial resume file).
+        # A public download, only read when a VM is created. Not the rest of ~/.vphone: the local cloudos image and
+        # the *-parts folders are not provably re-downloadable, so they stay (report only, unchecked).
+        Family(VPHONE_IPSWS, HOME / ".vphone/ipsws", True, "vphone-cli downloads the restore image again",
+               files=True, min_idle_hours=VPHONE_IPSW_IDLE_HOURS, max_idle_hours=VPHONE_IPSW_IDLE_HOURS, owner="vphone-cli", rebuild_minutes=30, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -7126,6 +7155,14 @@ def _ended_step_checkout(path: Path) -> str:
 # cmux's journey cache (scripts/journeys/build_cache.py): its builds and fetch scratch, an entry per job.
 JOURNEY_CACHE = Path(".cache/cmux-journeys")  # under HOME
 JOURNEY_SUBDIRS = ("builds", "fetch")
+PERF_BENCH_CACHE = Path("Library/Caches/cmux-perf-bench")  # under HOME: scripts/perf-bench's --cache default
+PERF_BENCH_APPS, PERF_BENCH_COPIES = "perf-bench-apps", "perf-bench-rivals-copies"
+PERF_BENCH_APPS_IDLE_HOURS = 3 * 24.0
+PERF_BENCH_COPIES_IDLE_HOURS = 2.0
+CMUX_CEF_RUNTIMES = "cmux-cef-runtimes"
+CMUX_CEF_IDLE_HOURS = 7 * 24.0
+VPHONE_IPSWS = "vphone-ipsws"
+VPHONE_IPSW_IDLE_HOURS = 14 * 24.0
 JOURNEY_IDLE_HOURS = 3 * 24.0
 
 # --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
@@ -8617,6 +8654,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "user-cache",          # ~/.cache
     "cua-cache",
     "cmux-ghosttykit-cache",
+    PERF_BENCH_APPS, PERF_BENCH_COPIES, CMUX_CEF_RUNTIMES, VPHONE_IPSWS,  # re-downloadable caches no job owns
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
     "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
     "lume-bench-images",   # LUME_BENCH_IMAGES: a pulled bench image; a lume command or open disk.img still keeps it
@@ -8664,7 +8702,7 @@ def deletion_owner_live(path: Path) -> str:
     except OSError:
         pass  # another user's live process
     command = _owner_command(pid)
-    if not command or "glaeda-disk" in command:
+    if not command or "glaeda-disk" in command or "cmux-disk" in command:
         return f"glaeda-disk (pid {pid}) is still deleting it"
     return ""
 
@@ -9870,6 +9908,57 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
         os.chmod(tmp, 0o600)
         os.replace(tmp, manifest)
     return gone
+
+
+# What a writer of ~/archive/glaeda-disk leaves when it is killed before its `finally` (a pass past its bound, a
+# reboot): `.<archive name>.<pid>.tmp` (a bundle, patch or tar being written or checked, _write_bundle,
+# archive_work_tree, archive_git_dir; `.manifest.<pid>.tmp` too) and `.<archive name>.<pid>.expiring` (an expired
+# archive renamed aside by prune_mirror_archive before its hash). cmux22, 2026-11-26: seven `.tmp` files from
+# 2026-11-07..24, 3.7 GB, none open and their writers long gone, which no pass ever took: the manifest lists only
+# finished archives, so prune_mirror_archive never saw them, and they sat on a mini whose 18 runners waited on the
+# disk floor. A leftover is stale once its writer's pid is gone, or once nothing wrote it for
+# ARCHIVE_LEFTOVER_STALE_S (a writer's git and tar steps are bounded at 600 s each; a reused pid keeps one no longer).
+ARCHIVE_LEFTOVER_RE = re.compile(r"\.(?P<name>.+)\.(?P<pid>\d+)\.(?P<kind>tmp|expiring)")
+ARCHIVE_LEFTOVER_STALE_S = 24 * 3600
+
+
+def prune_archive_leftovers(now: float | None = None, in_use=lambda p: False) -> list[str]:
+    """Reclaim the stale leftovers of killed archive writers in ~/archive/glaeda-disk (ARCHIVE_LEFTOVER_RE): a
+    `.tmp` is deleted (it never became an archive; an archive linked from it keeps its own name), an `.expiring`
+    goes back to its archive name, which the manifest still lists, so the next prune hashes it as usual (never
+    over a file there). Kept: a writer still alive and writing, anything in_use, a symlink or anything not a plain
+    file, and anything else in the directory. The names reclaimed or restored."""
+    now, root, done = time.time() if now is None else now, mirror_archive(), []
+    if root.is_symlink() or not root.is_dir():
+        return done
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return done
+    for e in entries:
+        if not (m := ARCHIVE_LEFTOVER_RE.fullmatch(e.name)):
+            continue
+        p = Path(e.path)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        idle = now - st.st_mtime  # a writer's bytes move mtime; a pid reused since keeps it no longer than this
+        if pid_alive(int(m["pid"])) and idle < ARCHIVE_LEFTOVER_STALE_S:
+            continue  # its writer may still be at it
+        if in_use(p):
+            continue
+        try:
+            if m["kind"] == "tmp":
+                p.unlink()
+            else:
+                rename_noreplace(p, root / m["name"])
+        except OSError:
+            continue
+        done.append(e.name)
+    return done
 
 
 def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> list[str]:
@@ -15006,7 +15095,7 @@ def _take_over_stale_evict_owner() -> bool:
         # A dead owner has already released flock; retrying the acquisition is sufficient.
         return True
     command = _owner_command(pid)
-    if "glaeda-disk" not in command:
+    if "glaeda-disk" not in command and "cmux-disk" not in command:  # cmux-disk: its primary name runs the same code
         return False
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGTERM)
@@ -15078,7 +15167,54 @@ def pressure_pass_lock() -> bool:
         os.close(fd)
         return True
     _PRESSURE_PASS_HANDLE = fd
+    with contextlib.suppress(OSError):  # who holds it, for a skipped pass's line (pressure_pass_holder)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({"pid": os.getpid(), "started_at": time.time(),
+                                  "caller": RUN.get("caller")}).encode(), 0)
     return True
+
+
+def pressure_pass_holder(now: float | None = None) -> tuple[str, dict]:
+    """Why a pressure pass skipped, said so a reader can tell a live pass from a stuck one: who holds
+    pressure-pass.lock (pid, age, caller, as the holder wrote it) and what the last pass that ran, from the run log,
+    freed and found blocked. 2026-11-26, two lane VMs at 95-96%: a coordinator's own apply skipped with "another
+    pressure pass is running" and read it as a stuck lock; the holder was the 15-minute timer's pass, alive 2-4 min,
+    and each finished pass had freed 0 GiB with 70-77 GiB blocked as live-held."""
+    now = time.time() if now is None else now
+    details: dict = {}
+    parts: list[str] = []
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        held = json.loads((EVICT_LOCK.parent / "pressure-pass.lock").read_text() or "{}")
+        if isinstance(held, dict) and held.get("pid"):
+            alive = True
+            try:
+                os.kill(int(held["pid"]), 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                pass
+            age = max(0, int(now - float(held.get("started_at") or now)))
+            details["holder"] = {"pid": int(held["pid"]), "age_s": age, "caller": held.get("caller"), "alive": alive}
+            parts.append(f"pid {held['pid']} ({'alive' if alive else 'gone'}), started {age // 60} min {age % 60} s "
+                         f"ago by {held.get('caller') or 'an unnamed caller'}")
+    last = None
+    with contextlib.suppress(OSError, ValueError):
+        with open(RUN_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - (1 << 20)))
+            for line in reversed(fh.read().decode("utf-8", "replace").splitlines()):
+                with contextlib.suppress(ValueError):
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("mode") == "pressure" and not row.get("skipped"):
+                        last = row
+                        break
+    if last:
+        blocked = last.get("blocked") or {}
+        details["last_pass"] = {k: last.get(k) for k in ("at", "reclaimed_gib", "free_gib_after", "blocked")}
+        held_by = ", ".join(f"{k} {v} GiB" for k, v in sorted(blocked.items(), key=lambda kv: -kv[1])[:4])
+        parts.append(f"the last pass that ran ({last.get('at')}) freed {last.get('reclaimed_gib', 0)} GiB"
+                     + (f"; it found in use: {held_by}" if held_by else ""))
+    return ("; ".join(parts), details)
 
 
 def floor_evict_wait_until(apply_: bool) -> float:
@@ -15759,14 +15895,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
     cwds = open_index(cwds)
+
+    def archive_in_use(q: Path) -> bool:
+        try:
+            o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
+        except NoEvidence as error:
+            RUN["apply_incomplete"] = f"archive pruning: {error}"
+            return True
+        return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
+    # Every pass, mirror items or not: a killed writer's leftovers are no archive any expiry reaches (cmux22,
+    # 2026-11-26, 3.7 GB; prune_archive_leftovers).
+    if not archive_root_why() and (left := prune_archive_leftovers(in_use=archive_in_use)):
+        RUN.setdefault("archive_leftovers", []).extend(left)
     if any(f.mirror_idle_hours is not None for f in every):
-        def archive_in_use(q: Path) -> bool:
-            try:
-                o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
-            except NoEvidence as error:
-                RUN["apply_incomplete"] = f"archive pruning: {error}"
-                return True
-            return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
         if not archive_root_why():
             prune_mirror_archive(in_use=archive_in_use)
         if (expired := prune_foreign_archives(in_use=archive_in_use)):
@@ -17985,7 +18126,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # pass that holds it judges the same filesystems against the same floor, so a second one only waits.
     if (a.pressure and a.apply and under and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
             and not pressure_pass_lock()):
-        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
+        said, held = pressure_pass_holder()
+        RUN["pressure_pass_holder"] = held
+        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped"
+                        + (f" ({said})" if said else ""), **held)
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # what a fleet mini under pressure frees that it otherwise holds for good (PRESSURE_WORKER_BUILD_OUTPUT)
@@ -18831,7 +18975,9 @@ def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = su
     if put.returncode != 0:
         why = (put.stderr or b"").decode(errors="replace").strip()[-200:] or f"exit {put.returncode}"
         return {**row, "state": "not reached", "why": why}
+    # CMUX_NAME_AS: a copy this program runs itself is not a use of the old name (count_old_name); sudo drops the env
     argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
+            "CMUX_NAME_AS=cmux-disk",
             _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
     try:
         done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
@@ -18956,6 +19102,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
+        row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass
         row["runner_accounts"] = RUN["runner_accounts"]
     if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)

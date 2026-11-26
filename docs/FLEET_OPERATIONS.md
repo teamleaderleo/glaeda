@@ -13,7 +13,7 @@ read-only unless a command ends with `--apply` or `--yes`.
 | What a host actually reports | the host probe | `glaeda-mini-fleet observe` and `glaeda-fleet-status` |
 | Current worker, queue, and controller state | the controller status endpoint | `build-fleet/status.py --json` or its saved JSON |
 | Installed Glaeda generation | the host's OTA receipt | `glaeda-fleet-status` tooling source and `fleet up` |
-| Disk pressure and reclaim receipts | the host's `glaeda-disk` state | `glaeda-disk --json` and `glaeda-fleet-status` disk source |
+| Disk pressure and reclaim receipts | the host's `glaeda-disk` state | `cmux-disk --json` and `glaeda-fleet-status` disk source |
 | Seed usefulness and transfer cost | job records and seed receipts | `glaeda-seed-prefetch`, seed logs, and build receipts |
 | Dashboard presentation | ci-dash's deployed data document | the dashboard version and role metadata in its snapshot |
 

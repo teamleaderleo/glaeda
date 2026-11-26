@@ -343,7 +343,9 @@ def plist_for(install: Install) -> dict:
         "ProgramArguments": [os.fspath(install.python), "-I", os.fspath(install.snapshot),
                               "--runner-caches", "--pressure", "--idle", "--apply", "--top", "0"],
         "UserName": install.account.name,
-        "EnvironmentVariables": {"HOME": os.fspath(install.account.home)},
+        # CMUX_NAME_AS: this pinned copy of glaeda-disk runs under its primary name, cmux-disk; the old name counts
+        # its uses and is retired once they stop (cmuxterm-hq docs/design/glaeda-into-cmux.md, Rename map)
+        "EnvironmentVariables": {"HOME": os.fspath(install.account.home), "CMUX_NAME_AS": "cmux-disk"},
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
         "ProcessType": "Background",
@@ -364,6 +366,7 @@ def census_plist_for(install: Install) -> dict:
         "Label": CENSUS_LABEL,
         "Comment": CENSUS_COMMENT,
         "ProgramArguments": [os.fspath(install.python), "-I", os.fspath(install.census_snapshot), "--root-census"],
+        "EnvironmentVariables": {"CMUX_NAME_AS": "cmux-disk"},  # as plist_for: run under the primary name
         "StartInterval": CENSUS_INTERVAL,
         "RunAtLoad": True,
         "ProcessType": "Background",

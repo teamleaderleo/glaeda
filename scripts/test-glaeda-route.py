@@ -702,6 +702,30 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(entry["state"], "rescued")
         self.assertIn("overflow", entry["note"])
 
+    def test_a_run_with_a_job_on_any_runner_is_never_cancelled(self):
+        # cmux run 45823199209: its job ran on a Blacksmith macOS label, not the pool, and was cancelled mid-compile.
+        for runner_job in (job(2, pool="blacksmith-6vcpu-macos-26", status="in_progress", runner="blacksmith-x"),
+                           job(2, pool="blacksmith-6vcpu-macos-26", status="queued", runner="blacksmith-x"),
+                           job(2, status="in_progress", runner="m1-glaeda")):
+            with self.subTest(runner_job=runner_job):
+                self.cmux = FakeCmux()
+                self.api = gr.GitHub("repo-token", self.cmux)
+                self.cmux.add_run(jobs=[job(1, created=NOW - 600), dict(runner_job)])
+                store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
+                seen = {"job:1": NOW - 200}
+                self.tick(ledger, now=NOW, seen=seen)
+                self.tick(ledger, now=NOW + 91, seen=seen)
+                self.assertEqual(self.cmux.effects, [])
+                self.assertEqual(store.doc()["reservations"][0]["state"], "held")
+
+    def test_a_rescuing_run_whose_job_took_a_runner_is_released_uncancelled(self):
+        self.cmux.add_run(jobs=[job(1, created=NOW - 600),
+                                job(2, pool="blacksmith-6vcpu-macos-26", status="in_progress", runner="blacksmith-x")])
+        store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+        self.tick(ledger, seen={"job:1": NOW - 200})
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "released")
+
     def test_cancel_record_is_saved_before_a_failing_second_write(self):
         self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
         store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))

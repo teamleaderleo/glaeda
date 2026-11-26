@@ -6337,6 +6337,35 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
         os.close(gd._PRESSURE_PASS_HANDLE)
 
+    def test_a_skipped_pressure_apply_names_the_live_holder_and_the_last_pass(self) -> None:
+        # 2026-11-26: "another pressure pass is running" read as a stuck lock on two lane VMs at 95-96%; the holder
+        # was the timer's live pass, and every finished pass had freed 0 GiB with the rest held in use
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        lock = self.root / "pressure-pass.lock"
+        held = json.loads(lock.read_text())
+        self.assertEqual(held["pid"], os.getpid(), "the pass that takes the lock records itself in it")
+        os.close(gd._PRESSURE_PASS_HANDLE)
+        gd._PRESSURE_PASS_HANDLE = None
+        lock.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time() - 130, "caller": "timer"}))
+        with (self.root / "runs.jsonl").open("a") as log:
+            log.write(json.dumps({"at": "2026-11-26T06:14:50+0000", "mode": "pressure", "skipped": None,
+                                  "reclaimed_gib": 0.0, "free_gib_after": 12.5,
+                                  "blocked": {"user-cache": 38.7, "projects": 24.7}}) + "\n")
+        self.said = ""
+        with lock.open("a") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+        self.assertIn(f"pid {os.getpid()} (alive), started 2 min", self.said)
+        self.assertIn("by timer", self.said)
+        self.assertIn("freed 0.0 GiB; it found in use: user-cache 38.7 GiB, projects 24.7 GiB", self.said)
+        holder = rows[-1]["pressure_pass_holder"]
+        self.assertTrue(holder["holder"]["alive"])
+        self.assertEqual(holder["last_pass"]["blocked"]["user-cache"], 38.7)
+
     def test_a_second_pressure_apply_skips_before_queueing_behind_a_running_eviction(self) -> None:
         # 2026-11-21: with the pass lock taken after the evict.lock queue, 8 to 14 pressure applies still waited
         # in that queue at once on one mini; the second must leave at once, never join the queue
@@ -9613,10 +9642,15 @@ class VolumeCensusTest(unittest.TestCase):
 
     def test_open_deleted_counts_a_held_file_once(self) -> None:
         held = self.write("held", 4096 * 8)
+        dev = self.root.stat().st_dev
+        # The runner's process may already hold other deleted files on this fs (an earlier test's
+        # temp file not yet collected): measure the change this file makes, not the absolute total.
+        before, _ = gd.open_deleted_local(dev)
         with open(held, "rb") as one, open(held, "rb") as two:
             held.unlink()
-            got, _ = gd.open_deleted_local(self.root.stat().st_dev)
-        self.assertEqual(got.get(str(os.getpid())), 4096 * 8)
+            got, _ = gd.open_deleted_local(dev)
+        pid = str(os.getpid())
+        self.assertEqual(got.get(pid, 0) - before.get(pid, 0), 4096 * 8)
 
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent
@@ -10672,6 +10706,86 @@ class SparkleAppcastTest(unittest.TestCase):
         self.assertTrue(path.exists(), "live appcast generation keeps its extraction")
 
 
+class BenchCachesTest(unittest.TestCase):
+    """cmux20 (2026-11-26): perf-bench app copies, rival copies, CEF runtimes and vphone IPSWs held 38 GiB no family reached."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        for root in ("Library/Caches/cmux-perf-bench/apps", "Library/Caches/cmux-perf-bench/rivals-copies",
+                     "Library/Caches/cmux/cef", ".vphone/ipsws"):
+            (self.home / root).mkdir(parents=True)
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            self.families = {f.id: f for f in gd.default_families()}
+
+    def age(self, path: Path, hours: float) -> Path:
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_declared_and_library_caches_leaves_the_bench_root_to_them(self) -> None:
+        for fid in (gd.PERF_BENCH_APPS, gd.PERF_BENCH_COPIES, gd.CMUX_CEF_RUNTIMES, gd.VPHONE_IPSWS):
+            self.assertIn(fid, self.families)
+            self.assertIn(fid, gd.OUT_OF_BAND_FAMILY_IDS)
+        self.assertIn("cmux-perf-bench", self.families["library-caches"].skip)
+
+    def test_app_versions_go_idle_and_a_used_one_stays(self) -> None:
+        fam = self.families[gd.PERF_BENCH_APPS]
+        old, new = fam.root / "chrome/2026-10-20", fam.root / "chrome/2026-11-24"
+        make(old / "Google Chrome.app/Contents/Frameworks/X.framework/Versions/A")
+        make(new / "Google Chrome.app/Contents/MacOS")
+        self.age(old, 100)
+        self.age(new, 5)
+        for path in (old, new):
+            os.chmod(path / "Google Chrome.app", 0o555)  # fetch_browsers makes the copy read-only
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {i.path: i for i in gd.survey([fam], 24, 0)}
+            self.assertEqual(items[str(old)].verdict, "reclaimable", items[str(old)].reasons)
+            self.assertEqual(items[str(new)].verdict, "recent")
+            gd.apply(list(items.values()), {fam.id: fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+
+    def test_rival_copies_go_after_their_session(self) -> None:
+        fam = self.families[gd.PERF_BENCH_COPIES]
+        done, live = fam.root / "cmux-r1-3861", fam.root / "cmux-r1-99"
+        make(done / "cmux.app/Contents/MacOS")
+        make(live / "cmux.app/Contents/MacOS")
+        self.age(done, 5)
+        self.age(live, 0.5)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {i.path: i for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(items[str(done)].verdict, "reclaimable", items[str(done)].reasons)
+        self.assertEqual(items[str(live)].verdict, "recent")
+
+    def test_only_cef_runtimes_and_ipsw_files_are_candidates(self) -> None:
+        cef, ipsw = self.families[gd.CMUX_CEF_RUNTIMES], self.families[gd.VPHONE_IPSWS]
+        old, shim = cef.root / "cef-154.0.28-cmux.28", cef.root / "shim"
+        make(old / "Frameworks")
+        make(shim / "bin")
+        self.age(old, 24 * 8)
+        self.age(shim, 24 * 8)
+        image = ipsw.root / "iPhone.ipsw"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"x" * 4096)
+        stamp = time.time() - 24 * 15 * 3600
+        os.utime(image, (stamp, stamp))
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            cef_items = {i.path: i for i in gd.survey([cef], 24, 0)}
+            ipsw_items = {i.path: i for i in gd.survey([ipsw], 24, 0)}
+        self.assertEqual(cef_items[str(old)].verdict, "reclaimable", cef_items[str(old)].reasons)
+        self.assertNotIn(str(shim), cef_items)
+        self.assertEqual(ipsw_items[str(image)].verdict, "reclaimable", ipsw_items[str(image)].reasons)
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
@@ -11613,6 +11727,41 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(gd.prune_mirror_archive("9999-12-31"), len(files) - 1)
         self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
         self.assertEqual(files[0].read_bytes(), b"changed since")
+
+    def test_a_killed_writers_leftovers_are_reclaimed_and_a_live_ones_kept(self) -> None:
+        # cmux22, 2026-11-26: 3.7 GB of `.<archive>.<pid>.tmp` from passes killed mid-write, which no expiry reached
+        unit, _, _ = self.dirty_mirror()
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        archive = self.home / "archive/glaeda-disk"
+        archives = sorted(p.name for p in archive.iterdir())
+        listed = next(n for n in archives if n != "manifest.jsonl")
+        dead = 2 ** 22 + 7  # no such process
+        stale = archive / f".20261107T112734-{dead}-ab-x.expires-2026-12-07.tar.gz.{dead}.tmp"
+        stale.write_bytes(b"half a tar")
+        live = archive / f".20261126T112734-{os.getpid()}-ab-y.expires-2026-12-26.bundle.{os.getpid()}.tmp"
+        live.write_bytes(b"being written")
+        old_live = archive / f".20261101T000000-{os.getpid()}-ab-z.expires-2026-12-01.bundle.{os.getpid()}.tmp"
+        old_live.write_bytes(b"pid reused")
+        os.utime(old_live, (time.time() - gd.ARCHIVE_LEFTOVER_STALE_S - 60,) * 2)
+        open_one = archive / f".held.{dead}.tmp"
+        open_one.write_bytes(b"open")
+        (archive / listed).rename(aside := archive / f".{listed}.{dead}.expiring")
+        link = archive / f".elsewhere.{dead}.tmp"
+        link.symlink_to(self.home / "elsewhere")
+        other = archive / ".note.txt"
+        other.write_text("someone's")
+        done = gd.prune_archive_leftovers(in_use=lambda p: p == open_one)
+        self.assertEqual(sorted(done), sorted([stale.name, old_live.name, aside.name]))
+        self.assertFalse(stale.exists())
+        self.assertFalse(old_live.exists())
+        self.assertFalse(aside.exists())
+        self.assertTrue((archive / listed).is_file())  # back under its name; the manifest still lists it
+        self.assertTrue(open_one.exists() and other.exists() and link.is_symlink())
+        self.assertEqual(sorted(p.name for p in archive.iterdir() if p.name in archives), archives)
+        # a live writer is kept while it writes
+        self.assertTrue(live.exists())
+        self.assertEqual(gd.prune_archive_leftovers(in_use=lambda p: False), [open_one.name])
+        self.assertTrue(live.exists())
 
     def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
         unit, clone, env = self.mirror_unit()
