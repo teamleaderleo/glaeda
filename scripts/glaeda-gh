@@ -1495,8 +1495,11 @@ FULL_PR_SECS_FILE = "full-pr-secs.json"
 # merge yet. The land host, 2026-11-26 02:39-03:39Z: 470 queued rows, 262 gated, PR data p50 4,580 s, GraphQL in stop
 # mode. Such a row (same head, state, mergeability and review, a rollup still PENDING, only the counts moved) is
 # confirmed by its probe and read in full at most this often; a rollup that settles, a new head or a
-# changed merge state is read at once.
-PR_FULL_PENDING_EVERY = 900
+# changed merge state is read at once. The same bound replaces PR_FULL_EVERY/PR_FULL_BEHIND_EVERY in probe_ok for such
+# a row, which cannot merge until its rollup settles: at 900 s (#2853) no row qualified, as the land host's queued rows
+# were all past an hour since their last full read (05:38-06:04Z: 0 confirmed, PR data p50 2,580 s, the hourly GraphQL
+# quota under its reserve), and every one of them went back to a full read.
+PR_FULL_PENDING_EVERY = 7200
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -12031,7 +12034,8 @@ class Daemon:
                 and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
                 and isinstance(c.get("fullAt"), (int, float))
-                and self.now - c["fullAt"] < (PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
+                and self.now - c["fullAt"] < (PR_FULL_PENDING_EVERY if self.queued_pending(e)
+                                              else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
                 and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
                 and not self.rollup_stale(e["key"], c))
 
@@ -12200,21 +12204,30 @@ class Daemon:
                        **confirmed_updated(e.get("cache"), node, self.now))
         return changed, None
 
+    def queued_pending(self, e: dict) -> bool:
+        """Whether E is a land-queue PR, open, whose cached rollup is still PENDING or EXPECTED: not near merging, so
+        a probe stands in for a full read up to PR_FULL_PENDING_EVERY."""
+        if e["key"] not in self.rollup_wanted():
+            return False
+        try:
+            fp = json.loads((e.get("cache") or {}).get("fp") or "null")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(fp, list) and len(fp) == 12 and fp[0] == "OPEN" and fp[7] in ("PENDING", "EXPECTED")
+
     def pending_counts_only(self, e: dict, node: dict | None) -> bool:
-        """Whether E, a land-queue PR, differs from its cached answer only in the counts of its running checks: the
-        same head, state, mergeability and review, a rollup that was and is PENDING, and its last full read within
+        """Whether E, a queued_pending PR, differs from its cached answer only in the counts of its running checks:
+        the same head, state, mergeability and review, a rollup still PENDING, and its last full read within
         PR_FULL_PENDING_EVERY."""
         cache = e.get("cache") or {}
         full = cache.get("fullAt")
-        if e["key"] not in self.rollup_wanted() or not isinstance(full, (int, float)) \
-                or self.now - full >= PR_FULL_PENDING_EVERY:
+        if not isinstance(full, (int, float)) or self.now - full >= PR_FULL_PENDING_EVERY or not self.queued_pending(e):
             return False
         try:
             old, new = json.loads(cache.get("fp") or "null"), json.loads(pr_fingerprint(node) or "null")
         except (TypeError, ValueError):
             return False
-        return (isinstance(old, list) and isinstance(new, list) and len(old) == len(new) == 12
-                and old[:8] == new[:8] and old[0] == "OPEN" and old[7] in ("PENDING", "EXPECTED"))
+        return isinstance(new, list) and len(new) == 12 and old[:8] == new[:8]
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
@@ -14327,6 +14340,10 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
+# LAND_CLOSED_BEFORE_REQUEST: a reopened PR stayed CLOSED in the cache (a terminal copy is re-read rarely, and never
+# while reads are scarce), and every re-request stopped at once "closed unmerged (the cache shows it closed)": cmux#57225,
+# 2026-11-26 05:57-06:50Z, copy read mid close-and-reopen, three re-requests each stopped on it. A CLOSED copy read
+# before the entry's latest request ends it only after one read since that request (closed_copy_stale).
 # LAND_BEFORE_REQUEST_READ: a land request with no --sha, sent right after a push, was judged on the copy read before
 # the push. It stopped at once on land_judge's conflict verdict for the old head, and the requester got that back as its answer: a forwarded
 # `land --wait` returned "head <old> conflict" seconds after the push (incident hq#20521's second data point). A
@@ -16560,6 +16577,13 @@ LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
 LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
+# A judgment that read nothing because a git read of this host's own mirror timed out (land_judge's classifier
+# archive, "git archive ... tried twice: Command '[...git...]' timed out after 24 seconds") is no GitHub read the
+# broker host does better: it is this disk, busy for the moment. a lane VM, 2026-11-26: leo-workspace#11598
+# answered unreadable while a fetch of the 3.8 G cmux mirror ran, the archive timing out at 24 s twice (0.56 s after),
+# and was handed off on that. Such an answer is judged here again, LAND_LOCAL_GIT_RETRIES times per head, first.
+LAND_LOCAL_GIT_TIMEOUT = re.compile(r"\bgit\b[^\n]{0,400}?\btimed out\b")
+LAND_LOCAL_GIT_RETRIES = 2
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
 LAND_HANDOFF_DEADLINE = 60.0
 # A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
@@ -16593,6 +16617,12 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # read of the PR (outcome_read: one peek, LAND_FORWARD_READ_WAIT for it to land), so a merged PR is never told
 # "no outcome".
 LAND_FORWARD_ASK_FIRST = 300.0
+# LAND_BROKER_ASK: a lane VM has no `land serve` program to ask (far_command: no executor, no overflow peer), so its
+# handed-off rows were never asked and ran blind to the re-send and the give-up. a lane VM, 2026-11-26:
+# leo-workspace#11598 handed off at 03:59Z and 04:20Z, 0 land-forward-asked events, re-sent at 05:08Z, re-landed by
+# its give-up at 05:20Z. It asks through the broker instead (broker_ask_command: `lane-gh call land_handoff REPO`
+# {"outcomes": [N, ...]}, cmuxterm-hq parts/49-calls-land-handoff.py), one call per repo and pass, and the answer is
+# read as a far host's is. A broker that does not know `outcomes` refuses it: an ask failure, which changes nothing.
 # A row its far host stopped (forward_stopped) is asked about this long after its stop, this often: the far queue
 # rearms a stop that clears by itself (rearm), and its merge or reopen then reaches the forwarding host's row.
 LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
@@ -18712,14 +18742,31 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "")
-        if state == "CLOSED":
-            at = c.get("dataAt")
-            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
-                return False
+        if state == "CLOSED" and self.closed_copy_stale(e, c):
+            return False
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
             return True
         return self.stop_moved_pin(e, c, data)
+
+    def closed_copy_stale(self, e: dict, c: dict) -> bool:
+        """Under the lock. Whether a CLOSED copy of E's PR is too old to end E on: read before E was queued, or before
+        its last land request (requestedAt, a re-request's too) and not read since. A reopen lands between the two, so
+        that copy predates it: the first such look asks for one read (readBeforeStop, refresh_due's before-request
+        read) instead of stopping, and a fresh copy that still reads CLOSED ends E (LAND_CLOSED_BEFORE_REQUEST)."""
+        at = c.get("dataAt")
+        if not _finite(at) or at < float(e.get("created") or 0):
+            return True
+        asked = e.get("requestedAt")
+        last = (e.get("refresh") or {}).get("at")
+        if not _finite(asked) or at >= asked or (_finite(last) and last >= asked):
+            return False
+        if e.get("readBeforeStop") != asked:
+            e["readBeforeStop"] = asked
+            self.history(e, "stop_read_first", code="closed", age=round(asked - at))
+            self.save(e)
+            log({"event": "land-stop-read-first", "key": e["key"], "code": "closed", "age": round(asked - at)})
+        return True
 
     def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
         """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
@@ -19040,11 +19087,13 @@ class LandQueue:
                         or self.now - self.forward_asked.get(key, float("-inf")) < LAND_FORWARD_ASK_EVERY:
                     continue
                 host = self.forward_host(e)
-                command = self.far_command(host)
+                command, group = self.far_command(host), host
+                if command is None:
+                    command, group = self.broker_ask_command(e), f"{host}\t{e.get('repo')}"
                 if command is None:
                     continue
                 self.forward_asked[key] = self.now
-                groups.setdefault(host, (command, []))[1].append(key)
+                groups.setdefault(group, (command, []))[1].append(key)
             if len(self.forward_asked) > 4 * max(1, len(self.entries)):
                 self.forward_asked = {k: t for k, t in self.forward_asked.items() if k in self.entries}
         if not groups:
@@ -19059,12 +19108,16 @@ class LandQueue:
     def forward_ask(self, groups: dict[str, tuple[list[str], list[str]]], at: float) -> None:
         """GROUPS: far host -> (its program, the keys to ask about). Each answer, or why it could not be had, is kept
         in forward_answers as {"at", "host", "row"} or {"at", "host", "error"}."""
-        for host, (command, keys) in groups.items():
+        for group, (command, keys) in groups.items():
+            host = group.split("\t", 1)[0]
             for i in range(0, len(keys), LAND_OUTCOMES_MAX):
                 part = keys[i:i + LAND_OUTCOMES_MAX]
                 try:
-                    answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
-                                          LAND_FORWARD_DEADLINE)
+                    if command[1:3] == ["call", LAND_HANDOFF_TOOL]:
+                        answer = self.broker_outcomes(command, part)
+                    else:
+                        answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
+                                              LAND_FORWARD_DEADLINE)
                     rows = answer.get("outcomes")
                     if not answer.get("ok") or not isinstance(rows, dict):
                         raise WatchError(f"{host}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
@@ -19078,6 +19131,31 @@ class LandQueue:
                     log({"event": "land-forward-ask-failed", "host": host, "asked": len(part), "error": why})
                 with self.lock:
                     self.forward_answers.update(got)
+
+    def broker_ask_command(self, e: dict) -> list[str] | None:
+        """Under the lock. On a lane VM (broker_client), the broker call that asks its host's queue about E, a row
+        handed there (handedOff): `lane-gh call land_handoff REPO` with {"outcomes": [N, ...]} (LAND_BROKER_ASK's
+        comment); else None."""
+        if not e.get("handedOff") or not self.broker_client() or not isinstance(e.get("repo"), str):
+            return None
+        return [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "call", LAND_HANDOFF_TOOL, e["repo"]]
+
+    def broker_outcomes(self, command: list[str], keys: list[str]) -> dict:
+        """The broker host's queue's rows for KEYS (one repo's PRs) through COMMAND (broker_ask_command), in `land
+        serve` outcomes' shape ({"ok", "host", "outcomes": {key: row}}), or WatchError: no answer."""
+        numbers = {int(split_key(k)[3]): k for k in keys}
+        got = self.call([*command, json.dumps({"outcomes": sorted(numbers)})], LAND_HANDOFF_DEADLINE)
+        envelope: Any = None
+        with contextlib.suppress(ValueError):
+            envelope = json.loads(got.stdout or "")
+        doc = envelope.get("data") if isinstance(envelope, dict) else None
+        rows = doc.get("outcomes") if isinstance(doc, dict) else None
+        if got.returncode != 0 or not isinstance(rows, dict):
+            said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 200) or f"exit {got.returncode}"
+            raise WatchError(f"the broker's {LAND_HANDOFF_TOOL} outcomes: {said}")
+        repo = command[3]
+        return {"ok": True, "host": doc.get("host"),
+                "outcomes": {k: rows.get(f"{repo}#{n}") for n, k in numbers.items()}}
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -20760,7 +20838,10 @@ class LandQueue:
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
-        if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
+        state = str(data.get("state") or "")
+        if state == "CLOSED" and self.closed_copy_stale(e, c or {}):
+            return  # refresh_due reads it first (LAND_CLOSED_BEFORE_REQUEST)
+        if self.ended(e, state, e.get("mergeSha") or "", "the cache shows it"):
             return
         infra = e.pop("infraHandoff", None)
         if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED \
@@ -22748,6 +22829,13 @@ class LandQueue:
             return ""
         if self.broker_peer_silent():
             return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
+        if LAND_LOCAL_GIT_TIMEOUT.search(str(answer.get("reason") or "")):
+            tries = e.get("localGitRetry") if isinstance(e.get("localGitRetry"), dict) else {}
+            n = int(tries.get("count") or 0) + 1 if tries.get("head") == head else 1
+            if n <= LAND_LOCAL_GIT_RETRIES:
+                e["localGitRetry"] = {"head": head, "count": n, "at": self.now}
+                self.history(e, "local_git_retry", head=head[:12], n=n)
+                return ""  # judged here again (LAND_LOCAL_GIT_TIMEOUT's comment)
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
@@ -34943,12 +35031,47 @@ def path_gh_after(directory: Path) -> Path | None:
 
 def broker_guard_comes_back(guard: Path) -> bool:
     """Whether the gh-quota guard would hand the call back to this broker: the next `gh` after it on PATH is this
-    broker's own shim. A merge and a create go to the guard either way (one is refused without it, the other has a
-    pause only it can ask), but for every other call this is the condition that makes the hand-off free: without
-    it the guard runs the real gh behind this broker's back, and the call loses the answer cache, the source
-    refusal and the repeat hold -- a worse trade than the quota route it would gain."""
+    broker's own shim. When it is, the hand-off keeps the answer cache, the source refusal and the repeat hold."""
     following = path_gh_after(guard.parent)
     return following is not None and BROKER_MARK.encode() in file_head(following)
+
+
+# Where `glaeda-gh gh --install-shim` writes the broker's shim; GLAEDA_GH_SHIM_DIR names another (tests).
+BROKER_SHIM_DIR = Path(".local/lib/glaeda-gh/bin")
+
+
+def broker_installed_shim_dir() -> Path | None:
+    """The directory of this host's installed broker shim (a `gh` carrying BROKER_MARK), or None."""
+    directory = Path(os.environ.get("GLAEDA_GH_SHIM_DIR") or Path.home() / BROKER_SHIM_DIR)
+    shim = directory / "gh"
+    if shim.is_file() and os.access(shim, os.X_OK) and BROKER_MARK.encode() in file_head(shim):
+        return directory
+    return None
+
+
+def broker_handoff_path(guard: Path) -> str:
+    """The PATH the gh-quota guard is exec'd with: its own directory first, then -- when the next `gh` after it would
+    not be this broker -- the installed broker shim's directory, so the guard hands the call back here and the call
+    keeps the answer cache, the source refusal and the repeat hold. With no shim installed the guard runs the real
+    gh itself: the call is charged to the login's ledger either way, which is the point of the hand-off.
+
+    Before 2026-11-26 the hand-off was skipped whenever the guard would not come back, which is every `glaeda-gh gh`
+    run from a timer, a LaunchAgent or a systemd unit (their PATH has the guard after nothing, or not at all). Those
+    calls ran the real gh outside the gh-quota shim, so its ledger never saw them: measured 2026-11-26 03:40Z, 240 s
+    on seven login hosts, 238 `gh` processes started by this broker without GH_QUOTA_DEPTH (air-blue's leo-asks
+    tick alone 58 GraphQL searches), against a NOW quota-untallied red of 2144 of 2379 GraphQL points untallied."""
+    rest = os.environ.get("PATH", "")
+    parts = [str(guard.parent)]
+    if not broker_guard_comes_back(guard):
+        shim_dir = broker_installed_shim_dir()
+        if shim_dir is not None and shim_dir != guard.parent:
+            parts.append(str(shim_dir))
+        elif path_gh_after(guard.parent) is None:
+            # A LaunchAgent's PATH can hold no gh at all: the guard would fall back to a bare `gh` and fail where
+            # this broker finds one in the usual install paths. Name that one's directory last.
+            with contextlib.suppress(Exception):
+                rest = os.pathsep.join(entry for entry in (rest, str(Path(broker_real_gh()).parent)) if entry)
+    return os.pathsep.join([*parts, rest]) if rest else os.pathsep.join(parts)
 
 
 def broker_real_gh() -> str:
@@ -37236,8 +37359,9 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         # -- which is what this tool's own next-step lines print -- the call had one route and no ledger entry.
         # Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr edit 2358 -R
         # teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the
-        # identical bare `gh pr edit` answered over REST at once. Unlike a merge or a create, this hand-off is taken only when the guard would hand the
-        # call back here (broker_guard_comes_back) and not for this daemon's own reads, which keep their route.
+        # identical bare `gh pr edit` answered over REST at once. The hand-off is taken whether or not the guard would hand the
+        # call back here (broker_handoff_path puts the installed shim after it when it would not), and not for this
+        # daemon's own reads, which keep their route.
         # CMUX_GH_BROKER_DISABLE is honoured here, unlike for a merge or a create: a merge may never be sent
         # past land_judge and a create may never skip the login's pause, but for an ordinary call that switch is
         # a person asking for the real gh and the line they typed, and it is the escape hatch the loop message
@@ -37249,15 +37373,13 @@ def broker_merge_handoff(args: list[str]) -> int | None:
         if create or other:
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-                if guard.is_file() and os.access(guard, os.X_OK) \
-                        and (create or broker_guard_comes_back(guard)):
+                if guard.is_file() and os.access(guard, os.X_OK):
                     # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
                     # to the process being started. Mutating this process first leaves the guard's directory on
                     # PATH and the hop mark set for every later call in the same process, which is wrong for
                     # every in-process caller (a test, the daemon) whenever the exec does not happen.
                     # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
-                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
-                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()), "PATH": broker_handoff_path(guard)}
                     os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
