@@ -24357,8 +24357,9 @@ class LandQueue:
                 e.pop("overrideWait", None)
             self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
-        if kind in LAND_OVERRIDE_PIN_KINDS and land_override_pinned(e, head):
-            # LAND_OVERRIDE_PIN_KINDS' comment: the pinned merge carrying the override, once per head
+        if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
+            # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
+            # head
             if (e.get("overridePinMerge") or {}).get("head") == head:
                 with self.lock:
                     self.stop(e, "pinned_override_refused",
@@ -26837,6 +26838,20 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
 # A hold, BLOCK, conflict or other LAND_STOP_CLASSES stop still stops; an unpinned override still waits on a running
 # check (land_override_carries), and a head off the pin is judged as before.
 LAND_OVERRIDE_PIN_KINDS = LAND_WAIT_KINDS | {"rerun_failed"}
+
+
+# land_judge's merge train (leo-workspace tools/land_judge/merge_train.py) replaces the update_branch step of a
+# manaflow-ai/cmux PR into feat-cmux-next with a timed retry that carries "board_train" (boarding) or "train" (boarded,
+# waiting on the train's status). A pinned override row is merged at its pin when land_judge names an update_branch
+# (update_branch's own comment), but the train's stand-in for that same step fell to the plain retry backoff, so the
+# override never reached a merge. manaflow-ai/cmux#58296, 2026-11-26: queued at 30061064 with --override-reason and
+# --override-receipt at 12:11:43Z (a base red on 'pr pipeline / linux' it does not touch), judged red_not_excused
+# step=retry (train=boarded) at 12:16:04Z and woken for another 5-minute retry, while the gh shim's own train hold had
+# already lapsed at 11:29:16Z. Now that retry is taken as the update_branch it replaces: the pinned merge carrying the
+# override, once per head. Any other retry (unreadable, quota, host_cap, explain_failed) waits as before.
+def land_train_retry(act: dict) -> bool:
+    """True when ACT is the merge train's retry standing in for an update_branch step (the comment above)."""
+    return act.get("kind") == "retry" and bool(act.get("train") or act.get("board_train"))
 
 
 def land_override_pinned(e: dict, head: str) -> bool:
