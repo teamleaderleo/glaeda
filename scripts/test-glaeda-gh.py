@@ -34989,6 +34989,7 @@ class LandTest(Base):
         for name, (why, sent, slept) in cases.items():
             with self.subTest(name):
                 self.w.notices.clear()
+                self.q.__dict__.pop("notify_gone", None)  # each case its own session (LAND_NOTIFY_GONE_KEEP)
                 self.pr(LA)
                 self.land()
                 self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
@@ -35013,6 +35014,59 @@ class LandTest(Base):
                     self.assertNotIn("land-notify-failed", [n[0] for n in self.w.notices])
                 else:
                     self.assertIn("land-notify-failed", events)
+
+    def test_a_session_acpmux_said_is_gone_is_not_asked_again_until_the_keep_passes(self):
+        # cmux-cp-1, 2026-11-25 08:30Z to 11-26 08:30Z: 2,114 land-notify-no-session, 1,572 to one ended session
+        e = {"key": self.KEY, "repo": "o/r", "number": 1}
+        real, tries, clock = self.w.run, [], [1000.0]
+
+        def gone(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv[3])
+                if argv[3] == "host/ended":
+                    return subprocess.CompletedProcess(argv, 1, "", 'acpmux: no_session: no session matches "host/ended"')
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real(argv, timeout, env)
+        self.q.run, self.q.inline = gone, True
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append), mock.patch.object(gg.time, "time", lambda: clock[0]):
+            self.q.notify(e, "host/ended", "glaeda land: stopped: one")
+            self.q.notify(e, "host/ended", "glaeda land: stopped: two")
+            self.q.notify(e, "host/live", "glaeda land: stopped: three")  # another session is told as before
+            self.assertEqual(tries, ["host/ended", "host/live"])
+            clock[0] += gg.LAND_NOTIFY_GONE_KEEP + 1
+            self.q.notify(e, "host/ended", "glaeda land: stopped: four")  # asked again once the keep has passed
+        self.assertEqual(tries, ["host/ended", "host/live", "host/ended"])
+        said = [ln for ln in lines if ln.get("event") == "land-notify-no-session"]
+        self.assertEqual([(ln["tries"], "memo" in ln) for ln in said], [(1, False), (0, True), (1, False)])
+        self.assertNotIn("land-notify-failed", [ln.get("event") for ln in lines])
+
+    def test_a_burst_of_notices_runs_at_most_the_parallel_bound_and_every_one_is_sent(self):
+        # cmux-cp-1, 2026-11-26 04:44Z: 2,078 reminders in one minute, 1,433 "OSError" and 516 timed out (94% lost)
+        e = {"key": self.KEY, "repo": "o/r", "number": 1}
+        real, lock, state, sent = self.w.run, threading.Lock(), {"now": 0, "peak": 0}, []
+
+        def slow(argv, timeout, env):
+            if argv[0] != "/fake/acpmux":
+                return real(argv, timeout, env)
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.02)
+            with lock:
+                state["now"] -= 1
+                sent.append(argv[3])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        self.q.run, self.q.inline = slow, False
+        before = set(threading.enumerate())
+        with mock.patch.object(gg, "log", lambda line: None):
+            for n in range(40):
+                self.q.notify(e, f"host/lane-{n}", "glaeda land: stopped: x")
+            for t in set(threading.enumerate()) - before:
+                t.join(30)
+        self.assertEqual(sorted(sent), sorted(f"host/lane-{n}" for n in range(40)))
+        self.assertLessEqual(state["peak"], gg.LAND_NOTIFY_PARALLEL)
+        self.assertGreater(state["peak"], 1)
 
     def test_a_requester_named_none_is_nobody(self):
         with mock.patch.object(gg, "policy_host", return_value="hostx"), mock.patch.dict(os.environ, {}, clear=True):
