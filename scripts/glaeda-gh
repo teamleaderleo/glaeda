@@ -15709,6 +15709,16 @@ def land_requester_idle_s(out: str, now: float) -> float | None:
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
+# LAND_MERGED_CLASS: this queue's own merge is a result, not a blocker: nothing waits on the requester. Sent as class
+# block, every merge reached its requester tagged [blocker] (gcp-codex-lane-10, 2026-11-26 12:49Z and 12:50Z: "merged
+# at 2f3de658" for lw#11661 and "merged at 951bc81f" for lw#11593, both class block), and a meta-audit read those as
+# merged PRs still raising blockers. Leo, 2026-11-24: "are there any like process level fixes?". A result waits up to
+# 15 min in an idle inbox (acpmux hub/inbox.rs), so it carries LAND_MERGED_WITHIN: the receiver still wakes within a
+# minute. An acpmux older than --within (it refuses the flag) gets the same send once without it. Detector:
+# test-glaeda-gh.py test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute.
+LAND_MERGED_CLASS = "result"
+LAND_MERGED_WITHIN = "60s"
+LAND_NOTIFY_NO_WITHIN = re.compile(r"unexpected argument '--within'")
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
 # An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
 # shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
@@ -25925,7 +25935,8 @@ class LandQueue:
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
-                    cls=None if own else LAND_FORWARD_FYI_CLASS)
+                    cls=LAND_MERGED_CLASS if own else LAND_FORWARD_FYI_CLASS,
+                    within=LAND_MERGED_WITHIN if own else None)
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -26074,7 +26085,7 @@ class LandQueue:
         self.notify(e, e.get("requester") or "", msg, wake=wake, cls=cls)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None,
-               unless_idle: float | None = None) -> None:
+               unless_idle: float | None = None, within: str | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -26087,7 +26098,8 @@ class LandQueue:
         land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone.
 
         UNLESS_IDLE: send nothing when the receiver has sat between turns that many seconds or longer, read once
-        before the send (LAND_OWNER_REMIND_IDLE)."""
+        before the send (LAND_OWNER_REMIND_IDLE). WITHIN: acpmux's --within, the latest the receiver is woken
+        (LAND_MERGED_WITHIN)."""
         to = land_notify_target(e, to)
         if not wake:
             log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
@@ -26114,7 +26126,8 @@ class LandQueue:
         # CLS (an inbox fyi: forward_give_up) is held in the receiver's inbox and wakes nobody
         severity = "info" if cls or message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
+                "--class", cls or LAND_NOTICE_CLASS, *(["--within", within] if within else []), "--title", title,
+                message]
 
         now = self.now
 
@@ -26143,6 +26156,17 @@ class LandQueue:
                          "severity": severity, "message": land_trim(message, 160)})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if "--within" in argv and LAND_NOTIFY_NO_WITHIN.search(whys[-1]):
+                    # LAND_MERGED_WITHIN's comment: an acpmux older than --within; the same send without it
+                    i = argv.index("--within")
+                    del argv[i:i + 2]
+                    got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                    if got.returncode == 0:
+                        gone.pop(to, None)
+                        log({"event": "land-notified", "key": e["key"], "to": to, "class": cls or LAND_NOTICE_CLASS,
+                             "severity": severity, "message": land_trim(message, 160), "within": "unsupported"})
+                        return
+                    whys[-1] = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
                 if LAND_NOTIFY_GONE.search(whys[-1]):
                     # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
                     gone[to] = time.time()

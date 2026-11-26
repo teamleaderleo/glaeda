@@ -27233,8 +27233,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
-                                                   "--class", "block", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:14], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "result", "--within", "60s", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -27245,15 +27245,29 @@ class LandTest(Base):
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
 
-    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
-        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
-        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+    def test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute(self):
+        # LAND_MERGED_CLASS: its own merge asks nothing of the requester, so it is a result, never a [blocker]
+        # (lw#11661 and #11593, 2026-11-26), and --within still wakes an idle lane within a minute.
         self.pr(LA)
         self.land()
         self.w.answers.append(ok_answer(LA))
         self.tick()
         sent = self.w.sent()[-1]
-        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
+        self.assertEqual(sent[sent.index("--within") + 1], "60s")
+        self.assertIn("merged", sent[-1])
+
+    def test_a_merged_notice_to_an_acpmux_without_within_is_sent_again_without_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--within' found\n")
+        real = self.q.call
+        self.q.call = lambda argv, *a, **k: (refused if "--within" in argv else real(argv, *a, **k))  # type: ignore
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertNotIn("--within", sent)
+        self.assertEqual(sent[sent.index("--class") + 1], "result")
         self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
