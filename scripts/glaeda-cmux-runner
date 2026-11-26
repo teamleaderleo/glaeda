@@ -1035,8 +1035,13 @@ def console_session_runner(ctx: Context) -> bool:
     mapping a SessionCreate session to the console's: `lsappinfo front` reads [ NULL ] from it and xcodebuild dies
     launching the test runner with "IDELaunchServicesLauncher.m:418 Assertion failed: childPID > 0" (cmuxs-mac-mini-3
     and cmux8s, 2026-10-30; a fresh SessionCreate agent there could not see Finder, one without it could). It isolates
-    nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway."""
-    return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False))
+    nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway.
+    A runner.dedicated entry with a user (DEDICATED_USER) runs in that account's own GUI session too: it is a hidden
+    CI account kept logged in for exactly that (gui-ci-users), and its jobs open the app with /usr/bin/open. In a
+    SessionCreate session none came up: cmux8s's hq-app-probe failed every production chat it took, 30 of 30 from
+    2026-11-25 19:56Z, `launch: not within 120 s`, and job_keychain's GUI-session job never read its commands."""
+    return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False)
+                                     or user_entry(ctx))
 
 
 def role_daemon(ctx: Any) -> bool:
