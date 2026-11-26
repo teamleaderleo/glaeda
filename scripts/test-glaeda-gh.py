@@ -27236,6 +27236,7 @@ class RunReadOnceTest(unittest.TestCase):
 # ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
 
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
+LD = "d" * 40  # a resync commit (pr_resync): LB's tree, on LB
 
 
 def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
@@ -27292,6 +27293,7 @@ class LandWorld:
         self.watched: list[str] = []
         self.notices: list[tuple] = []
         self.session_info: dict | None = None  # what `acpmux session info --json` answers (None: nothing printed)
+        self.resync_sha = LD  # the commit pr_resync's commit_create (or POST git/commits) makes
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
@@ -27381,12 +27383,39 @@ class LandWorld:
                     "ok": True, "merged": True}}, indent=1) + "\n", "")
             err = self.gh_err.get("merge", "merge refused")
             return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": err}, indent=1) + "\n", "")
+        if argv[0] == "/fake/lane-gh" and argv[1:3] in (["call", "commit_create"], ["call", "ref_update"]):
+            # the broker's git data writes (pr_resync): a commit, then a fast-forward that moves the branch ref read
+            tool, args = argv[2], json.loads(argv[4])
+            rc = self.gh_rc.get("commit" if tool == "commit_create" else "ref", 0)
+            if rc:
+                return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": self.gh_err.get(
+                    "ref", f"refused: {tool}: lane/x is nobody's by the broker's owner record")}, indent=1), "")
+            if tool == "ref_update":
+                self.api[f"repos/{argv[3]}/git/ref/heads/{args['branch']}"] = args["sha"]
+            sha = self.resync_sha if tool == "commit_create" else args["sha"]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 201, "data": {
+                "sha": sha}}, indent=1) + "\n", "")
         if argv[0] in ("/fake/git", "/fake/lane-gh", "/fake/git-fetch-once"):
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
                 return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
+            if words[:1] == ["api"] and len(words) > 3 and words[2:4] == ["-X", "POST"] \
+                    and words[1].endswith("/git/commits"):  # pr_resync's commit on a host with its own login
+                rc = self.gh_rc.get("commit", 0)
+                return subprocess.CompletedProcess(argv, rc, self.resync_sha + "\n" if rc == 0 else "",
+                                                   "" if rc == 0 else "HTTP 422: Tree SHA does not exist")
+            if words[:1] == ["api"] and len(words) > 3 and words[2:4] == ["-X", "PATCH"] and "/git/refs/heads/" in words[1]:
+                rc = self.gh_rc.get("ref", 0)
+                sha = next(w[4:] for w in words if w.startswith("sha="))
+                if rc == 0:  # the branch ref read (git/ref/heads/B) says the fast-forward from now on
+                    self.api[words[1].replace("/git/refs/heads/", "/git/ref/heads/")] = sha
+                return subprocess.CompletedProcess(argv, rc, sha + "\n" if rc == 0 else "",
+                                                   "" if rc == 0 else "HTTP 422: Update is not a fast forward")
+            if words[:1] == ["api"] and len(words) > 1 and "/git/commits/" in words[1] \
+                    and not any(words[1].startswith(p) for p in self.api):
+                return subprocess.CompletedProcess(argv, 0, "e" * 40 + "\n", "")  # a commit's tree (pr_resync)
             if words[:1] == ["api"] and len(words) > 1:
                 for prefix, out in self.api.items():
                     if words[1].startswith(prefix):
