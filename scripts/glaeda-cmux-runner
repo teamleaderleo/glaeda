@@ -3916,7 +3916,7 @@ def relay_plist(ctx: Context) -> dict[str, Any]:
     relay, follow = relay_of(ctx), relay_follow_of(ctx)
     if follow:  # LAN_RELAY_FOLLOW: the node's own LAN endpoints first, then the declared addresses
         declared = relay if isinstance(relay, list) else [relay]
-        net, bits = follow["within"].split("/")  # glaeda_fleet_labels.follow_prefix: "172.20.21.0/24" -> "172.20.21."
+        net, bits = follow["within"].split("/")  # glaeda_fleet_labels.follow_prefix: "10.1.2.0/24" -> "10.1.2."
         prefix = ".".join(net.split(".")[: int(bits) // 8]) + "."
         argv = [LAN_RELAY_SH, "-c", LAN_RELAY_FOLLOW_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
                 str(LAN_RELAY_IDLE_S), declared[0].rsplit(":", 1)[1], follow["tailnetIp"], follow["node"],
