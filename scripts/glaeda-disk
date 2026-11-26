@@ -15079,7 +15079,54 @@ def pressure_pass_lock() -> bool:
         os.close(fd)
         return True
     _PRESSURE_PASS_HANDLE = fd
+    with contextlib.suppress(OSError):  # who holds it, for a skipped pass's line (pressure_pass_holder)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({"pid": os.getpid(), "started_at": time.time(),
+                                  "caller": RUN.get("caller")}).encode(), 0)
     return True
+
+
+def pressure_pass_holder(now: float | None = None) -> tuple[str, dict]:
+    """Why a pressure pass skipped, said so a reader can tell a live pass from a stuck one: who holds
+    pressure-pass.lock (pid, age, caller, as the holder wrote it) and what the last pass that ran, from the run log,
+    freed and found blocked. 2026-11-26, two lane VMs at 95-96%: a coordinator's own apply skipped with "another
+    pressure pass is running" and read it as a stuck lock; the holder was the 15-minute timer's pass, alive 2-4 min,
+    and each finished pass had freed 0 GiB with 70-77 GiB blocked as live-held."""
+    now = time.time() if now is None else now
+    details: dict = {}
+    parts: list[str] = []
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        held = json.loads((EVICT_LOCK.parent / "pressure-pass.lock").read_text() or "{}")
+        if isinstance(held, dict) and held.get("pid"):
+            alive = True
+            try:
+                os.kill(int(held["pid"]), 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                pass
+            age = max(0, int(now - float(held.get("started_at") or now)))
+            details["holder"] = {"pid": int(held["pid"]), "age_s": age, "caller": held.get("caller"), "alive": alive}
+            parts.append(f"pid {held['pid']} ({'alive' if alive else 'gone'}), started {age // 60} min {age % 60} s "
+                         f"ago by {held.get('caller') or 'an unnamed caller'}")
+    last = None
+    with contextlib.suppress(OSError, ValueError):
+        with open(RUN_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - (1 << 20)))
+            for line in reversed(fh.read().decode("utf-8", "replace").splitlines()):
+                with contextlib.suppress(ValueError):
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("mode") == "pressure" and not row.get("skipped"):
+                        last = row
+                        break
+    if last:
+        blocked = last.get("blocked") or {}
+        details["last_pass"] = {k: last.get(k) for k in ("at", "reclaimed_gib", "free_gib_after", "blocked")}
+        held_by = ", ".join(f"{k} {v} GiB" for k, v in sorted(blocked.items(), key=lambda kv: -kv[1])[:4])
+        parts.append(f"the last pass that ran ({last.get('at')}) freed {last.get('reclaimed_gib', 0)} GiB"
+                     + (f"; it found in use: {held_by}" if held_by else ""))
+    return ("; ".join(parts), details)
 
 
 def floor_evict_wait_until(apply_: bool) -> float:
@@ -17986,7 +18033,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # pass that holds it judges the same filesystems against the same floor, so a second one only waits.
     if (a.pressure and a.apply and under and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
             and not pressure_pass_lock()):
-        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
+        said, held = pressure_pass_holder()
+        RUN["pressure_pass_holder"] = held
+        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped"
+                        + (f" ({said})" if said else ""), **held)
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # what a fleet mini under pressure frees that it otherwise holds for good (PRESSURE_WORKER_BUILD_OUTPUT)
@@ -18957,6 +19007,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
+        row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass
         row["runner_accounts"] = RUN["runner_accounts"]
     if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)
