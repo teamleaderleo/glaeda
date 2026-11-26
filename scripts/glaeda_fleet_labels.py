@@ -998,7 +998,7 @@ def lan_relay_follow(value: Any, where: str, relay: Any) -> tuple[dict[str, str]
 
 
 def follow_prefix(within: str) -> str:
-    """The dotted string prefix every address inside `within` starts with: "172.20.21.0/24" -> "172.20.21."."""
+    """The dotted string prefix every address inside `within` starts with: "10.1.2.0/24" -> "10.1.2."."""
     net, bits = within.split("/")
     return ".".join(net.split(".")[: int(bits) // 8]) + "."
 
