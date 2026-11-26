@@ -132,5 +132,5 @@ listed as `not reached`. A host turns this off with `"runner_accounts": false` i
 its disk policy.
 
 ```sh
-glaeda-disk --dead --apply    # then: runner account NAME: ran: reclaimed N, home M
+cmux-disk --dead --apply      # then: runner account NAME: ran: reclaimed N, home M
 ```

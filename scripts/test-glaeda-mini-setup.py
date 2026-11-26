@@ -296,7 +296,7 @@ class MiniSetupTest(unittest.TestCase):
         registry = plistlib.loads(
             (self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-registry-evict.plist").read_bytes())
         self.assertEqual(registry["ProgramArguments"][1:],
-                         [os.fspath(bin_dir / "glaeda-disk-registry"), "evict", "--json", "--apply"])
+                         [os.fspath(bin_dir / "cmux-disk-registry"), "evict", "--json", "--apply"])
         self.assertNotIn("GLAEDA_DISK_REGISTRY", registry.get("EnvironmentVariables", {}))
         self.assertEqual((bin_dir / "glaeda-disk-registry").read_bytes(), (ROOT / "scripts/glaeda-disk-registry").read_bytes())
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
