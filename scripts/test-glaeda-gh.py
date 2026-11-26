@@ -32600,6 +32600,41 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
         self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
 
+    def test_land_override_naming_only_files_outside_the_diff_updates_when_its_pin_merge_is_refused(self):
+        # lw#11929, 2026-11-26: overridden for base reds in test_reach and others, its pin merge refused behind main,
+        # stopped pinned_override_update and a person merged main by hand. Those files are not the PR's: update.
+        self.pr(LA)
+        self.w.files = ["tools/fanout_cap.py", "tools/test_fanout_cap.py"]
+        reason = "ws-check reds are base reds in files this PR does not touch (test_reach, tools/test_ws_check.py)"
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override={"reason": reason, "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertNotEqual(e.get("state"), "stopped", e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "override_update_outside_diff"],
+                         ["override_update_outside_diff"])
+        self.assertTrue(e.get("updateSent") or self.w.gh_calls("api", "-X", "PUT"), e["history"][-4:])
+
+    def test_land_override_naming_a_file_of_the_diff_still_stops_when_its_pin_merge_is_refused(self):
+        self.pr(LA)
+        self.w.files = ["tools/test_reach.py"]
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                        override={"reason": "test_reach red is flaky", "receipt": "r"})
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: behind; next: gh api -X PUT "
+                                  f"repos/o/r/pulls/1/update-branch -f expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
+
+    def test_land_override_files(self):
+        self.assertEqual(gg.land_override_files("base reds (test_reach, tools/test_ws_check.py; a/b.rs) on main 45810787066"),
+                         {"test_reach", "test_ws_check.py", "b.rs"})
+        self.assertEqual(gg.land_override_files("base red: ci fails the same way on main"), set())
+
     def test_land_override_pinned_row_merges_at_its_pin_past_running_or_red_checks(self):
         # cmux#52546 parked until 04:30Z and cmux#53958 (override recorded 03:30:35Z, judged checks_running 24 s later),
         # 2026-11-25: queued pinned with an override, they waited on their checks and never merged; a direct pinned
