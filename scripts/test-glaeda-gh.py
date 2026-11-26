@@ -33612,6 +33612,13 @@ class LandTest(Base):
             with self.subTest(said=said[:30]):
                 self.assertTrue(gg.land_handoff_transient(1, said))
         self.assertFalse(gg.land_handoff_transient(1, "refused: unknown tool 'land_handoff'"))
+        # lane-gh's busy-retry progress precedes whatever the final answer is: a real refusal after it is real
+        progress = ("lane-gh land_handoff: the broker is busy (busy: admission queue full (the broker is CPU-bound); "
+                    "nothing was started, retry after 1s); nothing was started; asking again in 1.1 s (try 2), 300 s "
+                    "left of the 300 s retry window ")
+        self.assertFalse(gg.land_handoff_transient(1, progress + "lane-gh call land_handoff: refused: unknown argument "
+                                                      "'nominated'"))
+        self.assertTrue(gg.land_handoff_transient(1, progress))  # still busy when lane-gh's window ran out
         self.broker = True
         self.pr(LA)
         self.land()
@@ -33625,7 +33632,7 @@ class LandTest(Base):
             e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
         self.assertEqual(len(self.handoffs()), gg.LAND_RETRY_STREAK_STOP)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_transient"))
-        self.assertNotIn("handoffFail", e)
+        self.assertIsNone(e.get("handoffFail"))
         self.w.handoff = ok
         self.w.answers.append(ok_answer(LA))
         e = self.tick(gg.LAND_REARM_AFTER + 1)
@@ -33636,7 +33643,7 @@ class LandTest(Base):
             self.w.answers.append(ok_answer(LA))
             e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
         self.assertEqual(e["state"], "forwarded")
-        self.assertNotIn("handoffTransient", e)
+        self.assertIsNone(e.get("handoffTransient"))
 
     def test_a_legacy_handoff_refused_stop_on_a_timeout_is_rearmed_and_a_real_refusal_is_not(self):
         # The 59 rows stopped before LAND_HANDOFF_TRANSIENT: their last refusal was a timeout, so they re-arm as a
