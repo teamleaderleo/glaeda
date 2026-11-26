@@ -21657,12 +21657,17 @@ class BrokerAnswerCacheTest(CountingGhBase):
                 args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
                                  reviewer=None, label=None, remove_label=None, event="comment", **made)
                 err = io.StringIO()
+                kept = set(gg.unsent_dir().glob("*.md")) if gg.unsent_dir().is_dir() else set()
                 with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
                         contextlib.redirect_stderr(err):
                     self.assertEqual(gg.cmd_post(args), 3)
                 said = err.getvalue()
-                # one id per write, random-suffixed: this subTest's body is the newest, not the last sorted
-                body = max(gg.unsent_dir().glob("*.md"), key=lambda f: f.stat().st_mtime_ns)
+                # this subTest's body is the one file it added. Not the newest by mtime: Linux stamps files with
+                # the kernel's coarse clock, so three writes in one tick tie and max() picked an earlier subTest's
+                # body (manaflow-ai/glaeda#43, Verify run 45715716038, glaeda-gh-tests (2), 2026-11-26).
+                added = set(gg.unsent_dir().glob("*.md")) - kept
+                self.assertEqual(len(added), 1, added)
+                body = added.pop()
                 self.assertEqual(body.read_text(), "hi")
                 self.assertIn("has no login to post with", said)
                 self.assertIn(hand.format(body=body), said)  # whole, never cut
