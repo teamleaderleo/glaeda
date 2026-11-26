@@ -477,7 +477,7 @@ def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
 
 # What one iOS simulator runtime download needs on the Data volume, above the host's disk floor. Measured
 # An Xcode copied over the LAN lands at its apparent size: tar does not keep the HFS compression an App Store
-# install has. Measured on cmux13s-mac-mini 2026-11-26: Xcode_27.0.app (27A266a) 9.6 GiB apparent (3.5 GiB
+# install has. Measured on a fleet mini 2026-11-26: Xcode_27.0.app (27A266a) 9.6 GiB apparent (3.5 GiB
 # allocated, compressed), Xcode_26.6.app 8.3 GiB apparent; one GiB of headroom over the larger.
 XCODE_COPY_GIB = 11
 # 2026-10-29: the arm64 iOS 26.5 (23F77) image Xcode 26.6 installs is 7.9 GiB (simctl runtime list -v); the
