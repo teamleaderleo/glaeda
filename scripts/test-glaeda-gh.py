@@ -32911,6 +32911,27 @@ class LandTest(Base):
         self.assertEqual(e["state"], "merged", e.get("stop"))
         self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
 
+    def test_a_lane_push_s_auto_opened_draft_is_queued_readied_at_the_merge_and_merged(self):
+        """The commonest source of these drafts: `lane-gh push` opens a draft PR for every new lane/ branch
+        ("note: opened draft .../pull/N for lane/NAME ... PR_AUTO_DRAFT=0 turns this off"), and only a later
+        `gh pr create` fills it in and marks it ready. A lane that queues `glaeda-gh land` straight after its push
+        skips that step, and its PR is still the auto-opened draft. The request holds no fresh read of it (a PR opened
+        seconds ago), so it is queued; the merge meets the draft and the queue readies it, with no re-queue."""
+        self.pr(LA, draft=True)  # the daemon's own read: a draft from the start, never readied by anyone
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1))  # no read on disk at the request
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "ready"), [["pr", "ready", "1", "-R", "o/r"]])
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.w.gh_rc["merge"] = 0
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(e["state"], "merged", e.get("stop"))
+        self.assertFalse(any("stopped" in str(m) for m in self.w.sent()), self.w.sent())  # nobody was asked to act
+
     def test_a_draft_stops_merge_draft_when_marking_it_ready_is_refused_or_it_is_a_draft_again(self):
         """The stop stays for the two cases the queue cannot answer: `gh pr ready` itself refused, and a PR converted
         back to a draft after the queue readied it at that head (someone's deliberate hold). One refusal each, and the
