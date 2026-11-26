@@ -29171,13 +29171,74 @@ class LandTest(Base):
         self.w.answers.append(refusal("cancelled", LB, {"kind": "rerun_failed", "runs": [5]}))
         return self.tick()
 
-    def test_an_age_only_stale_rerun_at_this_lands_own_head_is_the_rerun(self):
-        # LAND_UPDATE_ONCE's comment: the run's merge is this land's own; only the base's age makes it stale
-        e = self.stale_at_own_head(["src/a.ts"], ahead=gg.STALE_REPLAY_BEHIND + 30)
-        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"]])
+    def test_an_age_only_stale_rerun_at_this_lands_own_head_is_a_base_merge_too(self):
+        # LAND_STALE_MERGE_KEY's comment: cmux#56958's ios ffi job failed again on a merge 509 commits behind main
+        e = self.stale_at_own_head(["src/a.ts"], ahead=509)
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
         updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
-        self.assertEqual(updates, [f"expected_head_sha={LA}"])
-        self.assertIn("stale_replay_own_head", [h["event"] for h in e["history"]])
+        self.assertEqual(updates, [f"expected_head_sha={LA}", f"expected_head_sha={LB}"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.assertNotIn("update_again_unnamed", [h["event"] for h in e["history"]])
+        self.assertIn("509 commits behind", [h for h in e["history"] if h["event"] == "stale_replay"][0]["why"])
+
+    STALE_MERGE = ("run 5's merge was built on main at bbbbbbbbbbbb (2026-11-22T00:05:00Z), 509 commits behind main "
+                   "now (more than 50); a rerun replays that merge; rerun on the run's own merge commit anyway.")
+
+    def broker_red(self, head: str, run: int = 5, name: str = "ios ffi") -> None:
+        """A lane VM's land (the broker's forms) whose PR at HEAD has NAME red in RUN, beside a green check."""
+        self.broker = True
+        self.q = self.queue()
+        self.w.set_pr(self.KEY, {**land_pr(head), "checks": [
+            {"name": name, "workflow": "w", "status": "COMPLETED", "conclusion": "FAILURE", "runId": run},
+            {"name": "lint", "workflow": "w", "status": "COMPLETED", "conclusion": "SUCCESS", "runId": run},
+            {"name": "other", "workflow": "x", "status": "COMPLETED", "conclusion": "FAILURE", "runId": 99}]}, self.t)
+
+    def test_a_brokers_stale_merge_answer_to_a_rerun_takes_update_branch_naming_the_reds_not_a_wait(self):
+        # gcp-agent-lane-1/coord-successor, 2026-11-26: "on a stale_merge answer, call update_branch (land: true,
+        # needs_newer_base = the red checks) instead of rerun". This host's own read failed; the broker's did not.
+        self.broker_red(LA)
+        self.w.api["repos/o/r/actions/runs/5"] = None
+        self.w.gh_out["rerun"] = json.dumps({"ok": True, "status": 201, "data": {
+            "run": 5, "rerun": "failed", "pr": 1, "stale_merge": self.STALE_MERGE}}, indent=1)
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--needs-newer-base", "ios ffi",
+                           "--match-head-commit", LA]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.assertIn("509 commits behind", [h for h in e["history"] if h["event"] == "stale_merge_answer"][0]["why"])
+
+    def test_a_stale_rerun_on_a_lane_vm_is_never_sent_and_its_update_names_the_reds(self):
+        self.broker_red(LA)
+        self.stale_api(5, ["src/a.ts"], ahead=509)
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--needs-newer-base", "ios ffi",
+                           "--match-head-commit", LA]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
+    def test_a_rerun_answer_with_no_stale_merge_waits_on_the_rerun_as_before(self):
+        self.broker_red(LA)
+        self.w.api["repos/o/r/actions/runs/5"] = None
+        self.w.gh_out["rerun"] = json.dumps({"ok": True, "status": 201, "data": {"run": 5, "rerun": "failed"}})
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+
+    def test_stale_merge_note_reads_the_brokers_envelope_and_nothing_else(self):
+        note = gg.land_stale_merge_note
+        self.assertEqual(note(json.dumps({"ok": True, "data": {"stale_merge": ' a "q" '}})), 'a "q"')
+        self.assertEqual(note("lane-gh: x\n" + json.dumps({"data": {"stale_merge": "b"}}, indent=1)), "b")
+        for out in ("", "{}", json.dumps({"ok": True, "data": {"run": 5}}), "stale_merge", '{"stale_merge": 3}'):
+            self.assertEqual(note(out), "", out)
 
     def test_a_stale_rerun_the_base_fixed_at_this_lands_own_head_is_still_a_base_merge(self):
         e = self.stale_at_own_head(["scripts/ci/api_call_log/env.sh"], ahead=3)
@@ -29274,6 +29335,22 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_an_unrelated_reruns_stale_merge_answer_takes_the_base_merge_not_a_wait(self):
+        # LAND_STALE_MERGE_KEY's comment: the broker reran a merge this host could not read as stale
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.w.api[f"repos/o/r/actions/runs/{self.RUN}"] = None
+        self.w.gh_out["rerun"] = json.dumps({"ok": True, "data": {"run": self.RUN, "stale_merge": "509 commits behind"}})
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "stale_merge_answer"], ["stale_merge_answer"])
+        checks = (self.q.cache_of(self.KEY) or {})["data"]["checks"]  # what a lane VM's update names (--needs-newer-base)
+        self.assertEqual(gg.land_rerun_red_names(checks, [self.RUN]), ["Native/OptChat/optchat-chief", "rust workspaces"])
 
     def test_an_unrelated_red_on_a_merge_the_base_fixed_since_is_a_pinned_base_merge_once(self):
         self.unrelated_world(["webviews/src/a.ts"])
