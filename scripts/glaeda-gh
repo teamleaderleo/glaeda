@@ -22381,12 +22381,14 @@ class LandQueue:
             e = self.entries.get(key)
             if e is None:
                 return
-            live = self.update_live_tip(e, (self.cache_of(key) or {}).get("data") or {})[0]
+            data = (self.cache_of(key) or {}).get("data") or {}
+            live = self.update_live_tip(e, data)[0]
+            follow = self.live_base_merge(e, live, head, pin, data)
             with self.lock:
                 self.check(e)
                 if str(e.get("pinSha") or "") != pin or e.get("state") == "stopped":
                     return
-                if not self.stale_live(e, head, pin, live):
+                if not self.stale_live(e, head, pin, live, follow):
                     e.pop("pinWait", None)
                     self.stop(e, "head_moved", land_moved_clause(head, pin) + " (GitHub's branch ref is at it too)",
                               f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
@@ -22396,7 +22398,46 @@ class LandQueue:
         finally:
             self.local.gen = was
 
-    def stale_live(self, e: dict, head: str, pin: str, live: str) -> bool:
+    def live_base_merge(self, e: dict, live: str, head: str, pin: str, data: dict) -> tuple[str, int]:
+        """On a worker, from stale_live_job and base_merge_check, before stale_live: whether LIVE, GitHub's branch ref
+        past the pin (the copy here shows HEAD, an older commit of it), is only a base merge on PIN, read as
+        base_merge_check reads a cached head (LAND_LIVE_BASE_MERGE's comment). (the merge's second parent, merges)
+        when it is, so stale_live follows it; ("", 0) when it is not, is the pin or HEAD, or a read did not answer:
+        stale_live stops naming it as before."""
+        live = str(live or "").lower()
+        gh, base = self.gh(), str(data.get("baseRefName") or "")
+        if not gh or not base or not pin or not SHA40.fullmatch(live) or live in (pin, str(head or "").lower()):
+            return "", 0
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{live}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            parents = None
+        if not isinstance(parents, list):
+            return "", 0
+        parents = [str(p).lower() for p in parents]
+        parent, chain = land_base_merge_parent(pin, live, {"headRefOid": live, "headParents": parents}), 1
+        if not parent and len(parents) == 2:
+            parent, _why, _unread, _said, chain = self.base_merge_chain(e, live, pin, base)
+        if not parent:
+            return "", 0
+        docs: list[dict] = []
+        for path in (f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{live}",
+                     f"repos/{e['repo']}/compare/{parent}...{pin}"):
+            got = self.call([gh, "api", path, "--jq", LAND_BASE_MERGE_JQ], LAND_GH_DEADLINE)
+            try:
+                doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                doc = None
+            if not isinstance(doc, dict):
+                return "", 0
+            docs.append(doc)
+        if land_base_merge_why(pin, live, parent, base, docs[1], docs[0]):
+            return "", 0
+        return parent, chain
+
+    def stale_live(self, e: dict, head: str, pin: str, live: str, follow: tuple[str, int] = ("", 0)) -> bool:
         """Under the lock (LAND_STALE_LIVE's comment): HEAD, the copy's head, is an older commit of PIN and its wait
         ran out; LIVE is GitHub's branch ref read just now ("" when the read failed). True when this decided E: at the
         pin it is kept and the wait starts again; at another head the stop names that head; a failed read waits and is
@@ -22433,6 +22474,21 @@ class LandQueue:
             e.pop("baseMergeUnread", None)
             if live == head:
                 return False
+            if follow[0]:
+                # LAND_LIVE_BASE_MERGE: the branch moved past the pin only by a merge of its base (the queue's own
+                # update_branch, a lander's), so the pin follows the live head and the land goes on there; the copy
+                # here, still at HEAD, is an older commit of the new pin too and waits for a read that shows it
+                e.pop("staleLive", None)
+                e.pop("pinWait", None)
+                e["pinSha"], e["pinSince"], e["pinSeen"] = live, self.now, True
+                e["updatedHead"], e["updatedHeadAt"] = live, self.now
+                self.ancestry_record(e, head, live, True)
+                e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
+                self.history(e, "repin_base_merge", was=pin[:12], head=live[:12], base=follow[0][:12],
+                             copy=head[:12], live=True, **({"merges": follow[1]} if follow[1] > 1 else {}))
+                self.nudge(e["key"])
+                self.requeue(e)
+                return True
             # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
             self.stop(e, "head_moved", land_moved_clause(live, pin)
                       + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
@@ -22562,10 +22618,12 @@ class LandQueue:
         if why and not unread and ancestor is None and gh:
             older = self.ancestry_read(e, head, pin)
         live: str | None = None  # None: not read (no older commit, or its wait has not run out)
+        follow: tuple[str, int] = ("", 0)
         if why and (ancestor or (older is not False and older[0] is True)):
             w = e.get("oldPinWait") or {}
             if w.get("head") == head and self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
                 live = self.update_live_tip(e, data)[0]  # LAND_STALE_LIVE's comment: one REST read of the branch
+                follow = self.live_base_merge(e, live, head, pin, data)
         with self.lock:
             self.check(e)
             if older is not False:
@@ -22576,7 +22634,7 @@ class LandQueue:
                 # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
                 self.requeue(e)
                 return False
-            if ancestor and live is not None and self.stale_live(e, head, pin, live):
+            if ancestor and live is not None and self.stale_live(e, head, pin, live, follow):
                 return False  # LAND_STALE_LIVE: GitHub's branch ref decided (kept, moved on, or read again)
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
@@ -26113,6 +26171,13 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
 # and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
+# The same stale copy, with GitHub's branch ref past the pin: it stopped head_moved naming the live head, a hand re-land
+# each. cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 47 rows stopped "(GitHub's branch ref; the copy here still
+# showed X, an older commit of the pin)", 43 of them only a base merge on the pin (mostly this queue's own
+# update_branch, read before the copy caught up). The live head is read as base_merge_check reads a cached one (its
+# parents, a run of base merges, the two compares of the PR's diff), and when it is only a base merge the pin follows it
+# (repin_base_merge, live=True) and the land goes on; a push, or a read that does not answer, stops naming it as before.
+LAND_LIVE_BASE_MERGE = "repin_base_merge"
 # LAND_STALE_LIVE_MAX: how long stale_live keeps the pin while GitHub's PR shows the same older commit of it. Past it
 # the copy is no lag a read waits out: GitHub's PR itself is behind its branch ref, and the land stops
 # pr_head_lags_branch naming the push that re-syncs it. gcp-agent-lane-14, 2026-11-25 23:55Z to 2026-11-26 07:28Z:

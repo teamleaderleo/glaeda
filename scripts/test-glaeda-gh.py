@@ -29599,6 +29599,58 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--sha {self.LE}", e["stop"]["next"])
 
+    def live_past_the_pin(self, parents: list) -> None:
+        """The copy shows LE, an older commit of the pin LA, while GitHub's branch ref is at LB, whose parents are
+        PARENTS; the compares of a base merge LB on LA answer as base_merged's do."""
+        self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"].update(headRefName="lane/x", baseRefName="main")
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}
+        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps({"mb": self.LD, "files": [moved]})
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
+
+    def test_a_live_head_past_the_pin_that_is_only_a_base_merge_is_followed_and_lands_there(self):
+        # Leo (c-d1b15a2876): "go bring some more analysis into what agents have been doing and what we can do better,
+        # then keep trying to improve stuff". cmux-cp-1, 2026-11-25 22:30Z to 2026-11-26 08:30Z: 47 rows stopped
+        # "(GitHub's branch ref; the copy here still showed X, an older commit of the pin)", 43 only a base merge on the
+        # pin. The first cut of this stopped at the pin; the live head is what the pin follows (LAND_LIVE_BASE_MERGE).
+        self.pinned_and_waiting()
+        self.live_past_the_pin([LA, self.LD])
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        follow = [h for h in e["history"] if h["event"] == gg.LAND_LIVE_BASE_MERGE and h.get("live")]
+        self.assertEqual([(h["was"], h["head"], h["copy"]) for h in follow], [(LA[:12], LB[:12], self.LE[:12])])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        e = self.tick(30)  # the copy still at LE: an older commit of the new pin too, so it waits and never stops
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LB)
+
+    def test_a_live_head_past_the_pin_that_is_a_push_still_stops_naming_it(self):
+        self.pinned_and_waiting()
+        self.live_past_the_pin([LA])  # one parent: a commit pushed on the pin, not a base merge
+        e = self.tick(30)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("GitHub's branch ref; the copy here still showed", e["stop"]["reason"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
+    def test_a_live_head_past_the_pin_whose_diff_differs_still_stops_naming_it(self):
+        self.pinned_and_waiting()
+        self.live_past_the_pin([LA, self.LD])
+        other = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+zz\n z"}
+        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps({"mb": self.LD, "files": [other]})
+        e = self.tick(30)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
     def test_an_older_commit_of_the_pin_still_shown_with_the_branch_at_the_pin_keeps_the_pin(self):
         # the same stale copy on the cache-only path (stop_moved_pin, pin_wait): one parent, so no base merge check
         self.pinned_and_waiting()
