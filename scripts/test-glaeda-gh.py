@@ -26974,6 +26974,7 @@ class LandWorld:
         self.refreshed: list[str] = []
         self.watched: list[str] = []
         self.notices: list[tuple] = []
+        self.session_info: dict | None = None  # what `acpmux session info --json` answers (None: nothing printed)
         self.gh = Path(tmp) / "bin" / "gh"
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
@@ -27025,6 +27026,9 @@ class LandWorld:
                 doc = {**doc, "cacheOnly": True,
                        "cacheMiss": doc.get("cacheMiss", doc.get("code") in ("quota", "unreadable", "regen_retry"))}
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
+        if argv[0] == "/fake/acpmux" and argv[1:3] == ["session", "info"]:
+            # the requester as a due reminder reads it (LAND_OWNER_REMIND_IDLE); unset, nothing certain: it is told
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.session_info) if self.session_info else "", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
@@ -27110,7 +27114,7 @@ class LandWorld:
         return [c[1:] for c in self.calls if c[0] == os.fspath(self.gh) and c[1:1 + len(prefix)] == list(prefix)]
 
     def sent(self) -> list[list[str]]:
-        return [c for c in self.calls if c[0] == "/fake/acpmux"]
+        return [c for c in self.calls if c[0] == "/fake/acpmux" and c[1:3] != ["session", "info"]]
 
 
 class LandCrash(BaseException):
@@ -30753,6 +30757,32 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 16)  # past LAND_OWNER_REMIND_MAX: silent, still listed
         self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
 
+    def test_a_reminder_to_a_lane_idle_past_the_reaper_bound_wakes_nobody(self):
+        # LAND_OWNER_REMIND_IDLE: 2026-11-26, 53 of 406 live Claude sessions were finished lanes woken by "still
+        # stopped after N h" reminders, 38 of gcp-agent-lane-10's 40 idle 24 to 101 h before it (cmuxterm-hq#28514).
+        e = self.conflict_stop()
+        sent = len(self.w.sent())
+        infos = lambda: [c for c in self.w.calls if c[0] == "/fake/acpmux" and c[1:3] == ["session", "info"]]  # noqa
+        idle_since = lambda h: {"status": "ready", "inputSince": None, "pendingPermissions": 0,  # noqa: E731
+                                "queued": 0, "lastTurn": {"endedAt": (self.t - h * 3600) * 1000}}
+        self.w.session_info = idle_since(30)  # finished 30 h ago: past the reaper's 12 h
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["reminds"]["n"]), ("stopped", 1))  # due, and spent
+        self.assertEqual(len(self.w.sent()), sent)  # but nobody was woken
+        self.assertEqual(len(infos()), 1)  # one read of the requester per due reminder
+        self.assertEqual(infos()[-1][3], self.w.sent()[-1][self.w.sent()[-1].index("--no-wait") + 1])  # the same one
+        # a lane that is still at work (ran a turn an hour ago) is told, as before
+        self.w.session_info = idle_since(1 - 2 * gg.LAND_OWNER_REMIND_EVERY / 3600)  # 1 h before the tick's time
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 1))
+        self.assertIn("still stopped after", self.w.sent()[-1][-1])
+        # a running one, or an answer with nothing certain in it, is told too: unsure tells
+        for info in ({**idle_since(30), "status": "running"}, {**idle_since(30), "queued": 1}, None):
+            self.assertIsNone(gg.land_requester_idle_s(json.dumps(info) if info else "", self.t), info)
+        self.assertGreater(gg.land_requester_idle_s(json.dumps(idle_since(30)), self.t), gg.LAND_OWNER_REMIND_IDLE)
+        self.assertEqual(gg.land_requester_idle_s(json.dumps({"status": "ready", "createdAt": (self.t - 60) * 1000}),
+                                                  self.t), 60.0)  # never ran a turn: idle since it was made
+
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
         sent = len(self.w.sent())
@@ -30773,6 +30803,32 @@ class LandTest(Base):
                          ("stopped", "closed", None, sent))
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
+
+    def test_a_stopped_row_whose_pr_merged_or_closed_elsewhere_is_read_and_ends(self):
+        # LAND_STOPPED_OVER: gcp-agent-lane-11, 2026-11-26: cmux#52553 merged 11-24 and cmux#54984 closed unmerged
+        # 11-25 sat stopped in the queue (no copy of an unwatched PR) until a lane cancelled them by hand.
+        for state, ended in (("CLOSED", ("stopped", "closed")), ("MERGED", ("merged", "conflict"))):
+            with self.subTest(state=state):
+                self.setUp()
+                e = self.conflict_stop()
+                sent = len(self.w.sent())
+                self.w.cache.pop(self.KEY, None)  # a lane VM keeps no copy of an unwatched PR
+                self.q.refresh = lambda key, state=state: (
+                    self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA, state=state), self.t))[1]
+                e = self.tick(gg.LAND_STOPPED_READ_EVERY - 60)
+                self.assertEqual((e["state"], self.w.refreshed), ("stopped", []))  # not before the cadence
+                e = self.tick(60)
+                self.assertEqual(self.w.refreshed, [self.KEY])  # one read, shared with the due reminder
+                e = self.tick(1)
+                self.assertEqual((e["state"], e["stop"]["code"] if e["state"] == "stopped" else "conflict"), ended)
+                self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+
+    def test_a_stopped_row_still_open_is_read_once_a_cadence(self):
+        e = self.conflict_stop()
+        self.q.refresh = lambda key: (self.w.refreshed.append(key), self.w.set_pr(key, land_pr(LA), self.t))[1]
+        for _ in range(6):
+            e = self.tick(gg.LAND_STOPPED_READ_EVERY / 6)
+        self.assertEqual((e["state"], len(self.w.refreshed)), ("stopped", 1))
 
     def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
         # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
@@ -35127,9 +35183,10 @@ class LandTest(Base):
         self.w.calls.clear()
         self.w.cache[self.KEY]["data"]["state"] = "MERGED"
         self.q.stop(e, "forward_no_outcome", "no outcome", "land again")
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual(e["state"], "merged")  # LAND_STOP_SETTLE: the row ends with the PR's outcome
         self.assertEqual([c for c in self.w.sent() if "stopped" in c[-1]], [])
         self.w.cache[self.KEY]["data"]["state"] = "OPEN"
+        self.w.cache[self.KEY]["dataAt"] = self.q.now  # a fresh copy: told at once
         self.q.stop(e, "own_red", "ci failed", "fix it")
         self.assertEqual(len([c for c in self.w.sent() if "own_red" in c[-1]]), 1)  # an open PR's stop still tells
 
@@ -35440,6 +35497,133 @@ class LandTest(Base):
             e = self.past_give_up()
         self.assertEqual((e["state"], self.state_reads()), ("forwarded", []))
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+
+    # -- LAND_STOP_SETTLE: a stop or a reminder reads the PR first; merged or closed ends the row and tells nobody
+
+    def stop_reads(self) -> list[list[str]]:
+        return self.state_reads()
+
+    def stale_open_row(self) -> dict:
+        """A land of o/r#1 at LA waiting on its checks, its cached copy reading open but read long ago (a PR nobody
+        here watches any more): glaeda#2639's rows on 2026-11-23."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick()
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_STOP_STATE_FRESH - 1
+        self.w.calls.clear()
+        return e
+
+    def test_a_head_moved_stop_for_a_pr_that_merged_ends_merged_and_tells_nobody(self):
+        # glaeda#2639 merged 09:15:47Z; a row sent it a head_moved [blocker] more than an hour later on a copy that
+        # still read open. The stop's notice now waits on one read of the PR, which ends the row merged.
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "MERGED"
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        self.assertEqual((e["state"], e["stopNotice"]["kind"]), ("stopped", "stop"))
+        self.assertEqual(len(self.w.sent()), sent)  # held, not sent
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"], e.get("stopNotice")), ("merged", "f" * 40, None))
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.assertEqual(len(self.w.sent()), sent)  # nobody told
+        self.assertEqual(e["history"][-1]["quiet"], "stop_settled")
+        self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual(len(self.stop_reads()), 1)  # an ended row is read no more
+
+    def test_a_stop_for_a_pr_that_closed_stops_closed_and_tells_nobody(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "CLOSED"
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("stopNotice")), ("stopped", "closed", None))
+        self.assertEqual(len(self.w.sent()), sent)
+
+    def stop_read_tells(self, view_err: str | None) -> None:
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_err = view_err
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stopNotice")), ("stopped", None))
+        said = [c for c in self.w.sent()[sent:] if "stopped: head_moved" in c[-1]]
+        self.assertEqual(len(said), 1)
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.tick()
+        self.assertEqual(len(self.stop_reads()), 1)  # read once
+
+    def test_a_stop_whose_pr_reads_open_still_tells_its_requester(self):
+        self.stop_read_tells(None)
+
+    def test_a_stop_whose_pr_state_is_unread_still_tells_its_requester(self):
+        self.stop_read_tells("HTTP 502: Bad Gateway")  # an unread state never swallows a stop
+
+    def test_a_stop_a_fresh_copy_reads_open_tells_at_once_and_reads_nothing(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        self.assertEqual(len([c for c in self.w.sent()[sent:] if "own_red" in c[-1]]), 1)
+        self.tick()
+        self.assertEqual(self.stop_reads(), [])
+
+    def still_stopped_reminder(self, state: str) -> dict:
+        # glaeda#2639: "still stopped after 68 h ... reminded code=head_moved hours=67.9", 68 h after its merge.
+        # The reminder's one read is LAND_OWNER_REMIND_READ's; the stop path adds no second one.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: inside one UTC day
+        e = self.stale_open_row()
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        self.sent0 = len(self.w.sent())
+        self.w.refreshed = []
+        self.q.refresh = lambda key: (self.w.refreshed.append(key),
+                                      self.w.set_pr(key, land_pr(LB, state=state), self.t))[1]
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual(self.w.refreshed, [self.KEY])  # one read, the reminder's
+        self.assertEqual(self.stop_reads(), [])  # and no second one
+        return e
+
+    def test_a_still_stopped_reminder_for_a_pr_merged_since_ends_merged_and_tells_nobody(self):
+        e = self.still_stopped_reminder("MERGED")
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("merged", None, self.sent0))
+        self.assertNotIn("reminded", [h.get("event") for h in e["history"]])
+
+    def test_a_still_stopped_reminder_for_an_open_pr_is_sent_after_its_read(self):
+        e = self.still_stopped_reminder("OPEN")
+        self.assertEqual((e["state"], e["reminds"]["n"], e.get("stopNotice")), ("stopped", 1, None))
+        [said] = self.w.sent()[self.sent0:]
+        self.assertIn("still stopped after 6 h", said[-1])
+
+    def test_a_row_stopped_before_for_a_pr_merged_since_is_settled_at_load(self):
+        # rows stopped before this (no stopReadAt) whose PR merged by hand: read once at load, ended merged, silently
+        e = {"key": self.KEY, "repo": "o/r", "number": 1, "state": "stopped", "created": self.t - 3 * 86400,
+             "updated": self.t - 3 * 86400, "requester": "host/lane", "history": [],
+             "stop": {"code": "head_moved", "at": self.t - 3 * 86400, "reason": "o/r#1 moved"}}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3 * 86400
+        self.w.view_state = "MERGED"
+        self.q = self.queue()
+        sent = len(self.w.sent())
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual((len(self.stop_reads()), len(self.w.sent())), (1, sent))
+
+    def test_stop_state_reads_are_capped_per_pass(self):
+        e = self.stale_open_row()
+        self.w.view_state = "MERGED"
+        with mock.patch.object(gg, "LAND_STOP_STATE_READS", 0):
+            with self.q.lock:
+                self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+            e = self.tick()
+        self.assertEqual((e["state"], self.stop_reads()), ("stopped", []))
+        e = self.tick()
         self.assertEqual(e["state"], "merged")
 
     def test_a_pinned_rows_hand_off_to_an_executor_carries_its_pin(self):
