@@ -30166,6 +30166,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["reminds"]["n"], e.get("rearms")), ("stopped", 1, None))
         self.assertEqual((len(self.w.explains()), e.get("gen")), (judged, gen))  # reminded, never re-judged
         said = self.w.sent()[-1][-1]
+        argv = self.w.sent()[-1]
+        self.assertEqual(argv[argv.index("--class") + 1], "fyi")  # told at the stop: a repeat wakes nobody
         self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
         self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
@@ -30178,7 +30180,21 @@ class LandTest(Base):
         sent = len(self.w.sent())
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        # LAND_OWNER_REMIND_ENDS: the row ends with the PR, and nobody is woken for it
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))
+        self.assertTrue(all(c[c.index("--class") + 1] == "fyi" for c in self.w.sent()[sent:]))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(e["state"], "merged")
+
+    def test_a_stopped_row_whose_pr_closed_ends_quietly_at_its_reminder(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.pr(LA, state="CLOSED", mergeable="CONFLICTING")
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("reminds"), len(self.w.sent())),
+                         ("stopped", "closed", None, sent))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
 
     def test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded(self):
         # LAND_OWNER_REMIND_READ: gcp-agent-lane-2, 2026-11-26: cmux#55358 stopped at 03:08Z, merged at 07:56Z by
@@ -30189,9 +30205,10 @@ class LandTest(Base):
                                       self.w.set_pr(key, land_pr(LA, state="MERGED"), self.t))[1]
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
         self.assertEqual(self.w.refreshed, [self.KEY])  # one read, asked by the due reminder
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        self.assertEqual((e["state"], e.get("reminds")), ("merged", None))  # the row ends with the PR
+        self.assertTrue(all(c[c.index("--class") + 1] == "fyi" for c in self.w.sent()[sent:]))  # waking nobody
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e.get("reminds"), len(self.w.sent()), len(self.w.refreshed)), (None, sent, 1))
+        self.assertEqual((e.get("reminds"), len(self.w.refreshed)), (None, 1))
 
     def test_a_reminder_whose_read_never_comes_is_still_told(self):
         e = self.conflict_stop()
