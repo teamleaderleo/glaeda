@@ -16474,8 +16474,10 @@ LAND_HANDOFF_TRANSIENT = re.compile(r"\bbusy: admission queue full\b|\bconnectio
 # TOOL: the broker is busy (...); [nothing was started; ]asking again in 1.1 s (try 2), 300 s left of the 300 s retry
 # window". It precedes the call's final answer on stderr whatever that answer is, so only what follows the last one is
 # the broker's answer: a busy retry that ended in a real refusal ("unknown argument 'nominated'") is a real refusal.
-LAND_HANDOFF_BUSY_PROGRESS = re.compile(r"asking again in [\d.]+ s \(try \d+\), \d+ s left of (?:the )?\d+ s"
-                                        r"(?: retry window)?")
+# Every form ends "N s left of" the bound it counts down: "300 s retry window", "the call's 120 s bound", "the queue
+# bound", "the command's deadline" (ask_while_busy, admission_loop, the queue wait): cut after its last word.
+LAND_HANDOFF_BUSY_PROGRESS = re.compile(r"asking again in [\d.]+ s \(try \d+\), \d+ s left of (?:the )?"
+                                        r"(?:\d+ s retry window|\d+ s(?! retry)|[^\n]*?(?:bound|deadline))\b")
 
 
 def land_handoff_transient(rc: int, said: str) -> bool:
