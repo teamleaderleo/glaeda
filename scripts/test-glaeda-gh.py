@@ -35110,8 +35110,8 @@ class LandTest(Base):
             [said] = [c for c in self.w.sent() if "merged" in c[-1]]
             return said[said.index("--class") + 1]
 
-        self.assertEqual(told("merged pinned"), gg.LAND_NOTICE_CLASS)
-        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("merged pinned"), gg.LAND_MERGED_CLASS)
+        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_MERGED_CLASS)
         self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
         self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
 
