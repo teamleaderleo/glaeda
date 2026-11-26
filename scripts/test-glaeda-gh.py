@@ -34770,7 +34770,7 @@ class LandTest(Base):
         return head, base
 
     def test_union_seed_borrows_the_hosts_warm_wt_mirror_for_the_base(self):
-        """gcp-agent-lane-12, 2026-11-26: the union mirror's feat-cmux-next was five weeks stale, so the broker refused
+        """A lane VM, 2026-11-26: the union mirror's feat-cmux-next was five weeks stale, so the broker refused
         every base merge's fetch (HTTP 413, bundle over 256 MiB) and cmux#56666 and #56078 stopped base_merge_transient.
         union_seed points the union mirror at the host's wt mirror and moves its origin/BASE up to that tip, so the
         broker's fetch names it as had. A tip not ahead of the union's own, or no mirror, is left alone."""

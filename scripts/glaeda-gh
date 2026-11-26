@@ -16920,7 +16920,7 @@ LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
 # A lane VM's union mirror is filled only by the broker's fetch (lane-gh fetch), which names the mirror's own tips as
-# had. gcp-agent-lane-12, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
+# had. A lane VM, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
 # commits back), so every base merge's fetch asked for five weeks of history and the broker refused it in 13 s ("HTTP
 # 413: the bundle is over 256 MiB"); glaeda read that as base_merge_transient and stopped cmux#56666 and #56078 after
 # 8 tries. The same host's wt mirror (wt keeps it warm for every checkout) had feat-cmux-next from minutes before.
