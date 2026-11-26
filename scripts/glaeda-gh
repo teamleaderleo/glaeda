@@ -29642,7 +29642,12 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
     deadline = time.monotonic() + first_wait
 
     def unready(entry: dict | None) -> bool:
-        return entry is None or (jobs and "jobs" not in entry and not entry.get("error"))
+        # An entry holding only an error (no data, not missing) is unread too: on a lane VM 2026-11-25 an upstream
+        # entry whose one read had failed 38 min before ("graphql: HTTP 200", the shared GraphQL spent) made `status`
+        # exit 3 in 1.4 s with no data and no direct read, though REST answered a cold key in 15 s beside it.
+        if entry is None or (not entry.get("data") and not entry.get("missing")):
+            return True
+        return jobs and "jobs" not in entry and not entry.get("error")
     entries = {key: read_cache(key) for key in keys}
     while any(unready(e) for e in entries.values()) and time.monotonic() < deadline:
         time.sleep(1)
