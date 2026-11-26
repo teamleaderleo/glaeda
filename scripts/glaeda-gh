@@ -16552,6 +16552,13 @@ LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
 LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
+# A judgment that read nothing because a git read of this host's own mirror timed out (land_judge's classifier
+# archive, "git archive ... tried twice: Command '[...git...]' timed out after 24 seconds") is no GitHub read the
+# broker host does better: it is this disk, busy for the moment. a lane VM, 2026-11-26: leo-workspace#11598
+# answered unreadable while a fetch of the 3.8 G cmux mirror ran, the archive timing out at 24 s twice (0.56 s after),
+# and was handed off on that. Such an answer is judged here again, LAND_LOCAL_GIT_RETRIES times per head, first.
+LAND_LOCAL_GIT_TIMEOUT = re.compile(r"\bgit\b[^\n]{0,400}?\btimed out\b")
+LAND_LOCAL_GIT_RETRIES = 2
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
 LAND_HANDOFF_DEADLINE = 60.0
 # A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
@@ -16585,6 +16592,12 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # read of the PR (outcome_read: one peek, LAND_FORWARD_READ_WAIT for it to land), so a merged PR is never told
 # "no outcome".
 LAND_FORWARD_ASK_FIRST = 300.0
+# LAND_BROKER_ASK: a lane VM has no `land serve` program to ask (far_command: no executor, no overflow peer), so its
+# handed-off rows were never asked and ran blind to the re-send and the give-up. a lane VM, 2026-11-26:
+# leo-workspace#11598 handed off at 03:59Z and 04:20Z, 0 land-forward-asked events, re-sent at 05:08Z, re-landed by
+# its give-up at 05:20Z. It asks through the broker instead (broker_ask_command: `lane-gh call land_handoff REPO`
+# {"outcomes": [N, ...]}, cmuxterm-hq parts/49-calls-land-handoff.py), one call per repo and pass, and the answer is
+# read as a far host's is. A broker that does not know `outcomes` refuses it: an ask failure, which changes nothing.
 # A row its far host stopped (forward_stopped) is asked about this long after its stop, this often: the far queue
 # rearms a stop that clears by itself (rearm), and its merge or reopen then reaches the forwarding host's row.
 LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
@@ -19032,11 +19045,13 @@ class LandQueue:
                         or self.now - self.forward_asked.get(key, float("-inf")) < LAND_FORWARD_ASK_EVERY:
                     continue
                 host = self.forward_host(e)
-                command = self.far_command(host)
+                command, group = self.far_command(host), host
+                if command is None:
+                    command, group = self.broker_ask_command(e), f"{host}\t{e.get('repo')}"
                 if command is None:
                     continue
                 self.forward_asked[key] = self.now
-                groups.setdefault(host, (command, []))[1].append(key)
+                groups.setdefault(group, (command, []))[1].append(key)
             if len(self.forward_asked) > 4 * max(1, len(self.entries)):
                 self.forward_asked = {k: t for k, t in self.forward_asked.items() if k in self.entries}
         if not groups:
@@ -19051,12 +19066,16 @@ class LandQueue:
     def forward_ask(self, groups: dict[str, tuple[list[str], list[str]]], at: float) -> None:
         """GROUPS: far host -> (its program, the keys to ask about). Each answer, or why it could not be had, is kept
         in forward_answers as {"at", "host", "row"} or {"at", "host", "error"}."""
-        for host, (command, keys) in groups.items():
+        for group, (command, keys) in groups.items():
+            host = group.split("\t", 1)[0]
             for i in range(0, len(keys), LAND_OUTCOMES_MAX):
                 part = keys[i:i + LAND_OUTCOMES_MAX]
                 try:
-                    answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
-                                          LAND_FORWARD_DEADLINE)
+                    if command[1:3] == ["call", LAND_HANDOFF_TOOL]:
+                        answer = self.broker_outcomes(command, part)
+                    else:
+                        answer = self.forward(command, {"op": "outcomes", "targets": part, "from": policy_host()},
+                                              LAND_FORWARD_DEADLINE)
                     rows = answer.get("outcomes")
                     if not answer.get("ok") or not isinstance(rows, dict):
                         raise WatchError(f"{host}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
@@ -19070,6 +19089,31 @@ class LandQueue:
                     log({"event": "land-forward-ask-failed", "host": host, "asked": len(part), "error": why})
                 with self.lock:
                     self.forward_answers.update(got)
+
+    def broker_ask_command(self, e: dict) -> list[str] | None:
+        """Under the lock. On a lane VM (broker_client), the broker call that asks its host's queue about E, a row
+        handed there (handedOff): `lane-gh call land_handoff REPO` with {"outcomes": [N, ...]} (LAND_BROKER_ASK's
+        comment); else None."""
+        if not e.get("handedOff") or not self.broker_client() or not isinstance(e.get("repo"), str):
+            return None
+        return [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "call", LAND_HANDOFF_TOOL, e["repo"]]
+
+    def broker_outcomes(self, command: list[str], keys: list[str]) -> dict:
+        """The broker host's queue's rows for KEYS (one repo's PRs) through COMMAND (broker_ask_command), in `land
+        serve` outcomes' shape ({"ok", "host", "outcomes": {key: row}}), or WatchError: no answer."""
+        numbers = {int(split_key(k)[3]): k for k in keys}
+        got = self.call([*command, json.dumps({"outcomes": sorted(numbers)})], LAND_HANDOFF_DEADLINE)
+        envelope: Any = None
+        with contextlib.suppress(ValueError):
+            envelope = json.loads(got.stdout or "")
+        doc = envelope.get("data") if isinstance(envelope, dict) else None
+        rows = doc.get("outcomes") if isinstance(doc, dict) else None
+        if got.returncode != 0 or not isinstance(rows, dict):
+            said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 200) or f"exit {got.returncode}"
+            raise WatchError(f"the broker's {LAND_HANDOFF_TOOL} outcomes: {said}")
+        repo = command[3]
+        return {"ok": True, "host": doc.get("host"),
+                "outcomes": {k: rows.get(f"{repo}#{n}") for n, k in numbers.items()}}
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -22725,6 +22769,13 @@ class LandQueue:
             return ""
         if self.broker_peer_silent():
             return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
+        if LAND_LOCAL_GIT_TIMEOUT.search(str(answer.get("reason") or "")):
+            tries = e.get("localGitRetry") if isinstance(e.get("localGitRetry"), dict) else {}
+            n = int(tries.get("count") or 0) + 1 if tries.get("head") == head else 1
+            if n <= LAND_LOCAL_GIT_RETRIES:
+                e["localGitRetry"] = {"head": head, "count": n, "at": self.now}
+                self.history(e, "local_git_retry", head=head[:12], n=n)
+                return ""  # judged here again (LAND_LOCAL_GIT_TIMEOUT's comment)
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:

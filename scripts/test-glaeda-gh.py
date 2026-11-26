@@ -26836,6 +26836,8 @@ class LandWorld:
         # `gh api PATH --jq ...` reads by path prefix: what the jq answers (None: the read fails). Unset: exit 0, no
         # output, which no reader can use (a run read before a rerun: rerun as before)
         self.api: dict[str, str | None] = {}
+        # `land_handoff` {"outcomes"}: REPO#N -> the broker queue's row; None (the default): a broker older than it
+        self.outcomes: dict[str, dict] | None = None
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
         # as lane-gh prints it: the broker's whole envelope, indented over many lines
         self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
@@ -26872,6 +26874,14 @@ class LandWorld:
                                        **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
+        if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"] and "outcomes" in json.loads(argv[4]):
+            # the broker host's queue's rows for the asked PRs (LAND_BROKER_ASK); None: a broker that refuses it
+            if self.outcomes is None:
+                return subprocess.CompletedProcess(argv, 1, "", "lane-gh call land_handoff: refused: land_handoff: "
+                                                   "unknown argument outcomes (number, sha, requester)")
+            asked = [f"{argv[3]}#{n}" for n in json.loads(argv[4])["outcomes"]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": {
+                "ok": True, "host": "huge-blue", "outcomes": {t: self.outcomes.get(t) for t in asked}}}, indent=1), "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
             # a list answers in order, its last answer for every call after
             rc, out, err = (self.handoff.pop(0) if len(self.handoff) > 1 else self.handoff[0]) \
@@ -31726,7 +31736,9 @@ class LandTest(Base):
                  "(lane-gh-broker own); nor is it a PR host adopted (no claim)")
 
     def handoffs(self) -> list[list[str]]:
-        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]]
+        """The hand-offs sent (not the outcome asks: outcome_asks)."""
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]
+                and "outcomes" not in json.loads(c[4])]
 
     def test_an_ownership_refusal_on_a_lane_vm_hands_the_land_to_the_broker_host_once(self):
         # cmux#45756, 2026-11-18: "branch lane/drag-like-paste was not pushed by gcp-agent-lane-6": a lander lane only
@@ -33632,6 +33644,25 @@ class LandTest(Base):
                 self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
                 self.broker = False
 
+    def test_a_local_git_timeout_on_a_lane_vm_is_judged_here_again_before_it_is_handed_off(self):
+        # a lane VM, 2026-11-26: leo-workspace#11598 answered unreadable because land_judge's git archive of
+        # the cmux mirror timed out at 24 s, twice, during a mirror fetch (0.56 s later), and was handed off on that.
+        why = ("git archive 0130fc15aaaa (origin/feat-cmux-next) scripts/ci in /m/cmux, tried twice: Command "
+               "'['git', '-C', '/m/cmux', 'archive', '--format=tar']' timed out after 24 seconds")
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            for _ in range(gg.LAND_LOCAL_GIT_RETRIES):
+                self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=why))
+                e = self.tick(600)
+                self.assertEqual(self.handoffs(), [], e.get("history"))
+                self.assertNotEqual(e["state"], "forwarded")
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=why))
+            e = self.tick(600)
+        self.assertEqual(len(self.handoffs()), 1, "past its local tries it is handed off as before")
+        self.assertEqual(e["state"], "forwarded")
+
     def test_a_land_tier_stop_on_a_lane_vm_hands_the_land_to_the_broker_host(self):
         # cmux#53696, 2026-11-24: land_judge refused land_tier_pending (cmux/land-tier pending, needs ready-to-land) and
         # its label add went through the broker, which never sets that label for a lane: the land stopped on a `gh pr
@@ -33814,6 +33845,35 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual(e["state"], "forwarded")
         return e
+
+    def outcome_asks(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]
+                and "outcomes" in json.loads(c[4])]
+
+    def test_a_lane_vms_handed_off_row_asks_the_broker_and_ends_with_its_merge(self):
+        # a lane VM, 2026-11-26: leo-workspace#11598 handed off twice, no verdict back for over an hour, and 0
+        # land-forward-asked events: far_command has no program on a lane VM, so nothing asked. It asks the broker.
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_ASK_FIRST - 10)
+        self.assertEqual(self.outcome_asks(), [], "not before LAND_FORWARD_ASK_FIRST")
+        self.w.outcomes = {"o/r#1": {"state": "merged", "mergeSha": "c" * 40, "updated": self.t, "stop": None}}
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 10)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        [ask] = self.outcome_asks()
+        self.assertEqual(ask[3:], ["o/r", json.dumps({"outcomes": [1]})])
+        self.assertEqual(e["state"], "merged", e.get("history"))
+        self.assertEqual([c for c in self.w.sent()[sent:] if "--class" in c and c[c.index("--class") + 1] == "block"],
+                         [], "no blocker for a PR the far queue merged")
+
+    def test_a_broker_that_does_not_know_outcomes_leaves_the_row_forwarded(self):
+        self.handed_off()
+        self.w.outcomes = None
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.tick(1)
+        self.assertEqual(len(self.outcome_asks()), 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
 
     def quiet_notices(self) -> list[list[str]]:
         return [c for c in self.w.sent() if "no verdict has come back" in c[-1]]
