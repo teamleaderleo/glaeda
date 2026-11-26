@@ -1397,6 +1397,9 @@ PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in ful
 # from the rollup; the probe at 2026-11-25 00:15Z found all 57 of the most recently updated open cmux and cmuxterm-hq
 # heads' rollups complete.
 PR_REST_SUITES_FROM_CONTROLLER = True
+# The REST PR read's pulls/N comes from the controller's webhook-fed PR row when it is seeded and fresh
+# (Daemon.controller_pull): glaeda-upstream asked pulls/{n} 567 and issues/{n} 214 times an hour (2026-11-26).
+PR_PULL_FROM_CONTROLLER = True
 CONTROLLER_ROLLUP_TIMEOUT = 2.0  # a complete rollup answers in 0.05-1.4 s; a cold one is seeding from GitHub
 CONTROLLER_ROLLUP_SLOW_SKIP = 15.0  # a head whose rollup timed out is not asked again for this long
 CONTROLLER_ROLLUP_DOWN = 30.0  # a controller that failed otherwise is not asked for a rollup for this long
@@ -2496,6 +2499,15 @@ def iso_epoch(text: str | None) -> float | None:
         return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def github_time(text: Any) -> str | None:
+    """A Go RFC 3339 time (the controller's rows) as GitHub's REST API writes it, 2026-11-26T07:00:00Z, so a
+    controller answer and GitHub's compare equal; the text itself when it does not parse."""
+    at = iso_epoch(stream_time(text)) if isinstance(text, str) else None
+    if at is None:
+        return text
+    return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def stream_time(text: Any) -> str | None:
@@ -13098,6 +13110,13 @@ class Daemon:
         manaflow-ai/cmux#44595), so a 304 on it means unchanged since that pull. A failed issue read falls back to
         reading the pull. Raises WatchError (the pull's), OutOfTime."""
         path, gate = f"{root}/pulls/{number}", f"{root}/issues/{number}"
+        row = self.controller_pull(root, number) if reuse else None
+        if row is not None:  # the controller's webhook-fed row answers: no issues/N, no pulls/N
+            parts[path] = row
+            if gate not in parts and not self.etags:
+                parts[gate] = {"doc": slim_issue_gate(row["doc"])}
+            # reused: when every check settles and something changed, fetch_pr_rest reads GitHub's merge state
+            return row["doc"], True
         kept = old.get(path) or {}
         at = kept.get("at")
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
@@ -13130,6 +13149,50 @@ class Daemon:
         if (parts.get(gate) or {}).get("doc", {}).get("updated_at") != pull.get("updated_at"):
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
+
+    def controller_pull(self, root: str, number: Any) -> dict | None:
+        """GET pulls/N's part (slim_pull) from the controller's webhook-fed PR row (/v1/github/prs/N/verdict), else
+        None (off, out, slow, failed, not seeded, or an open row whose mergeability is unknown or was stored
+        PULL_REUSE_MAX ago or more: the bound a kept pull has). A closed or merged row answers at any age: that
+        state is final until a reopen, which the controller's delivery moves. No GitHub request. Why
+        (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 23:15Z-11-26 05:15Z): glaeda-upstream, every lane
+        VM's direct reads, asked pulls/{n} 567 and issues/{n} 214 times an hour while the controller held each row."""
+        if not PR_PULL_FROM_CONTROLLER:
+            return None
+        own = self.controller is not None
+        get = getattr(self.controller if own else self.rollup_controller, "get", None)
+        if (not callable(get) or (own and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT))
+                or self.now < self.rollup_down_until or not str(number).isdigit()):
+            return None
+        repo = root.removeprefix("/repos/")
+        try:
+            body = get(f"/v1/github/prs/{int(number)}/verdict?repo=" + urllib.parse.quote(repo, safe="/"),
+                       timeout=CONTROLLER_ROLLUP_TIMEOUT)
+        except (ControllerTimeout, NoReceiver):  # slow, or no such route or row: GitHub answers
+            return None
+        except WatchError:
+            self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
+            return None
+        row = body.get("pr") if isinstance(body, dict) and body.get("found") is True \
+            and body.get("seeded") is True else None
+        if (not isinstance(row, dict) or row.get("number") != int(number)
+                or str(row.get("repo") or "").lower() != repo.lower()
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", str(row.get("head_sha") or ""))
+                or row.get("state") not in ("open", "closed") or not row.get("updated_at")):
+            return None
+        stored = iso_epoch(stream_time(row.get("received_at")))
+        if row["state"] == "open" and (not isinstance(row.get("mergeable"), bool) or stored is None
+                                       or self.now - stored >= PULL_REUSE_MAX):
+            return None
+        doc = slim_pull({"number": row["number"], "html_url": row.get("url"), "title": row.get("title"),
+                         "state": row["state"], "draft": bool(row.get("draft")), "merged": bool(row.get("merged")),
+                         "merged_at": github_time(row.get("merged_at")) if row.get("merged") else None,
+                         "mergeable": row.get("mergeable"),
+                         "mergeable_state": row.get("mergeable_state") or None,
+                         "updated_at": github_time(row["updated_at"]),
+                         "head": {"sha": str(row["head_sha"]).lower(), "ref": row.get("head_ref")},
+                         "base": {"ref": row.get("base_ref")}})
+        return {"doc": doc, "at": min(self.now, stored or self.now), "via": "controller"}
 
     def issue_vouches(self, held: dict) -> bool:
         """Whether HELD, a kept GET issues/N answer, can say a PR has not changed (issue_same): its ETag, or with no

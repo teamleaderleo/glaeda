@@ -24242,9 +24242,18 @@ class RollupController(FakeController):
     def __init__(self, gh) -> None:
         super().__init__()
         self.gh, self.rollups, self.incomplete, self.slow = gh, [], set(), set()
+        self.pulls: dict = {}
+        self.pull_asks: list = []
 
     def get(self, path: str, timeout: float | None = None) -> dict:
         self.fail()
+        if "/v1/github/prs/" in path:  # a PR row: only those a test seeded (`pulls`), else no row (404)
+            number, repo = int(path.split("/prs/", 1)[1].split("/", 1)[0]), path.split("repo=", 1)[1]
+            self.pull_asks.append((repo, number))
+            row = self.pulls.get((repo, number))
+            if row is None:
+                raise gg.NoReceiver("controller: HTTP 404")
+            return {"found": True, "seeded": True, "pr": row}
         sha = path.split("/commits/", 1)[1].split("/", 1)[0]
         self.rollups.append(sha)
         if sha in self.slow:
@@ -24940,6 +24949,49 @@ class StaleDataTest(Base):
             self.assertIsNone(gg.direct_read(dict(read)))
         self.assertTrue([p for p in served if "/check-suites" in p], served)  # no controller: GitHub's, as before
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "SUCCESS")
+
+    def test_a_direct_read_through_the_broker_takes_the_pull_from_the_controllers_row(self) -> None:
+        """rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 23:15Z-11-26 05:15Z: glaeda-upstream asked pulls/{n}
+        567 and issues/{n} 214 times an hour while the controller held each PR's webhook-fed row. A seeded row stored
+        within PULL_REUSE_MAX with its mergeability known answers pulls/N, and a closed or merged row at any age, with
+        no pulls/N or issues/N request; a stale open row, or none, reads GitHub as before."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[workflow_check("a", 7)])
+        read = {"key": "pr:o/r#9", "kind": "pr", "jobs": False, "began": time.time() - 700}
+        ctl = RollupController(self.gh)
+
+        def row(age: float, **over) -> dict:
+            stored = dt.datetime.fromtimestamp(time.time() - age, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            return {"repo": "o/r", "number": 9, "title": "PR 9", "url": "https://github.com/o/r/pull/9",
+                    "state": "open", "merged": False, "mergeable": True, "mergeable_state": "clean",
+                    "updated_at": "2026-11-26T07:00:00.123456789Z", "received_at": stored, "base_ref": "main",
+                    "head_ref": "lane/x", "head_sha": self.gh.prs[("o", "r", 9)]["headRefOid"], **over}
+
+        def served_by(answer: dict | None) -> list[str]:
+            ctl.pulls = {} if answer is None else {("o/r", 9): answer}
+            served: list[str] = []
+            with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                    mock.patch.object(gg, "direct_rollup_controller", return_value=ctl):
+                self.assertIsNone(gg.direct_read(dict(read)))
+            return [p for p in served if p in ("pulls/9", "issues/9")]
+
+        # the first read's head is new and every check is done: its merge state is GitHub's, once (fetch_pr_rest)
+        self.assertEqual(served_by(row(30)), ["pulls/9"])
+        self.assertEqual(served_by(row(30)), [])  # the head unchanged since: the row answers, nothing from GitHub
+        data = gg.read_cache("pr:o/r#9")["data"]
+        self.assertEqual((data["state"], data["checkState"], data["mergeable"]), ("OPEN", "SUCCESS", "MERGEABLE"))
+        self.assertEqual(ctl.pull_asks, [("o/r", 9)] * 2)
+        self.assertTrue(served_by(row(gg.PULL_REUSE_MAX + 5)))  # a stale row: GitHub answers, as before
+        self.assertTrue(served_by(row(30, mergeable=None)))  # mergeability not computed yet: GitHub
+        self.assertTrue(served_by(None))  # no row: GitHub
+        merged = row(90000, state="closed", merged=True, merged_at="2026-11-25T01:00:00Z", mergeable=None)
+        self.assertEqual(served_by(merged), [])
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["state"], "MERGED")
 
     def test_a_refused_direct_read_holds_the_hosts_direct_reads(self) -> None:
         """A refusal for the read Apps' reserve holds every direct GET on the host for its wait: the next asks run
