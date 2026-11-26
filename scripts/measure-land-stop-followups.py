@@ -7,10 +7,13 @@ same switch, so a code correctly left out of re-judging lost its follow-up with 
 rows sit stopped, how old they are, and how many have been followed up *since that stop*, so a code whose rows sit
 unanswered is a number rather than a hunch.
 
-Only a reminder is attributable: the `reminds` counter carries the time it last spoke, so `reminds.at > stop.at`
-says this stop's requester heard again. The `rearms` counter carries a day and a count and no time, so a row
-re-armed for an earlier, re-armable stop and since stopped on something else (a conflict, say) still shows a
-non-zero counter -- it is reported as `rearmed_entry` and is not evidence about the current stop.
+A follow-up is attributable only when its counter says which stop it answered. `reminds` and `rearms` both carry
+the time and the code they answered (LAND_OWNER_REMIND_MOVED), so `at > stop.at` and a matching code say this stop's
+requester heard again: `reminded` and `rearmed_this_stop`. A counter written before those fields existed carries a
+day and a count only, so a row re-armed for an earlier stop and since stopped on something else (a conflict, say)
+still shows a non-zero one -- those are counted as `rearmed_entry`, which is not evidence about the current stop.
+`reminded_at_moved_head` counts the reminders that read a head different from their stop's, the ones that would
+otherwise have quoted a sha the PR had moved past.
 
 The source is the daemon's own entry store (BASE/land/entries, one file per PR), so these are the host's real rows
 and the code is the row's -- not the judge's rule code, which differs for some (a base conflict is the row's
@@ -42,7 +45,8 @@ def percentile(values: list, q: float) -> float:
 
 
 def read_entries(d: str, now: float) -> dict:
-    per: dict = collections.defaultdict(lambda: {"rows": 0, "rearmed_entry": 0, "reminded": 0, "ages": []})
+    per: dict = collections.defaultdict(lambda: {"rows": 0, "rearmed_entry": 0, "rearmed_this_stop": 0,
+                                                 "reminded": 0, "reminded_at_moved_head": 0, "ages": []})
     total = unreadable = 0
     for path in glob.glob(os.path.join(d, "*")):
         try:
@@ -58,12 +62,20 @@ def read_entries(d: str, now: float) -> dict:
         total += 1
         row = per[code]
         row["rows"] += 1
-        if (e.get("rearms") or {}).get("n"):
-            row["rearmed_entry"] += 1  # not this stop's: the counter carries no time (see the module docstring)
         try:
             at = float(stop.get("at") or 0)
         except (TypeError, ValueError):
             at = 0.0
+        rearms = e.get("rearms") if isinstance(e.get("rearms"), dict) else {}
+        try:
+            armed = float(rearms.get("at") or 0)
+        except (TypeError, ValueError):
+            armed = 0.0
+        if rearms.get("n"):
+            if armed > at and str(rearms.get("code") or code) == code:
+                row["rearmed_this_stop"] += 1
+            else:
+                row["rearmed_entry"] += 1  # an older counter, with no time of its own (see the module docstring)
         reminds = e.get("reminds") if isinstance(e.get("reminds"), dict) else {}
         try:
             said = float(reminds.get("at") or 0)
@@ -71,13 +83,17 @@ def read_entries(d: str, now: float) -> dict:
             said = 0.0
         if reminds.get("n") and said > at:
             row["reminded"] += 1
+            head = str(reminds.get("head") or "").lower()
+            if head and head != str(stop.get("head") or "").lower():
+                row["reminded_at_moved_head"] += 1
         if at:
             row["ages"].append(max(0.0, now - at) / 3600.0)
     rows = []
     for code, r in sorted(per.items(), key=lambda kv: (-kv[1]["rows"], kv[0]))[:TOP]:
         ages = r["ages"]
         rows.append({"code": code, "rows": r["rows"], "reminded": r["reminded"],
-                     "rearmed_entry": r["rearmed_entry"],
+                     "rearmed_entry": r["rearmed_entry"], "rearmed_this_stop": r["rearmed_this_stop"],
+                     "reminded_at_moved_head": r["reminded_at_moved_head"],
                      "median_h": round(percentile(ages, 0.5), 1), "p90_h": round(percentile(ages, 0.9), 1),
                      "max_h": round(max(ages), 1) if ages else 0.0,
                      "over_24h": sum(1 for a in ages if a > 24), "over_48h": sum(1 for a in ages if a > 48)})
@@ -129,7 +145,8 @@ def main() -> int:
     if as_json:
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0
-    cols = ("rows", "reminded", "median_h", "p90_h", "max_h", "over_24h", "over_48h", "rearmed_entry")
+    cols = ("rows", "reminded", "reminded_at_moved_head", "median_h", "p90_h", "max_h", "over_24h", "over_48h",
+            "rearmed_this_stop", "rearmed_entry")
     width = {c: max(10, len(c) + 2) for c in cols}  # a header never runs into its neighbour
     print("%-24s" % "stop code" + "".join("%*s" % (width[c], c) for c in cols))
     for r in out["rows"]:
