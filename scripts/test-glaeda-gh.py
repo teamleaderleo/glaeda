@@ -13922,9 +13922,10 @@ class BudgetRefreshTest(Base):
         self.daemon.tick(NOW)
         self.gh.rest_remaining = 1057
         self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
-        self.assertEqual(self.daemon.budget["rest"], {"limit": 5000, "remaining": 1057,
-                                                      "reset": int(NOW + 1800),
-                                                      "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
+        rest = dict(self.daemon.budget["rest"])
+        self.assertRegex(rest.pop("token", ""), r"^[0-9a-f]{8}$", "the reading names the token it counts")
+        self.assertEqual(rest, {"limit": 5000, "remaining": 1057, "reset": int(NOW + 1800),
+                                "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
         self.assertEqual(self.daemon.status["lastHour"]["rest"], 0, "the refresh spends no REST")
 
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
