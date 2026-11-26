@@ -14991,6 +14991,12 @@ class BrokerMergeGuardTest(BrokerBase):
         self.assertEqual(path, str(self.guard))
 
     def test_reads_and_other_writes_never_go_to_the_guard(self) -> None:
+        """Neither a merge nor a create: only the ordinary hand-off (BrokerQuotaGuardTest) sends these to the guard,
+        and this daemon's own reads (GLAEDA_GH_INTERNAL) skip that one, so they show the merge and create lists
+        leave them alone. Before 2026-11-26 the ordinary hand-off was also skipped here, because no broker shim sat
+        after the guard on this test's PATH."""
+        os.environ["GLAEDA_GH_INTERNAL"] = "1"
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_INTERNAL", None)
         for args in (["pr", "view", "7", "-R", "o/r", "--json", "state"],
                      ["api", "repos/o/r/pulls/7/merge"],  # GET: whether it merged
                      ["api", "-X", "PUT", "repos/o/r/pulls/7/update-branch"],
@@ -16256,15 +16262,45 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.patch_env({gg.BROKER_MARK: f"1:{os.getpid()}"})
         self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
 
-    def test_the_guard_is_left_out_when_it_would_not_hand_the_call_back(self) -> None:
-        """The guard execs the next `gh` on PATH. Where that is not this broker's shim, this route would hand the
-        read to the real gh behind this broker's back -- losing the answer cache, the source refusal and the repeat
-        hold, a worse trade than the one quota route it would gain. A create still goes (it has a pause only the
-        guard can ask) and a merge is refused without the guard: neither changes here."""
-        self.chain(comes_back=False)
-        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+    def test_a_read_goes_to_the_guard_even_when_it_would_not_hand_the_call_back(self) -> None:
+        """A timer's, a LaunchAgent's or a systemd unit's `glaeda-gh gh` has no broker shim after the guard on PATH
+        (often no guard at all). Leaving the guard out there ran the real gh outside the gh-quota ledger: 2026-11-26,
+        2144 of 2379 GraphQL points in 22 minutes were untallied, and this broker started 238 of the unshimmed gh
+        processes measured in 240 s on seven hosts. With no shim installed the guard runs the real gh itself."""
+        os.environ.pop("GLAEDA_GH_SHIM_DIR", None)
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "no-shim-here")})
+        guard = self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"], os.pathsep.join([str(guard.parent), os.environ["PATH"]]),
+                         "no shim installed: the guard's directory, then PATH as it was")
         self.assertEqual(self.first_exec(["pr", "comment", "7", "-R", "o/r", "--body", "x"])[0],
-                         str(self.home / "quota" / "gh"), "a create goes to the guard either way")
+                         str(guard), "a create goes to the guard either way")
+
+    def test_the_installed_shim_is_put_after_the_guard_so_the_call_comes_back(self) -> None:
+        installed = self.home / "installed-shim"
+        installed.mkdir()
+        (installed / "gh").write_text(f"#!/bin/sh\n# {gg.BROKER_MARK} shim\nexit 9\n")
+        (installed / "gh").chmod(0o755)
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(installed)})
+        guard = self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[:2], [str(guard.parent), str(installed)],
+                         "the guard execs the next gh after its own directory: the broker's shim")
+
+    def test_a_guard_off_path_still_gets_the_read(self) -> None:
+        """A LaunchAgent's PATH names neither the guard nor the shim (cmux16, air-blue, cosmic-gray, 2026-11-26)."""
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "no-shim-here")})
+        guard = self.chain(comes_back=False)
+        self.patch_env({"PATH": str(self.home / "nothing")})
+        self.assertEqual(self.first_exec()[0], str(guard))
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[-1], str(Path(os.environ["GLAEDA_GH_REAL"]).parent),
+                         "no gh after the guard on PATH: the real gh this broker would have run is named last")
+
+    def test_a_shim_already_after_the_guard_is_not_added_twice(self) -> None:
+        guard = self.chain()
+        self.patch_env({"GLAEDA_GH_SHIM_DIR": str(self.home / "shim")})
+        self.first_exec()
+        self.assertEqual(self.exec_env["PATH"], os.pathsep.join([str(guard.parent), os.environ["PATH"]]))
 
     def test_a_host_with_no_guard_runs_the_read_as_before(self) -> None:
         self.chain(guard=False)
@@ -26836,6 +26872,8 @@ class LandWorld:
         # `gh api PATH --jq ...` reads by path prefix: what the jq answers (None: the read fails). Unset: exit 0, no
         # output, which no reader can use (a run read before a rerun: rerun as before)
         self.api: dict[str, str | None] = {}
+        # `land_handoff` {"outcomes"}: REPO#N -> the broker queue's row; None (the default): a broker older than it
+        self.outcomes: dict[str, dict] | None = None
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
         # as lane-gh prints it: the broker's whole envelope, indented over many lines
         self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
@@ -26872,6 +26910,14 @@ class LandWorld:
                                        **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
+        if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"] and "outcomes" in json.loads(argv[4]):
+            # the broker host's queue's rows for the asked PRs (LAND_BROKER_ASK); None: a broker that refuses it
+            if self.outcomes is None:
+                return subprocess.CompletedProcess(argv, 1, "", "lane-gh call land_handoff: refused: land_handoff: "
+                                                   "unknown argument outcomes (number, sha, requester)")
+            asked = [f"{argv[3]}#{n}" for n in json.loads(argv[4])["outcomes"]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": {
+                "ok": True, "host": "huge-blue", "outcomes": {t: self.outcomes.get(t) for t in asked}}}, indent=1), "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
             # a list answers in order, its last answer for every call after
             rc, out, err = (self.handoff.pop(0) if len(self.handoff) > 1 else self.handoff[0]) \
@@ -30372,6 +30418,33 @@ class LandTest(Base):
         e = self.tick(60)
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (1, sent + 1))  # told on the copy there is
 
+    def test_a_reminder_names_the_head_now_when_the_stop_head_moved(self):
+        # LAND_OWNER_REMIND_MOVED: lw#9376's reminder quoted 4a7ee5cb2b6a, the head its stop was read at; re-queued
+        # there it stopped again at 0d18d91f773a. The read the reminder already asks for gives the head now for free.
+        e = self.conflict_stop()
+        self.assertEqual(e["stop"]["head"], LA)
+        self.fresh_head = LB  # pushed since the stop: its reason and its one step are evidence at LA
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        said = self.w.sent()[-1][-1]
+        self.assertEqual((e["state"], e["reminds"]["n"], e["reminds"]["head"]), ("stopped", 1, LB))
+        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, still said
+        self.assertIn(LA[:12], said)  # dated at the head it was read at
+        self.assertIn(f"--pin {LB}", said)  # and the step that judges the head now
+        reminded = [h for h in e["history"] if h.get("event") == "reminded"]
+        self.assertEqual([h.get("moved") for h in reminded], [LB[:12]])
+
+    def test_a_reminder_on_an_unread_copy_dates_the_stop_instead_of_naming_a_head(self):
+        # The wait ran out with no read (LAND_OWNER_REMIND_READ_WAIT): the copy's head may be as old as the stop, so
+        # the reminder names no head now and says the stop's sha is dated.
+        self.conflict_stop()
+        self.fresh_head = None  # every read fails
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        said = self.w.sent()[-1][-1]
+        self.assertEqual((e["reminds"]["n"], e["reminds"].get("head")), (1, None))
+        self.assertIn("could not be read just now", said)
+        self.assertNotIn("--pin", said)
+
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
         # and a reminder beside it would be the same words twice.
@@ -31781,7 +31854,9 @@ class LandTest(Base):
                  "(lane-gh-broker own); nor is it a PR host adopted (no claim)")
 
     def handoffs(self) -> list[list[str]]:
-        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]]
+        """The hand-offs sent (not the outcome asks: outcome_asks)."""
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]
+                and "outcomes" not in json.loads(c[4])]
 
     def test_an_ownership_refusal_on_a_lane_vm_hands_the_land_to_the_broker_host_once(self):
         # cmux#45756, 2026-11-18: "branch lane/drag-like-paste was not pushed by gcp-agent-lane-6": a lander lane only
@@ -33687,6 +33762,25 @@ class LandTest(Base):
                 self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
                 self.broker = False
 
+    def test_a_local_git_timeout_on_a_lane_vm_is_judged_here_again_before_it_is_handed_off(self):
+        # a lane VM, 2026-11-26: leo-workspace#11598 answered unreadable because land_judge's git archive of
+        # the cmux mirror timed out at 24 s, twice, during a mirror fetch (0.56 s later), and was handed off on that.
+        why = ("git archive 0130fc15aaaa (origin/feat-cmux-next) scripts/ci in /m/cmux, tried twice: Command "
+               "'['git', '-C', '/m/cmux', 'archive', '--format=tar']' timed out after 24 seconds")
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            for _ in range(gg.LAND_LOCAL_GIT_RETRIES):
+                self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=why))
+                e = self.tick(600)
+                self.assertEqual(self.handoffs(), [], e.get("history"))
+                self.assertNotEqual(e["state"], "forwarded")
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=why))
+            e = self.tick(600)
+        self.assertEqual(len(self.handoffs()), 1, "past its local tries it is handed off as before")
+        self.assertEqual(e["state"], "forwarded")
+
     def test_a_land_tier_stop_on_a_lane_vm_hands_the_land_to_the_broker_host(self):
         # cmux#53696, 2026-11-24: land_judge refused land_tier_pending (cmux/land-tier pending, needs ready-to-land) and
         # its label add went through the broker, which never sets that label for a lane: the land stopped on a `gh pr
@@ -33869,6 +33963,35 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual(e["state"], "forwarded")
         return e
+
+    def outcome_asks(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land_handoff"]
+                and "outcomes" in json.loads(c[4])]
+
+    def test_a_lane_vms_handed_off_row_asks_the_broker_and_ends_with_its_merge(self):
+        # a lane VM, 2026-11-26: leo-workspace#11598 handed off twice, no verdict back for over an hour, and 0
+        # land-forward-asked events: far_command has no program on a lane VM, so nothing asked. It asks the broker.
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_ASK_FIRST - 10)
+        self.assertEqual(self.outcome_asks(), [], "not before LAND_FORWARD_ASK_FIRST")
+        self.w.outcomes = {"o/r#1": {"state": "merged", "mergeSha": "c" * 40, "updated": self.t, "stop": None}}
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 10)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        [ask] = self.outcome_asks()
+        self.assertEqual(ask[3:], ["o/r", json.dumps({"outcomes": [1]})])
+        self.assertEqual(e["state"], "merged", e.get("history"))
+        self.assertEqual([c for c in self.w.sent()[sent:] if "--class" in c and c[c.index("--class") + 1] == "block"],
+                         [], "no blocker for a PR the far queue merged")
+
+    def test_a_broker_that_does_not_know_outcomes_leaves_the_row_forwarded(self):
+        self.handed_off()
+        self.w.outcomes = None
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.tick(1)
+        self.assertEqual(len(self.outcome_asks()), 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
 
     def quiet_notices(self) -> list[list[str]]:
         return [c for c in self.w.sent() if "no verdict has come back" in c[-1]]
@@ -34848,6 +34971,36 @@ class LandTest(Base):
         self.q.park_queue_quota(self.t + 1800, "quota")
         self.tick()
         self.assertEqual(self.q.entries[self.KEY]["state"], "queued")
+
+    def test_a_re_request_on_a_closed_copy_read_before_it_reads_once_before_it_stops(self):
+        """LAND_CLOSED_BEFORE_REQUEST: cmux#57225, 2026-11-26: a copy read mid close-and-reopen kept the PR CLOSED in
+        the cache, and three re-requests after the reopen each stopped at once "closed unmerged (the cache shows it
+        closed)". A CLOSED copy read before the latest request is read again first; one read since that still says
+        CLOSED stops it."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        self.w.set_pr(self.KEY, land_pr(LA, state="CLOSED"), self.t)  # read mid close-and-reopen
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.t += 2 * gg.LAND_OWN_REFRESH_AFTER  # the PR is reopened; nothing re-reads a closed copy
+        self.fresh_head = LA
+        with mock.patch.object(gg.time, "time", return_value=self.t):  # the request is written now, after the copy
+            self.land()
+        e = self.tick()
+        self.assertNotEqual(e["state"], "stopped", e.get("stop"))
+        self.assertIn(self.KEY, self.w.refreshed)
+        self.assertEqual(self.w.cache[self.KEY]["data"]["state"], "OPEN")
+        # a re-request whose read since it still says CLOSED stops as before
+        self.w.set_pr(self.KEY, land_pr(LA, state="CLOSED"), self.t)
+        self.t += 10
+        self.fresh_head = None  # GitHub's read fails: the copy is the newest there is, and it was read once
+        with mock.patch.object(gg.time, "time", return_value=self.t):
+            self.land()
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "stop_read_first"]), 2)
 
     def test_a_merged_pr_leaves_the_queue_while_every_worker_is_busy_or_its_entry_is_parked(self):
         """A full pool (refresh_due waits for a free worker) and an entry parked on its own backoff both still let a
@@ -46834,6 +46987,22 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         settled[7] = "SUCCESS"
         self.assertFalse(self.check(json.dumps(settled), json.dumps(settled)))
         self.assertFalse(self.check("junk", self.fp()))
+
+    def test_probe_stands_in_for_a_queued_pending_row_past_an_hour(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 20000.0
+        d.rollup_wanted = lambda: frozenset({"pr:o/r#1"})
+        d.pr_behind = lambda c: True
+        d.rollup_stale = lambda key, c: False
+        e = {"key": "pr:o/r#1", "cache": {"fp": self.fp(), "via": "graphql", "data": {"state": "OPEN", "checks": []},
+                                          "fullAt": d.now - gg.PR_FULL_BEHIND_EVERY - 600}}
+        self.assertTrue(d.probe_ok(e))
+        e["cache"]["fullAt"] = d.now - gg.PR_FULL_PENDING_EVERY
+        self.assertFalse(d.probe_ok(e))
+        settled = json.loads(self.fp())
+        settled[7] = "SUCCESS"
+        e["cache"].update(fp=json.dumps(settled), fullAt=d.now - gg.PR_FULL_BEHIND_EVERY - 600)
+        self.assertFalse(d.probe_ok(e))
 
 
 class FullPrReadFoldsItsHead(unittest.TestCase):
