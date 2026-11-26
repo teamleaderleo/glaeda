@@ -15616,6 +15616,21 @@ LAND_REARM_CAP = 3
 LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 LAND_OWNER_REMIND_CAP = 2
+# LAND_STOP_SETTLE: a stop or a "still stopped" reminder for a PR that already merged or closed asks its requester for
+# nothing. teamleaderleo/glaeda#2639 merged 2026-11-23 09:15Z; a row on one fleet host sent it a head_moved [blocker]
+# more than an hour later, and a row on another reminded about it 68 h later ("still stopped after 68 h ...
+# reminded code=head_moved hours=67.9"), each on a cached copy that still read open. #2644 fixed the same class for
+# the forward give-up only (forward_settle); now every stop notice and every reminder reads the PR first, the same
+# cheap way: the daemon's cache when it shows the PR ended (a CLOSED copy no older than the row), or open in a copy
+# read within LAND_STOP_STATE_FRESH; else the notice is held on the row (stopNotice) and one live read through the gh
+# shim (its own cache first, then GraphQL) settles it off the lock, at most LAND_STOP_STATE_READS a pass
+# (stops_settle). Merged or closed: the row ends with that outcome and tells nobody. Open, or unreadable: the held
+# notice goes as it would have (an unread state never swallows a stop). A stopped row is also read once at load and
+# then every LAND_STOP_SETTLE_EVERY, so a row stopped before this, or whose PR merged by hand since, ends merged
+# instead of sitting stopped. Detector: test-glaeda-gh.py test_a_head_moved_stop_for_a_pr_that_merged_ends_merged_*.
+LAND_STOP_STATE_FRESH = 900.0
+LAND_STOP_STATE_READS = 10
+LAND_STOP_SETTLE_EVERY = LAND_OWNER_REMIND_EVERY
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -17529,6 +17544,8 @@ class LandQueue:
         self.forward_reading: set[str] = set()
         self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
+        self.stop_reading: set[str] = set()  # stopped keys whose PR state is read live (stops_settle)
+        self.stop_state_thread: threading.Thread | None = None
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.peer_quiet: dict[str, str] = {}  # silent peers, each to why (silent_peers, LAND_PEER_SILENT)
         self.peer_quiet_at = float("-inf")  # silent_peers reads the rows again after this
@@ -17948,6 +17965,16 @@ class LandQueue:
     # -- the tick
 
     def tick(self, now: float | None = None, dirty: set[str] | None = None, local_only: bool = False) -> None:
+        """One pass (tick_pass), then the stopped rows' state reads (stops_settle): last, so a stop this pass made has
+        its held notice settled in the same tick when the read can run inline."""
+        self.tick_pass(now, dirty, local_only)
+        if not local_only:
+            try:
+                self.stops_settle()
+            except Exception as error:  # noqa: BLE001  a read is a look, never a reason to stop the queue
+                log({"event": "land-error", "site": error_site(error), "error": describe(error), "in": "stops_settle"})
+
+    def tick_pass(self, now: float | None = None, dirty: set[str] | None = None, local_only: bool = False) -> None:
         executor = land_executor(self.config())
         self.executes = executor is None  # ingest_between: a forwarding host's requests are forward_tick's
         if local_only and (executor is not None or self.forward_thread is not None and self.forward_thread.is_alive()):
@@ -19255,6 +19282,7 @@ class LandQueue:
             return  # it moved on while its state was read
         host = str(e.get("forwardedTo") or "the host it was handed to")
         e["forwardStateAt"] = self.now
+        e["stopReadAt"] = self.now  # a stop it makes now is not read again (LAND_STOP_SETTLE)
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         held = float((e.get("forwardHeld") or {}).get("at") or 0)  # the far host's last answer holding it open
         if self.now - max(first, held) <= LAND_FORWARD_GIVE_UP:  # read early (forward_state_wanted): an end ends it, as the cache's
@@ -19667,9 +19695,13 @@ class LandQueue:
         to = str(e.get("requester") or "")
         if not to:
             return False  # notify's land-unnotified already said it at the stop
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
-            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        if e.get("stopNotice"):
+            return False  # a notice already waits on its state read (stops_settle)
+        over = self.stop_over(e)
+        if over is not None and over[0] != "OPEN":
+            # a PR that is over owes its requester nothing: the row ends with that outcome (LAND_STOP_SETTLE)
+            self.settle_stopped(e, over[0], over[1], "the cache shows it")
+            return False
         day = land_day(self.now)
         r = e.get("reminds") or {}
         n = int(r.get("n") or 0) if r.get("day") == day else 0
@@ -19687,12 +19719,158 @@ class LandQueue:
             msg += f" next: {land_trim(str(st['next']), 300)}"
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
-        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
-        log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1)})
+        held = {"msg": msg, "kind": "remind", "to": to, "code": code, "n": n + 1, "hours": round(hours, 1)}
+        if over is None:  # no copy says it is still open: read it first (LAND_STOP_SETTLE)
+            self.hold_notice(e, held)
+            return True
         self.save(e)
-        self.notify(e, to, msg)
+        self.send_held(e, held)
         return True
+
+    # -- LAND_STOP_SETTLE: a stop or reminder for a PR that is over tells nobody
+
+    def stop_over(self, e: dict) -> tuple[str, str] | None:
+        """Under the lock. What the daemon's cache says of E's PR (LAND_STOP_SETTLE): ("MERGED", merge sha),
+        ("CLOSED", "") from a copy no older than the row, ("OPEN", "") from a copy read within LAND_STOP_STATE_FRESH,
+        else None: no copy settles it, read it live."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") if isinstance(c.get("data"), dict) else {}
+        state = str(data.get("state") or "").upper()
+        at = c.get("dataAt")
+        read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        if state == "MERGED":
+            merge = data.get("mergeCommit")
+            return "MERGED", str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+        if state == "CLOSED" and read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen
+            return "CLOSED", ""
+        if state == "OPEN" and self.now - read_at <= LAND_STOP_STATE_FRESH:
+            return "OPEN", ""
+        return None
+
+    def settle_stopped(self, e: dict, state: str, merge_sha: str, how: str) -> None:
+        """Under the lock. Stopped E's PR is over: the row ends with that outcome and nobody is told (LAND_STOP_SETTLE)
+        -- whoever merged or closed it knows, and `land status` shows the row."""
+        e.pop("stopNotice", None)
+        code = str((e.get("stop") or {}).get("code") or "")
+        e["stopReadAt"] = self.now
+        if state == "MERGED":
+            sha = merge_sha or e.get("mergeSha") or ""
+            e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
+            self.history(e, "merged", sha=sha, how=f"stopped {code}: {how} merged", quiet="stop_settled")
+            self.save(e)
+        else:
+            self.stop(e, "closed", f"closed unmerged ({how} closed); nothing is merged", "", tell="quiet")
+        log({"event": "land-stop-settled", "key": e["key"], "state": state.lower(), "code": code, "how": how})
+
+    def hold_notice(self, e: dict, held: dict) -> None:
+        """Under the lock. HELD (a stop's or a reminder's notice) waits on the row for one read of its PR's state
+        (stops_settle), kept across a restart."""
+        e["stopNotice"] = {**held, "at": self.now, "stopAt": float((e.get("stop") or {}).get("at") or 0)}
+        self.save(e)
+        log({"event": "land-notice-held", "key": e["key"], "kind": held.get("kind"),
+             "code": str((e.get("stop") or {}).get("code") or "")})
+
+    def send_held(self, e: dict, held: dict) -> None:
+        """Under the lock. Send a stop's or a reminder's notice, its PR read and not over."""
+        e.pop("stopNotice", None)
+        if held.get("kind") == "remind":
+            self.history(e, "reminded", code=held.get("code"), n=held.get("n"), hours=held.get("hours"))
+            log({"event": "land-owner-reminded", "key": e["key"], "code": held.get("code"), "to": held.get("to"),
+                 "n": held.get("n"), "hours": held.get("hours")})
+            self.save(e)
+            self.notify(e, str(held.get("to") or ""), str(held.get("msg") or ""))
+            return
+        self.save(e)
+        self.notify(e, e.get("requester") or "", str(held.get("msg") or ""), cls=held.get("cls") or None)
+
+    def stop_settle_due(self, e: dict) -> bool:
+        """Under the lock. Whether stopped E's PR state is read now (stops_settle): a notice waits on it, or it was
+        not read since the row was loaded or LAND_STOP_SETTLE_EVERY ago."""
+        if e.get("state") != "stopped" or e["key"] in self.jobs or e["key"] in self.stop_reading:
+            return False
+        if e.get("stopNotice"):
+            return True
+        if str((e.get("stop") or {}).get("code") or "") == "closed":
+            return False  # already over
+        return self.now - float(e.get("stopReadAt") or 0) >= LAND_STOP_SETTLE_EVERY
+
+    def stops_settle(self) -> None:
+        """Each stopped row due a look (stop_settle_due) is settled from the cache when a copy says enough
+        (stop_over), else read live: at most LAND_STOP_STATE_READS a pass, off the lock (inline: here), one reading
+        at a time. A held notice under a quota park is sent unread: the park holds every read of the login."""
+        if self.stop_state_thread is not None and self.stop_state_thread.is_alive():
+            return
+        due: list[str] = []
+        parked = self.queue_quota_parked()
+        for key in [k for k, e in self.entries.items() if e.get("state") == "stopped"]:
+            try:
+                with self.lock:
+                    e = self.entries[key]
+                    if not self.stop_settle_due(e):
+                        continue
+                    over = self.stop_over(e)
+                    if over is not None and over[0] != "OPEN":
+                        self.settle_stopped(e, over[0], over[1], "the cache shows it")
+                    elif over is not None:
+                        e["stopReadAt"] = self.now
+                        held = e.get("stopNotice")
+                        if held:
+                            self.send_held(e, held)
+                        else:
+                            self.save(e)
+                    elif parked:
+                        if e.get("stopNotice"):  # sent unread: a park may outlast any wait for its read
+                            self.send_held(e, e["stopNotice"])
+                    else:
+                        due.append(key)
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        if not due:
+            return
+        # the held notices first, then the longest unread
+        due.sort(key=lambda k: (not self.entries[k].get("stopNotice"), float(self.entries[k].get("stopReadAt") or 0)))
+        picked = due[:LAND_STOP_STATE_READS]
+        self.stop_reading = set(picked)
+        token = {k: (self.entries[k].get("gen"), (self.entries[k].get("stop") or {}).get("at")) for k in picked}
+
+        def read_all() -> None:
+            try:
+                for key in picked:
+                    try:
+                        state, merge_sha, _head, why = self.forward_read_state(self.entries[key])
+                        with self.lock:
+                            e = self.entries.get(key)
+                            if e is None or e.get("state") != "stopped" \
+                                    or (e.get("gen"), (e.get("stop") or {}).get("at")) != token[key]:
+                                continue  # it moved on while its state was read
+                            self.stop_read_settle(e, state, merge_sha, why)
+                    except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                        log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                    finally:
+                        self.stop_reading.discard(key)
+            finally:
+                self.stop_reading = set()
+
+        if self.inline:
+            read_all()
+        else:
+            self.stop_state_thread = threading.Thread(target=read_all, name="land-stop-state", daemon=True)
+            self.stop_state_thread.start()
+
+    def stop_read_settle(self, e: dict, state: str, merge_sha: str, why: str) -> None:
+        """Under the lock. Stopped E's PR read live (stops_settle): MERGED or CLOSED ends it and tells nobody; OPEN,
+        or unread (WHY), sends the notice it held, if any."""
+        if state in ("MERGED", "CLOSED"):
+            self.settle_stopped(e, state, merge_sha, "read live")
+            return
+        e["stopReadAt"] = self.now
+        if not state:
+            log({"event": "land-stop-state-unread", "key": e["key"], "why": land_trim(why, 160)})
+        held = e.get("stopNotice")
+        if held:
+            self.send_held(e, held)
+        else:
+            self.save(e)
 
     def unlabel_owed(self, e: dict) -> bool:
         """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
@@ -24577,6 +24755,7 @@ class LandQueue:
         live = LAND_MOVED_NEXT.search(nxt or "") if code == "head_moved" else None
         if live and e.get("pinSha"):
             e["movedFrom"] = {"was": str(e["pinSha"]).lower(), "head": live.group(1), "at": self.now}
+        e.pop("stopNotice", None)  # an older stop's notice is replaced by this one's
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
                      "holdWindow", "forwardFirst", "forwardHeld", "forwardMissing", "forwardRead", "forwardAsk"):
@@ -24588,20 +24767,32 @@ class LandQueue:
             msg += f" next: {land_trim(nxt, 300)}"
         if detail:
             msg += "\n" + detail[:LAND_HUNK_CHARS + 20]
+        if repeat or infra or tell == "quiet":
+            # a stop that tells nobody reads nothing now: the sweep looks again in LAND_STOP_SETTLE_EVERY
+            e["stopReadAt"] = max(float(e.get("stopReadAt") or 0), self.now)
+            self.save(e)
         if repeat:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
-        if not tell and str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("state") or "") == "MERGED":
-            # LAND_STOP_MERGED_QUIET: a stop of a PR that already merged asks the requester for nothing (a merge never
-            # reverts). gcp-agent-lane-12, 2026-11-23..25: 16 such stops (forward_no_outcome, head_moved, own_red) each
-            # woke a lane that answered "already merged". A line in the log and the entry's history, as a repeat is.
-            tell = "quiet"
         if code == "head_moved" and not tell and land_requester_far(e):
             tell = "fyi"  # LAND_FAR_HEAD_MOVED_FYI's comment: the requester's own queue says it, or it moved on
+        cls = LAND_FORWARD_FYI_CLASS if tell == "fyi" else None
         # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
-        self.notify(e, e.get("requester") or "", msg, wake=not infra and tell != "quiet",
-                    cls=LAND_FORWARD_FYI_CLASS if tell == "fyi" else None)
+        wake = not infra and tell != "quiet"
+        if wake and code != "closed":
+            # LAND_STOP_SETTLE (and LAND_STOP_MERGED_QUIET before it): a stop of a PR that already merged or closed
+            # asks the requester for nothing; the row ends with that outcome. No copy that says: read it first.
+            over = self.stop_over(e)
+            if over is not None and over[0] != "OPEN":
+                self.settle_stopped(e, over[0], over[1], "the cache shows it")
+                return
+            if over is None and self.now - float(e.get("stopReadAt") or 0) > LAND_STOP_STATE_FRESH:
+                self.hold_notice(e, {"msg": msg, "kind": "stop", "cls": cls})
+                return
+            e["stopReadAt"] = self.now
+            self.save(e)
+        self.notify(e, e.get("requester") or "", msg, wake=wake, cls=cls)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never

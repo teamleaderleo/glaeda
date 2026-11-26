@@ -30177,7 +30177,8 @@ class LandTest(Base):
         sent = len(self.w.sent())
         self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
-        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+        # LAND_STOP_SETTLE: the row ends with the PR's outcome, and nobody is told
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("merged", None, sent))
 
     def test_a_rearmable_stop_is_not_also_reminded(self):
         # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
@@ -33846,9 +33847,10 @@ class LandTest(Base):
         self.w.calls.clear()
         self.w.cache[self.KEY]["data"]["state"] = "MERGED"
         self.q.stop(e, "forward_no_outcome", "no outcome", "land again")
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual(e["state"], "merged")  # LAND_STOP_SETTLE: the row ends with the PR's outcome
         self.assertEqual([c for c in self.w.sent() if "stopped" in c[-1]], [])
         self.w.cache[self.KEY]["data"]["state"] = "OPEN"
+        self.w.cache[self.KEY]["dataAt"] = self.q.now  # a fresh copy: told at once
         self.q.stop(e, "own_red", "ci failed", "fix it")
         self.assertEqual(len([c for c in self.w.sent() if "own_red" in c[-1]]), 1)  # an open PR's stop still tells
 
@@ -34095,6 +34097,136 @@ class LandTest(Base):
             e = self.past_give_up()
         self.assertEqual((e["state"], self.state_reads()), ("forwarded", []))
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+
+    # -- LAND_STOP_SETTLE: a stop or a reminder reads the PR first; merged or closed ends the row and tells nobody
+
+    def stop_reads(self) -> list[list[str]]:
+        return self.state_reads()
+
+    def stale_open_row(self) -> dict:
+        """A land of o/r#1 at LA waiting on its checks, its cached copy reading open but read long ago (a PR nobody
+        here watches any more): glaeda#2639's rows on 2026-11-23."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick()
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_STOP_STATE_FRESH - 1
+        self.w.calls.clear()
+        return e
+
+    def test_a_head_moved_stop_for_a_pr_that_merged_ends_merged_and_tells_nobody(self):
+        # glaeda#2639 merged 09:15:47Z; a row sent it a head_moved [blocker] more than an hour later on a copy that
+        # still read open. The stop's notice now waits on one read of the PR, which ends the row merged.
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "MERGED"
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        self.assertEqual((e["state"], e["stopNotice"]["kind"]), ("stopped", "stop"))
+        self.assertEqual(len(self.w.sent()), sent)  # held, not sent
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"], e.get("stopNotice")), ("merged", "f" * 40, None))
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.assertEqual(len(self.w.sent()), sent)  # nobody told
+        self.assertEqual(e["history"][-1]["quiet"], "stop_settled")
+        self.tick(gg.LAND_STOP_SETTLE_EVERY + 1)
+        self.assertEqual(len(self.stop_reads()), 1)  # an ended row is read no more
+
+    def test_a_stop_for_a_pr_that_closed_stops_closed_and_tells_nobody(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "CLOSED"
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("stopNotice")), ("stopped", "closed", None))
+        self.assertEqual(len(self.w.sent()), sent)
+
+    def stop_read_tells(self, view_err: str | None) -> None:
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.view_err = view_err
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stopNotice")), ("stopped", None))
+        said = [c for c in self.w.sent()[sent:] if "stopped: head_moved" in c[-1]]
+        self.assertEqual(len(said), 1)
+        self.assertEqual(len(self.stop_reads()), 1)
+        self.tick()
+        self.assertEqual(len(self.stop_reads()), 1)  # read once, then every LAND_STOP_SETTLE_EVERY
+
+    def test_a_stop_whose_pr_reads_open_still_tells_its_requester(self):
+        self.stop_read_tells(None)
+
+    def test_a_stop_whose_pr_state_is_unread_still_tells_its_requester(self):
+        self.stop_read_tells("HTTP 502: Bad Gateway")  # an unread state never swallows a stop
+
+    def test_a_stop_a_fresh_copy_reads_open_tells_at_once_and_reads_nothing(self):
+        e = self.stale_open_row()
+        sent = len(self.w.sent())
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "own_red", "ci failed", "fix it")
+        self.assertEqual(len([c for c in self.w.sent()[sent:] if "own_red" in c[-1]]), 1)
+        self.tick()
+        self.assertEqual(self.stop_reads(), [])
+
+    def test_a_still_stopped_reminder_for_a_pr_merged_since_ends_merged_and_tells_nobody(self):
+        # glaeda#2639: "still stopped after 68 h ... reminded code=head_moved hours=67.9", 68 h after its merge
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: inside one UTC day
+        e = self.stale_open_row()
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        sent = len(self.w.sent())
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_STOP_STATE_FRESH - 1  # nobody reads it after
+        self.w.view_state = "MERGED"
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), sent)
+        self.assertNotIn("reminded", [h.get("event") for h in e["history"]])
+        self.assertEqual(len(self.stop_reads()), 1)
+
+    def test_a_still_stopped_reminder_for_an_open_pr_is_sent_after_its_read(self):
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        e = self.stale_open_row()
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        with self.q.lock:
+            self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+        sent = len(self.w.sent())
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_STOP_STATE_FRESH - 1
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY + 1)
+        self.assertEqual((e["state"], e["reminds"]["n"], e.get("stopNotice")), ("stopped", 1, None))
+        [said] = self.w.sent()[sent:]
+        self.assertIn("still stopped after 6 h", said[-1])
+        self.assertIn("reminded", [h.get("event") for h in e["history"]])
+        self.assertEqual(len(self.stop_reads()), 1)
+
+    def test_a_row_stopped_before_for_a_pr_merged_since_is_settled_at_load(self):
+        # rows stopped before this (no stopReadAt) whose PR merged by hand: read once at load, ended merged, silently
+        e = {"key": self.KEY, "repo": "o/r", "number": 1, "state": "stopped", "created": self.t - 3 * 86400,
+             "updated": self.t - 3 * 86400, "requester": "host/lane", "history": [],
+             "stop": {"code": "head_moved", "at": self.t - 3 * 86400, "reason": "o/r#1 moved"}}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3 * 86400
+        self.w.view_state = "MERGED"
+        self.q = self.queue()
+        sent = len(self.w.sent())
+        e = self.tick()
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual((len(self.stop_reads()), len(self.w.sent())), (1, sent))
+
+    def test_stop_state_reads_are_capped_per_pass(self):
+        e = self.stale_open_row()
+        self.w.view_state = "MERGED"
+        with mock.patch.object(gg, "LAND_STOP_STATE_READS", 0):
+            with self.q.lock:
+                self.q.stop(e, "head_moved", "o/r#1 moved", f"glaeda-gh land o/r#1 --sha {LB}")
+            e = self.tick()
+        self.assertEqual((e["state"], self.stop_reads()), ("stopped", []))
+        e = self.tick()
         self.assertEqual(e["state"], "merged")
 
     def test_a_pinned_rows_hand_off_to_an_executor_carries_its_pin(self):
