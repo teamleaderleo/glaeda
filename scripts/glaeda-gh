@@ -14340,6 +14340,10 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
+# LAND_CLOSED_BEFORE_REQUEST: a reopened PR stayed CLOSED in the cache (a terminal copy is re-read rarely, and never
+# while reads are scarce), and every re-request stopped at once "closed unmerged (the cache shows it closed)": cmux#57225,
+# 2026-11-26 05:57-06:50Z, copy read mid close-and-reopen, three re-requests each stopped on it. A CLOSED copy read
+# before the entry's latest request ends it only after one read since that request (closed_copy_stale).
 # LAND_BEFORE_REQUEST_READ: a land request with no --sha, sent right after a push, was judged on the copy read before
 # the push. It stopped at once on land_judge's conflict verdict for the old head, and the requester got that back as its answer: a forwarded
 # `land --wait` returned "head <old> conflict" seconds after the push (incident hq#20521's second data point). A
@@ -18730,14 +18734,31 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "")
-        if state == "CLOSED":
-            at = c.get("dataAt")
-            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
-                return False
+        if state == "CLOSED" and self.closed_copy_stale(e, c):
+            return False
         if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
                       "the cache shows it"):
             return True
         return self.stop_moved_pin(e, c, data)
+
+    def closed_copy_stale(self, e: dict, c: dict) -> bool:
+        """Under the lock. Whether a CLOSED copy of E's PR is too old to end E on: read before E was queued, or before
+        its last land request (requestedAt, a re-request's too) and not read since. A reopen lands between the two, so
+        that copy predates it: the first such look asks for one read (readBeforeStop, refresh_due's before-request
+        read) instead of stopping, and a fresh copy that still reads CLOSED ends E (LAND_CLOSED_BEFORE_REQUEST)."""
+        at = c.get("dataAt")
+        if not _finite(at) or at < float(e.get("created") or 0):
+            return True
+        asked = e.get("requestedAt")
+        last = (e.get("refresh") or {}).get("at")
+        if not _finite(asked) or at >= asked or (_finite(last) and last >= asked):
+            return False
+        if e.get("readBeforeStop") != asked:
+            e["readBeforeStop"] = asked
+            self.history(e, "stop_read_first", code="closed", age=round(asked - at))
+            self.save(e)
+            log({"event": "land-stop-read-first", "key": e["key"], "code": "closed", "age": round(asked - at)})
+        return True
 
     def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
         """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
@@ -20794,7 +20815,10 @@ class LandQueue:
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
-        if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
+        state = str(data.get("state") or "")
+        if state == "CLOSED" and self.closed_copy_stale(e, c or {}):
+            return  # refresh_due reads it first (LAND_CLOSED_BEFORE_REQUEST)
+        if self.ended(e, state, e.get("mergeSha") or "", "the cache shows it"):
             return
         infra = e.pop("infraHandoff", None)
         if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED \
