@@ -10527,6 +10527,28 @@ class Daemon:
             reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
+    def land_ingest_idle(self) -> int:
+        """From the forward scheduler's thread, every TICK, on a host that executes its own lands: apply the requests
+        that came since the last pass (LandQueue.ingest_between), so a `land` is a row in seconds. land_refill does it
+        only between two of this login's own requests, and a host that reads through an upstream makes none: there a
+        request waited for the next whole pass, once a tick (a lane VM, 2026-11-26: passes ~5 min apart, and `land
+        status` showed no row meanwhile). Never inside a pass or a refill (land_pass_lock); refill stays the tick's."""
+        q = self.land_queue
+        if q is None or self.reexec_waiting or getattr(self, "in_land", False) or not getattr(q, "executes", False):
+            return 0
+        d = q.requests_dir()
+        if not d.is_dir() or not any(d.glob("*.json")):
+            return 0
+        if not self.land_pass_lock.acquire(blocking=False):
+            return 0
+        try:
+            if land_executor(q.config()) is not None:
+                return 0
+            q.now = time.time() if getattr(self, "clock_real", True) else self.now
+            return q.ingest_between()
+        finally:
+            self.land_pass_lock.release()
+
     def land_tick(self, forward_only: bool = False) -> None:
         """The forward scheduler and read tick share one queue, including when its executor changes at runtime."""
         if not self.land_pass_lock.acquire(blocking=False):
@@ -25821,15 +25843,54 @@ def land_override_history(e: dict) -> dict:
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
 
 
+# A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only
+# then a row in entries/. `land status` read entries/ alone, so for that window a land that had answered "requested"
+# showed no row and "nothing queued" (exit 1): a lane VM, 2026-11-26 07:47Z, cmuxterm-hq#28163 pinned 3f3a3c12 read as
+# dropped, and was queued again by hand from another directory (its history: "queued" then "updated" in the same
+# pass, 07:47:56Z, both requests applied). On a host whose daemon reads through an upstream, the pass ran once a tick,
+# every ~5 min, so the window was minutes. Now status lists what still waits in requests/ (land_pending_requests).
+def land_pending_requests(target_key: str | None = None) -> list[dict]:
+    """What waits in requests/ for the daemon's next pass, oldest first: {key, op, requester, sha, at, id}. Files only."""
+    d = LandQueue.requests_dir()
+    out: list[dict] = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        req = read_json(p)
+        if not isinstance(req, dict) or not isinstance(req.get("key"), str):
+            continue
+        if target_key and req["key"] != target_key:
+            continue
+        at = req.get("at")
+        out.append({"key": req["key"], "op": str(req.get("op") or ""), "requester": str(req.get("requester") or ""),
+                    "sha": str(req.get("sha") or ""), "id": str(req.get("id") or ""),
+                    "at": float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0})
+    return out
+
+
+def land_pending_line(req: dict, now: float) -> str:
+    """One `land status` line for a request not yet applied: it is accepted, and not a row yet."""
+    what = "cancel requested" if req.get("op") == LAND_WITHDRAW else "requested"
+    bits = [key_name(req["key"]), what]
+    if req.get("sha"):
+        bits.append(f"pin {req['sha'][:12]}")
+    age = f" {int(max(0.0, now - req['at']))}s ago" if req.get("at") else ""
+    bits.append(f"written{age}, not applied yet: the daemon applies requests/ on its next land pass")
+    if req.get("requester"):
+        bits.append(f"for {req['requester']}")
+    return "  ".join(bits)
+
+
 def land_status_doc(target: str | None) -> dict:
-    """What `land status` shows of this host's queue (`land serve`'s status answer too)."""
+    """What `land status` shows of this host's queue (`land serve`'s status answer too), with the requests still
+    waiting in requests/ for the daemon (pending, land_pending_requests)."""
     entries = land_entries()
-    if target:
-        key = land_key(target)[0]
+    key = land_key(target)[0] if target else None
+    if key:
         entries = [e for e in entries if e.get("key") == key]
+    pending = land_pending_requests(key)
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
-    return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
+    return {"ok": True, "entries": entries, "pending": pending, "steps": land_counts(),
+            "refused": refused if isinstance(refused, dict)
             else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries),
             "greenWait": land_green_waits(entries, read_cache, time.time())}
@@ -26025,17 +26086,20 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         try:
             remote = land_forward(executor, {"op": "status", "target": target})
             remote_entries = [e for e in remote.get("entries") or [] if isinstance(e, dict)]
-            doc = {**remote, "entries": mine + remote_entries, "executor": name}
+            remote_pending = [r for r in remote.get("pending") or [] if isinstance(r, dict) and r.get("key")]
+            doc = {**remote, "entries": mine + remote_entries, "executor": name,
+                   "pending": doc["pending"] + remote_pending}
         except WatchError as error:
             doc = {**doc, "entries": mine, "executor": name, "executorError": str(error)}
         d = LandQueue.requests_dir()
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
     entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
+    pending = [r for r in doc.get("pending") or [] if isinstance(r, dict) and r.get("key")]
     doc["stoppedByCause"] = land_stopped_by_cause(entries)
     if as_json:
         print(json.dumps(doc, sort_keys=True))
-        return EXIT_OK if entries or not target else EXIT_FAIL
+        return EXIT_OK if entries or pending or not target else EXIT_FAIL
     now = time.time()
     if executor is not None:
         print(f"glaeda land: this host forwards its lands to {doc['executor']}"
@@ -26081,7 +26145,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
             st = e.get("stop") or {}
             if e.get("state") == "stopped" and st.get("next"):
                 print(f"next: {st['next']}")
-    if not entries:
+    for r in pending:
+        print(land_pending_line(r, now))
+    if not entries and not pending:
         print("glaeda land: nothing queued" + (f" for {target}" if target else ""))
     today = counts.get(land_day(now)) or {}
     week = {}
@@ -26102,7 +26168,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
               f"{split['redundant']} on a change the verdict does not depend on"
               + (f" ({why}): that share alone is skippable" if why else ": none skippable"))
     print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
-    if target and not entries:
+    if target and not entries and not pending:
         return EXIT_FAIL
     return EXIT_OK
 
@@ -26759,7 +26825,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if as_json:
         print(json.dumps(out, sort_keys=True))
     else:
-        print(land_line(entry, time.time()) if picked else f"{key_name(key)} requested; the daemon takes it next tick")
+        print(land_line(entry, time.time()) if picked else
+              f"{key_name(key)} requested; the daemon takes it next tick (a request in requests/, not a row yet: "
+              f"glaeda-gh land status {key_name(key)} shows it as requested until the daemon applies it)")
         if not running:
             say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
             say_waiting("next: glaeda-gh restart")
@@ -26794,6 +26862,24 @@ def cmd_land_cancel(target: str, as_json: bool) -> int:
                 say_waiting(f"glaeda land: {land_trim(got.get('reason') or got.get('code'), 200)}; the cancel waits "
                             "here and is forwarded when it answers")
     else:
+        # The queue applies a withdraw only to a row it can cancel (apply): one open, or stopped. Any other answered
+        # "cancel requested" and changed nothing, so a cancel of a PR this host never queued (or already merged or
+        # cancelled) read as done. Said here instead, with nothing written.
+        e = read_json(LandQueue.entries_dir() / file_name(key))
+        live = isinstance(e, dict) and (e.get("state") not in LAND_DONE or e.get("state") == "stopped")
+        waiting = any(r["op"] == "land" for r in land_pending_requests(key))
+        if executor is None and not live and not waiting:  # a forwarding host's row is the executor's to judge
+            state = e.get("state") if isinstance(e, dict) else None
+            why = (f"{key_name(key)} is {state} in this host's land queue, so there is nothing to cancel" if state
+                   else f"{key_name(key)} is not in this host's land queue ({LandQueue.entries_dir()}), so there "
+                        "is nothing to cancel")
+            nxt = "glaeda-gh land status, to see what this host holds"
+            if as_json:
+                print(json.dumps({"ok": False, "key": key, "code": "land_cancel_nothing", "reason": why,
+                                  "next": nxt, "state": state}, sort_keys=True))
+            else:
+                say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
+            return EXIT_FAIL
         land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
         print(json.dumps({"ok": True, "key": key, "state": "cancel requested"}))
@@ -27735,6 +27821,7 @@ def land_forward_loop(daemon: Daemon, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             daemon.land_tick(forward_only=True)
+            daemon.land_ingest_idle()
         except Exception as error:  # noqa: BLE001  retry on the next pass; requests remain on disk
             log({"event": "land-error", "error": describe(error), "site": error_site(error)})
         stop.wait(TICK)

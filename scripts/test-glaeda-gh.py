@@ -34108,6 +34108,90 @@ class LandTest(Base):
         self.assertEqual(self.q.ingest_between(), 0)
         self.assertEqual(self.q.next_up.count(self.KEY), 1)
 
+    def test_a_requested_land_shows_in_status_before_the_daemon_applies_it(self):
+        """a lane VM, 2026-11-26 07:47Z: `land manaflow-ai/cmuxterm-hq#28163 --pin ...` answered "requested", and `land
+        status` then showed no row ("nothing queued", exit 1) while the request sat in requests/ for the next pass, so
+        it read as dropped and was queued again by hand. A request the daemon has not applied yet is in status, as
+        requested, with its pin and requester; once applied it is the row and the pending line goes."""
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land_status("o/r#1", False)
+        self.assertEqual(rc, gg.EXIT_OK, out.getvalue())
+        self.assertNotIn("nothing queued", out.getvalue())
+        line = next(x for x in out.getvalue().splitlines() if x.startswith("o/r#1"))
+        self.assertIn("requested", line)
+        self.assertIn(f"pin {LA[:12]}", line)
+        self.assertIn("not applied yet", line)
+        self.assertIn("for host/lane", line)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land_status("o/r#1", True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(rc, gg.EXIT_OK)
+        self.assertEqual([(r["key"], r["op"], r["sha"]) for r in doc["pending"]], [(self.KEY, "land", LA)])
+        self.pr(LA)
+        self.q.ingest()
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            gg.cmd_land_status("o/r#1", True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["pending"], [])
+        self.assertEqual([e["key"] for e in doc["entries"]], [self.KEY])
+
+    def test_the_forward_loop_applies_requests_between_passes_on_a_host_with_no_login(self):
+        """The same morning: that host's daemon reads through an upstream, so land_refill (which runs between two of
+        this login's own requests) never ran, and a request waited ~5 min for the next whole pass. The forward
+        scheduler's thread, which runs every TICK, now applies it: a row in seconds."""
+        self.daemon.land_queue = self.q
+        self.daemon.clock_real = False
+        self.daemon.now = self.t
+        self.pr(LA)
+        self.tick()  # one pass: this host executes its lands (q.executes)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.assertNotIn(self.KEY, self.q.entries)
+        with mock.patch.object(gg, "land_executor", return_value=None):
+            self.assertEqual(self.daemon.land_ingest_idle(), 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "queued")
+        self.assertEqual(list(self.q.requests_dir().glob("*.json")), [])
+        with mock.patch.object(gg, "land_executor", return_value=None):
+            self.assertEqual(self.daemon.land_ingest_idle(), 0, "nothing waits: one directory read, nothing applied")
+        # inside a pass (land_pass_lock held) it applies nothing: the pass is the one that does
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
+        with self.daemon.land_pass_lock, mock.patch.object(gg, "land_executor", return_value=None):
+            self.assertEqual(self.daemon.land_ingest_idle(), 0)
+        self.assertEqual(len(list(self.q.requests_dir().glob("*.json"))), 1)
+
+    def test_a_cancel_of_a_pr_this_host_does_not_hold_says_so(self):
+        """`land cancel` answered "cancel requested" for any PR and wrote a withdraw the queue then ignored (apply
+        cancels only an open or stopped row), so a cancel of a PR never queued here, or already merged, read as done.
+        It refuses now, naming what this host holds, and writes nothing; an open row, or a land still in requests/,
+        is cancelled as before."""
+        said: list[str] = []
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land_cancel("o/r#1", False)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        self.assertNotIn("cancel requested", out.getvalue())
+        self.assertTrue(any("not in this host's land queue" in s for s in said), said)
+        self.assertFalse(self.q.requests_dir().is_dir() and any(self.q.requests_dir().glob("*.json")))
+        gg.land_request("land", "o/r#1", [], "host/lane")  # a land not yet applied: its cancel is taken
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land_cancel("o/r#1", True)
+        self.assertEqual(rc, gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["state"], "cancel requested")
+        self.pr(LA)
+        self.q.ingest()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "cancelled")
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land_cancel("o/r#1", True)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["code"], doc["state"]), ("land_cancel_nothing", "cancelled"))
+
     def forwarded_row(self, sha: str = "") -> dict:
         """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
         read nothing: the row is "forwarded" (finding hq#19725's rows)."""
