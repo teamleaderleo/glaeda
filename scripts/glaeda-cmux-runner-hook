@@ -6205,8 +6205,15 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # workflow change. A fetch of https://github.com/manaflow-ai/cmux whose refspecs are all object ids the mirror holds
 # is served from the mirror (url.<mirror>.insteadOf for that one command). Anything else (a pull request's merge
 # commit, a branch or tag pattern, --all, --tags, a shallow-history change) goes to github.com as before, with bounded
-# backoff on a refusal (429, 403, 5xx) during which the mirror is asked again. A fetch of a run on a branch the mirror
-# keeps waits up to GIT_SHIM_WAIT_S for the mirror's next pass before asking github.com. Each github.com fetch or
+# backoff on a refusal (429, 403, 5xx) during which the mirror is asked again. A fetch of a run's own commit
+# ($GITHUB_SHA) on a branch the mirror keeps waits up to GIT_SHIM_WAIT_S for the mirror's next pass before asking
+# github.com; any other id (a lane-gh ci merge snapshot, minutes old) goes to github.com at once, since no pass of
+# the mirror's branches brings it. Every github.com attempt is bounded: git's low-speed limit ends one that moves
+# no bytes, not even keepalives, for GIT_SHIM_STALL_S; a watchdog stops a shallow fetch of ids (actions/checkout's,
+# small) past GIT_SHIM_ATTEMPT_S; and no retry starts past GIT_SHIM_BUDGET_S, so actions/checkout's own retry and
+# its step timeout still have room (cmux jobs 139823571654
+# and 139837960264, 2026-11-26: one unbounded github.com fetch, its stderr held until exit, ran silent into the
+# checkout step's 10 min timeout after the 90 s mirror wait). Each github.com fetch or
 # ls-remote of cmux is a line in $RUNNER_TEMP/glaeda-git-fetches.log; job-completed prints the count. Opt-in by
 # repository: only manaflow-ai/cmux jobs get the shim. Kill switch: GLAEDA_GIT_SHIM=0 in the runner's environment
 # (no shim) or in a step's env (that step's git is the real one).
@@ -6215,6 +6222,11 @@ GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
 GIT_SHIM_WAIT_S = 90
 GIT_SHIM_TRIES = 3
+# git's http.lowSpeedTime at http.lowSpeedLimit 1 B/s: a stream with no bytes for this long ends. Not 1000: GitHub
+# sends only keepalives while it builds a pack (cmuxterm-hq handbook network-transfer-stalls-the-whole-job).
+GIT_SHIM_STALL_S = 60
+GIT_SHIM_ATTEMPT_S = 180  # one github.com attempt, stopped by the shim's watchdog past this
+GIT_SHIM_BUDGET_S = 240  # seconds into the shim (mirror wait included) past which no retry starts or capped fetch runs
 GIT_SHIM_BODY = r'''
 say() { echo "glaeda git shim: $*" >&2; }
 [ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
@@ -6294,6 +6306,7 @@ if [ "$sub" = submodule ]; then
   kind=submodule; remote=submodule; refspecs=("${misses[@]}")
 fi
 [ "$kind" = submodule ] || { remote=; have_remote=; dd=; plain=1; refspecs=(); }
+shallow=
 n=$#
 i=0
 [ "$kind" = submodule ] && n=0
@@ -6307,7 +6320,9 @@ while [ $i -lt $n ]; do
       --all|--multiple|--stdin|--tags|-t|--unshallow|--refetch|--update-shallow|--negotiate-only|--dry-run) plain= ;;
       --deepen|--shallow-since|--shallow-exclude) plain=; i=$((i + 1)) ;;
       --deepen=*|--shallow-since=*|--shallow-exclude=*) plain= ;;
-      --depth|--negotiation-tip|--server-option|-o|--upload-pack|--recurse-submodules-default|--refmap|--filter|-j|--jobs|--submodule-prefix) i=$((i + 1)) ;;
+      --depth=*) shallow=1 ;;
+      --depth) shallow=1; i=$((i + 1)) ;;
+      --negotiation-tip|--server-option|-o|--upload-pack|--recurse-submodules-default|--refmap|--filter|-j|--jobs|--submodule-prefix) i=$((i + 1)) ;;
     esac
   fi
   i=$((i + 1))
@@ -6339,6 +6354,13 @@ if [ "$kind" != submodule ] && [ "$sub" = fetch ] && [ -n "$plain" ] && [ ${#ref
     printf '%s\n' "$r" | grep -Eq '^\+?([0-9a-f]{40}|[0-9a-f]{64})(:refs/[^:*]+)?$' || { ids_only=; break; }
   done
 fi
+run_sha_only() {  # every refspec is the run's own commit, the one the mirror's next pass of a kept branch brings
+  [ -n "${GITHUB_SHA:-}" ] || return 1
+  for r in "${refspecs[@]}"; do
+    id=${r#+}; id=${id%%:*}
+    [ "$id" = "$GITHUB_SHA" ] || return 1
+  done
+}
 has_all() {
   mirror_ok || return 1
   for r in "${refspecs[@]}"; do
@@ -6359,7 +6381,7 @@ if [ -n "$ids_only" ]; then
   case "$kind:${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
     pins:*|*:pull_request*|*:merge_group*) ;;
     *:refs/heads/main|*:refs/heads/feat-cmux-next|*:refs/heads/nightly-next)
-      if mirror_ok; then
+      if run_sha_only && mirror_ok; then
         until=$((SECONDS + ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s}))
         say "waiting up to ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s} s for the mirror's next pass to bring ${refspecs[*]}"
         while [ "$SECONDS" -lt "$until" ]; do
@@ -6369,12 +6391,47 @@ if [ -n "$ids_only" ]; then
       fi ;;
   esac
 fi
+tries=${GLAEDA_GIT_SHIM_TRIES:-$tries}
+budget=${GLAEDA_GIT_SHIM_BUDGET_S:-$budget_s}
+stall=${GLAEDA_GIT_SHIM_STALL_S:-$stall_s}
+bounded_git() {  # $1: seconds. The real git with the low-speed limit, stopped past $1 (it and the children it
+  # started, git-remote-https: PIDs read once, no pattern kill); sets rc and stopped
+  "$real" -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$stall" "${orig[@]}" <&0 2>"$errf" &
+  gp=$!
+  stopped=
+  end=$((SECONDS + $1))
+  while kill -0 "$gp" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$end" ]; then
+      stopped=1
+      kids=$(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$gp" '$2 == p { print $1 }')
+      kill -TERM $kids "$gp" 2>/dev/null
+      end=$((SECONDS + 5))
+      while kill -0 "$gp" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
+      kill -KILL $kids "$gp" 2>/dev/null
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$gp" 2>/dev/null
+  rc=$?
+}
 try=1
 while :; do
+  # A shallow fetch of commit ids (actions/checkout's) is small, so a slow one is a stuck one: the watchdog
+  # stops it within the budget. Anything else (a full history, a pattern, a submodule clone) may be large and
+  # slow while healthy, so only the low-speed limit ends it.
+  if [ -n "$ids_only" ] && [ -n "$shallow" ]; then
+    bound=$((budget - SECONDS))
+    [ "$bound" -gt "${GLAEDA_GIT_SHIM_ATTEMPT_S:-$attempt_s}" ] && bound=${GLAEDA_GIT_SHIM_ATTEMPT_S:-$attempt_s}
+    [ "$bound" -ge 1 ] || bound=1
+    limit="at most $bound s; "
+  else
+    bound=86400; limit=
+  fi
   note github
   errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
-  "$real" "${orig[@]}" 2>"$errf"
-  rc=$?
+  say "asking github.com (try $try of $tries; ${limit}no bytes for $stall s ends it)"
+  bounded_git "$bound"
   cat "$errf" >&2
   if [ $rc -eq 0 ]; then
     rm -f "$errf"
@@ -6382,14 +6439,22 @@ while :; do
     exit 0
   fi
   refused=
-  grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect' "$errf" && refused=1
+  grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect|too slow|timed out' "$errf" && refused=1
   rm -f "$errf"
-  if [ -z "$refused" ] || [ "$try" -ge "${GLAEDA_GIT_SHIM_TRIES:-$tries}" ]; then
+  if [ -n "$stopped" ]; then
+    say "github.com did not finish within $bound s; stopped it (exit $rc)"
+    refused=1
+  fi
+  if [ -z "$refused" ] || [ "$try" -ge "$tries" ]; then
     say "github.com git fetches this job: $(count); this one failed (exit $rc)"
     exit $rc
   fi
   delay=$((${GLAEDA_GIT_SHIM_BACKOFF_S:-15} * try * try))
-  say "github.com refused (exit $rc); again in $delay s (try $try of ${GLAEDA_GIT_SHIM_TRIES:-$tries}), asking the mirror meanwhile"
+  if [ $((SECONDS + delay + 30)) -gt "$budget" ]; then
+    say "github.com git fetches this job: $(count); this one failed (exit $rc); no try left in the shim's $budget s budget (GLAEDA_GIT_SHIM_BUDGET_S) after $SECONDS s, so the caller's own retry gets the time"
+    exit $rc
+  fi
+  say "github.com refused (exit $rc); again in $delay s (try $try of $tries), asking the mirror meanwhile"
   until=$((SECONDS + delay))
   while [ "$SECONDS" -lt "$until" ]; do
     sleep "${GLAEDA_GIT_SHIM_POLL_S:-5}"
@@ -6405,7 +6470,8 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
     head = (f"#!/bin/bash\n# glaeda-cmux-runner-hook GIT_SHIM: written at job-started; see the hook.\n"
             f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
             f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
-            f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\n")
+            f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\nstall_s={GIT_SHIM_STALL_S}\n"
+            f"attempt_s={GIT_SHIM_ATTEMPT_S}\nbudget_s={GIT_SHIM_BUDGET_S}\n")
     return head + GIT_SHIM_BODY
 
 
