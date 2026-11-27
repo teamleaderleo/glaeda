@@ -271,6 +271,61 @@ def widened_labels(labels: list[str]) -> list[str]:
     return [label for label in out if not _stale_nightly_spill(label, out)]
 
 
+# RFD 0185 (cmuxterm-hq docs/rfd/0185-one-fleet-standard.md), Leo 2026-11-27: "unify labels to simplify things". No Xcode
+# version and no glaeda- prefix in a routing label: mac-std, mac-light, mac-gui, plus the version-free labels that carry
+# safety or queue isolation (nightly, trusted, sim, gateway, fast, dev). Phase 1 issues them BESIDE the old labels
+# (with_unified); a workflow moves to them in phase 2; the old ones drop in phase 3 once no queued job names one.
+UNIFIED_STATIC = {
+    IOS_SIM_LABEL: "mac-ios-sim",
+    "glaeda-trusted": "mac-trusted",
+    "glaeda-trusted-next-nightly": "mac-trusted-nightly",
+    TRUSTED_NEXT_SIGNING_LABEL: "mac-trusted-signing",
+}
+UNIFIED_FIXED = {"gateway": "mac-gateway", "sim": "mac-sim", "small": "mac-light"}
+UNIFIED_ROLES = {"root", "side", "gui", "session", "fast", "trusted", "nightly", "dev"}
+
+
+def unified_label(label: str) -> str | None:
+    """The version-free label a legacy pool label also answers to, or None (no counterpart: the bare xcode-<v>, the
+    capability labels, a namespaced pool such as glaeda-aws-side-std-xcode-<v>, and anything that is not a pool label).
+    Folds: root and side -> mac-std (std, xl) or mac-light; session -> mac-gui; small and the shared side -> mac-light.
+    Kept apart, because they carry safety or isolate a queue: nightly, trusted, dev, fast, sim, gateway."""
+    if label in UNIFIED_STATIC:
+        return UNIFIED_STATIC[label]
+    parts = label.split("-")
+    if len(parts) < 4 or parts[0] != "glaeda" or parts[-2] != "xcode" or not re.fullmatch(VERSION_RE, parts[-1]):
+        return None
+    middle = parts[1:-2]
+    if len(middle) == 1 and middle[0] in UNIFIED_FIXED:
+        return UNIFIED_FIXED[middle[0]]
+    if middle == ["side"]:  # the shared side label, no class
+        return "mac-light"
+    klass = next((p for p in middle if p in RUNNER_CLASSES), None)
+    if klass is None or middle[-1] != klass:
+        return None
+    roles = middle[:-1]
+    if not set(roles) <= UNIFIED_ROLES or len(set(roles)) != len(roles):
+        return None
+    if "trusted" in roles:
+        return f"mac-trusted-{'gui' if {'gui', 'session'} & set(roles) else klass}"
+    for role in ("nightly", "dev", "fast"):
+        if role in roles:
+            return f"mac-{role}" + ("" if klass == "std" else f"-{klass}")
+    if {"gui", "session"} & set(roles):
+        return "mac-gui"
+    return "mac-std" if klass in ("xl", "std") else "mac-light"
+
+
+def with_unified(labels: list[str]) -> list[str]:
+    """`labels` plus the unified_label() of each, in order, each once. Pure and idempotent."""
+    out = list(dict.fromkeys(labels))
+    for label in list(out):
+        extra = unified_label(label)
+        if extra is not None and extra not in out:
+            out.append(extra)
+    return out
+
+
 def _stale_nightly_spill(label: str, labels: list[str]) -> bool:
     """Whether `label` is a nightly slot label whose pool, at a wider class, is also among `labels`'s nightly slot
     labels (widened_labels())."""

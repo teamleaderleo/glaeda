@@ -21565,6 +21565,35 @@ class PoolNodeViewTest(unittest.TestCase):
 
 
 class ManifestLabelsTest(unittest.TestCase):
+    def test_unified_labels_ride_beside_the_old_ones(self):
+        # RFD 0185 phase 1 (Leo, 2026-11-27: "unify labels to simplify things"): a version-free label beside each
+        # legacy pool label; nothing is removed. Folds go to mac-std/-light/-gui; safety and isolation labels stay apart.
+        expect = {
+            "glaeda-root-std-xcode-26.6": "mac-std", "glaeda-side-std-xcode-26.6": "mac-std",
+            "glaeda-std-xcode-26.6": "mac-std", "glaeda-side-xl-xcode-27.2": "mac-std",
+            "glaeda-root-light-xcode-26.6": "mac-light", "glaeda-side-light-xcode-26.6": "mac-light",
+            "glaeda-small-xcode-26.6": "mac-light", "glaeda-side-xcode-26.6": "mac-light",
+            "glaeda-gui-std-xcode-26.6": "mac-gui", "glaeda-session-light-xcode-26.6": "mac-gui",
+            "glaeda-nightly-std-xcode-26.6": "mac-nightly", "glaeda-nightly-xl-xcode-26.6": "mac-nightly-xl",
+            "glaeda-dev-std-xcode-26.6": "mac-dev", "glaeda-fast-std-xcode-26.6": "mac-fast",
+            "glaeda-trusted-std-xcode-26.6": "mac-trusted-std", "glaeda-side-trusted-light-xcode-26.6": "mac-trusted-light",
+            "glaeda-gui-trusted-std-xcode-26.6": "mac-trusted-gui", "glaeda-gateway-xcode-26.6": "mac-gateway",
+            "glaeda-sim-xcode-26.6": "mac-sim", "glaeda-ios-sim": "mac-ios-sim", "glaeda-trusted": "mac-trusted",
+            "glaeda-trusted-next-nightly": "mac-trusted-nightly", "glaeda-trusted-next-signing": "mac-trusted-signing",
+        }
+        for old, new in expect.items():
+            self.assertEqual(fleet_labels.unified_label(old), new, old)
+        for none in ("xcode-26.6", "glaeda-mini", "glaeda-macos-27", "glaeda-class-std", "glaeda-dedicated",
+                     "glaeda-aws-side-std-xcode-26.6", "glaeda-runner-mini-glaeda-3", "cmux-mac"):
+            self.assertIsNone(fleet_labels.unified_label(none), none)
+        once = fleet_labels.with_unified(["glaeda-mini", "xcode-26.6", "glaeda-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(once, ["glaeda-mini", "xcode-26.6", "glaeda-std-xcode-26.6", "glaeda-side-light-xcode-26.6",
+                                "mac-std", "mac-light"])
+        self.assertEqual(fleet_labels.with_unified(once), once)
+        # a trusted runner never answers the shared labels, and the shared labels never answer a trusted one
+        trusted = fleet_labels.with_unified(["glaeda-trusted", "glaeda-trusted-std-xcode-26.6"])
+        self.assertFalse({"mac-std", "mac-light", "mac-gui"} & set(trusted))
+
     def test_side_labels_widen_to_every_class(self) -> None:
         S, X, L = ("glaeda-side-std-xcode-26.6", "glaeda-side-xl-xcode-26.6", "glaeda-side-light-xcode-26.6")
         # A side runner carries its own class's side label first, then every other class's (Leo, 2026-11-21,
