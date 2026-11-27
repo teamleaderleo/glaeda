@@ -7387,6 +7387,23 @@ class GlaedaDiskTest(unittest.TestCase):
             with mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "0"}):
                 self.assertIs(gd.saturation_halt({1: full}, "5%"), gd.host_saturated)
 
+    def test_saturation_never_holds_a_pressure_pass_below_the_low_line(self) -> None:
+        """22% free with a 35% low line (lane VMs, 2026-11-27): above the 20% saturated-free share, below the low line."""
+        total = 100 * gd.GIB
+        under = gd.Fs(1, "/", 22 * gd.GIB, total, 35 * gd.GIB, 45 * gd.GIB)
+        fine = gd.Fs(1, "/", 50 * gd.GIB, total, 35 * gd.GIB, 45 * gd.GIB)
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIsNone(gd.saturation_halt({1: under}, "5%", pressure=True))
+            self.assertIs(gd.saturation_halt({1: under}, "5%", pressure=False), gd.host_saturated)  # an idle sweep waits
+            self.assertIs(gd.saturation_halt({1: fine}, "5%", pressure=True), gd.host_saturated)
+
+    def test_io_priority_is_nice_19_on_a_saturated_host(self) -> None:
+        with mock.patch.object(gd, "_IO_LOWERED", False), mock.patch.object(gd.os, "nice") as nice, \
+                mock.patch.object(gd, "host_saturated", return_value="busy"), \
+                mock.patch.object(gd.shutil, "which", return_value=None):
+            gd.lower_io_priority()
+        nice.assert_called_once_with(19)
+
     def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
         """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
         sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""

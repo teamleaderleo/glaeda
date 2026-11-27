@@ -2872,13 +2872,19 @@ def host_saturated() -> str:
     return ""
 
 
-def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
+def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0, pressure: bool = False):
     """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
     if emergency_devs(fss, emergency, floor_gib):
         return None
     spec = str(POLICY.get("saturated_delete_below_free", "0")).strip()
     if spec not in ("", "0") and any(
             not fs.tmpfs and fs.free < space(spec, fs.total) for fs in fss.values()):
+        return None
+    # A filesystem under pressure (free below its own low line) is cleaned under load too, at idle priority
+    # (lower_io_priority: nice 19, ionice idle), not skipped: lane VMs run at load 2-4x their cores all day, and with
+    # the hold lifted only below 20% free a host at 22% free (low line 35%) was skipped every pass while filling
+    # +20-30 GB/day (fs-agent-lane-22 and lane-33, 2026-11-27). Idle sweeps (no pressure) still wait for a quiet host.
+    if pressure and any(not fs.tmpfs and fs.free < fs.low for fs in fss.values()):
         return None
     return host_saturated
 
@@ -2895,8 +2901,10 @@ def lower_io_priority() -> str:
         return "already lowered"
     done = []
     with contextlib.suppress(OSError):
-        os.nice(10)
-        done.append("nice 10")
+        # 19 on a saturated host (the pressure pass runs there instead of skipping), else 10
+        level = 19 if host_saturated() else 10
+        os.nice(level)
+        done.append(f"nice {level}")
     if sys.platform == "darwin":
         with contextlib.suppress(OSError, AttributeError):
             libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
@@ -18573,15 +18581,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
-    # A saturated host deletes nothing: the apply's halt (saturation_halt) stops it at its first item. So ask the halt
-    # before the walks, not after them: on an agent host held at load 21-29 (2026-11-23 08:40Z) the
+    # A saturated host deletes nothing unless it is under pressure (saturation_halt): the apply's halt stops it at its
+    # first item. So ask the halt before the walks, not after them (ACTIVITY_MODE is set just below, so a pressure run
+    # is judged here by a.pressure): on an agent host held at load 21-29 (2026-11-23 08:40Z) the
     # 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU sizing trees it then never touched, and its walks'
     # reads and the snapshot rewrites competed with the sessions that saturated it. Below the emergency floor (the
     # floor-lifted one) the halt is None, so that pass runs as before; a skipped idle sweep leaves its stamp, so the
     # next pass that finds the host unsaturated sweeps.
     if (a.apply and (a.pressure or sweep) and not a.cmux_next_drain
             and not (sweep and POLICY["defer_during_ci"])
-            and (saturated := saturation_halt(fss, a.emergency, floor_gib)) is not None
+            and (saturated := saturation_halt(fss, a.emergency, floor_gib, pressure=bool(a.pressure and not sweep))) is not None
             and (why := saturated())):
         return deferred(HOST_SATURATED, f"{why}: an apply would delete nothing; skipped before measuring")
     # One plain pressure apply per host at a time (pressure_pass_lock), taken as soon as the run knows it is under
@@ -18980,7 +18989,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         RUN["io_priority"] = lower_io_priority()
         halt = with_run_deadline(cmux_next_drain_halt if a.cmux_next_drain
                                  else host_busy if sweep and POLICY["defer_during_ci"]
-                                 else saturation_halt(fss, a.emergency, floor_gib))
+                                 else saturation_halt(fss, a.emergency, floor_gib, pressure=bool(a.pressure and not sweep)))
         # a bounded hold: past EVICT_SLICE_S with a waiter queued, a pressure pass lets go between items. The idle
         # sweep keeps its own halt: it runs only with no filesystem under pressure, so no floor eviction waits on it
         if queued_apply and ACTIVITY_MODE == "pressure":
