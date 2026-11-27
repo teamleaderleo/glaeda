@@ -316,6 +316,18 @@ ENROLL_FLAGS = ("--renew", "--class-receipt", "--class-receipt-sha256", "--fleet
 # The Homebrew formulas fix installs, all pinned afterwards: class receipts pin toolchain strings, and the
 # reference host (cmux14) runs `brew pin zig rustup python@3.13`.
 BREW_FORMULAS = ("rustup", "zig", "python@3.13")
+# Ghostty pins a Zig major.minor (ghostty/build.zig.zon minimum_zig_version; cmux setup.sh refuses any other series),
+# so fix installs Homebrew's versioned zig@MAJOR.MINOR and links it as /opt/homebrew/bin/zig: `brew install zig` takes
+# the newest release (0.17.1 on 2026-11-27), and every new mini then failed "setup: builds GhosttyKit".
+ZIG_SERIES_RE = re.compile(r"\d+\.\d+\Z")
+
+
+def zig_series(required: str | None) -> str | None:
+    """0.16 for a Ghostty minimum of 0.16.0; None when the minimum is unknown (then plain zig)."""
+    match = re.match(r"(\d+)\.(\d+)\.\d+", required or "")
+    return f"{match.group(1)}.{match.group(2)}" if match else None
+
+
 # The workload PATH's python3: brew's python@3.13 installs only python3.13, so /usr/bin/python3 (3.9) would win.
 BREW_PYTHON = ("python@3.13", "python3.13")
 # Homebrew formulas fix installs and never pins: cmux CI jobs call gh (authenticated by GH_TOKEN, so no gh auth),
@@ -2558,9 +2570,10 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     # strands disk pressure and OTA maintenance on a headless worker.
     setup_headless = " --headless" if host.get("gui") is False else ""
 
-    def brew(formula: str) -> dict[str, Any]:
+    def brew(formula: str, series: str | None = None) -> dict[str, Any]:
         return {"kind": "brew", "formula": formula, "owner": owner or user,
-                **({"default": declared.get("rustup_default") or "stable"} if formula == "rustup" else {})}
+                **({"default": declared.get("rustup_default") or "stable"} if formula == "rustup" else {}),
+                **({"zig_series": series} if formula == "zig" and series else {})}
 
     # The bootstrap's supportedOs and hardwareCapability (cmux-mac-build-large).
     major = int(re.match(r"\d*", obs.get("macos") or "").group() or 0)
@@ -2725,13 +2738,17 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     minimums = [v for v in (pf.get("zig_min"), declared.get("zig_min")) if v]
     required = max(minimums, key=version_tuple) if minimums else zig_fallback
     if not zig.get("path"):
-        put("zig", "fail", "not on the workload PATH", f"{as_owner}brew install zig", brew_group, brew("zig"))
+        series = zig_series(required)
+        put("zig", "fail", "not on the workload PATH", f"{as_owner}brew install {f'zig@{series}' if series else 'zig'}",
+            brew_group, brew("zig", series))
     elif required is None:
         put("zig", "unknown", f"{zig['version']} at {zig['path']}; Ghostty's minimum is unknown (no ghostty/build.zig.zon)")
     elif not bootstrap.zig_version_compatible(zig["version"], required):
         put("zig", "fail", f"{zig['version']} at {zig['path']}, Ghostty needs {required}",
+            f"{as_owner}brew install zig@{zig_series(required)}, linked as /opt/homebrew/bin/zig "
+            "(/opt/homebrew/bin comes first on the workload PATH)" if zig_series(required) else
             f"{as_owner}brew install zig (or brew upgrade zig); /opt/homebrew/bin comes first on the workload PATH",
-            brew_group, brew("zig"))
+            brew_group, brew("zig", zig_series(required)))
     else:
         put("zig", "ok", f"{zig['version']} (needs {required})")
     absent = [t for t in ("git", "xcodebuild", "xcrun") if not (tools.get(t) or {}).get("path")]
@@ -3276,8 +3293,11 @@ def planned_actions(result: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
             if merged:
                 merged["formulas"].append(action["formula"])
                 merged["checks"].append(check)
+                if action.get("zig_series"):
+                    merged["zig_series"] = action["zig_series"]
                 continue
-            action = {"kind": "brew", "owner": action["owner"], "formulas": [action["formula"]]}
+            action = {"kind": "brew", "owner": action["owner"], "formulas": [action["formula"]],
+                      **({"zig_series": action["zig_series"]} if action.get("zig_series") else {})}
         into.append({**action, "checks": [check]})
     mine.sort(key=lambda a: FIX_ORDER.index(a["kind"]))
     root.sort(key=lambda a: SUDO_ORDER.index(a["kind"]))
@@ -3315,7 +3335,9 @@ def describe(action: dict[str, Any], manifest: dict[str, Any] | None = None, nam
         link = f", link {' and '.join(links)} into /opt/homebrew/bin" if links else ""
         pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
         pin = f", then brew pin {' '.join(pinned)}" if pinned else ""
-        return f"brew install {' '.join(action['formulas'])}{link}{pin}"
+        shown = [f"zig@{action['zig_series']} (as zig)" if f == "zig" and action.get("zig_series") else f
+                 for f in action["formulas"]]
+        return f"brew install {' '.join(shown)}{link}{pin}"
     if kind == "python_link":
         return f"link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}"
     if kind == "homebrew_fetch":
@@ -3598,7 +3620,8 @@ def host_gate_block() -> str:
     return text[text.index("# >>> host gate"):text.index("# <<< host gate")]
 
 
-def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool = False) -> list[str]:
+def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool = False,
+                  zig: str | None = None) -> list[str]:
     """Install or upgrade formulas in /opt/homebrew as its owner, link rustup's proxies, python3 and an unlinked gh
     onto the workload PATH, then pin the BREW_FORMULAS among them (never BREW_UNPINNED).
 
@@ -3606,6 +3629,10 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
     steps still go through sudo -H -u, and the staged bottles are the login user's ($login_home, set by the plan)."""
     if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS) - set(BREW_UNPINNED):
         raise Failure(f"refusing Homebrew step for owner {owner!r}, formulas {formulas}")
+    if zig is not None and not ZIG_SERIES_RE.fullmatch(zig):
+        raise Failure(f"refusing Homebrew step: zig series {zig!r} is not MAJOR.MINOR")
+    # zig with a series goes in as zig@SERIES (below), never as the newest zig.
+    loop = [f for f in formulas if not (zig and f == "zig")]
     run = f"sudo -H -u {owner} " if as_owner else ""
     root = "sudo " if as_owner and not as_root else ""
     # Newer Homebrew asks before installing unless told not to; sudo drops the variable, so env sets it.
@@ -3629,7 +3656,7 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
              # Not `|| true` inside the substitution: that would hide a timeout (brew_as's exit leaves only the subshell).
              f'pinned_list=$(brew_as list --pinned 2>/dev/null) || {{ [ $? != {BREW_TIMED_OUT} ] || exit {BREW_TIMED_OUT}; }}',
              'pinned=" $(printf "%s" "$pinned_list" | tr "\\n" " ") "',
-             f"for f in {' '.join(formulas)}; do",
+             f"for f in {' '.join(loop)}; do",
              '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then',
              '    if ! brew_as install "$f"; then',
              '      if [ "$f" = rustup ] && [ -x "/opt/homebrew/opt/rustup/bin/rustup" ]; then echo "rustup installed; ignoring obsolete Homebrew postinstall failure"',
@@ -3638,6 +3665,18 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
              '  elif [[ "$pinned" == *" $f "* ]]; then echo "$f is pinned, left as it is; brew unpin $f to upgrade it"',
              '  else brew_as upgrade "$f"; fi',
              "done"]
+    if zig and "zig" in formulas:
+        keg = f"zig@{zig}"
+        # Ghostty's series as /opt/homebrew/bin/zig: an unversioned zig is unlinked (kept, pin and all), the versioned
+        # keg linked over it and pinned. A host already on that series (a pinned zig@SERIES) is left as it is.
+        lines += [f'if [ "$(/opt/homebrew/bin/zig version 2>/dev/null | cut -d. -f1,2)" != {zig} ]; then',
+                  f"  brew_as list --versions {keg} >/dev/null 2>&1 || brew_as install {keg}",
+                  # unlink keeps the keg and its pin (the pins check reads it); link --overwrite takes bin/zig.
+                  '  if brew_as list --versions zig >/dev/null 2>&1; then brew_as unlink zig; fi',
+                  f"  brew_as link --overwrite --force {keg}",
+                  "fi",
+                  f'case "$(/opt/homebrew/bin/zig version 2>/dev/null)" in {zig}.*) ;; *) '
+                  f'echo "/opt/homebrew/bin/zig is not {zig}.x after linking {keg}" >&2; exit 1;; esac']
     if "rustup" in formulas:
         lines += [f"for t in {' '.join(RUSTUP_PROXIES)}; do",
                   f'  [ -e "/opt/homebrew/bin/$t" ] || [ -L "/opt/homebrew/bin/$t" ] || '
@@ -3649,7 +3688,7 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
         # Installed but unlinked (a keg someone unlinked) still leaves the workload PATH without it.
         lines.append(f'[ -e "/opt/homebrew/bin/{f}" ] || brew_as link {f}')
     # Class receipts pin toolchain strings; the reference host pins exactly these, and no receipt names the rest.
-    pinned = [f for f in formulas if f in BREW_FORMULAS]
+    pinned = [f"zig@{zig}" if zig and f == "zig" else f for f in formulas if f in BREW_FORMULAS]
     if pinned:
         lines.append(f"brew_as pin {' '.join(pinned)}")
     return lines
@@ -3836,7 +3875,8 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     if kind == "candidate":
         return stage_candidate(name, user, action, log, route)
     if kind in {"brew", "python_link"}:
-        lines = brew_commands(action["owner"], action["formulas"], False) if kind == "brew" else \
+        lines = brew_commands(action["owner"], action["formulas"], False,
+                              zig=action.get("zig_series")) if kind == "brew" else \
             python_link_commands(action["owner"], False)
         script = "\n".join(["set -euo pipefail", "cd /", *lines])
         code = routed_ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log,
@@ -4115,7 +4155,7 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
             pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
             pin = f", then pin {' '.join(pinned)}" if pinned else ""
             lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}{pin}'")
-            lines += brew_commands(action["owner"], action["formulas"], True, as_root)
+            lines += brew_commands(action["owner"], action["formulas"], True, as_root, zig=action.get("zig_series"))
         elif kind == "python_link":
             lines.append(f"step 'as {action['owner']}: link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}'")
             lines += python_link_commands(action["owner"], True)
