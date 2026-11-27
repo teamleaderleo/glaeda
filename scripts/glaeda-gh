@@ -24631,7 +24631,7 @@ class LandQueue:
                 # incomplete base-red search; take() checks the target and uses the ordinary pinned merge.
                 self.history(e, "override_merge", code=answer["code"], head=head[:12], **land_override_history(e))
                 act = {**act, "kind": "merge", "sha": head}
-                answer = {**answer, "ok": True, "code": "ok", "action": act}
+                answer = {**answer, "ok": True, "code": "ok", "via": "override_receipted_base_red", "action": act}
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
                 bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
                     and bool(LAND_UNREAD_TRANSIENT.search(reason))
@@ -25002,7 +25002,8 @@ class LandQueue:
                              **land_override_history(e))
             log({"event": "land-override-carried", "key": e["key"], "head": head[:12],
                  "code": str(answer.get("code") or kind), "override": (e.get("override") or {}).get("reason")})
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_carried",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if land_override_waited(e, act, answer, head, self.now):
             # LAND_OVERRIDE_WAIT_CODES' comment: the check never posted within its wait, and the override answers it
@@ -25010,7 +25011,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              waited=round(self.now - float(e["overrideWait"]["since"])), **land_override_history(e))
                 e.pop("overrideWait", None)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_waited",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
             # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
@@ -25029,7 +25031,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              carried="pinned", **land_override_history(e))
                 self.save(e)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_pinned",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
@@ -25042,7 +25045,8 @@ class LandQueue:
                 # the queue's own update-branch's head included, as a pinned merge carrying it
                 with self.lock:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
-                self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                self.do_merge(e, head, {**answer, "ok": True, "via": "override_takes",
+                                        "action": {"v": 1, "kind": "merge", "sha": head}})
                 return
             if (str(answer.get("code") or "") == "conflicts_base" or cls == "conflict") and self.base_merge_first(
                     e, head, "base", land_reason(why), land_trim(nxt or answer.get("next"))):
@@ -26566,7 +26570,7 @@ class LandQueue:
                     self.history(e, "override_pin_merge", head=head[:12],
                                  why="a pinned override row is merged at its pin, never base-updated")
                     self.save(e)
-                self.do_merge(e, head, {"pinned": True})
+                self.do_merge(e, head, {"pinned": True, "via": "override_pin"})
                 return
         sent = e.get("updateSent") or {}
         if head and sent.get("head") == head:
@@ -27057,8 +27061,10 @@ class LandQueue:
         lease = self.merge_lease(e, sha)
         if lease is False:
             return
+        snapshot = (self.cache_of(e["key"]) or {}).get("data")  # a file read, off the lock
         with self.lock:
             self.claim(e, "merge", sha=sha)
+            judged = land_merge_record(e, sha, answer, snapshot, self.now)
         if self.broker_client():
             got = self.broker_land(e, sha)
         else:
@@ -27084,7 +27090,7 @@ class LandQueue:
         with self.lock:
             self.finish(e, got, verified=state)
             if state == "MERGED":
-                self.merged(e, merge_sha, "merged pinned")
+                self.merged(e, merge_sha, "merged pinned", judged=judged)
                 return
             if self.ended(e, state, merge_sha, "the read after its merge shows it"):
                 return  # CLOSED: closed unmerged, no refusal counted
@@ -27233,10 +27239,13 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True) -> None:
-        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here."""
+    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True, judged: dict | None = None) -> None:
+        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here. JUDGED:
+        this queue's own merge's record (LAND_MERGE_RECORD), on the entry and its "merged" row."""
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
-        self.history(e, "merged", sha=merge_sha, how=how)
+        if judged is not None:
+            e["landJudge"] = judged
+        self.history(e, "merged", sha=merge_sha, how=how, **({"landJudge": judged} if judged is not None else {}))
         self.save(e)
         # LAND_MERGED_ELSEWHERE_FYI: only this queue's own merge is news that wakes its requester. A merge read from a
         # copy (a hand merge, another host's queue that told it already) reaches it as an inbox fyi with its next news.
@@ -28359,6 +28368,44 @@ def land_override_history(e: dict) -> dict:
     of at most 240 characters)."""
     o = e.get("override")
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
+
+
+# LAND_MERGE_RECORD: the daemon's own merge history names what let each merge through. Before, its "merged" row said
+# only the SHA and "merged pinned": a merge past a red or pending check left no trace of which check, under which
+# verdict, or the override's reason (the queue's entries on one land host, 2026-11-26/27: four such merges, two past a
+# red ws-check and two past a pending one, each read back as a plain merge). leo-workspace#12618 closed the same hole
+# in the gh shim's landing record (land_judge.{verdict, excused[], override_reason}); this mirrors that record on the
+# entry ("landJudge") and its "merged" history row. It is written from what the queue already held at the merge (the
+# judgment it acted on and the check snapshot at the merged head): it reads nothing new and changes no decision.
+# Detector: test-glaeda-gh.py test_a_merge_past_a_red_or_pending_check_records_its_verdict_and_each_excused_check.
+LAND_RECORD_EXCUSED_MAX = 40
+
+
+def land_merge_record(e: dict, sha: str, answer: dict, data: dict | None, now: float) -> dict:
+    """What let E's merge at SHA through, as the shim's landing record words it: {verdict, excused[{name, state, why}],
+    override_reason?}. VERDICT is how the queue reached the merge (land_judge's ok code, or the override path, "via");
+    EXCUSED each check the snapshot DATA shows red or unfinished at SHA; an override's reason when one rode the merge."""
+    via = str(answer.get("via") or "")
+    code = str(answer.get("code") or ("ok" if answer.get("ok") else ""))
+    verdict = f"{via} ({code})" if via and code and code != "ok" else via or code or "unjudged"
+    o = e.get("override")
+    reason = str(o.get("reason") or "") if isinstance(o, dict) else ""
+    why = (f"override: {reason}" if via.startswith("override") and reason
+           else f"land_judge {verdict}: {land_reason(answer.get('reason'))}" if answer.get("reason")
+           else f"land_judge {verdict} at this head")
+    excused: list[dict] = []
+    data = data or {}
+    if str(data.get("headRefOid") or "").lower() == sha.lower():
+        groups = classify(data, now)
+        for state, cs in (("red", groups["failed"]), ("held", groups["held"]), ("pending", groups["pending"])):
+            for c in cs:
+                excused.append({"name": land_trim(c.get("name"), 200), "state": state, "why": land_trim(why, 400)})
+    out: dict = {"verdict": land_trim(verdict, 80), "excused": excused[:LAND_RECORD_EXCUSED_MAX]}
+    if data and str(data.get("headRefOid") or "").lower() != sha.lower():
+        out["checksUnread"] = True  # the snapshot was of another head: no check list, said so rather than "none"
+    if reason:
+        out["override_reason"] = land_trim(reason, 500)
+    return out
 
 
 # A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only
@@ -34629,12 +34676,75 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
               f"the land daemon reads that PR, judges it on its own schedule and ends the row itself, and it tells "
               f"the row's requester when it does. A second watcher here reads nothing the daemon does not already "
               f"read and spends the shared GraphQL pool the land's own reserve keeps back for lands")
-    nxt = f"glaeda-gh land {name} --wait {max(1, int(timeout)):d}"
+    nxt = f"glaeda-gh wait pr {name} --until merged --timeout {max(1, int(timeout)):d}"
     out = json.dumps({"ok": False, "code": "land_row_watching", "reason": reason, "next": nxt,
                       "landRow": {"key": key, "state": row.get("state"), "head": row.get("head"),
                                   "wakeAt": row.get("wakeAt"), "requester": row.get("requester")}}) + "\n" \
         if as_json else ""
     return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
+
+
+# LAND_ROW_WAIT: the two wait commands pointed at each other. `wait pr R#N` on a PR this host's land queue holds refused
+# (land_row_watching, exit 64) and named `land R#N --wait T`; an agent's `land --wait` is held to LAND_AGENT_WAIT_CAP
+# (150 s) and then named `cmux-gh wait pr R#N --until merged --timeout 1800`, which refused again. So an agent could
+# follow neither hint to wait on a queued land. Now `wait pr` with --until merged (or no --until) on an active row
+# waits on that row itself: it reads only the local land/entries file, as `land --wait` does, so it is still never a
+# second GitHub watcher (the refusal's reason, glaeda#2612), and it re-requests nothing. It ends with the row: exit 0
+# merged, 1 stopped or cancelled, 2 when --timeout passes with no change in the row. A row forwarded away, gone, or a
+# daemon that is down hands it back to the ordinary wait. --until green|done|required still refuses, naming this wait.
+# Detector: test-glaeda-gh-wait-land-row.py test_the_refusals_next_and_the_land_caps_next_end_in_a_wait_that_waits.
+LAND_ROW_WAIT_POLL = 1.0  # a local file read, as cmd_land's own wait
+
+
+def land_row_now(key: str) -> dict | None:
+    """KEY's land row as last saved, from its own file, or from a scan of land/entries when that file is not it."""
+    e = land_wait_entry(key)
+    if e is not None:
+        return e
+    return next((r for r in land_entries() if r.get("key") == key), None)
+
+
+def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+                  sleep: Callable[[float], None] = time.sleep) -> int | None:
+    """Wait on ROW, this host's active land row for KEY, until it ends or TIMEOUT passes with no change in it
+    (LAND_ROW_WAIT's comment). None: the row went where this wait cannot follow (forwarded, gone) or no daemon
+    works it, so the caller takes the ordinary wait."""
+    name = key_name(key)
+    if not daemon_running():
+        return None
+    say_waiting(f"glaeda-gh: {name} is an active row in this host's land queue ({row.get('state')}): waiting on that "
+                f"row until it merges or stops (a local read; no GitHub watcher)")
+    leash = Leash(timeout, ceiling)
+    entry: dict | None = row
+    while True:
+        entry = land_row_now(key)
+        state = (entry or {}).get("state")
+        if entry is None or state == LAND_FORWARDED:
+            say_waiting(f"glaeda-gh: {name}'s land row is "
+                        f"{'forwarded to another host' if entry else 'gone'}: waiting on the PR instead")
+            return None
+        leash.see(land_progress(entry))
+        if state in LAND_DONE or leash.left() <= 0:
+            break
+        sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
+    state = str(entry.get("state") or "")
+    code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
+    out: dict[str, Any] = {"ok": code == EXIT_OK, "key": key, "code": "land_row", "state": state,
+                           "result": {"merged": "merged", "stopped": "stopped", "cancelled": "cancelled"}.get(
+                               state, "timeout"), "mergeSha": entry.get("mergeSha"),
+                           "line": land_line(entry, time.time())}
+    stop = entry.get("stop") if isinstance(entry.get("stop"), dict) else {}
+    if state == "stopped":
+        out.update(reason=stop.get("reason"), next=stop.get("next"), stop=stop.get("code"))
+    if code == EXIT_TIMEOUT:
+        out.update(leash.fields(), next=f"glaeda-gh land status {name}")
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(out["line"])
+        if out.get("next"):
+            say_waiting(f"next: {out['next']}")
+    return code
 
 
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
@@ -44497,6 +44607,11 @@ def main(argv: list[str] | None = None) -> int:
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
             row = land_row_watched_here(pr_key, args.sha)
+            if row is not None and args.until in (None, "merged"):
+                code = land_row_wait(pr_key, row, args.timeout, args.max, args.json)
+                if code is not None:
+                    return code
+                row = None  # forwarded, gone or no daemon: the ordinary wait below
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))
