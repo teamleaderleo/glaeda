@@ -997,6 +997,13 @@ CONSUMER_WINDOW = 3600
 # also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
 # REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
 HEAD_DIRECT_MAX = 60
+# A waited PR or run whose data is past STALE_DATA_AFTER while GraphQL cannot read it (under its reserve, or GitHub told the
+# daemon to back off) is read over REST past the daemon's REST share (restShare 0 on a host the config does not name), the
+# oldest first, STALE_DIRECT_PER_TICK a tick and STALE_DIRECT_MAX an hour. cmux-cp-1 2026-11-27: GraphQL stopped at 723 left
+# and restShare 0, the share is "0 of 0", PR data a wait was blocked on reached 13,380 s while REST had 4,373 of 5,000 left,
+# and the stale valve restarted the daemon eight ticks in a row, which only hid it (read_stale_direct).
+STALE_DIRECT_MAX = 120
+STALE_DIRECT_PER_TICK = 3
 # A head asked after a tick's due phase (`glaeda-gh checks` on a new SHA: a merge gate's bounded wait) is read between
 # that tick's read batches, not at the next tick's due phase. cosmic-gray, 2026-11-23 23:17-23:49Z: ticks ran 1.5-5 min
 # (PR reads took 483 of 614 s), the lane-gh broker's land waits 20 s for an unread head (next_autoland
@@ -6833,6 +6840,7 @@ class Daemon:
         self.tick_splits: dict[str, int] = {}  # queries each kind added this tick by splitting (GQL_SPLITS)
         self.tick_asked: dict[str, bool] = {}  # a kind sent a query this tick: a share's UNTIL may cut its next call
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
+        self.stale_direct_at: list[float] = []  # when each stale waited read over REST was admitted (STALE_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
@@ -10570,6 +10578,42 @@ class Daemon:
             self.resume_key, self.resume_from = "", float("inf")
             self.settle_prefetch()
 
+    def stale_direct_room(self) -> bool:
+        """Whether a stale waited key may be read over REST past the daemon's share now: GraphQL cannot read it (stopped, or
+        GitHub's back-off), REST is neither stopped nor under its floor, no secondary hold, and fewer than STALE_DIRECT_MAX
+        such reads this hour. While GraphQL can read, the batches and read_waited's own pass do."""
+        self.stale_direct_at = [t for t in self.stale_direct_at if self.now - t < CONSUMER_WINDOW]
+        graphql_out = self.mode("graphql") == "stop" or self.backoff["graphql"] > self.now
+        return (graphql_out and self.mode("rest") != "stop" and self.rest_above_floor()
+                and self.clock() >= self.secondary_until and self.backoff["rest"] <= self.now
+                and len(self.stale_direct_at) < STALE_DIRECT_MAX)
+
+    def read_stale_direct(self, entries: list[dict], read: set[str]) -> None:
+        """The waited PRs and runs with data past STALE_DATA_AFTER, oldest first (starved_lead), read over REST this tick
+        although the daemon's REST share is spent or zero and GraphQL is stopped: the quota rules left them no path at all,
+        so an age bound held only while GraphQL had room (cmux-cp-1 2026-11-27, 13,380 s). At most STALE_DIRECT_PER_TICK a
+        tick and STALE_DIRECT_MAX an hour, charged to the key's own waiters; a key tried within WAITED_FRESH waits."""
+        if not self.stale_direct_room():
+            return
+        pool = [e for e in entries if e["key"] not in read
+                and self.now - self.waited_tried.get(e["key"], float("-inf")) >= WAITED_FRESH]
+        for _ in range(STALE_DIRECT_PER_TICK):
+            lead = self.starved_lead(pool)
+            if lead is None or not self.stale_direct_room() or time.monotonic() >= self.tick_deadline:
+                return
+            pool = [e for e in pool if e is not lead]
+            kind = lead["key"].split(":", 1)[0]
+            self.waited_tried[lead["key"]] = self.now
+            self.stale_direct_at.append(self.now)
+            log({"event": "stale-direct", "key": lead["key"], "age": round(self.now - float((lead.get("cache") or {}).get("dataAt") or 0))})
+            try:
+                with self.calling(*caller_of(lead["key"]), waiter_of(lead)), self.phase("read rest"):
+                    self.rest_fetch[kind](lead)
+            except OutOfTime:
+                raise
+            except Exception as error:  # noqa: BLE001  one key's failure leaves the next its turn
+                self.errors.append(f"{lead['key']}: {describe(error)}")
+
     def read_waited(self, entries: list[dict], read: set[str]) -> None:
         """The PRs and runs a wait is blocked on (here, or a lane VM's through the broker: its upstream read carries
         "wait"), read over GraphQL once their data is WAITED_FRESH old while the GraphQL reserve alone stops the
@@ -10579,6 +10623,12 @@ class Daemon:
         through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
         self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
         self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
+        try:
+            self.read_stale_direct(entries, read)
+        except OutOfTime:
+            pass  # the tick's own budget ran out: the tick ends on its next read
+        except Exception as error:  # noqa: BLE001  a bounded extra read must never stop the tick
+            self.errors.append(f"stale direct: {describe(error)} at {error_site(error)}")
         if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
                 or self.waited_points() >= WAITED_PER_MINUTE):
             return
