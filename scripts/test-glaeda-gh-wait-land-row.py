@@ -27,8 +27,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import contextlib
+import io
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "glaeda-gh"
@@ -91,12 +94,67 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
 
     def test_next_is_a_wait_that_can_end(self) -> None:
         """docs/handbook/wait-that-cannot-end.md: every `next:` names something that can change the state it waits
-        on. `land --wait` blocks on this row in the local queue and, re-requesting the land, re-arms it."""
+        on. `wait pr --until merged` on this row waits on the row in the local queue (LAND_ROW_WAIT)."""
         row = write_row(13, "waiting")
         _, out, lines = gg.land_row_wait_refusal(f"pr:{REPO}#13", row, 600, True)
         nxt = json.loads(out)["next"]
-        self.assertEqual(nxt, f"glaeda-gh land {REPO}#13 --wait 600")
+        self.assertEqual(nxt, f"glaeda-gh wait pr {REPO}#13 --until merged --timeout 600")
         self.assertIn(nxt, lines)
+
+    # LAND_ROW_WAIT: the two hints pointed at each other
+    def wait_cli(self, number: int, *extra: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = gg.main(["wait", "pr", f"{REPO}#{number}", "--json", *extra])
+        return code, out.getvalue()
+
+    def test_the_refusals_next_and_the_land_caps_next_end_in_a_wait_that_waits(self) -> None:
+        """`wait pr` on a land row named `land --wait`; an agent's capped `land --wait` named `wait pr --until
+        merged`, which refused (64) again. Every hint now ends in `wait pr --until merged`, and that waits on the row:
+        here it runs out its 1 s --timeout on an unchanged row (exit 2) instead of refusing."""
+        row = write_row(41, "waiting")
+        _, refused, _ = gg.land_row_wait_refusal(f"pr:{REPO}#41", row, 60, True)
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "GLAEDA_LAND_AGENT_WAIT_CAP": "1"}):
+            _, _, capped = gg.land_agent_wait_cap(f"{REPO}#41", 1800, None)
+        for said in (json.loads(refused)["next"], capped):
+            self.assertIn(f"wait pr {REPO}#41 --until merged", said)
+        for extra in (("--until", "merged"), ()):
+            with self.subTest(until=extra):
+                began = time.monotonic()
+                code, out = self.wait_cli(41, "--timeout", "1", *extra)
+                self.assertNotEqual(code, 64, f"the wait refused again: {out!r}")
+                self.assertEqual(code, gg.EXIT_TIMEOUT, out)
+                doc = json.loads(out.strip().splitlines()[-1])
+                self.assertEqual((doc["code"], doc["state"], doc["result"]), ("land_row", "waiting", "timeout"))
+                self.assertLess(time.monotonic() - began, 30)
+
+    def test_the_row_wait_ends_with_the_row_merged_or_stopped(self) -> None:
+        for end, want in (("merged", gg.EXIT_OK), ("stopped", gg.EXIT_FAIL), ("cancelled", gg.EXIT_FAIL)):
+            with self.subTest(end=end):
+                row = write_row(42, "waiting")
+                ticks = []
+
+                def tick(_: float, end: str = end) -> None:
+                    ticks.append(1)
+                    write_row(42, end, mergeSha="f" * 40 if end == "merged" else None,
+                              stop={"code": "conflict", "reason": "r", "next": "n"} if end == "stopped" else None)
+
+                out = io.StringIO()
+                with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    code = gg.land_row_wait(f"pr:{REPO}#42", row, 60, None, True, sleep=tick)
+                self.assertEqual(code, want)
+                self.assertEqual(len(ticks), 1)
+                self.assertEqual(json.loads(out.getvalue())["state"], end)
+
+    def test_the_row_wait_hands_a_forwarded_or_gone_row_back_to_the_ordinary_wait(self) -> None:
+        row = write_row(43, "waiting")
+        write_row(43, gg.LAND_FORWARDED)
+        with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, 60, None, True, sleep=lambda _: None))
+        with mock.patch.object(gg, "daemon_running", return_value=False):
+            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, 60, None, True))
 
     def test_refusal_names_the_row_the_caller_can_look_up(self) -> None:
         """The row's own words, as `land status` prints them, so the caller can match the two."""
@@ -111,7 +169,7 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         env = {**os.environ, "GLAEDA_GH_DIR": HOME}
         began = time.monotonic()
         p = subprocess.run([sys.executable, "-I", os.fspath(SCRIPT), "wait", "pr", f"{REPO}#15",
-                            "--timeout", "8", "--json"], capture_output=True, text=True, env=env, timeout=120)
+                            "--until", "green", "--timeout", "8", "--json"], capture_output=True, text=True, env=env, timeout=120)
         took = time.monotonic() - began
         self.assertEqual(p.returncode, 64, f"exit {p.returncode}; out={p.stdout[-400:]!r} err={p.stderr[-400:]!r}")
         self.assertEqual(json.loads(p.stdout.strip())["code"], "land_row_watching")

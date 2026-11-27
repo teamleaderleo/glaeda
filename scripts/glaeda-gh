@@ -34629,12 +34629,75 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
               f"the land daemon reads that PR, judges it on its own schedule and ends the row itself, and it tells "
               f"the row's requester when it does. A second watcher here reads nothing the daemon does not already "
               f"read and spends the shared GraphQL pool the land's own reserve keeps back for lands")
-    nxt = f"glaeda-gh land {name} --wait {max(1, int(timeout)):d}"
+    nxt = f"glaeda-gh wait pr {name} --until merged --timeout {max(1, int(timeout)):d}"
     out = json.dumps({"ok": False, "code": "land_row_watching", "reason": reason, "next": nxt,
                       "landRow": {"key": key, "state": row.get("state"), "head": row.get("head"),
                                   "wakeAt": row.get("wakeAt"), "requester": row.get("requester")}}) + "\n" \
         if as_json else ""
     return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
+
+
+# LAND_ROW_WAIT: the two wait commands pointed at each other. `wait pr R#N` on a PR this host's land queue holds refused
+# (land_row_watching, exit 64) and named `land R#N --wait T`; an agent's `land --wait` is held to LAND_AGENT_WAIT_CAP
+# (150 s) and then named `cmux-gh wait pr R#N --until merged --timeout 1800`, which refused again. So an agent could
+# follow neither hint to wait on a queued land. Now `wait pr` with --until merged (or no --until) on an active row
+# waits on that row itself: it reads only the local land/entries file, as `land --wait` does, so it is still never a
+# second GitHub watcher (the refusal's reason, glaeda#2612), and it re-requests nothing. It ends with the row: exit 0
+# merged, 1 stopped or cancelled, 2 when --timeout passes with no change in the row. A row forwarded away, gone, or a
+# daemon that is down hands it back to the ordinary wait. --until green|done|required still refuses, naming this wait.
+# Detector: test-glaeda-gh-wait-land-row.py test_the_refusals_next_and_the_land_caps_next_end_in_a_wait_that_waits.
+LAND_ROW_WAIT_POLL = 1.0  # a local file read, as cmd_land's own wait
+
+
+def land_row_now(key: str) -> dict | None:
+    """KEY's land row as last saved, from its own file, or from a scan of land/entries when that file is not it."""
+    e = land_wait_entry(key)
+    if e is not None:
+        return e
+    return next((r for r in land_entries() if r.get("key") == key), None)
+
+
+def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+                  sleep: Callable[[float], None] = time.sleep) -> int | None:
+    """Wait on ROW, this host's active land row for KEY, until it ends or TIMEOUT passes with no change in it
+    (LAND_ROW_WAIT's comment). None: the row went where this wait cannot follow (forwarded, gone) or no daemon
+    works it, so the caller takes the ordinary wait."""
+    name = key_name(key)
+    if not daemon_running():
+        return None
+    say_waiting(f"glaeda-gh: {name} is an active row in this host's land queue ({row.get('state')}): waiting on that "
+                f"row until it merges or stops (a local read; no GitHub watcher)")
+    leash = Leash(timeout, ceiling)
+    entry: dict | None = row
+    while True:
+        entry = land_row_now(key)
+        state = (entry or {}).get("state")
+        if entry is None or state == LAND_FORWARDED:
+            say_waiting(f"glaeda-gh: {name}'s land row is "
+                        f"{'forwarded to another host' if entry else 'gone'}: waiting on the PR instead")
+            return None
+        leash.see(land_progress(entry))
+        if state in LAND_DONE or leash.left() <= 0:
+            break
+        sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
+    state = str(entry.get("state") or "")
+    code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
+    out: dict[str, Any] = {"ok": code == EXIT_OK, "key": key, "code": "land_row", "state": state,
+                           "result": {"merged": "merged", "stopped": "stopped", "cancelled": "cancelled"}.get(
+                               state, "timeout"), "mergeSha": entry.get("mergeSha"),
+                           "line": land_line(entry, time.time())}
+    stop = entry.get("stop") if isinstance(entry.get("stop"), dict) else {}
+    if state == "stopped":
+        out.update(reason=stop.get("reason"), next=stop.get("next"), stop=stop.get("code"))
+    if code == EXIT_TIMEOUT:
+        out.update(leash.fields(), next=f"glaeda-gh land status {name}")
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(out["line"])
+        if out.get("next"):
+            say_waiting(f"next: {out['next']}")
+    return code
 
 
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
@@ -44497,6 +44560,11 @@ def main(argv: list[str] | None = None) -> int:
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
             row = land_row_watched_here(pr_key, args.sha)
+            if row is not None and args.until in (None, "merged"):
+                code = land_row_wait(pr_key, row, args.timeout, args.max, args.json)
+                if code is not None:
+                    return code
+                row = None  # forwarded, gone or no daemon: the ordinary wait below
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))
