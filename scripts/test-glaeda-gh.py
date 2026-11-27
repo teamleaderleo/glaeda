@@ -3434,6 +3434,59 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
 
+    def test_an_upstream_host_follows_the_feed_itself_when_the_upstreams_view_is_stale(self) -> None:
+        """UPSTREAM_OWN_FEED: cmux-cp-1's copy and feed view of a waited PR went stale (staleWaited pr 437 s), so each
+        lane VM's wait re-read it through the broker: glaeda-upstream 3,194 of 24,743 App requests in an hour. The
+        lane VM's daemon follows the token-less feed itself, and a copy its own feed vouches for is current."""
+        ctl = FakeController()
+        ctl.token = None
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon.controller = ctl  # a lane VM's Controller.from_env: no token file there
+        bound, gg.UPSTREAM_DIRECT_AFTER = gg.UPSTREAM_DIRECT_AFTER, 10  # the copy below is past it
+        self.addCleanup(setattr, gg, "UPSTREAM_DIRECT_AFTER", bound)
+        key, sha = "pr:o/r#7", "a" * 40
+        gg.register(key)
+        self.daemon.tick(now=NOW - 60)  # the feed's cursor: quiet starts here
+        since = NOW - 30
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since}  # the upstream gives no view of it
+        ctl.suites = [{"id": 1, "repo": "o/r", "head_sha": "b" * 40, "status": "completed", "pull_requests": []}]
+        self.daemon.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.daemon.controller_status["why"], "reads through upstream")
+        entry = gg.read_cache(key)
+        self.assertIsNone(entry.get("upstreamFeed"))
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "this host's own feed vouches")
+        req = {"key": key, "kind": "pr", "began": NOW - 600}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 1), "no direct read for a quiet PR")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + gg.CONTROLLER_FRESH + 1), "a view gone stale")
+            ctl.suites = [{"id": 2, "repo": "o/r", "head_sha": sha, "status": "completed", "pull_requests": []}]
+            self.daemon.tick(now=NOW + 2)
+            self.assertFalse(self.daemon.land_feed_quiet(key, sha, since), "an event for its head")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + 3), "an event after the copy: read it")
+        ctl.down = True
+        self.daemon.tick(now=NOW + 4)
+        self.assertIsNone(self.daemon.feed_live_since, "a feed that is out vouches for nothing")
+
+    def test_a_head_keys_feed_view_is_its_commits_mark(self) -> None:
+        """A lane VM's wait on a commit's checks (head key) had no feed view, so it re-read check-runs, status and
+        check-suites every UPSTREAM_DIRECT_AFTER: 1,861 of glaeda-upstream's 4,460 App requests an hour. Its view is
+        the feed's sha mark, which head_feed_quiet trusts on the broker host."""
+        sha = "c" * 40
+        key = f"head:o/r@{sha}"
+        doc = {"liveSince": NOW - 7200, "okAt": NOW - 1, "fedRepos": {"o/r": NOW - 1}, "marks": {}}
+        view = gg.feed_view(key, None, doc, NOW)
+        self.assertEqual(view, {"liveSince": NOW - 7200, "at": NOW - 1, "eventAt": None, "head": sha})
+        self.assertTrue(gg.upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", NOW - 60, NOW))
+        doc["marks"] = {f"sha:o/r@{sha}": NOW - 10, f"sha:o/r@{'d' * 40}": NOW - 5}
+        view = gg.feed_view(key, None, doc, NOW)
+        self.assertEqual(view["eventAt"], NOW - 10, "its own commit's mark only")
+        self.assertFalse(gg.upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", NOW - 60, NOW),
+                         "a run for the commit after the copy: read it")
+        self.assertIsNone(gg.feed_view(f"head:x/y@{sha}", None, doc, NOW), "a repository the feed does not cover")
+
     def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
         """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
         feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
@@ -10632,6 +10685,84 @@ class TickBudgetTest(Base):
         print(f"\nhuge-blue shape: {got}", file=sys.stderr)
         self.assertLess(got["waitedAgeMax"], gg.STALE_DATA_AFTER, got)
         self.assertGreater(got["plain"], 0, "the floor still reads the plain backlog")
+
+    def broker_waited_starve(self, waited: int = 40, heavy: int = 3, query_s: float = 10.7, head_s: float = 10.7,
+                             heads: int = 6, hours: float = 1.0) -> dict:
+        """cmux-cp-1 and cmux-cp-2, 2026-11-27 02:20Z, simulated with the real tick() over GraphQL: WAITED PRs of one
+        repository a lane VM's wait is blocked on (the brokers'), HEAVY of them PRs GitHub answers 502 on after QUERY_S
+        in any batch (cmux's 160-check PRs), and HEADS heads the land judge asks each tick, each query HEAD_S. Every
+        query takes its seconds of the tick's TICK_BUDGET. The answer: the oldest data a readable waited PR had when a
+        tick ended, how many of them no tick ever sent a query for, and the PR queries sent."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 99999},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 99999}}
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        self.daemon.rest_room = lambda cost: False  # REST lean, its share spent (both brokers: "rest": "lean")
+        keys = [f"pr:o/r#{n}" for n in range(1, waited + 1)]
+        bad = set(keys[:heavy])  # the oldest data: on both brokers the PRs GitHub 502s on are the oldest (cmux#54153)
+        clock, spent, sent, queries = [NOW], [0.0], {k: 0 for k in keys}, {"pr": 0, "head": 0}
+        for i, key in enumerate(keys):  # read once, a while ago, alike but for a second apart
+            at = NOW - (20000 if key in bad else 900 - i)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at, "error": None,
+                                                               "data": {"state": "OPEN"}})
+
+        def take(seconds: float) -> None:
+            self.daemon.tick_deadline -= seconds
+            spent[0] += seconds
+
+        def fetch(kind):
+            def read(chunk):
+                queries[kind] += 1
+                take(query_s if kind == "pr" else head_s)
+                if kind == "pr":
+                    for e in chunk:
+                        sent[e["key"]] += 1
+                    if any(e["key"] in bad for e in chunk):
+                        return "graphql: timed out (GitHub answered 502 after 10.7s)"
+                for e in chunk:
+                    self.daemon.store(e["key"], e["cache"], data={"state": "OPEN"} if kind == "pr" else {"checks": []},
+                                      dataAt=self.daemon.now)
+                return None
+            return read
+
+        worst, tick = 0.0, 0
+        with mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                               return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}), \
+                mock.patch.object(gg.Daemon, "from_controller", lambda _self, entries: take(5.0)), \
+                mock.patch.object(gg.Daemon, "gql_room", lambda _self, cost: True):  # the App pool's points
+            while clock[0] < NOW + hours * 3600:
+                with mock.patch.object(gg.time, "time", side_effect=lambda: clock[0]):
+                    for key in keys:
+                        gg.register(key, waited=True)
+                    for n in range(heads):  # the land judge's asks: new heads each tick
+                        gg.register(f"head:o/r@{tick:020x}{n:020x}", consumer="land-judge")
+                for key in keys:  # read lately (the broker's answers touch them)
+                    os.utime(gg.watch_dir() / gg.file_name(key), (clock[0], clock[0]))
+                spent[0] = 0.0
+                self.daemon.tick(clock[0])
+                for key in keys:
+                    if key not in bad:
+                        worst = max(worst, clock[0] - ((gg.read_cache(key) or {}).get("dataAt") or NOW))
+                clock[0] += max(spent[0], 1.0) + gg.TICK
+                tick += 1
+        return {"waitedAgeMax": round(worst), "neverSent": sum(1 for k in keys if not sent[k]),
+                "ticks": tick, **{f"{k}Queries": v for k, v in queries.items()}}
+
+    def test_a_broker_reads_every_waited_pr_behind_502ing_batches(self) -> None:
+        """cmux-cp-2, 2026-11-27 02:20Z: ~40 waited PRs "not read for 1298s (14 due ticks, its query sent on 0)", ticks
+        spending 545 of 600 s in read pr and read head, pr batches of 10 answered 502 after 10.7 s. The PRs whose
+        chunks kept failing were read alone ahead of every batch, tick after tick, and failing alone kept their data
+        oldest, so they went first again. Before (half an hour, 15 of them 502ing, 40 heads a tick): 13 of 40 and 213
+        of 240 waited PRs never sent, oldest readable data 2,632 s. After: every one sent, 1,430 s and 1,772 s."""
+        for i, waited in enumerate(int(n) for n in os.environ.get("SIM_WAITED", "40,240").split(",")):
+            if i:  # each shape on a fresh daemon and cache, as the first
+                self.tearDown()
+                self.setUp()
+            got = self.broker_waited_starve(waited=waited, heads=int(os.environ.get("SIM_HEADS", "40")),
+                                            heavy=int(os.environ.get("SIM_HEAVY", "15")),
+                                            hours=float(os.environ.get("SIM_HOURS", "0.5")))
+            print(f"\nbroker shape, {waited} waited: {got}", file=sys.stderr)
+            self.assertEqual(got["neverSent"], 0, got)
+            self.assertLess(got["waitedAgeMax"], 3 * gg.STALE_DATA_AFTER, got)
 
 
 CHILD_PRELUDE = """
@@ -29026,6 +29157,27 @@ class LandTest(Base):
             e = self.tick(gg.NUDGE_MIN * 3 + 1)
         self.assertEqual(len(self.w.gh_calls("api")), 2)
 
+    def test_the_relabel_pulse_sends_its_add_again_when_the_first_add_is_refused(self):
+        # cmux#57755, 2026-11-27: a pulse whose add a pool app refused left the PR without ready-to-land, and its land's
+        # iOS-matrix carry (which reads the label) stopped matrix_missing.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.pulse_refusal(LA))
+        real, refused = self.q.call, []
+
+        def call(argv, *a, **k):
+            if "POST" in argv and not refused:
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            return real(argv, *a, **k)
+        self.q.call = call
+        e = self.tick()
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(self.w.gh_calls("api"), [
+            ["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"],
+            ["api", "-X", "POST", "repos/o/r/issues/1/labels", "-f", "labels[]=ready-to-land"]])
+        self.assertEqual((e["lastAction"]["kind"], e["lastAction"]["exit"], e["labelSent"]["head"]), ("label", 0, LA))
+
     def test_the_relabel_pulse_on_a_lane_vm_goes_through_the_brokers_pr_edit_not_a_hand_off(self):
         self.broker = True
         self.pr(LA)
@@ -31953,6 +32105,40 @@ class LandTest(Base):
         self.assertIsNone(e.get("unlabeled"))
         self.tick(gg.LAND_UNLABEL_AFTER + 1)
         self.assertEqual(len(self.unlabels()), 2)
+
+    def label_adds(self, *ats: float) -> None:
+        """GitHub's answer to the queue's read of the PR's ready-to-land adds (gg.land_label_adds_args), at ATS."""
+        nodes = [{"createdAt": dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "label": {"name": "ready-to-land"}} for at in ats]
+        nodes.append({"createdAt": "2030-01-01T00:00:00Z", "label": {"name": "risk:normal"}})  # another label's add
+        self.w.gh_out["other"] = json.dumps({"data": {"repository": {"issueOrPullRequest": {
+            "timelineItems": {"nodes": nodes}}}}})
+
+    def test_unlabel_keeps_a_ready_to_land_re_added_after_the_row_ended(self):
+        # cmux#57755, 2026-11-27: ready-to-land came off six times in 5 h, each 6-30 min after a live land re-added it:
+        # an older stopped row owed its removal and sent it under the live land, whose iOS-matrix carry needs the label.
+        e = self.stopped_on("block")
+        self.label_adds(e["stop"]["at"] - 600, e["stop"]["at"] + gg.LAND_UNLABEL_AFTER - 60)
+        e = self.tick(gg.LAND_UNLABEL_AFTER + 10)
+        self.assertEqual(self.unlabels(), [])
+        self.assertEqual(len(self.w.gh_calls("api", "graphql")), 1)
+        self.assertIn("kept", e["unlabeled"])
+        self.assertEqual(e["history"][-1]["event"], "label_kept")
+        self.tick(gg.LAND_UNLABEL_AFTER)
+        self.assertEqual((self.unlabels(), len(self.w.gh_calls("api", "graphql"))), ([], 1))  # read once, kept once
+
+    def test_unlabel_keeps_nothing_when_the_newest_add_is_the_rows_own(self):
+        e = self.stopped_on("block")
+        self.label_adds(e["stop"]["at"] - 600)
+        e = self.tick(gg.LAND_UNLABEL_AFTER + 10)
+        self.assertEqual(self.unlabels(), [["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"]])
+        self.assertEqual(e["history"][-1]["event"], "label_removed")
+
+    def test_unlabel_keeps_reads_the_adds_as_a_lane_vms_broker_takes_them(self):
+        argv = gg.land_label_adds_args("manaflow-ai/cmux", "57755")
+        self.assertEqual((argv[:2], argv[-2:]), (["api", "graphql"], ["-F", "n=57755"]))
+        self.assertIsNone(gg.land_label_added_at(""))
+        self.assertIsNone(gg.land_label_added_at('{"errors": [{"message": "x"}]}'))
 
     def test_unlabel_on_a_lane_vm_goes_through_the_brokers_pr_edit(self):
         # 2026-11-26 (ci-min-per-pr-30): a broker client skipped the removal, so lane VMs' queues never took a label off
