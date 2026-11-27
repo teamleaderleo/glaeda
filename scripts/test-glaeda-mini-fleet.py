@@ -1942,6 +1942,34 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("brew unpin $f to upgrade it", "\n".join(lines))
         subprocess.run(["bash", "-n"], input="\n".join(lines), text=True, check=True)
 
+    def test_zig_is_installed_at_ghosttys_series_not_the_newest(self) -> None:
+        # 2026-11-27: brew install zig took 0.17.1 on cmux25-33 and cmux setup.sh refused it (Ghostty needs 0.16.x),
+        # so "setup: builds GhosttyKit" failed on every new mini. fix installs zig@0.16 and links it as bin/zig.
+        self.assertEqual((mf.zig_series("0.16.0"), mf.zig_series("0.16.2-dev.1"), mf.zig_series(None)),
+                         ("0.16", "0.16", None))
+        for text in (preflight_text(zig="0.17.1"), preflight_text(zig="0.17.1", zig_path="")):
+            result = self.result(text, zig_fallback="0.16.0")
+            check = result["checks"]["zig"]
+            self.assertEqual((check["state"], check["action"].get("zig_series")), ("fail", "0.16"), check)
+            self.assertIn("brew install zig@0.16", check["fix"])
+            mine, _ = mf.planned_actions(result)
+            brew = next(a for a in mine if a["kind"] == "brew")
+            self.assertEqual((brew["formulas"], brew["zig_series"]), (["zig"], "0.16"))
+            self.assertIn("zig@0.16 (as zig)", mf.describe(brew))
+        lines = mf.brew_commands("builder", ["rustup", "zig"], False, zig="0.16")
+        script = "\n".join(lines)
+        self.assertIn("for f in rustup; do", script)  # never the newest zig through the shared loop
+        self.assertIn("brew_as install zig@0.16", script)
+        self.assertIn("brew_as link --overwrite --force zig@0.16", script)
+        self.assertIn("brew_as unlink zig;", script)
+        self.assertNotIn("brew_as unpin", script)  # the unversioned keg keeps its pin
+        self.assertEqual(lines[-1], "brew_as pin rustup zig@0.16")
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # Unknown minimum: plain zig as before; a malformed series is refused.
+        self.assertIn("for f in zig; do", "\n".join(mf.brew_commands("builder", ["zig"], False)))
+        with self.assertRaises(mf.Failure):
+            mf.brew_commands("builder", ["zig"], False, zig="0.16; rm -rf /")
+
     def test_missing_gh_is_brew_installed_and_left_unpinned(self) -> None:
         # cmux CI jobs call gh with GH_TOKEN and failed with FileNotFoundError on minis without it.
         result = self.result(preflight_text(gh=""))
@@ -2671,7 +2699,8 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup;",
+                                           "brew_as link --overwrite --force zig@0.16",
                                            "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))

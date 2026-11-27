@@ -2872,9 +2872,20 @@ def host_saturated() -> str:
     return ""
 
 
+# A Linux lane VM (role devbox, not DARWIN) holds no pressure delete for load: it runs at load 2-3x its 4 cores all day,
+# so the saturated_delete_below_free share (20%) was its real trigger and every 15-minute pass from 70% to 80% used
+# skipped (two lane VMs at 77-78% used, +12 and +31 GB/day, load 7-63 on 4 cores,
+# 2026-11-27: "host CPU saturated ... skipped before measuring" at the timer's own --low 30%). Its sessions are the
+# load, not a CI job a delete would slow; deletes still run at background IO priority and keep every in-use veto.
+def lane_vm_pressure(fss: "dict[int, Fs]") -> bool:
+    """A Linux devbox with a filesystem under its pressure line (Fs.low)."""
+    return ROLE == "devbox" and not DARWIN and any(not fs.tmpfs and fs.under for fs in fss.values())
+
+
 def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
-    """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
-    if emergency_devs(fss, emergency, floor_gib):
+    """host_saturated as an apply halt, except while a filesystem is below its emergency floor or a lane VM is under
+    pressure (lane_vm_pressure): then nothing holds."""
+    if emergency_devs(fss, emergency, floor_gib) or lane_vm_pressure(fss):
         return None
     spec = str(POLICY.get("saturated_delete_below_free", "0")).strip()
     if spec not in ("", "0") and any(
@@ -8863,6 +8874,293 @@ def apply_docker_store(receipt: Path, halt=None, below_target=None, families: fr
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(max(0, before - after))}  {fam} (docker {' '.join(command)})")
         if why:
+            break
+    return released
+
+
+# Another account's runner directories (/home/ghrun/<runner>, an ordinary actions/runner install the build-fleet
+# started with its own user). A lane VM (2026-11-27, 92% of 774G) held 124.4G there that no family named, so every
+# pass reported 0.0G reclaimable and blocked 219.5G: the folder is mode 750 and owned by another account, which the
+# in-process families can neither list nor delete. This family reads and deletes it with `sudo -n` (where sudo needs
+# no password) and only these parts, each only once nothing can be using it:
+# - <runner>/_work/<repo> and <runner>/work/<repo> (job checkouts and their build output) and <runner>/_work/_tool
+#   (the tool cache a job's setup step downloads again), when no Runner.Listener or Runner.Worker runs from that runner
+#   directory and nothing below the item changed for GHRUN_IDLE_HOURS;
+# - /home/ghrun/.cache/go-build, when no Runner.Worker runs anywhere on the host and nothing changed in it for the
+#   window (go rebuilds it).
+# Never: a runner's config (.runner, .credentials*, .path, .env), bin, externals, svc.sh, _diag, _actions, _temp,
+# _PipelineMapping. Without `sudo -n` the family reports one blocked item and deletes nothing. Deletion needs sudo.
+# Each item is also proved as root (GHRUN_PROOF_SRC), once when listed and again right before its `rm`: no process
+# holds a file, cwd, root or executable at or below it (every /proc entry read; one unreadable keeps everything), and
+# its runner's systemd unit (<runner>/.service) is inactive or failed (one that is active, starting, or did not answer
+# keeps the runner's items). A command line alone names no open file, and the gate starts a stopped runner at any time.
+GHRUN_FAMILY = "ghrun-idle-runner"
+GHRUN_ROOT = Path("/home/ghrun")
+GHRUN_IDLE_HOURS = BUILD_STATE_STALE_HOURS
+GHRUN_TIMEOUT_S = 300
+GHRUN_RUNNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GHRUN_WORKER_RE = re.compile(r"(/[^\s]*?)/bin/Runner\.(Listener|Worker)(?:\s|$)")
+GHRUN_UNIT_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+\.service$")
+GHRUN_STOPPED_STATES = frozenset({"inactive", "failed"})
+# Read as root (`sudo -n python3 -I -c`): every process's cwd, root, executable and open files, since this account
+# cannot read another account's /proc/PID/fd and a command line names no open file; and each runner's `.service` (the
+# systemd unit svc.sh installed, which the gate stops and starts). Prints {paths, denied, units}; read only.
+GHRUN_PROOF_SRC = r'''
+import json, os, sys
+runners = json.loads(sys.argv[1])
+paths, denied = [], 0
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    base = "/proc/" + pid
+    try:
+        fds = [base + "/fd/" + fd for fd in os.listdir(base + "/fd")]
+    except FileNotFoundError:
+        continue
+    except OSError:
+        denied, fds = denied + 1, []
+    for link in [base + "/cwd", base + "/root", base + "/exe", *fds]:
+        try:
+            paths.append(os.readlink(link))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            denied += 1
+units = {}
+for r in runners:
+    try:
+        with open(os.path.join(r, ".service"), "rb") as f:
+            units[r] = f.read(512).decode("utf-8", "replace").strip()
+    except FileNotFoundError:
+        units[r] = ""
+    except OSError:
+        units[r] = None
+print(json.dumps({"paths": paths, "denied": denied, "units": units}))
+'''
+
+
+def ghrun_present() -> bool:
+    """Whether this Linux host has the runner account's folder (it exists even where we cannot read it)."""
+    return not DARWIN and os.path.isdir(GHRUN_ROOT)
+
+
+def ghrun_target_ok(path: str, root: Path | None = None) -> bool:
+    """Whether PATH, as it stands (already a realpath), is one of the only places this family may delete:
+    <root>/<runner>/_work/_tool, <root>/<runner>/{_work,work}/<repo> (a name not starting with _ or .), or
+    <root>/.cache/go-build. Any `..`, empty part, relative path or other shape is refused."""
+    root = GHRUN_ROOT if root is None else root
+    if not isinstance(path, str) or not path.startswith("/") or os.path.normpath(path) != path:
+        return False
+    try:
+        rel = Path(path).relative_to(root).parts
+    except ValueError:
+        return False
+    if rel == (".cache", "go-build"):
+        return True
+    if len(rel) != 3 or not GHRUN_RUNNER_RE.match(rel[0]) or rel[1] not in ("_work", "work"):
+        return False
+    leaf = rel[2]
+    if leaf == "_tool":
+        return rel[1] == "_work"
+    return bool(GHRUN_RUNNER_RE.match(leaf)) and not leaf.startswith(("_", "."))
+
+
+def ghrun_sudo(args: list[str], timeout: float = GHRUN_TIMEOUT_S) -> tuple[int, str]:
+    """One command as root (`sudo -n`): (exit code, stdout); (-1, why) when sudo is unavailable or the call fails."""
+    if not sudo_reads():
+        return -1, "sudo -n is not available here"
+    try:
+        r = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, e.__class__.__name__
+    return r.returncode, r.stdout if r.returncode == 0 else (r.stderr.strip()[:200] or f"exit {r.returncode}")
+
+
+def ghrun_live() -> tuple[set[str], bool]:
+    """(the runner directories with a Runner.Listener or Runner.Worker running from them, whether any Runner.Worker
+    runs on the host). Raises NoEvidence when the process list cannot be read: that keeps everything."""
+    _, cmds = process_evidence()
+    dirs: set[str] = set()
+    worker = False
+    for m in GHRUN_WORKER_RE.finditer(cmds):
+        worker = worker or m.group(2) == "Worker"
+        dirs.add(os.path.normpath(m.group(1)))
+    return dirs, worker
+
+
+def ghrun_unit_states(units: list[str]) -> dict[str, str]:
+    """systemd's word for each unit ("active", "inactive", ...); a unit it did not answer for is absent."""
+    if not units:
+        return {}
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--", *units], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    lines = r.stdout.split()
+    return dict(zip(units, lines)) if len(lines) == len(units) else {}
+
+
+def ghrun_proofs(runners: list[str]) -> tuple[list[str], dict[str, str]]:
+    """(every path a process on the host holds, read as root; RUNNER -> why its service keeps it, or "" when it has
+    no unit or its unit is stopped). Raises NoEvidence when /proc cannot be read whole: that keeps everything."""
+    code, out = ghrun_sudo(["python3", "-I", "-c", GHRUN_PROOF_SRC, json.dumps(sorted(set(runners)))], timeout=300)
+    if code != 0:
+        raise NoEvidence(f"cannot read /proc as root: {out[:120]}")
+    try:
+        got = json.loads(out)
+        paths, denied, units = list(got["paths"]), int(got["denied"]), dict(got["units"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise NoEvidence(f"the /proc proof did not parse: {e.__class__.__name__}") from e
+    if denied or not paths:
+        raise NoEvidence(f"/proc as root: {denied} entries unreadable, {len(paths)} read")
+    named = {r: u for r, u in units.items() if isinstance(u, str) and GHRUN_UNIT_RE.match(u)}
+    states = ghrun_unit_states(sorted(set(named.values())))
+    held = {}
+    for r in set(runners):
+        u = units.get(r)
+        if u == "":
+            held[r] = ""  # no unit installed: the process check alone decides
+        elif r not in named:
+            held[r] = "its runner service could not be read"
+        elif states.get(named[r]) is None:
+            held[r] = f"its runner service {named[r]} did not report its state"
+        elif states[named[r]] not in GHRUN_STOPPED_STATES:
+            held[r] = f"its runner service {named[r]} is {states[named[r]]}"
+        else:
+            held[r] = ""
+    return [h.removesuffix(" (deleted)") for h in paths], held
+
+
+def ghrun_holder(path: str, holders: list[str]) -> str:
+    """The first held path at or below PATH; "" when no process holds anything there."""
+    return next((h for h in holders if h == path or h.startswith(path + "/")), "")
+
+
+def ghrun_held(path: str, runner: str, holders: list[str], units: dict[str, str]) -> str:
+    """Why the root proof keeps PATH (a process holds a file below it, or its runner's service is not stopped)."""
+    h = ghrun_holder(path, holders)
+    if h:
+        return f"a process holds {h[len(path):][:60] or 'it'} below it"
+    return units.get(runner, "its runner service was not read") if runner else ""
+
+
+def ghrun_changed_since(path: str, hours: float) -> str:
+    """"" when nothing below PATH changed in the last HOURS, else why not (a changed file, or why it could not be read)."""
+    cutoff = int(time.time() - hours * 3600)
+    code, out = ghrun_sudo(["find", path, "-xdev", "-newermt", f"@{cutoff}", "-print", "-quit"])
+    if code != 0:
+        return f"cannot tell whether it changed: {out}"
+    return f"changed in the last {hours:g}h ({out.strip()[:80]})" if out.strip() else ""
+
+
+def ghrun_size(path: str) -> int:
+    code, out = ghrun_sudo(["du", "-xs", "-B1", "--", path])
+    try:
+        return int(out.split()[0]) if code == 0 else 0
+    except (ValueError, IndexError):
+        return 0
+
+
+def ghrun_candidates(root: Path | None = None) -> list[str] | None:
+    """The candidate paths (one `sudo -n find` of the account's fixed places), or None when sudo cannot list them."""
+    root = GHRUN_ROOT if root is None else root
+    code, out = ghrun_sudo(["find", os.fspath(root), "-mindepth", "1", "-maxdepth", "4", "-xdev", "-type", "d",
+                            "(", "-path", f"{root}/*/_work/*", "-o", "-path", f"{root}/*/work/*", "-o", "-path",
+                            f"{root}/.cache/go-build", ")", "-prune", "-print"], timeout=120)
+    if code != 0:
+        return None
+    return sorted({p for p in out.splitlines() if ghrun_target_ok(p, root)})
+
+
+def ghrun_runner_of(path: str) -> str:
+    """The runner directory an item sits in; "" for the account's go-build cache."""
+    return "" if path.endswith("/.cache/go-build") else os.fspath(Path(path).parent.parent)
+
+
+def ghrun_items(root: Path | None = None, live: tuple[set[str], bool] | None = None) -> list[Item]:
+    """The account's items with their verdicts (see GHRUN_FAMILY); one unchecked item when it cannot be judged."""
+    root = GHRUN_ROOT if root is None else root
+    cands = ghrun_candidates(root)
+    if cands is None:
+        return [Item(GHRUN_FAMILY, os.fspath(root), 0, 0.0, "unchecked",
+                     ["blocked: sudo -n cannot list it, so nothing here can be judged or deleted"],
+                     platform="linux")]
+    try:
+        dirs, worker = ghrun_live() if live is None else live
+        holders, units = ghrun_proofs([r for r in map(ghrun_runner_of, cands) if r])
+    except NoEvidence as e:
+        return [Item(GHRUN_FAMILY, p, ghrun_size(p), 0.0, "unchecked", [f"no process evidence: {e}"],
+                     platform="linux") for p in cands]
+    items = []
+    for p in cands:
+        runner = ghrun_runner_of(p)
+        held = ghrun_held(p, runner, holders, units)
+        if runner and runner in dirs:
+            verdict, why = "in-use", "a Runner.Listener or Runner.Worker runs from this runner directory"
+        elif not runner and worker:
+            verdict, why = "in-use", "a Runner.Worker is running on this host"
+        elif held:
+            verdict, why = "in-use", held
+        else:
+            why = ghrun_changed_since(p, GHRUN_IDLE_HOURS)
+            verdict = "recent" if why.startswith("changed") else "unchecked" if why else "reclaimable"
+            why = why or ((f"its runner is not running" if runner else "no Runner.Worker runs")
+                          + f" and nothing changed for {GHRUN_IDLE_HOURS:g}h")
+        items.append(Item(GHRUN_FAMILY, p, ghrun_size(p), GHRUN_IDLE_HOURS if verdict == "reclaimable" else 0.0,
+                          verdict, [why], platform="linux"))
+    return items
+
+
+def ghrun_remove(path: str, root: Path | None = None) -> str:
+    """Delete one item: "" on success, else why not. Confined to ghrun_target_ok on the realpath; liveness and the
+    idle window are read again right before the delete."""
+    root = GHRUN_ROOT if root is None else root
+    code, real = ghrun_sudo(["realpath", "-e", "--", path], timeout=60)
+    real = real.strip()
+    if code != 0 or real != path or not ghrun_target_ok(real, root):
+        return f"refusing: {path} is not a confined path (realpath {real or '?'})"
+    try:
+        dirs, worker = ghrun_live()
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    runner = ghrun_runner_of(real)
+    if (runner and runner in dirs) or (not runner and worker):
+        return "a runner is live now"
+    try:
+        holders, units = ghrun_proofs([runner] if runner else [])
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    held = ghrun_held(real, runner, holders, units)
+    if held:
+        return held
+    changed = ghrun_changed_since(real, GHRUN_IDLE_HOURS)
+    if changed:
+        return changed
+    code, out = ghrun_sudo(["rm", "-rf", "--one-file-system", "--", real], timeout=3600)
+    return "" if code == 0 else f"rm failed: {out}"
+
+
+def apply_ghrun(receipt: Path, halt=None, below_target=None, root: Path | None = None) -> int:
+    """Under pressure, delete the account's reclaimable items largest first (see GHRUN_FAMILY); returns the bytes
+    released. Each removed path is printed and appended to the receipt with its size."""
+    released = 0
+    for item in sorted((i for i in ghrun_items(root) if i.verdict == "reclaimable"), key=lambda i: -i.bytes):
+        if below_target is not None and not below_target():
+            break
+        stop = halt() if halt is not None else ""
+        why = stop or ghrun_remove(item.path, root)
+        outcome = "reclaimed" if not why else f"kept:{why[:80]}"
+        released += 0 if why else item.bytes
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": GHRUN_FAMILY, "path": item.path, "bytes": item.bytes, "sweep": "pressure",
+               "rebuild": "a job's checkout step or setup step, or go build, makes it again"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome[:16]:16s} {gib(item.bytes)}  {GHRUN_FAMILY} {item.path}")
+        if stop:
             break
     return released
 
@@ -18759,13 +19057,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # the container image store, by image and tag (DOCKER_IMAGES): a report lists it; an apply asks docker again
     docker_items = ((docker_store_items(pressure=bool(a.pressure and under)) or [])
                     if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and docker_store_present() else [])
-    fill_holds([*items, *tooling, *docker_items])
+    ghrun_report = (ghrun_items() if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and ghrun_present()
+                    else [])
+    fill_holds([*items, *tooling, *docker_items, *ghrun_report])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
                           "cmux_acts": ROLE == "devbox" and cmux_build_caches_on(),
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
                           "docker": [asdict(i) for i in docker_items],
+                          "ghrun": [asdict(i) for i in ghrun_report],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
                           "held": held_summary(items),
@@ -18789,6 +19090,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if docker_items:
             print("\nContainer image store (docker's own commands reclaim it, under pressure only)")
         for t in sorted(docker_items, key=lambda i: -i.bytes):
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
+        if ghrun_report:
+            print("\nRunner account (sudo -n lists and deletes it: idle runners' checkouts, _tool and go-build only)")
+        for t in sorted(ghrun_report, key=lambda i: -i.bytes):
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
@@ -18880,6 +19185,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
             logical_released += apply_docker_store(a.receipt, halt, below_target=short_of_target,
                                                    families=frozenset(a.family) & docker_families if a.family
                                                    else None)
+        if (a.pressure and under and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
+                and not DEAD_MODE and (not a.family or GHRUN_FAMILY in a.family) and ghrun_present()):
+            logical_released += apply_ghrun(a.receipt, halt, below_target=short_of_target)
         RUN["released"] = logical_released
         blocked: dict[str, int] = {}
         for i in items:
@@ -19186,6 +19494,14 @@ USERS_ROOT = Path("/Users")
 RUNNER_HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
 RUNNER_HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"
 SUDO = "/usr/bin/sudo"
+# The root-owned copy glaeda-runner-account-disk-root installs beside its sudoers rule (/etc/sudoers.d/
+# glaeda-runner-account-disk), which lets the fleet user run exactly
+# `/usr/bin/python3 -I RUNNER_ACCOUNT_ROOT_COPY --runner-account ...` as each runner account, with no password and no
+# shell. A fleet mini's sudo asks for a password, so without it every pass read "not reached" and the gui pool
+# accounts' homes (cmuxci-gui-01, 30-55 GiB per mini) were never cleaned (2026-11-27). Present and root-owned, the
+# pass runs it instead of copying this script in through /bin/sh (which would need a shell rule as that account).
+RUNNER_ACCOUNT_ROOT_COPY = Path("/usr/local/libexec/glaeda/glaeda-disk")
+RUNNER_ACCOUNT_ROOT_PYTHON = "/usr/bin/python3"
 RUNNER_ACCOUNT_ADMIN_GROUPS = ("admin", "wheel", "sudo")
 RUNNER_ACCOUNT_MODE = False  # set in the pass run inside another account: it never delegates again
 _RUNNER_ACCOUNTS_ENABLED = True  # the test suite turns it off, so no test ever reaches sudo
@@ -19266,12 +19582,28 @@ def _runner_account_python() -> str:
     return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
 
 
-def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
-    """One pass in ENTRY's account (RUNNER_ACCOUNTS): copy this script into its home as it, run it there as it with
-    ARGS, and return its summary row. Never raises."""
+def runner_account_root_copy(path: Path | None = None) -> Path | None:
+    """RUNNER_ACCOUNT_ROOT_COPY when it is a regular file root owns that no group or other may write, else None."""
+    path = RUNNER_ACCOUNT_ROOT_COPY if path is None else path
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return path if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022 else None
+
+
+def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run,
+                       root_copy: Path | None = None) -> dict[str, Any]:
+    """One pass in ENTRY's account (RUNNER_ACCOUNTS): run the root-owned copy as it when one is installed
+    (runner_account_root_copy; ROOT_COPY in tests), else copy this script into its home as it and run that, with
+    ARGS; return its summary row. Never raises."""
     row: dict[str, Any] = {"account": entry.pw_name, "home": entry.pw_dir}
     dest = Path(entry.pw_dir) / RUNNER_ACCOUNT_COPY_DIR
     sudo = [SUDO, "-n", "-u", entry.pw_name, "-H"]
+    root_copy = runner_account_root_copy() if root_copy is None else root_copy
+    if root_copy is not None:  # exactly the command the sudoers rule names: no env, no shell
+        return _runner_account_pass(row, [*sudo, RUNNER_ACCOUNT_ROOT_PYTHON, "-I", os.fspath(root_copy),
+                                          *runner_account_argv(args)], run)
     try:
         source = Path(os.path.abspath(__file__)).read_bytes()
         put = run([*sudo, "/bin/sh", "-c", _RUNNER_ACCOUNT_INSTALL, "sh", os.fspath(dest)], input=source,
@@ -19285,6 +19617,11 @@ def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = su
     argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
             "CMUX_NAME_AS=cmux-disk",
             _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
+    return _runner_account_pass(row, argv, run)
+
+
+def _runner_account_pass(row: dict[str, Any], argv: list[str], run: Callable[..., Any]) -> dict[str, Any]:
+    """Run one runner-account pass ARGV and fold its summary line into ROW. Never raises."""
     try:
         done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
