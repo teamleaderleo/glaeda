@@ -10,6 +10,8 @@ including callers written against the first one's signature. 2026-11-27: leo-wor
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ProcessPoolExecutor
+import os
 from pathlib import Path
 import unittest
 
@@ -55,18 +57,24 @@ def python_scripts() -> list[Path]:
     return out
 
 
+def scan(path: Path) -> list[str]:
+    try:
+        return duplicates(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, SyntaxError):
+        return []  # not this test's question
+
+
 class NoShadowTest(unittest.TestCase):
     def test_no_top_level_name_is_defined_twice(self):
         scripts = python_scripts()
         self.assertIn(SCRIPTS / "glaeda-disk", scripts)  # the scan reaches the shebang tools, not only *.py
-        for script in scripts:
+        # One parse per file, on every core: the 223 scripts hold multi-MB files (test-glaeda-gh.py, 3 MB, parses in
+        # about 8 s alone), so a serial scan took about 27 s.
+        with ProcessPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            found = dict(zip(scripts, pool.map(scan, scripts)))
+        for script, dups in found.items():
             with self.subTest(script=str(script.relative_to(SCRIPTS))):
-                try:
-                    source = script.read_text(encoding="utf-8")
-                    ast.parse(source)
-                except (UnicodeDecodeError, SyntaxError):
-                    continue  # not this test's question
-                self.assertEqual(duplicates(source), [])
+                self.assertEqual(dups, [])
 
     def test_it_finds_a_shadowed_def(self):
         self.assertEqual(duplicates("def f(a):\n    pass\nX = 1\ndef f(a, b):\n    pass\nX = 2\n"),
