@@ -149,6 +149,11 @@ class UpdateTest(unittest.TestCase):
         gu.local_target = lambda: TARGET
         os.environ["GLAEDA_TEST_BIN"] = str(self.bin)
         self.config = {"ring": "canary", "setupArgs": ["--hygiene-only"], "host": "test", "reportStatus": False}
+        # The minute probe as on a host of its own, whatever host runs this suite (a runner mini has FLEET_DIR).
+        self.real_shared_egress = gu.shared_egress
+        egress = mock.patch.object(gu, "shared_egress", return_value=False)
+        egress.start()
+        self.addCleanup(egress.stop)
 
     def tearDown(self) -> None:
         gu.fetch, gu.attestation, gu.local_target, test_bin = self.saved
@@ -1112,6 +1117,45 @@ class UpdateTest(unittest.TestCase):
         (self.state / gu.PROBE.name).write_text("not json")
         with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
             self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
+
+    def test_a_runner_mini_probes_every_five_minutes_not_every_minute(self) -> None:
+        # Leo, 2026-11-27: "we dont wanna like... get banned again ideally": ~25 minis share one office address.
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "stable.json": "s1"}
+        changed = {**seen, "stable.json": "s2"}
+        every = gu.SHARED_EGRESS_PROBE_EVERY_S
+        self.assertEqual(every, 300)
+        with mock.patch.object(gu, "shared_egress", return_value=True):
+            self.assertEqual(gu.probe_every(), every)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=changed) as probe:
+                gu.save_probe({"channel": seen, "fullRunAt": now}, self.state)
+                # within five minutes of the full run: no request, even though the channel moved
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state), (False, seen, "probed recently"))
+                self.assertEqual(gu.probe_gate(self.config, now + every - 1, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 0)
+                # five minutes on, it probes and sees the change
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state), (True, changed, "channel changed"))
+                self.assertEqual(probe.call_count, 1)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=seen) as probe:
+                # an unchanged probe is recorded, so the next one waits five minutes from it
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state)[0::2], (False, "unchanged"))
+                self.assertEqual(gu.load_probe(self.state)["probedAt"], now + every)
+                self.assertEqual(gu.load_probe(self.state)["fullRunAt"], now)
+                self.assertEqual(gu.probe_gate(self.config, now + every + 60, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 1)
+                # a due full run and a soak's end never wait for the probe interval
+                self.assertEqual(gu.probe_gate(self.config, now + gu.APPLY_EVERY_S, self.state)[0::2], (True, "due"))
+                gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": now + 60}, self.state)
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state)[0::2], (True, "soak ended"))
+                # a clock step back probes (and runs: the full run is due)
+                self.assertEqual(gu.probe_gate(self.config, now - 1, self.state)[0::2], (True, "due"))
+        with mock.patch.object(gu, "FLEET_DIR", self.root / "fleet"), \
+                mock.patch.object(gu, "shared_egress", self.real_shared_egress):
+            self.assertFalse(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), gu.PROBE_EVERY_S)
+            (self.root / "fleet").mkdir()
+            self.assertTrue(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), every)
 
     def test_the_minute_probe_starts_a_full_run_when_a_canary_soak_ends(self) -> None:
         now = 1_800_000_000.0
