@@ -1618,8 +1618,9 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append(act)
     if not ctx.gh_only and not ctx.update_only:
         actions += plan_hygiene_tools(ctx)
-    plan_agents(ctx, actions)
+    # RunAtLoad can start the updater immediately: its persisted profile must exist first.
     actions.append(update_config_action(ctx))
+    plan_agents(ctx, actions)
     if (mirror_source := git_mirror_source_action(ctx)) is not None:
         actions.append(mirror_source)
     mark_owned(ctx, actions)

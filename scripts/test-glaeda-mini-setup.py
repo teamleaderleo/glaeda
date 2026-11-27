@@ -1111,6 +1111,23 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn("--apply", plist["ProgramArguments"])
         self.assertEqual({a["kind"] for a in planned["actions"]}, {"dir", "tool", "agent", "config"})
 
+    def test_update_only_profile_exists_before_launchd_starts_it(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.update_only = True
+        ctx.hygiene_only = True
+        ctx.profile_flag = "--update-only"
+        ctx.skip_launchctl = False
+        actions = ms.plan_install(ctx)
+
+        def start(context, path):
+            config = json.loads(context.update_config.read_text())
+            self.assertEqual(config["setupArgs"], ["--update-only"])
+            return 0, "loaded"
+
+        with mock.patch.object(ms, "bootstrap", side_effect=start) as bootstrap:
+            ms.apply_install(ctx, actions)
+        bootstrap.assert_called_once()
+
     def test_update_only_does_not_narrow_an_existing_profile(self) -> None:
         self.invoke("--gh-only", "--apply")
         before = self.tree()

@@ -362,7 +362,7 @@ not a candidate; the caller owns this inventory decision.
 
 `--update-only` preserves service roles and installs no hygiene, runner or GitHub
 watcher services. It refuses an existing different updater profile: continue that
-host's recorded `setupArgs` instead. The profile persists across releases and
+host's recorded `setupArgs` instead. Setup writes the profile before starting the recurring updater. The profile persists across releases and
 checks only the updater's health and bytes. Older releases that lack the flag
 are refused before setup, as with other unsupported persisted flags.
 
