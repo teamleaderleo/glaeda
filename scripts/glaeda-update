@@ -396,13 +396,60 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # the probe reads the redirect itself
 
 
-def channel_fingerprint(ring: str, source: str = REPOSITORY) -> dict | None:
+# The build controller's release probe (cmuxterm-hq build-fleet/cmd/controller/github_release_probe.go): it reads
+# the channel release's assets from GitHub's REST API at most once a minute for the whole fleet, with an App token and
+# an ETag (an unchanged channel is a 304). Before it, every fleet Mac HEADed github.com anonymously for each probe, from
+# the office's one address GitHub refused on 2026-11-26 (Leo, 2026-11-27: "we dont wanna like... get banned again
+# ideally"). GLAEDA_UPDATE_PROBE: a controller base URL, or "off"; else $CMUX_CI_CONTROLLER, else the cmux-ci client
+# config. A host with none probes github.com as before.
+PROBE_CONTROLLER_CONFIG = ".local/share/cmux-fleet-client/client.json"
+
+
+def probe_controller(home: Path | None = None) -> str | None:
+    """The controller this host probes its channel through, or None (off, or this host has none)."""
+    base = os.environ.get("GLAEDA_UPDATE_PROBE", "").strip()
+    if base == "off":
+        return None
+    base = base or os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if not base:
+        try:
+            doc = json.loads(((home or Path.home()) / PROBE_CONTROLLER_CONFIG).read_text())
+            base = doc.get("controller") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            base = None
+    return base.rstrip("/") if isinstance(base, str) and base.startswith(("http://", "https://")) else None
+
+
+def controller_fingerprint(base: str, ring: str, repo: str) -> dict | None:
+    """channel_fingerprint through the controller: each channel file's asset id, update time and size. None when the
+    controller cannot tell (starting, unreachable, GitHub refused it): the caller waits for its next full run, and
+    github.com is not asked."""
+    request = urllib.request.Request(f"{base}/v1/github-release-probe/{repo}/ota-channels",
+                                     headers={"User-Agent": "glaeda-update"})
+    try:
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            doc = json.loads(response.read(1 << 20))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("status") not in (200, 404) or not isinstance(doc.get("assets"), dict):
+        return None
+    out: dict = {"repo": repo, "via": "controller"}
+    for name in ("control.json", f"{ring}.json"):
+        value = doc["assets"].get(name)
+        out[name] = value if isinstance(value, str) else "absent"
+    return out
+
+
+def channel_fingerprint(ring: str, source: str = REPOSITORY, home: Path | None = None) -> dict | None:
     """What control.json and <ring>.json are now, without downloading them: one anonymous HEAD each at the first
     channel source, never the GitHub API. github.com answers a release download with a redirect to the asset's
     storage path, and every upload (`gh release upload --clobber`) is a new asset with a new path; an ETag stands
     in where there is no redirect. None when it cannot tell (offline, an unexpected answer): the caller then waits
     for its next full run."""
     repo = channel_sources(source)[0]
+    base = probe_controller(home)
+    if base:
+        return controller_fingerprint(base, ring, repo)
     opener = urllib.request.build_opener(_NoRedirect)
     out: dict = {"repo": repo}
     for name in ("control.json", f"{ring}.json"):
