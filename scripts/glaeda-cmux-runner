@@ -777,6 +777,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
         if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
             scope += " --yield-to-exclusive"
+        if dedicated.get("yieldToFleetBuild"):  # the hook's YIELD_TO_FLEET_BUILD
+            scope += " --yield-to-fleet-build"
         if dedicated.get("yieldToWaiters"):  # the hook's YIELD_TO_WAITERS (its listener gate reads it)
             scope += " --yield-to-waiters"
     # DEDICATED_USER: the account's own ledger directory (dedicated_context), for every phase and the gate

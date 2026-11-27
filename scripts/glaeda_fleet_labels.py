@@ -828,7 +828,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "yieldToWaiters", "lanRelay", "lanRelayFollow", "user"})
+                                       "yieldToFleetBuild", "yieldToWaiters", "lanRelay", "lanRelayFollow",
+                                       "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -904,6 +905,11 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        # YIELD_TO_FLEET_BUILD: the runner's jobs wait while the mini's fleet build (the CAS writer's fill) holds it
+        fleet_yields = entry.get("yieldToFleetBuild", False)
+        if not isinstance(fleet_yields, bool):
+            return [], f"{where}.yieldToFleetBuild must be boolean"
+
         # YIELD_TO_WAITERS: the runner's listener holds off while a build waits for the host lock, as a pool gate does
         waits = entry.get("yieldToWaiters", False)
         if not isinstance(waits, bool):
@@ -932,7 +938,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "yieldToWaiters": waits,
+                    "yieldToFleetBuild": fleet_yields, "yieldToWaiters": waits,
                     "lanRelay": relay, "lanRelayFollow": follow, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).

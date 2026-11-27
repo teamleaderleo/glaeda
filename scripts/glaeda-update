@@ -187,6 +187,13 @@ APPLY_EVERY_S = 600  # a full run at least this often, and the first retry's wai
 # full run only probes the channel (channel_fingerprint: two anonymous HEADs) and does the full run when it changed, so
 # a host sees a new release (or a pause) within about a minute instead of 10-13 (Leo, 2026-11-17).
 PROBE_EVERY_S = 60
+# A runner mini (FLEET_DIR exists) probes at most this often. The ~25 office minis leave through one address, and
+# GitHub limits anonymous requests to github.com per address: on 2026-11-26 it answered the whole office 403. Each
+# probe is two anonymous HEADs of github.com, so the minute probe was ~108 of a mini's ~132 github.com requests an
+# hour (6 full runs of 4 requests each, 54 probe-only runs of 2), about 3,200 an hour across the office. At 300 s a
+# mini makes ~36 (6 probes, 6 full runs); a stable mini still sees a promotion within five minutes. Leo,
+# 2026-11-27: "minis tho," / "we dont wanna like... get banned again ideally".
+SHARED_EGRESS_PROBE_EVERY_S = 300
 PROBE_TIMEOUT = 15
 PROBE = STATE_DIR / "probe.json"
 BACKOFF_MAX_S = 3600  # an unconverged host still retries at least hourly, as the agent used to run
@@ -435,21 +442,44 @@ def save_probe(doc: dict, state_dir: Path = STATE_DIR) -> None:
     os.replace(tmp, state_dir / PROBE.name)
 
 
+def shared_egress() -> bool:
+    """This host is a runner mini, one of many behind the office's single address (SHARED_EGRESS_PROBE_EVERY_S)."""
+    return FLEET_DIR.is_dir()
+
+
+def probe_every() -> int:
+    return SHARED_EGRESS_PROBE_EVERY_S if shared_egress() else PROBE_EVERY_S
+
+
+def _when(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def probe_gate(config: dict, now: float, state_dir: Path = STATE_DIR) -> tuple[bool, dict | None, str]:
     """(do a full run now, the fingerprint seen, why). A full run is due APPLY_EVERY_S after the last one, as the
     agent used to run; between them, only when the channel files changed since the last full run. A probe that
     cannot tell starts nothing, so an outage never turns the minute probe into a full run every minute, and the
-    backoff and quarantine of a full run apply as before."""
+    backoff and quarantine of a full run apply as before. On a runner mini a probe within probe_every() of the last
+    probe or full run is skipped, with no request at all ("probed recently"); a due full run or soak end is not."""
     doc = load_probe(state_dir)
-    seen = channel_fingerprint(config["ring"], config.get("source", REPOSITORY))
     last = doc.get("fullRunAt")
-    if not isinstance(last, (int, float)) or not 0 <= now - last < APPLY_EVERY_S:
+    due = not isinstance(last, (int, float)) or not 0 <= now - last < APPLY_EVERY_S
+    soak = _when(doc.get("soakEndsAt"))
+    soak_due = soak is not None and now >= soak
+    every = probe_every()
+    if not due and not soak_due and every > PROBE_EVERY_S:
+        probed = max((t for t in (_when(doc.get("probedAt")), _when(last)) if t is not None), default=None)
+        if probed is not None and 0 <= now - probed < every:
+            return False, doc.get("channel"), "probed recently"
+    seen = channel_fingerprint(config["ring"], config.get("source", REPOSITORY))
+    if due:
         return True, seen, "due"
     if seen is not None and seen != doc.get("channel"):
         return True, seen, "channel changed"
-    soak = doc.get("soakEndsAt")
-    if isinstance(soak, (int, float)) and not isinstance(soak, bool) and now >= soak:
+    if soak_due:
         return True, seen, "soak ended"  # this canary's post-soak promote nudge (nudge_pending_at)
+    if every > PROBE_EVERY_S:
+        save_probe({**doc, "probedAt": now}, state_dir)
     return False, seen, "unchanged"
 
 

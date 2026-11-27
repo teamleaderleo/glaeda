@@ -1683,14 +1683,29 @@ def cwd_repo(cwd: str | None = None) -> str | None:
 
     This is what a bare `N` names. A bare number was 173 of the 358 targets this host's transcripts had
     refused by 2026-11-21, more than any other form, and it is the one an agent reaches for while working in
-    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`."""
-    try:
-        done = subprocess.run(["git", "-C", cwd or ".", "remote", "get-url", "origin"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = REMOTE_RE.fullmatch(done.stdout.strip()) if done.returncode == 0 else None
-    return f"{match.group(1)}/{match.group(2)}" if match else None
+    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`.
+
+    `git remote get-url` answers the URL after `url.<base>.insteadOf`, so a host that routes fetches through a
+    local cache answers that cache's URL, not GitHub's: every lane VM's /run/cmux/git-cache/gitconfig rewrites
+    `https://github.com/` to `http://127.0.0.1:47380/github.com/`, and `origin` there read as no GitHub
+    repository at all. 2026-11-26: `glaeda-gh land manaflow-ai/cmuxterm-hq#30624 --match-head-commit e4852da0`
+    run inside a `wt` checkout of cmuxterm-hq said the directory was "no checkout of manaflow-ai/cmuxterm-hq"
+    and took the pin unchecked, as every pinned land on a lane VM did. So when the rewritten URL is not one this
+    reads, the URL as configured (`remote.origin.url`, before any rewrite) is asked once more."""
+    def ask(args: list[str]) -> str:
+        try:
+            done = subprocess.run(["git", "-C", cwd or ".", *args], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+    for args in (["remote", "get-url", "origin"], ["config", "--get", "remote.origin.url"]):
+        url = ask(args)
+        if not url:
+            return None  # no origin (or no repository): the second form has nothing more to say
+        match = REMOTE_RE.fullmatch(url)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return None
 
 
 def target_readable(kind: str, text: str) -> bool:
@@ -12775,6 +12790,15 @@ class Daemon:
             return None
         size = self.head_size(entries)
         for i in range(0, len(entries), size):
+            # batched() bounds outer chunks; measured cost can split one into many queries.
+            # Keep its first-query guarantee, then yield to waited PRs/runs at the same deadline.
+            if time.monotonic() >= getattr(self, "tick_deadline", float("inf")):
+                self.defer(entries[i:])
+                return None
+            until = getattr(self, "head_until", None)
+            if i and until is not None and time.monotonic() >= until:
+                self.defer(entries[i:], "the heads' share of the tick, waited reads due")
+                return None
             error = self.fetch_head_chunk(entries[i:i + size])
             if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
                 if error is not None:
@@ -24197,7 +24221,14 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
-        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
+        # judged at a head the copy shows: a later stale copy counts from its own first keep. The same older copy of
+        # the same pin keeps its first keep's clock: a judgment that went ahead on it (base_merge_due: its parents
+        # unread) is no read of the pin, and its worker's base_merge_check keeps it again (stale_live). Dropped here,
+        # every keep was the first and LAND_STALE_LIVE_MAX never ran out: 2026-11-26 18:17Z to 23:34Z, one row
+        # stale_head_kept 52 times, every 300 s, staleLive.n 1 each time, never pr_head_lags_branch.
+        kept = e.get("staleLive")
+        if not (isinstance(kept, dict) and kept.get("head") == sha and kept.get("pin") == str(e.get("pinSha") or "")):
+            e.pop("staleLive", None)
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()

@@ -4134,6 +4134,31 @@ class DaemonTest(Base):
         with mock.patch.object(gg.subprocess, "run", side_effect=OSError("no git")):
             self.assertIsNone(gg.cwd_repo())
 
+    def test_cwd_repo_sees_through_a_fetch_rewrite(self) -> None:
+        """A lane VM's git cache rewrites `https://github.com/` (url.<base>.insteadOf), so `git remote get-url`
+        answers `http://127.0.0.1:47380/github.com/o/r.git`; the configured URL still names o/r, and so does
+        land_pin_local_head, which is what lets a pinned land there be checked instead of taken as given. Real git,
+        a throwaway global config shaped like /run/cmux/git-cache/gitconfig."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, cfg = Path(tmp) / "r", Path(tmp) / "gitconfig"
+            cfg.write_text('[url "http://127.0.0.1:47380/github.com/"]\n\tinsteadOf = https://github.com/\n'
+                           '[user]\n\tname = t\n\temail = t@t\n')
+            env = {"GIT_CONFIG_GLOBAL": os.fspath(cfg), "GIT_CONFIG_NOSYSTEM": "1"}
+            with mock.patch.dict(os.environ, env):
+                git = lambda *a: subprocess.run(["git", "-C", os.fspath(repo), *a], check=True,
+                                                capture_output=True, text=True).stdout.strip()
+                subprocess.run(["git", "init", "-q", os.fspath(repo)], check=True)
+                git("remote", "add", "origin", "https://github.com/o/r.git")
+                git("commit", "-q", "--allow-empty", "-m", "x")
+                self.assertEqual(git("remote", "get-url", "origin"), "http://127.0.0.1:47380/github.com/o/r.git")
+                self.assertEqual(gg.cwd_repo(os.fspath(repo)), "o/r")
+                head = git("rev-parse", "HEAD")
+                with contextlib.chdir(repo):
+                    self.assertEqual(gg.land_pin_local_head("o/r"), head)
+                    self.assertEqual(gg.land_pin_local_head("o/other"), "")
+                git("remote", "set-url", "origin", "https://gitlab.com/o/r.git")  # rewritten or not, not GitHub
+                self.assertIsNone(gg.cwd_repo(os.fspath(repo)))
+
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
             with self.assertRaises(gg.WatchError):
@@ -30744,6 +30769,31 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertNotIn("staleLive", e)
 
+    def test_a_lagging_pr_head_judged_each_pass_still_stops_at_the_bound(self):
+        # 2026-11-26, 18:17Z to 23:34Z: a row stale_head_kept 52 times, every 300 s, never pr_head_lags_branch. The
+        # cache's read of the older copy carried no parents, so each pass judge() went ahead (base_merge_due), and
+        # its start dropped staleLive before the worker's base_merge_check kept the pin again: every keep was n=1,
+        # its clock new. The bound now counts from the first keep of the same head and pin across judgments.
+        self.pinned_and_waiting()
+        self.older_copy(parents=None)
+        for k in ("headParents", "headParent"):
+            self.w.cache[self.KEY]["data"].pop(k, None)
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        self.w.api[f"repos/o/r/commits/{self.LE}"] = json.dumps([self.LD])
+        e = self.tick(30)
+        kept = 0
+        for _ in range(int(gg.LAND_STALE_LIVE_MAX // gg.LAND_HEAD_TIMEOUT) * 3):
+            if e["state"] == "stopped":
+                break
+            kept = max(kept, int((e.get("staleLive") or {}).get("n") or 0))
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        keeps = [h for h in e["history"] if h["event"] == gg.LAND_STALE_LIVE]
+        self.assertGreater(kept, 1)  # one clock across the judgments, not a new one each pass
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "pr_head_lags_branch"))
+        self.assertLessEqual(len(keeps), int(gg.LAND_STALE_LIVE_MAX // gg.LAND_HEAD_TIMEOUT) + 1)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
@@ -49836,6 +49886,50 @@ class HeadReadsSizedByMeasuredCost(unittest.TestCase):
 
     def entries(self, n):
         return [{"key": f"head:{self.REPO}@{i:040x}", "cache": {}} for i in range(1, n + 1)]
+
+    def test_inner_queries_yield_the_heads_share_and_retry_only_unread_heads(self):
+        d, clock = self.daemon(3.0)
+        d.head_secs = {self.REPO: 3.0}  # two heads per query, six seconds each
+        d.head_until, d.tick_deadline = 40.0, 90.0
+        d.deferred, d.defer_why = set(), {}
+        heads = self.entries(100)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_heads(heads))
+            self.assertEqual(clock[0], 42.0)  # at most the in-flight query exceeds the share
+            self.assertEqual(d.stored, [e["key"] for e in heads[:14]])
+            self.assertEqual(d.deferred, {e["key"] for e in heads[14:]})
+            self.assertEqual(d.refunded_keys, [e["key"] for e in heads[14:]])
+            self.assertIn("heads' share", d.defer_why["head"][1])
+            # The unread entries retain no fabricated freshness. A later unrestricted pass finishes them.
+            d.head_until, d.tick_deadline = None, float("inf")
+            self.assertIsNone(d.fetch_heads(heads))
+        self.assertEqual(len(d.stored), 100)
+        self.assertEqual(len(set(d.stored)), 100)
+        self.assertEqual(clock[0], 300.0)
+
+    def test_inner_queries_preserve_first_query_when_share_is_already_spent(self):
+        d, clock = self.daemon(3.0)
+        d.head_secs = {self.REPO: 3.0}
+        d.head_until, d.tick_deadline = 0.0, 90.0
+        d.deferred, d.defer_why = set(), {}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_heads(self.entries(10)))
+        self.assertEqual(d.sent, [2])
+        self.assertEqual(len(d.deferred), 8)
+
+    def test_inner_queries_stop_at_tick_deadline_without_a_heads_share(self):
+        for deadline, reads in ((0.0, 0), (10.0, 4)):
+            with self.subTest(deadline=deadline):
+                d, clock = self.daemon(3.0)
+                d.head_secs = {self.REPO: 3.0}
+                d.head_until, d.tick_deadline = None, deadline
+                d.deferred, d.defer_why = set(), {}
+                heads = self.entries(10)
+                with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+                    self.assertIsNone(d.fetch_heads(heads))
+                self.assertEqual(len(d.stored), reads)
+                self.assertEqual(d.deferred, {e["key"] for e in heads[reads:]})
+                self.assertEqual(d.refunded_keys, [e["key"] for e in heads[reads:]])
 
     def test_a_slow_repos_heads_go_few_to_a_query_after_one_timeout(self):
         d, clock = self.daemon(2.5)

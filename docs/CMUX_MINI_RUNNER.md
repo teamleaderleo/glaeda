@@ -91,6 +91,11 @@ What `--apply` does:
      CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
      An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
      `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     A checkout whose git carries the job's token (`actions/checkout`'s `http.<url>.extraheader`, in the
+     repository's config or its included credentials file) skips the tunnel with no probe (`this checkout carries
+     the job's token`): the tunnel is there for anonymous fetches, which GitHub blocked from the office address.
+     The cmux wrapper does the same for its fetches and other commands (`this fetch carries the job's token`), but
+     not for `git submodule update`, whose clones are other repositories with no token.
      The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
      disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
@@ -1621,6 +1626,23 @@ same claim (`Gate.exclusive_yield`): it stops an idle listener while a signing j
 busy one as its job ends (`JOB_END_FREEZE`), and starts it again once the claim is gone. The label's queue then goes
 to a runner that can start it, so a member whose dedicated runners all yield needs a second member with the same
 labels.
+
+### Waiting for the CAS writer's slot (`yieldToFleetBuild`)
+
+The writer mini's catch-up fill (hq `build-fleet/catch-up/fill-main.py`) is the only process that puts into the
+fleet's compile cache. When it is owed a slot it waits for a moment with no `Runner.Worker`, takes `host.lock`
+exclusively and builds for at most its `SLOT_MAX_HOLD` (20 min), yielding meanwhile only to a job past glaeda's
+admission. A ledger runner's job waits for that in `job-started` (it takes the host lock); a dedicated runner takes no
+host lock, so its job went straight past. On cmux15 on 2026-11-26 (hq#25856) the `trusted-main` runner ran Seed
+DerivedData jobs back to back with 8-10 s gaps: the slot took the lock in a gap and lost it to the next seed
+(07:58:48Z, 08:17:22Z), and the store took no put in 6 h.
+
+A runner.dedicated entry with `"yieldToFleetBuild": true` gets the hook's `--yield-to-fleet-build`. Before its own
+admission, `job-started` waits while a fleet build holds `host.lock` exclusively and has not marked itself yielding
+(`<host.lock>.yield`: a spent slot, or a catch-up fill outside one, which stops for the next job anyway). The fill's
+own 20 min bound ends the wait; `YIELD_TO_FLEET_BUILD_WAIT_S` (30 min) is the backstop, after which the job is
+admitted, never refused. Its listener gate reads the same hold (`Gate.fleet_build_yield`) and stops listening through
+it, so a job of a shared label goes to another runner instead of waiting here. Without the key nothing changes.
 
 ### Yielding to a build waiting for the host lock (`yieldToWaiters`)
 

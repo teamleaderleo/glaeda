@@ -20122,6 +20122,27 @@ class DedicatedRunnerTest(unittest.TestCase):
         hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
         self.assertIn(" --yield-to-exclusive", (hooks / "job-started.sh").read_text())
 
+    def test_an_entry_that_yields_to_the_fleet_build_passes_the_opt_in_to_its_hook(self) -> None:
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertFalse(good[0]["yieldToFleetBuild"])
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToFleetBuild": True}),
+                                                   "mini-std")
+        self.assertIsNone(why)
+        self.assertTrue(good[0]["yieldToFleetBuild"])
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToFleetBuild": bad}),
+                                                        "mini-std")
+                self.assertIn("yieldToFleetBuild", why or "")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "yieldToFleetBuild": True}),
+                                  "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
+        self.assertIn(" --yield-to-fleet-build", (hooks / "job-started.sh").read_text())
+
     def test_an_entry_that_yields_to_waiters_passes_the_opt_in_to_its_hook(self) -> None:
         """YIELD_TO_WAITERS: cmux15's trusted-main declares yieldToWaiters, so its job-started hook carries
         --yield-to-waiters, which its listener gate reads; an entry without it is unchanged."""
@@ -20785,6 +20806,83 @@ class DedicatedHookTest(unittest.TestCase):
             for fd in fds:
                 os.close(fd)
         self.assertIsNone(hook.exclusive_claim(capacity))
+
+    def test_a_dedicated_runner_that_yields_to_the_fleet_build_waits_for_the_writers_slot(self) -> None:
+        # hq#25856, 2026-11-26: cmux15's trusted-main runner (no host lock) ran Seed DerivedData jobs back to back, and
+        # the CAS writer's slot took host.lock in each 8-10 s gap and lost it to the next seed: 0 puts in 6 h. With
+        # runner.dedicated yieldToFleetBuild (--yield-to-fleet-build) the job waits while a fleet build holds host.lock
+        # and does not yield; the fill's slot is spent when it marks <host.lock>.yield, and then the job goes ahead.
+        fleet = self.dir / "fleet"
+        fleet.mkdir(exist_ok=True)
+        lock = fleet / "host.lock"
+        lock.touch()
+        path = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/main"})
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        base = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--dedicated-admit", os.fspath(admit), "--host-lock", os.fspath(lock))
+        yielding = (*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "1")
+        self.assertIsNone(hook.fleet_build_hold(os.fspath(lock)))
+        result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+        fd = hook.lock_file(lock, fcntl.LOCK_EX)  # the writer's slot holds the host
+        try:
+            self.assertEqual(hook.fleet_build_hold(os.fspath(lock)), hook.FLEET_BUILD_HOLDS_HOST)
+            started = time.monotonic()
+            result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)  # the bound admits, never refuses
+            self.assertGreaterEqual(time.monotonic() - started, 1.0)
+            self.assertIn("starts nothing beside it (YIELD_TO_FLEET_BUILD)", result.stdout)
+            # without the opt-in (every other runner) nothing changes: no wait
+            result = self.run_hook(*base, repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+            # a spent slot (or a catch-up fill outside one) marks itself yielding: it stops for this job, no wait
+            (fleet / f"host.lock{hook.YIELD_SUFFIX}").write_text(f"{os.getpid()}\n")
+            self.assertIsNone(hook.fleet_build_hold(os.fspath(lock)))
+            result = self.run_hook(*(*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "30"),
+                                   repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+            (fleet / f"host.lock{hook.YIELD_SUFFIX}").unlink()
+            # the slot ends while the job waits: the job starts then, well inside its bound
+            threading.Timer(1.5, os.close, (fd,)).start()
+            fd = None
+            started = time.monotonic()
+            result = self.run_hook(*(*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "60"),
+                                   repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertLess(time.monotonic() - started, 30.0)
+            self.assertIn("waiting: a fleet build holds the host lock", result.stdout)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_a_fleet_build_yielding_runners_gate_stops_listening_through_the_writers_slot(self) -> None:
+        runner = self.dir / "actions-runner-glaeda-trusted-main"
+        (runner / cr.HOOK_DIR).mkdir(parents=True)
+        script = runner / cr.HOOK_DIR / "job-started.sh"
+        lock = self.dir / "host.lock"
+        lock.touch()
+        gate = hook.Gate(runner, os.fspath(lock), os.fspath(self.dir / "reservation.json"), self.dir / "state",
+                         waiters=False)
+        base = "#!/bin/bash\nexec python3 hook job-started --allowed-repo manaflow-ai/cmux --dedicated-admit /x/a.sh"
+        fd = hook.lock_file(lock, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(hook.Gate, "low_disk", return_value=None), \
+                    mock.patch.object(hook.Gate, "dedicated_toolchain", return_value=None):
+                script.write_text(base + "\n")
+                self.assertIsNone(gate.fleet_build_yield())  # no opt-in: the pool's holds never reach it
+                self.assertIsNone(gate.claimed())
+                script.write_text(base + " --yield-to-fleet-build\n")
+                self.assertEqual(gate.fleet_build_yield(), hook.FLEET_BUILD_HOLDS_HOST)
+                self.assertEqual(gate.claimed(), hook.FLEET_BUILD_HOLDS_HOST)
+                os.close(fd)
+                fd = None
+                self.assertIsNone(gate.claimed())
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def test_the_gate_never_holds_a_dedicated_runner_for_the_pool(self) -> None:
         runner = self.dir / "actions-runner-glaeda-nightly-next"
@@ -24082,6 +24180,21 @@ class GitShimTest(unittest.TestCase):
                 self.assertNotIn("using direct HTTPS", result.stderr)
                 self.assertEqual(receipt.read_text().splitlines(), [expected])
 
+    def test_hq_checkout_with_the_jobs_token_goes_direct_with_no_probe(self) -> None:
+        # cmuxterm-hq#27837: a healthy tunnel answers, yet a token's checkout still skips it (and its relay)
+        env, receipt = self.hq_checkout_fixture()
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        ref = "refs/remotes/origin/main"
+        env = {**env, "TEST_CONNECT": "200", "TEST_CURL_EXIT": "0"}
+        for args in (["fetch", "--no-tags", "--filter=blob:none", "--depth=1", "origin", f"+{self.pr_sha}:{ref}"],
+                     ["checkout", "--force", "--detach", ref]):
+            result = subprocess.run(["git", *args], cwd=self.ws, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("this checkout carries the job's token; using direct HTTPS", result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(), ["", ""])
+        self.assertFalse((Path(env["RUNNER_TEMP"]) / hook.HQ_GIT_SHIM_DEAD).exists())
+        self.assertEqual((self.ws / "b.txt").read_text(), "b\n")
+
     def test_hq_later_steps_use_git_without_checkout_recovery(self) -> None:
         env, receipt = self.hq_checkout_fixture()
         env.pop("GITHUB_ACTION_REPOSITORY")
@@ -24253,6 +24366,34 @@ class GitShimTest(unittest.TestCase):
         self.assertNotIn("going direct", result.stderr)
         self.assertTrue(curl_argv.exists())
         self.assertNotIn(".proxy=", argv.read_text())
+
+    def test_a_fetch_with_the_jobs_token_skips_the_tunnel_with_no_probe(self) -> None:
+        # cmuxterm-hq#27837: the tunnel rode a congested relay (a depth-1 clone 8-20 s through it, 1.5 s direct), and
+        # GitHub's block on the office address was on anonymous fetches. actions/checkout's fetch carries the token.
+        argv, curl_argv, env = self.proxied(curl_exit=0)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        result = self.checkout_fetch(self.pr_sha, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("this fetch carries the job's token, so it goes direct to github.com", result.stderr)
+        self.assertFalse(curl_argv.exists())  # no probe of the tunnel at all
+        self.assertIn("-c http.proxy= -c http.https://github.com/.proxy=", argv.read_text())
+        self.assertFalse((self.temp / f"{hook.GIT_SHIM_LOG}.direct").exists())  # no failure mark for later calls
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+        # a lazy blob fetch from any other command in the same repository skips it too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
+
+    def test_an_anonymous_call_keeps_the_tunnel(self) -> None:
+        # with no token (SwiftPM's package clones, a clone in another directory) the tunnel protects the office address
+        argv, curl_argv, env = self.proxied(curl_exit=0)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "X-Other: 1")
+        result = self.shim("fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("carries the job's token", result.stderr)
+        self.assertTrue(curl_argv.exists())
+        self.assertNotIn(".proxy=", argv.read_text())
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "http://127.0.0.1:18434", other.stderr)
 
     def test_a_proxy_failure_after_a_good_probe_retries_direct(self) -> None:
         # the probe passed, then the tunnel dropped mid-fetch (run 45811016977's third try: "Recv failure")
