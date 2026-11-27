@@ -10620,6 +10620,83 @@ class TickBudgetTest(Base):
         self.assertLess(got["waitedAgeMax"], gg.STALE_DATA_AFTER, got)
         self.assertGreater(got["plain"], 0, "the floor still reads the plain backlog")
 
+    def broker_waited_starve(self, waited: int = 40, heavy: int = 3, query_s: float = 10.7, head_s: float = 10.7,
+                             heads: int = 6, hours: float = 1.0) -> dict:
+        """cmux-cp-1 and cmux-cp-2, 2026-11-27 02:20Z, simulated with the real tick() over GraphQL: WAITED PRs of one
+        repository a lane VM's wait is blocked on (the brokers'), HEAVY of them PRs GitHub answers 502 on after QUERY_S
+        in any batch (cmux's 160-check PRs), and HEADS heads the land judge asks each tick, each query HEAD_S. Every
+        query takes its seconds of the tick's TICK_BUDGET. The answer: the oldest data a readable waited PR had when a
+        tick ended, how many of them no tick ever sent a query for, and the PR queries sent."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 99999},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 99999}}
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        self.daemon.rest_room = lambda cost: False  # REST lean, its share spent (both brokers: "rest": "lean")
+        keys = [f"pr:o/r#{n}" for n in range(1, waited + 1)]
+        bad = set(keys[::max(1, waited // max(1, heavy))][:heavy])
+        clock, spent, sent, queries = [NOW], [0.0], {k: 0 for k in keys}, {"pr": 0, "head": 0}
+        for i, key in enumerate(keys):  # read once, a while ago, alike but for a second apart
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 900 + i,
+                                                               "dataAt": NOW - 900 + i, "error": None,
+                                                               "data": {"state": "OPEN"}})
+
+        def take(seconds: float) -> None:
+            self.daemon.tick_deadline -= seconds
+            spent[0] += seconds
+
+        def fetch(kind):
+            def read(chunk):
+                queries[kind] += 1
+                take(query_s if kind == "pr" else head_s)
+                if kind == "pr":
+                    for e in chunk:
+                        sent[e["key"]] += 1
+                    if any(e["key"] in bad for e in chunk):
+                        return "graphql: timed out (GitHub answered 502 after 10.7s)"
+                for e in chunk:
+                    self.daemon.store(e["key"], e["cache"], data={"state": "OPEN"} if kind == "pr" else {"checks": []},
+                                      dataAt=self.daemon.now)
+                return None
+            return read
+
+        worst, tick = 0.0, 0
+        with mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                               return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}), \
+                mock.patch.object(gg.Daemon, "from_controller", lambda _self, entries: take(5.0)), \
+                mock.patch.object(gg.Daemon, "gql_room", lambda _self, cost: True):  # the App pool's points
+            while clock[0] < NOW + hours * 3600:
+                with mock.patch.object(gg.time, "time", side_effect=lambda: clock[0]):
+                    for key in keys:
+                        gg.register(key, waited=True)
+                    for n in range(heads):  # the land judge's asks: new heads each tick
+                        gg.register(f"head:o/r@{tick:020x}{n:020x}", consumer="land-judge")
+                for key in keys:  # read lately (the broker's answers touch them)
+                    os.utime(gg.watch_dir() / gg.file_name(key), (clock[0], clock[0]))
+                spent[0] = 0.0
+                q0 = queries["pr"]
+                status = self.daemon.tick(clock[0])
+                if os.environ.get("SIM_TRACE"):
+                    print(f"T{tick} spent={spent[0]:.1f} prq={queries['pr'] - q0} deferred={status.get('deferred')} "
+                          f"modes={status.get('modes')} oldest={max((clock[0] - ((gg.read_cache(k) or {}).get('dataAt') or NOW)) for k in keys if k not in bad):.0f}",
+                          file=sys.stderr)
+                for key in keys:
+                    if key not in bad:
+                        worst = max(worst, clock[0] - ((gg.read_cache(key) or {}).get("dataAt") or NOW))
+                clock[0] += max(spent[0], 1.0) + gg.TICK
+                tick += 1
+        return {"waitedAgeMax": round(worst), "neverSent": sum(1 for k in keys if not sent[k]),
+                "ticks": tick, **{f"{k}Queries": v for k, v in queries.items()}}
+
+    def test_a_broker_reads_every_waited_pr_behind_502ing_batches(self) -> None:
+        """cmux-cp-2, 2026-11-27 02:20Z: ~40 waited PRs "not read for 1298s (14 due ticks, its query sent on 0)", ticks
+        spending 545 of 600 s in read pr and read head, a pr batch of 10 answered 502 after 10.7 s. Every readable
+        waited PR is read within a few ticks, whatever the heavy ones cost, and at any PR count."""
+        for waited in [int(n) for n in os.environ.get("SIM_WAITED", "40,160").split(",")]:
+            got = self.broker_waited_starve(waited=waited, heads=int(os.environ.get("SIM_HEADS", "6")),
+                                            hours=float(os.environ.get("SIM_HOURS", "1")))
+            print(f"\nbroker shape, {waited} waited: {got}", file=sys.stderr)
+            self.assertEqual(got["neverSent"], 0, got)
+            self.assertLess(got["waitedAgeMax"], gg.STALE_DATA_AFTER * (1 + waited // 40), got)
+
 
 CHILD_PRELUDE = """
 import importlib.machinery, importlib.util, json, os, signal, sys, time
