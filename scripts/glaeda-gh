@@ -13730,7 +13730,9 @@ class Daemon:
         incomplete). No GitHub request."""
         if not PR_REST_HEAD_FROM_CONTROLLER:
             return None
-        doc = self.controller_rollup_doc(root, sha)
+        if self.rollup_memo is None or self.rollup_memo[:3] != (root, sha, self.now):
+            self.rollup_memo = (root, sha, self.now, self.controller_rollup_doc(root, sha))
+        doc = self.rollup_memo[3]
         return None if doc is None else rollup_head_parts(doc, sha, root)
 
     def status_part(self, old: dict, parts: dict, root: str, sha: str) -> Any:
@@ -13744,13 +13746,8 @@ class Daemon:
         return rolled[path]["doc"]
 
     def controller_rollup_doc(self, root: str, sha: str) -> dict | None:
-        """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed). One
-        ask a read (self.now) per head: the gate's suites and status, and the full read's runs, are one answer."""
-        if self.rollup_memo is not None and self.rollup_memo[:3] == (root, sha, self.now):
-            return self.rollup_memo[3]
-        doc = self.controller_rollup_ask(root, sha)
-        self.rollup_memo = (root, sha, self.now, doc)
-        return doc
+        """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed)."""
+        return self.controller_rollup_ask(root, sha)
 
     def controller_rollup_ask(self, root: str, sha: str) -> dict | None:
         own = self.controller is not None
