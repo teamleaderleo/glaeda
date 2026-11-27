@@ -139,6 +139,9 @@ pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
 #[cfg(target_os = "linux")]
 pub mod immutable_git_object_pool_admin_producer_plan;
+/// Publication-time descriptor-bound audit of staged immutable Git pool candidates.
+#[cfg(target_os = "linux")]
+pub mod immutable_git_object_pool_generation_audit;
 /// Pure fixed marker codec for immutable Git object-pool generations.
 pub mod immutable_git_object_pool_marker;
 /// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.
@@ -223,6 +226,9 @@ pub mod local_install_cargo_config_preflight;
 /// Crash-safe private per-user publication of verified Glaeda binary generations.
 #[cfg(unix)]
 pub mod local_install_generation_store;
+/// Descriptor-bound observation and publication of the canonical local `glaeda` launcher.
+#[cfg(unix)]
+pub mod local_install_launcher;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
 /// Read-only exact checkout and Cargo.lock proof for local self-builds.
@@ -293,6 +299,8 @@ pub mod project_catalog;
 /// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
 #[cfg(unix)]
 pub mod project_checkout_observation;
+/// Pure no-replay lifecycle for one exact formatted project-disk attachment.
+pub mod project_disk_attachment_state;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
 /// Descriptor-bound read-only observation of Lima standalone project disks.
@@ -309,6 +317,9 @@ pub mod quarry_parallel_verification_receipt;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
 pub mod renderprove_native_probe;
+/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
+#[cfg(target_os = "linux")]
+pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
@@ -364,6 +375,9 @@ pub mod state_root_generation;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+/// Pure sealed task-private Git clone planning from exact hot-path leases.
+#[cfg(target_os = "linux")]
+pub mod task_private_git_clone_plan;
 /// Root-only, closed, one-transaction Linux guest-control dispatcher.
 #[cfg(unix)]
 pub mod trusted_guest_control_dispatcher;
@@ -375,6 +389,9 @@ pub mod trusted_guest_control_probe_protocol;
 pub mod trusted_guest_control_protocol;
 /// Pure canonical request+payload and receipt+result guest-control transport frames.
 pub mod trusted_guest_control_transaction;
+#[cfg(target_os = "linux")]
+/// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
+pub mod trusted_overlay_mount_execution;
 #[cfg(target_os = "linux")]
 /// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.
 pub mod trusted_overlay_mount_plan;
@@ -393,6 +410,12 @@ pub mod trusted_project_filesystem_guest_protocol;
 pub mod trusted_workspace_receipt;
 #[cfg(unix)]
 pub mod unix_personal_worker_store;
+/// Unix descriptor-retained persistence for the empty protected cache-generation catalog.
+#[cfg(unix)]
+pub mod unix_protected_cache_generation_catalog_store;
+/// Descriptor-bound private persistence for the resident-sandbox catalog.
+#[cfg(unix)]
+pub mod unix_resident_sandbox_store;
 /// Pure closed generation selection for verification-derived cache identities.
 pub mod verification_cache_generation;
 /// Pure fixed repository verification command meanings for identity derivation and later execution.
