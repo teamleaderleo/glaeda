@@ -34156,6 +34156,64 @@ class LandTest(Base):
         self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_a_base_update_is_not_deferred_on_another_landers_pending_verdict(self):
+        # LAND_LANDER_VERDICT: manaflow-ai/cmux#61375 at b62e921d (2026-11-27). land_judge named the base_update merge at
+        # 11:59Z; every check run at the head had finished, and the one unfinished context was next-autoland's verdict
+        # status, so the update was deferred for the whole wait until a person ran it at 12:43Z.
+        real = {"headRefOid": LA, "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+                "isDraft": False, "checksTruncated": False, "checkCounts": None,
+                "checks": [{"name": "CI fast guards", "workflow": "CI", "id": "CR_a", "runId": 1,
+                            "status": "COMPLETED", "conclusion": "SUCCESS"},
+                           {"name": "cmux/land-tier", "workflow": None, "status": "COMPLETED", "conclusion": "SUCCESS",
+                            "description": "Land tier runs here: full"},
+                           {"name": "next-autoland / verdict", "workflow": None, "status": "PENDING",
+                            "conclusion": None, "url": None,
+                            "description": "next-autoland did not judge this head within 60m; queued for next pass"}]}
+        self.assertTrue(gg.land_checks_running(real, LA))  # a merge still waits on the status, as before
+        base = refusal("base_update", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                           "needs_newer_base": ["land-judge base update"]},
+                       reason="land-judge: refused: base update needed")
+
+        def judged(data):
+            shutil.rmtree(gg.land_dir(), ignore_errors=True)
+            self.w = LandWorld(self.tmp.name)
+            self.q = self.queue()
+            self.w.set_pr(self.KEY, data, self.t)
+            self.land()
+            self.tick()
+            e = self.q.entries[self.KEY]
+            self.w.answers.append(base)
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            sent = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+            return len(sent), "update_deferred" in [h["event"] for h in e["history"]]
+
+        self.assertEqual(judged(real), (1, False), "the named base merge is sent at once")
+        self.assertFalse(gg.land_update_held(real, LA))  # a base merge does not wait on it
+        # a pool job's pending status still defers it: a new head would restart that job
+        job = {**real, "checks": [*real["checks"], {"name": "ws-check", "workflow": None, "status": "PENDING",
+                                                    "conclusion": None, "description": "cmux-ci run 1 running"}]}
+        self.assertTrue(gg.land_update_held(job, LA))
+        self.assertEqual(judged(job), (0, True))
+        # and so does a run in progress
+        run = {**real, "checks": [*real["checks"], {"name": "build", "workflow": "CI", "id": "CR_x",
+                                                    "status": "IN_PROGRESS", "conclusion": None}]}
+        self.assertEqual(judged(run), (0, True))
+
+    def test_a_base_update_the_merge_train_holds_says_so_in_its_judged_row(self):
+        # manaflow-ai/cmux#61375, 2026-11-27: four "judged base_update step=retry" rows with no update read as the
+        # daemon's miss; each was land_judge's merge-train wait (its action carried "train"/"board_train").
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        for act, said in (({"kind": "retry", "after_s": 300, "train": "boarded"}, "boarded"),
+                          ({"kind": "retry", "after_s": 300, "board_train": {"label": "merge-train"}}, "board")):
+            self.w.answers.append(refusal("base_update", LA, act, reason="land-judge: refused: base update needed"))
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            row = [h for h in e["history"] if h["event"] == "judged"][-1]
+            self.assertEqual((row["code"], row["step"], row.get("train")), ("base_update", "retry", said))
+        self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
+
     def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
         # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
         # at the head never finished, and every timed-out wait judged again and deferred again: "3 identical refusals
@@ -51448,6 +51506,39 @@ class MergeTrainTurnAway(unittest.TestCase):
         data = self.data()
         data["checks"][1]["workflow"] = "CI"
         self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["merge-train"])
+
+
+class RollupHeadPartsTest(unittest.TestCase):
+    """rollup_head_parts: a complete controller rollup is the REST head read's check runs and first status page
+    (glaeda-upstream asked GitHub for commits/SHA/check-runs 747 and /status 376 times an hour while the rollup that
+    answered its check-suites held both)."""
+
+    SHA = "a" * 40
+
+    def doc(self, runs: int = 3, **over: object) -> dict:
+        doc = {"sha": self.SHA, "complete": True, "check_runs_complete": True, "status_complete": True,
+               "check_runs": {"total_count": runs, "check_runs": [
+                   {"id": i + 1, "name": f"c{i}", "status": "completed", "conclusion": "success",
+                    "check_suite": {"id": 9}, "app": {"slug": "github-actions"}} for i in range(runs)]},
+               "status": {"state": "success", "total_count": 1, "statuses": [
+                   {"context": "ci", "state": "success", "target_url": None, "created_at": "t"}]}}
+        return {**doc, **over}
+
+    def test_a_complete_rollup_is_the_kept_parts(self) -> None:
+        parts = gg.rollup_head_parts(self.doc(150), self.SHA, "/repos/o/r")
+        self.assertEqual(sorted(parts), sorted([gg.check_runs_path("/repos/o/r", self.SHA),
+                                                gg.check_runs_path("/repos/o/r", self.SHA) + "&page=2",
+                                                gg.status_path("/repos/o/r", self.SHA)]))
+        first = parts[gg.check_runs_path("/repos/o/r", self.SHA)]["doc"]
+        self.assertEqual((first["total_count"], len(first["check_runs"]), first["check_runs"][0]["suite"]),
+                         (150, 100, 9))
+        self.assertEqual(first["check_runs"][0]["node_id"], "controller:run:1")
+        self.assertEqual(parts[gg.status_path("/repos/o/r", self.SHA)]["doc"]["statuses"][0]["context"], "ci")
+
+    def test_an_incomplete_or_disagreeing_rollup_is_none(self) -> None:
+        for doc in (self.doc(check_runs_complete=False), self.doc(status_complete=False), self.doc(complete=False),
+                    self.doc(sha="b" * 40), self.doc(5, check_runs={"total_count": 9, "check_runs": []})):
+            self.assertIsNone(gg.rollup_head_parts(doc, self.SHA, "/repos/o/r"))
 
 
 if __name__ == "__main__":
