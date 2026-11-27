@@ -10441,6 +10441,36 @@ class TickBudgetTest(Base):
         order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
         self.assertEqual(set(order[:2]), cheap, order)
 
+    def test_many_waited_prs_are_read_by_a_bounded_pool_beside_the_serial_reads(self) -> None:
+        """The land host, 2026-11-27: ~330 waited PRs read one query at a time stored 22-50 a window. From WAITED_POOL_MIN
+        due, workers read up to WAITED_POOL_WORKERS chunks of WAITED_POOL_CHUNK beside the tick; the serial read gets the
+        rest and a key a worker could not read is deferred, not lost."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: (None if k.endswith("#1") else "no data stored") for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(len(pooled), 1, pooled)
+        self.assertLessEqual(len(pooled[0]), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(len(pooled[0]), total, "all of them fit one worker's chunk")
+        self.assertEqual(serial, [], "what a worker took is not read twice")
+        self.assertNotIn("pr:o/r#1", self.daemon.deferred)
+        self.assertIn("pr:o/r#2", self.daemon.deferred)
+
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
         left, and `checks --consumer merge-hold` said "unread (not read yet)" until the hour turned. A head with no
