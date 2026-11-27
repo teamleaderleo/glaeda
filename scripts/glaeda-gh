@@ -1633,6 +1633,18 @@ SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt c
 ... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
+# A head with more check suites than one page shows (a cmux head has 100+): its last-real-attempt read stops there, so
+# every full read of such a PR is partial, the same way, until its suites change. A partial read stored no fingerprint,
+# and probe_ok refuses a PR with none, so each was read in full every cycle and never probed. The control-plane host,
+# 2026-11-27 20:2xZ: 153 of 683 open PRs held this error and no fingerprint, land refreshes refused 20-23 of each 30
+# rows a probe as "no-fp", a full cmux read cost 2.6-7 s of GitHub's time, and ticks spent 410-484 s of each 600 s in
+# "read pr" while waited PR data reached 2,489 s. This partial is the head's shape, not a failed read: a full read of
+# the same fingerprint (which counts the suites, so one more or fewer is a change) comes back partial the same way. So
+# it keeps its fingerprint, and a probe that matches confirms it (still partial, never greener: checksPageError stays).
+SUITES_PAST_ONE_PAGE = "graphql: last real attempt: more than 100 check suites on one commit"
+STABLE_PARTIAL = frozenset({SUITES_PAST_ONE_PAGE})
+
+
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
     """The ids of COMMIT's check suites whose newest attempt ran no check run (an older attempt may have run some:
     last_real_contexts reads them); an error message when COMMIT has more suites than one page shows (one past it
@@ -1644,7 +1656,7 @@ def ran_nothing_suites(commit: dict | None) -> list[str] | str:
         # GitHub answers a field it failed to read as null beside an error: an unread field is never "none ran nothing"
         return "graphql: last real attempt: the commit's check suites could not be read"
     if (suites.get("pageInfo") or {}).get("hasNextPage"):
-        return "graphql: last real attempt: more than 100 check suites on one commit"
+        return SUITES_PAST_ONE_PAGE
     nodes = suites.get("nodes")
     if not isinstance(nodes, list):
         return "graphql: last real attempt: malformed check suites (no node list)"
@@ -1951,8 +1963,16 @@ def route_of(method: str, path: str) -> str:
     return f"{method} {'/'.join(out)}" + ("?" + "&".join(names) if names else "")
 
 
+# No one minute's row of one key sends this many requests (the whole REST pool is 5000 an hour). A row past it is a
+# miscount, not spend: 2026-11-27 21:28Z cmux-cp-1's rest_breakdown summed glaeda:outbox rows of 892775259368767916,
+# a row a fallback reader had folded back into spend.json each time it ran (spend_new), doubling every key (about 55x
+# in 9 min by 21:37Z: glaeda:run 612 -> 33684). load_spend drops
+# such a row, so a spend.json that holds one heals on the daemon's next save.
+SPEND_ROW_MAX = 5_000  # the whole pool's hour, in one minute of one key
+
+
 def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
-    """SPEND_FILE's minutes, the well-formed rows only."""
+    """SPEND_FILE's minutes, the well-formed rows only (none past SPEND_ROW_MAX)."""
     minutes = doc.get("minutes") if isinstance(doc, dict) else None
     out: dict[int, dict[str, list[int]]] = {}
     for minute, rows in (minutes if isinstance(minutes, dict) else {}).items():
@@ -1960,7 +1980,8 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
             continue
         for key, row in rows.items():
             if (isinstance(key, str) and isinstance(row, list) and len(row) == 3
-                    and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in row)):
+                    and all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= SPEND_ROW_MAX
+                            for n in row)):
                 out.setdefault(int(minute), {})[key] = list(row)
     return out
 
@@ -1982,6 +2003,24 @@ def no_login_reader(daemon: "Daemon") -> bool:
     """Whether DAEMON is a fallback reader with no login (fallback_no_login), so a read its App chain does not take
     returns DIRECT_NO_LOGIN before it is tried rather than failing inside the transport."""
     return getattr(daemon, "token_source", None) is fallback_no_login
+
+
+def spend_new(daemon: Any) -> dict[int, dict[str, list[int]]] | None:
+    """DAEMON's spend rows less those it read from SPEND_FILE when it was built (Daemon.spend_base): what this process
+    sent. A Daemon built outside the serving one starts from the whole of spend.json, so handing its whole spend to
+    spend_side_add folded the hour back in and doubled every row each run (SPEND_ROW_MAX)."""
+    spend = getattr(daemon, "spend", None)
+    if not spend:
+        return spend
+    base = getattr(daemon, "spend_base", None) or {}
+    out: dict[int, dict[str, list[int]]] = {}
+    for minute, rows in spend.items():
+        for key, row in rows.items():
+            was = (base.get(minute) or {}).get(key) or [0, 0, 0]
+            sent = [max(0, int(row[i]) - int(was[i])) for i in range(3)]
+            if any(sent):
+                out.setdefault(minute, {})[key] = sent
+    return out
 
 
 def spend_side_add(spend: dict[int, dict[str, list[int]]] | None) -> None:
@@ -7084,6 +7123,7 @@ class Daemon:
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         # the spend log (SPEND_FILE): minute -> "bucket\troute\tkind\trepo" -> [requests, counted, points]
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
+        self.spend_base = {m: {k: list(r) for k, r in rows.items()} for m, rows in self.spend.items()}  # spend_new
         self.spend_saved_at = float("-inf")
         self.spend_dirty = False
         self.caller: tuple[str, ...] = ("other", "", "")  # what the request being sent is for (calling)
@@ -12654,11 +12694,15 @@ class Daemon:
                 if kind == "pr" and snap is None and self.pr_head_key(e, node) is not None \
                         and not first_page_more(node):
                     snap = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
+                stable = False  # partial only by the head's shape (STABLE_PARTIAL): it keeps its fingerprint
                 if kind == "pr":
-                    page_error = self.extend_pr_contexts(e, node)
-                    page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
+                    pages_error = self.extend_pr_contexts(e, node)
+                    suites_partial = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error)
+                    page_error = suites_partial or pages_error
                     # a context GitHub could not read may be a red one: partial, never greener
                     page_error = page_error or (null_contexts_error(nulls[i]) if nulls.get(i) else None)
+                    stable = (suites_partial in STABLE_PARTIAL and pages_error is None and not nulls.get(i)
+                              and f"{alias}{i}" not in limits)
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if kind == "pr" and f"{alias}{i}" in limits:
                     # a field GitHub gave up on is null here, wherever it sits: the PR reads pending, never green
@@ -12667,7 +12711,7 @@ class Daemon:
                     parsed[i]["checksPageError"] = page_error
                     split_unread(parsed[i])  # a required name past the pages read is unread, not missing
                 if kind == "pr":
-                    fps[i] = None if page_error else pr_fingerprint(node)
+                    fps[i] = None if page_error and not stable else pr_fingerprint(node)
                 if i in captured:
                     self.save_rollup(e["key"], node, captured[i], fps[i])
                 if snap is not None and not page_error:
@@ -13031,7 +13075,8 @@ class Daemon:
         # (an answer from an upstream keeps this host's old fp: never confirmed against it)
         if c.get("source") == "upstream":
             return "upstream"
-        if not isinstance(data, dict) or data.get("checksPageError") or data.get("state") != "OPEN":
+        if not isinstance(data, dict) or data.get("checksPageError") not in (None, *STABLE_PARTIAL) \
+                or data.get("state") != "OPEN":
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"
@@ -16088,7 +16133,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
             why = f"{describe(failure)} at {error_site(failure)}"
             errors.update({k: why for k in todo if k not in errors})
         finally:
-            spend_side_add(getattr(daemon, "spend", None))
+            spend_side_add(spend_new(daemon))
     for k in todo:
         cached = read_cache(k) or {}
         if (cached.get("dataAt") or 0) >= daemon.now:
@@ -33064,7 +33109,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
                     state, doc = "error", "out of time"
                 out[path] = doc if state == "fresh" else str(doc)
     finally:
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     return out
 
 
@@ -36029,7 +36074,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     finally:
         if broker is not None:
             direct_parts_save(daemon.repo_parts, daemon.now)
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     if error:
         return error
     cached = read_cache(key) or {}
