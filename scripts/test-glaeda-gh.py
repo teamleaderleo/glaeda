@@ -7265,7 +7265,7 @@ class ClientTest(Base):
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1)))
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", "o/r#1", False, False, fields=["hed"])
-        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, inherited, own, passed"):
+        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, fallback, held, inherited, own, passed"):
             self.status("pr", "o/r#1", False, False, fields=["checks.red"])
         # a PR with no data yet refuses the typo too, rather than printing an empty column
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
@@ -45206,6 +45206,33 @@ class QueuedNeverDoneTest(unittest.TestCase):
         self.assertEqual(gg.wait_step(req, self.now + 1, runs("completed"))[0], gg.EXIT_OK)
         self.assertEqual(len(reads), before)
 
+    def test_a_quiet_heads_runs_answer_outlives_the_reread(self) -> None:
+        """A done wait re-read `actions/runs?head_sha=` every HEAD_RUNS_REREAD however quiet the head was: 754 of
+        glaeda-upstream's 4,023 App requests an hour. While this host's feed delivered nothing for the head since the
+        answer was read, the answer stands; a run event for the head after it, or a failed read, reads again."""
+        key, head = "pr:o/r#5", "e" * 40
+        data = {"headRefOid": head, "url": "https://github.com/o/r/pull/5"}
+        reads: list[str] = []
+
+        def get(repo: str, paths: list[str]) -> dict:
+            reads.extend(paths)
+            return {p: {"total_count": 1, "workflow_runs": [{"id": 1, "name": "ci", "status": "queued"}]} for p in paths}
+        self.assertEqual(gg.head_runs_unfinished(key, data, NOW, get), ["ci"])
+        self.assertEqual(len(reads), 1)
+        later = NOW + gg.HEAD_RUNS_REREAD + 5
+        feed = {"liveSince": NOW - 7200, "okAt": later - 1, "fedRepos": {"o/r": later - 1}, "marks": {}}
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, feed)
+        self.assertEqual(gg.head_runs_unfinished(key, data, later, get), ["ci"], "a quiet head: the answer stands")
+        self.assertEqual(len(reads), 1)
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, {**feed, "marks": {f"sha:o/r@{head}": NOW + 3}})
+        gg.head_runs_unfinished(key, data, later, get)
+        self.assertEqual(len(reads), 2, "a run event for the head after the answer: read again")
+        gg.head_runs_path(key).unlink()
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, feed)
+        self.assertIsNone(gg.head_runs_unfinished(key, data, NOW, lambda repo, paths: {p: "HTTP 502" for p in paths}))
+        gg.head_runs_unfinished(key, data, later, get)
+        self.assertEqual(len(reads), 3, "a failed read is never kept past HEAD_RUNS_REREAD")
+
     def test_hq13397_jobs_queued_past_the_bound_are_inconclusive(self) -> None:
         """The same head read 30+ minutes on: 3 finished, 7 queued check runs with no runner. Never success."""
         data, get = self.head(13397, ["Socket Security: Pull Request Alerts", "CodeRabbit",
@@ -50503,6 +50530,42 @@ class LandCarryTest(unittest.TestCase):
             gg.land_carry("manaflow-ai/glaeda", 43, "")
         self.assertIn("no approving review", str(said.exception))
         self.assertEqual(len(calls), 1)
+
+
+class MergeTrainTurnAway(unittest.TestCase):
+    """cmux#59074 at a3d4b1e0, 2026-11-27: 173 checks passed and the merge train posted `merge-train` error "not
+    seated: ...", its turn-away, whose fallback is the base merge and then the land. cmux-gh status said "failed:
+    merge-train" and land refused it as a red. The turn-away is "awaiting train / fallback", never failed
+    (cmuxterm-hq docs/handbook/merge-train-turn-away.md)."""
+
+    SAID = ("not seated: train T11270439-f0a5ca4 took 2 seats, the next no sooner than 05:39Z; "
+            "its base merge runs now (update_branch)")
+
+    def data(self, conclusion: str = "ERROR") -> dict:
+        train = {"name": "merge-train", "workflow": None, "status": "COMPLETED", "conclusion": conclusion,
+                 "url": "https://ci/merge-train", "description": self.SAID}
+        green = {"name": "tests", "workflow": "CI", "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "url": "https://ci/tests"}
+        return {"checks": [green, train]}
+
+    def test_the_turn_away_is_fallback_not_failed(self) -> None:
+        groups = gg.classify(self.data(), NOW, gg.RESCUE_GRACE)
+        self.assertEqual(groups["failed"], [])
+        self.assertEqual([c["name"] for c in groups["fallback"]], ["merge-train"])
+        self.assertTrue(gg.merge_train_turned_away(self.data()["checks"][1]))
+        self.assertNotEqual(gg.check_verdict(self.data(), "green", NOW), gg.EXIT_FAIL)
+
+    def test_a_train_failure_stays_failed(self) -> None:
+        groups = gg.classify(self.data("FAILURE"), NOW, gg.RESCUE_GRACE)
+        self.assertEqual([c["name"] for c in groups["failed"]], ["merge-train"])
+        self.assertEqual(groups["fallback"], [])
+        self.assertEqual(gg.check_verdict(self.data("FAILURE"), "green", NOW), gg.EXIT_FAIL)
+
+    def test_a_workflow_job_named_merge_train_in_error_stays_failed(self) -> None:
+        data = self.data()
+        data["checks"][1]["workflow"] = "CI"
+        self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["merge-train"])
+
 
 if __name__ == "__main__":
     unittest.main()
