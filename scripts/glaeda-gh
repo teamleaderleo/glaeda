@@ -19381,7 +19381,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
+                     waitBudget=None, afterStopped=None, afterUnqueued=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
                      lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
@@ -22861,6 +22861,10 @@ class LandQueue:
                           "(its land entry aged out)",
                           f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
                 return True
+            if ae is None and self.after_unqueued(e, a):
+                return True
+            if ae is not None and (e.get("afterUnqueued") or {}).get("key") == a:
+                e.pop("afterUnqueued", None)  # queued now: its own land bounds this wait
             pending.append(a)
         if stopped and self.after_stopped(e, *stopped):
             return True
@@ -22878,6 +22882,26 @@ class LandQueue:
             self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
             self.save(e)
         return False
+
+    def after_unqueued(self, e: dict, a: str) -> bool:
+        """E lands after A, which is open with no land row here: nothing would ever merge it, end it or stop it, so E
+        waited with no bound (cmux#45065 after #45002, open and idle since 11-22: 24 h waiting_after on cmux-cp-1 until
+        the forward give-up stopped it forward_no_outcome, naming neither). E waits LAND_AFTER_STOPPED_WAIT from the
+        first pass that sees A unqueued, then stops after_unqueued naming A and both ways on. True when E stopped."""
+        mark = e.get("afterUnqueued") or {}
+        if mark.get("key") != a:
+            e["afterUnqueued"] = {"key": a, "since": self.now}
+            self.history(e, "after_unqueued_waiting", after=a)
+            self.save(e)
+            return False
+        if self.now - float(mark.get("since") or self.now) < LAND_AFTER_STOPPED_WAIT:
+            return False
+        self.stop(e, "after_unqueued",
+                  f"{key_name(a)}, which it lands after, stayed open with no land queued for "
+                  f"{LAND_AFTER_STOPPED_WAIT:.0f} s",
+                  f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}, "
+                  f"or glaeda-gh land {key_name(e['key'])} without --after")
+        return True
 
     def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
         """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester

@@ -13912,6 +13912,41 @@ class GateTest(unittest.TestCase):
                         lsof.return_value = set()
                         self.assertIsNone(gate.claimed())
 
+    def test_a_waiter_yielding_dedicated_runner_stays_off_while_the_yielding_fill_holds_the_lock(self) -> None:
+        """YIELDER_KEEPS_ITS_TURN, cmux15 2026-11-26 23:10Z: the fill took host.lock after its wait, the gate read the
+        yielding holder as a free host and the next seed preempted it. The hold is bounded per holder, logged once
+        past the bound, starts over for a new holder, and is off without --yield-to-waiters or on the nightly slot."""
+        for flags, held in ((" --yield-to-waiters", True), ("", False)):
+            with self.subTest(flags=flags):
+                write_hook(self.runner, f"exec python3 /hook job-started --dedicated-admit /x/a.sh{flags}\n")
+                gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                                 waiters=False)
+                logs: list[str] = []
+                with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                        mock.patch.object(hook, "yielding_pid", return_value=88), \
+                        mock.patch.object(hook, "process_identity", return_value="ps:a"), \
+                        mock.patch.object(hook, "gate_yields", return_value=True) as yields, \
+                        mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                        mock.patch.object(hook.time, "monotonic", return_value=1000.0) as clock:
+                    self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)" if held else None)
+                    if not held:
+                        self.assertEqual(yields.call_count, 0)
+                        continue
+                    clock.return_value += hook.GATE_YIELDER_MAX_HOLD_S - 1
+                    self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)")
+                    clock.return_value += 2
+                    self.assertIsNone(gate.claimed(), "past the bound the seeds come back")
+                    self.assertIsNone(gate.claimed())
+                    self.assertEqual(len(logs), 1, logs)
+                    self.assertIn("has held the host for", logs[0])
+                    with mock.patch.object(hook, "process_identity", return_value="ps:b"):
+                        self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)", "a new holder")
+                    yields.return_value = False  # the fill only waits behind someone else, or let go
+                    self.assertIsNone(gate.claimed())
+                    yields.return_value = True
+                    gate.nightly_slot = True
+                    self.assertIsNone(gate.claimed(), "the nightly slot listens through it")
+
     def test_a_waiter_seen_during_a_job_stops_a_waiter_yielding_dedicated_listener_as_the_job_ends(self) -> None:
         """A seed job that ends while the fill's slot waits must not hand the next seed to the same listener."""
         for flags, stopped in ((" --yield-to-waiters", True), ("", False)):
@@ -20570,6 +20605,105 @@ class DedicatedRunnerTest(unittest.TestCase):
         broken = relay("10.0.0.9", "172.20.1.5")
         self.assertEqual(broken.returncode, 2)
         self.assertEqual(calls.read_text().splitlines(), ["-G 5 -w 900 10.0.0.9 22"], "a connected session ends it")
+
+    def test_a_lan_relay_follow_tries_the_nodes_own_lan_endpoints_before_the_declared_addresses(self) -> None:
+        """LAN_RELAY_FOLLOW: a DHCP lease moves, so a declared list breaks and the next device on an old lease answers
+        there. With lanRelayFollow the relay asks tailscaled for the declared node, checks its stable ID, and tries the
+        node's own IPv4 endpoints inside the declared private prefix first, on lanRelay's port, then the declared
+        addresses. A wrong node, an endpoint outside the prefix or one that is not an IPv4 address is never tried."""
+        route = {"name": "fleet-route", "repo": "manaflow-ai/cmuxterm-hq", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/cmuxterm-hq", "admit": ["/usr/bin/true"],
+                 "labels": ["glaeda-hq-fleet-route", "glaeda-runner-mini-std-fleet-route"],
+                 "lanRelay": ["172.20.1.6:22", "172.20.1.5:22"]}
+        follow = {"tailnetIp": "100.100.1.2", "node": "nTESTNODE1CNTRL", "within": "172.20.1.0/24"}
+
+        def manifest_doc(entry: dict) -> dict:
+            doc = dedicated_manifest(entry)
+            doc["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+            return doc
+
+        good, why = fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelayFollow": follow}), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(good[0]["lanRelayFollow"], follow)
+        self.assertIsNone(fleet_labels.dedicated_runners(manifest_doc(route), "mini-std")[0][0]["lanRelayFollow"])
+        self.assertEqual(fleet_labels.follow_prefix("172.20.1.0/24"), "172.20.1.")
+        self.assertEqual(fleet_labels.follow_prefix("10.0.0.0/8"), "10.")
+        bare = {k: v for k, v in route.items() if k != "lanRelay"}
+        for entry, needle in (({**bare, "lanRelayFollow": follow}, "needs lanRelay"),
+                              ({**route, "lanRelayFollow": {**follow, "extra": 1}}, "{tailnetIp, node, within}"),
+                              ({**route, "lanRelayFollow": "100.100.1.2"}, "{tailnetIp, node, within}"),
+                              ({**route, "lanRelayFollow": {**follow, "tailnetIp": "172.20.1.5"}}, "100.64.0.0/10"),
+                              ({**route, "lanRelayFollow": {**follow, "node": "n;rm -rf"}}, "stable ID"),
+                              ({**route, "lanRelayFollow": {**follow, "within": "172.20.1.0/23"}}, "one of 8, 16, 24"),
+                              ({**route, "lanRelayFollow": {**follow, "within": "172.20.1.7/24"}}, "one of 8, 16, 24"),
+                              ({**route, "lanRelayFollow": {**follow, "within": "8.8.8.0/24"}}, "RFC 1918"),
+                              ({**route, "lanRelayFollow": {**follow, "within": "172.0.0.0/8"}}, "RFC 1918")):
+            with self.subTest(entry=entry.get("lanRelayFollow")):
+                self.assertIn(needle, fleet_labels.dedicated_runners(manifest_doc(entry), "mini-std")[1] or "")
+
+        # the plist: the follow loop, its fixed arguments, then the declared addresses in order
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest_doc({**route, "lanRelayFollow": follow})))
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.fleet-route"
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                  "--dedicated", "fleet-route")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        relay = plistlib.loads((self.home / f"Library/LaunchAgents/{label}.relay.plist").read_bytes())
+        self.assertEqual(relay["ProgramArguments"],
+                         ["/bin/sh", "-c", cr.LAN_RELAY_FOLLOW_LOOP, "glaeda-lan-relay", str(cr.LAN_RELAY_CONNECT_S),
+                          str(cr.LAN_RELAY_IDLE_S), "22", "100.100.1.2", "nTESTNODE1CNTRL", "172.20.1.",
+                          cr.LAN_RELAY_TAILSCALED, "172.20.1.6", "172.20.1.5"])
+        self.assertNotIn("EnvironmentVariables", relay)
+        for word in ("172.", "100.", "CNTRL"):
+            self.assertNotIn(word, cr.LAN_RELAY_FOLLOW_LOOP, "addresses and the node are arguments, never script text")
+
+        # the loop, with fakes for Apple's curl, plutil and nc
+        calls = self.home / "nc-calls"
+        whois = self.home / "whois.json"
+        fakes = {"/usr/bin/nc": "#!/bin/sh\n"
+                                f'echo "$*" >> {shlex.quote(os.fspath(calls))}\n'
+                                'case "$5" in 172.20.1.77) cat; exit 0 ;; *) exit 1 ;; esac\n',
+                 "/usr/bin/curl": f"#!/bin/sh\ncat {shlex.quote(os.fspath(whois))} 2>/dev/null || exit 7\n",
+                 "/usr/bin/plutil": "#!/usr/bin/env python3\n"
+                                    "import json, sys\n"
+                                    "v = json.load(sys.stdin)\n"
+                                    "for k in sys.argv[2].split('.'):\n"
+                                    "    v = v[int(k)] if isinstance(v, list) else v[k]\n"
+                                    "if v is None: sys.exit(1)\n"
+                                    "print(len(v) if isinstance(v, list) else v)\n"}
+        loop = cr.LAN_RELAY_FOLLOW_LOOP
+        for real, text in fakes.items():
+            fake = self.home / ("fake-" + Path(real).name)
+            fake.write_text(text)
+            fake.chmod(0o755)
+            loop = loop.replace(real, os.fspath(fake))
+        self.assertNotIn("/usr/bin/", loop)
+
+        def run(node: str | None, endpoints: list[str] | None) -> tuple[int, bytes, list[str]]:
+            calls.unlink(missing_ok=True)
+            whois.unlink(missing_ok=True)
+            if node is not None:
+                whois.write_text(json.dumps({"Node": {"StableID": node, "Endpoints": endpoints}}))
+            done = subprocess.run(["/bin/sh", "-c", loop, "glaeda-lan-relay", "5", "900", "22", "100.100.1.2",
+                                   "nTESTNODE1CNTRL", "172.20.1.", "/nonexistent.sock", "172.20.1.6", "172.20.1.5"],
+                                  input=b"SSH-2.0-client\r\n", capture_output=True, timeout=30)
+            return done.returncode, done.stdout, calls.read_text().splitlines() if calls.exists() else []
+
+        moved = ["203.0.113.9:41641", "172.20.1.77:41641", "[fd00::1]:41641", "192.168.2.1:41641",
+                 "172.20.10.1:41641", "172.20.1.77:3478", "172.20.1.7;x:1"]
+        self.assertEqual(run("nTESTNODE1CNTRL", moved),
+                         (0, b"SSH-2.0-client\r\n", ["-G 5 -w 900 172.20.1.77 22"]),
+                         "the lease moved: the node's own LAN endpoint answers, and the client's bytes reach it")
+        self.assertEqual(run("nOTHERNODE9CNTRL", moved)[2], ["-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"],
+                         "another node's endpoints are never tried")
+        self.assertEqual(run(None, None), (1, b"", ["-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"]),
+                         "no tailscaled: the declared addresses, as before")
+        self.assertEqual(run("nTESTNODE1CNTRL", None)[2], ["-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"])
+        self.assertEqual(run("nTESTNODE1CNTRL", ["172.20.1.9:41641"])[2],
+                         ["-G 5 -w 900 172.20.1.9 22", "-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"])
 
     def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))

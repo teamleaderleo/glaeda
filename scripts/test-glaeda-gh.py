@@ -31193,6 +31193,21 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["next"], "glaeda-gh land o/r#2 && glaeda-gh land o/r#1 --after o/r#2")
         self.assertIn("o/r#2, which it lands after, stayed stopped (block", e["stop"]["reason"])
 
+    def test_an_after_pr_with_no_land_queued_stops_past_the_wait(self):
+        # cmux#45065 after #45002: #45002 stayed open with no land row anywhere, so #45065 waited_after with no bound
+        # until the forward give-up stopped it forward_no_outcome a day later, naming neither.
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land(after=["o/r#2"])
+        e = self.tick()
+        self.assertEqual((e["state"], e["afterUnqueued"]["key"]), ("waiting_after", "pr:o/r#2"))
+        e = self.tick(gg.LAND_AFTER_STOPPED_WAIT - 10)
+        self.assertEqual(e["state"], "waiting_after")
+        e = self.tick(20)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "after_unqueued"))
+        self.assertIn("o/r#2, which it lands after, stayed open with no land queued", e["stop"]["reason"])
+        self.assertIn("glaeda-gh land o/r#1 without --after", e["stop"]["next"])
+
     # The review of glaeda#2174: each of these left a land without a bound.
 
     def stop_o_r_2(self, why: str = "BLOCK") -> None:
