@@ -25936,12 +25936,30 @@ class LandQueue:
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
+    def merge_on_app(self, e: dict) -> bool:
+        """Whether `gh pr merge` of E goes out on the lander App (gh_app_token.py route says so): the App's token has its
+        own quota and no login's content-creation pause, so the pause never holds it. cmux#61194 and hq#32880 sat held
+        on the login's pause for over 30 min, 2026-11-27 (Leo: "aren't we using mosly the quota goblin pool intead of
+        my persoal login?"). A refusal of the App falls back to the login's shim, which parks it as before.
+        GLAEDA_APP_CREATES=0 turns it off. Detector: test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause."""
+        tool = app_pool_tool()
+        if not tool or not app_creates_on():
+            return False
+        try:
+            got = run_bounded([sys.executable, "-I", str(tool), "route", "pr", "merge", str(e["number"]), "-R",
+                               str(e["repo"])], timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return got.returncode == 0 and got.stdout.split("\t", 1)[0].strip() == "lander"
+
     def held_by_create_pause(self, e: dict, kind: str, head: str) -> bool:
         """Whether the login's create pause holds KIND at HEAD now (create_pause): then E is parked until it ends, as
         the shim's own refusal would park it (park_quota on its words), and nothing is sent. Never counted toward a
         stop, nor is the judgment after it (stepQuotaParked)."""
         until = self.create_pause(self.now)
         if until <= self.now:
+            return False
+        if kind == "merge" and self.merge_on_app(e):
             return False
         with self.lock:
             self.history(e, "step_held", kind=kind, head=head[:12], why="the login's create pause")

@@ -28958,6 +28958,30 @@ class LandTest(Base):
             self.tick(e["wakeAt"] - self.t + 1)
             self.assert_merged_at(LA)
 
+    def test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause(self):
+        # Before: green cmux#61194 and hq#32880 were held 30+ min by the login's create pause although `pr merge` is a
+        # lander write. After: gh_app_token.py route says lander, so the merge goes out at once.
+        root = Path(self.tmp.name) / "pause"
+        root.mkdir()
+        cmd = root / "content-pause-cmd"
+        cmd.write_text(f'#!/bin/sh\necho \'{{"blocked_until": {NOW + 3000}, "level": 3}}\'\n')
+        cmd.chmod(0o755)
+        tool = Path(self.tmp.name) / "gh_app_token.py"
+        tool.write_text("")
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "route" not in argv:
+                return real(argv, timeout, **kw)
+            return subprocess.CompletedProcess(argv, 0, "lander\tpr merge is a lander write\thold\n", "")
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}), \
+                mock.patch.object(gg, "app_pool_tool", return_value=tool), \
+                mock.patch.object(gg, "run_bounded", side_effect=run):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+            self.assert_merged_at(LA)
+
     def test_wait_pr_then_merge(self):
         self.pr(LA)
         self.land()
