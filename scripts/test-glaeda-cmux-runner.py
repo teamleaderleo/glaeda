@@ -18859,7 +18859,7 @@ class RunnerTest(unittest.TestCase):
         """LIVE_ROLE, 2026-11-27 12:26-13:14Z: cmux14-glaeda-16 held the gateway label while its hook ran --sim-runner
         and refused every gateway job. With no relabel, the hook follows the role label it is registered with."""
         def ctx(**roles):
-            return types.SimpleNamespace(gateway_runner=False, sim_runner=False, small_runner=False, **roles)
+            return types.SimpleNamespace(**{"gateway_runner": False, "sim_runner": False, "small_runner": False, **roles})
         stuck = ctx(sim_runner=True)
         note = cr.role_from_labels(stuck, ["self-hosted", "glaeda-mini", "glaeda-gateway-xcode-26.6"])
         self.assertEqual((stuck.gateway_runner, stuck.sim_runner, stuck.small_runner), (True, False, False))
