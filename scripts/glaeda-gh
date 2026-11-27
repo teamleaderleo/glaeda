@@ -17522,6 +17522,23 @@ LAND_LATE_WHY_EVERY = 60.0
 LAND_FORWARD_QUIET = LAND_DUE_LATE
 LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before giving up on it, telling nobody
 LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)  # a due-late row's reason is rewritten at most this often (note_late)
+# A cached read that never lands was the end of it: forward_quiet read=False told=False, and the row sat until the
+# give-up. 2026-11-27, two lands: manaflow-ai/cmux#60557 (53 min) and one in a private repo (~45 min) ended
+# their history on exactly that; on #60557 the far queue's own bot had merged the base into the branch at 06:13Z, so
+# the pinned head was stale, the far queue could never merge it, and a re-pin by hand landed it in minutes. Now a
+# missed cached read is followed by a direct read of the PR (forward_direct_reads: self.refresh, what a land's own
+# refresh reads, as `glaeda-gh wait` reads when its data goes stale), off the lock. An open PR whose live head is not
+# the pin is then read once more (its head commit: parents, author, committer; LAND_COMMIT_WHO_JQ): the queue's own
+# base update of the pin (a merge with the pin among its parents, made by a LAND_QUEUE_BOTS login) is re-pinned and
+# landed again (forward_reland), anything else tells the requester once, with the exact `--sha LIVE` command. Merged
+# or closed says nothing. A direct read that fails is tried LAND_FORWARD_DIRECT_TRIES times, LAND_FORWARD_DIRECT_EVERY
+# apart, before the old unread record (the give-up still reads it live). Still one fyi per PR (forwardQuietTold).
+LAND_FORWARD_DIRECT_TRIES = 3
+LAND_FORWARD_DIRECT_EVERY = 120.0
+# The logins whose base merge on a pinned head is this queue's own update (author or committer of the head commit);
+# land.json "queueBots" (a list of logins) adds more.
+LAND_QUEUE_BOTS = frozenset({"cmux-agents-lander[bot]"})
+LAND_COMMIT_WHO_JQ = '{p: [.parents[]?.sha], a: (.author.login // ""), c: (.committer.login // "")}'
 # A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
 # ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
 # slot held past it is seen where it is held, not only as a due count growing behind it. A lane VM,
@@ -19152,6 +19169,10 @@ class LandQueue:
         self.forward_reading: set[str] = set()
         self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
+        # forwards_unjudged's rows whose cached read missed or whose live head is not the pin (forward_direct_reads)
+        self.forward_direct_due: list[str] = []
+        self.forward_direct: set[str] = set()  # keys whose direct read is in flight
+        self.forward_direct_thread: threading.Thread | None = None
         self.stop_reading: set[str] = set()  # stopped keys whose PR state is read live (stops_settle)
         self.stop_load_unread: set[str] = set()  # keys loaded stopped, not yet read once (LAND_STOP_SETTLE)
         self.stop_state_thread: threading.Thread | None = None
@@ -20280,12 +20301,14 @@ class LandQueue:
         only a read that shows it still open tells its requester, once per PR (forwardQuietTold), as an fyi; a read
         that never lands tells nobody (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
         self.forward_reads = 0
+        self.forward_direct_due = []
         for key in [k for k, e in self.entries.items() if e.get("state") == LAND_FORWARDED and k not in self.jobs]:
             try:
                 with self.lock:
                     self.forward_unjudged(self.entries[key])
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.forward_direct_reads(self.forward_direct_due)
 
     def forwarded_at(self, e: dict) -> float:
         """When E was forwarded: its first forward (forwardFirst, which a re-send this host makes by itself keeps:
@@ -20299,7 +20322,8 @@ class LandQueue:
         return 0.0
 
     def forward_unjudged(self, e: dict) -> None:
-        """Under the lock. forwards_unjudged for one row."""
+        """Under the lock. forwards_unjudged for one row: an ended PR says nothing, an open one at its pin tells, and a
+        missed cached read or a live head that is not the pin goes to forward_direct_reads."""
         since = self.forwarded_at(e)
         if not since or self.now - since < LAND_FORWARD_QUIET:
             return
@@ -20307,10 +20331,12 @@ class LandQueue:
             return  # past the give-up its PR is read and settled, telling nobody when it ended (forward_settle)
         quiet = e.get("forwardQuiet") or {}
         if float(quiet.get("since") or 0) == since:
-            return  # this forward was told (or seen ended, or its read given up on) once
+            return  # this forward was told (or seen ended, re-pinned, or its read given up on) once
         if e.get("forwardQuietTold") or quiet.get("to"):
             return  # this PR's requester was told once (a "to" is a tell from before forwardQuietTold): never again
         key = e["key"]
+        if key in self.forward_direct:
+            return  # its direct read is in flight
         c = self.cache_of(key) or {}
         data = c.get("data") or {}
         at = c.get("dataAt")
@@ -20332,32 +20358,186 @@ class LandQueue:
                 return
             if self.now - peeked < LAND_FORWARD_READ_WAIT:
                 return  # the one read is asked; tell once it lands
-            # its wait is out and nothing here read the PR: no word on a state nobody read (forward_follow's
-            # give-up reads it live, ends a merged or closed one quietly and lands an open one again)
-            e["forwardQuiet"] = {"since": since, "at": self.now, "unread": True}
-            self.history(e, "forward_quiet", waited=round(self.now - since), read=False, told=False)
-            self.save(e)
-            log({"event": "land-forward-quiet", "key": key, "waited": round(self.now - since), "read": False,
-                 "told": False})
+            d = e.get("forwardQuietDirect") or {}
+            if float(d.get("since") or 0) == since and self.now - float(d.get("at") or 0) < LAND_FORWARD_DIRECT_EVERY:
+                return  # its last direct read failed a moment ago: the next try waits
+            self.forward_direct_due.append(key)  # the cached read missed: read the PR directly
             return
         if state != "OPEN":
             return  # a copy that names no state says nothing to tell
+        pin, live = self.forward_pin(e), str(data.get("headRefOid") or "").lower()
+        if SHA40.fullmatch(live) and SHA40.fullmatch(pin) and land_head_moved(pin, live):
+            self.forward_direct_due.append(key)  # whose head it is: a read of its commit says (forward_quiet_settle)
+            return
+        self.forward_quiet_tell(e, since, data, True)
+
+    def forward_pin(self, e: dict) -> str:
+        """The head E was handed off at (its pin), lowercased."""
+        return str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "").lower()
+
+    def forward_direct_reads(self, due: list[str]) -> None:
+        """Off the lock (inline: here): for each of the first LAND_FORWARD_READS keys in DUE, a direct read of its PR
+        when the cached one missed (self.refresh), then, when it reads open at a head that is not the pin, one read of
+        that head's commit (commit_who), each settled under the lock (forward_quiet_settle)."""
+        if not due or (self.forward_direct_thread is not None and self.forward_direct_thread.is_alive()):
+            return
+        picked = due[:LAND_FORWARD_READS]
+        token = {}
+        for k in picked:
+            e = self.entries[k]
+            token[k] = (e.get("gen"), self.forwarded_at(e), self.forward_pin(e), e["repo"])
+        self.forward_direct = set(picked)
+
+        def read_all() -> None:
+            try:
+                for key in picked:
+                    try:
+                        gen, since, pin, repo = token[key]
+                        c = self.cache_of(key) or {}
+                        at = c.get("dataAt")
+                        why, direct = None, False
+                        if not (isinstance(at, (int, float)) and not isinstance(at, bool)) \
+                                or float(at) < since + LAND_FORWARD_QUIET:
+                            direct = True
+                            why = self.refresh(key)
+                            c = self.cache_of(key) or {}
+                            at = c.get("dataAt")
+                        data = dict(c.get("data") or {})
+                        fresh = why is None and isinstance(at, (int, float)) and not isinstance(at, bool) \
+                            and float(at) >= since and bool(data.get("state"))
+                        live = str(data.get("headRefOid") or "").lower()
+                        who = None
+                        if fresh and data.get("state") == "OPEN" and SHA40.fullmatch(live) and SHA40.fullmatch(pin) \
+                                and land_head_moved(pin, live):
+                            who = self.commit_who(repo, live)
+                        with self.lock:
+                            e = self.entries.get(key)
+                            if e is not None and (e.get("gen"), self.forwarded_at(e)) == (gen, since):
+                                self.forward_quiet_settle(e, since, data if fresh else None,
+                                                          why or ("" if fresh else "the read named no state"),
+                                                          who, direct)
+                    except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                        log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                    finally:
+                        self.forward_direct.discard(key)
+            finally:
+                self.forward_direct = set()
+
+        if self.inline:
+            read_all()
+        else:
+            self.forward_direct_thread = threading.Thread(target=read_all, name="land-forward-direct", daemon=True)
+            self.forward_direct_thread.start()
+
+    def commit_who(self, repo: str, sha: str) -> dict | None:
+        """Off the lock. SHA's parents and its author's and committer's logins ({"p", "a", "c"}), or None: unread."""
+        gh = self.gh()
+        if gh is None:
+            return None
+        got = self.call([gh, "api", f"repos/{repo}/commits/{sha}", "--jq", LAND_COMMIT_WHO_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        if not isinstance(doc, dict) or not isinstance(doc.get("p"), list):
+            return None
+        return {"p": [str(p).lower() for p in doc["p"]], "a": str(doc.get("a") or ""), "c": str(doc.get("c") or "")}
+
+    def queue_bots(self) -> frozenset[str]:
+        extra = (self.config() or {}).get("queueBots")
+        return LAND_QUEUE_BOTS | frozenset(str(b).lower() for b in extra if isinstance(b, str)) \
+            if isinstance(extra, list) else LAND_QUEUE_BOTS
+
+    def own_base_update(self, pin: str, who: dict | None) -> bool:
+        """Whether WHO (commit_who of a head) is this queue's own base update of PIN: a merge (two parents or more)
+        with PIN among its parents, authored or committed by a LAND_QUEUE_BOTS login."""
+        if not who or len(who.get("p") or []) < 2 or pin not in who["p"]:
+            return False
+        bots = {b.lower() for b in self.queue_bots()}
+        return str(who.get("a") or "").lower() in bots or str(who.get("c") or "").lower() in bots
+
+    def forward_quiet_settle(self, e: dict, since: float, data: dict | None, why: str, who: dict | None,
+                             direct: bool) -> None:
+        """Under the lock. forward_direct_reads' answer for forwarded E (DATA: the PR as read, None: unread, WHY why).
+        Merged or closed: nothing said. Open at the pin: told once (forward_quiet_tell). Open at another head: this
+        queue's own base update of the pin re-pins and lands it again (forward_reland), any other head tells once
+        with `--sha LIVE`. Unread LAND_FORWARD_DIRECT_TRIES times: the unread record, as before."""
+        if e["state"] != LAND_FORWARDED or float((e.get("forwardQuiet") or {}).get("since") or 0) == since \
+                or e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"):
+            return
+        key = e["key"]
+        if data is None:
+            d = e.get("forwardQuietDirect") or {}
+            n = (int(d.get("n") or 0) if float(d.get("since") or 0) == since else 0) + 1
+            e["forwardQuietDirect"] = {"since": since, "at": self.now, "n": n, "why": land_trim(why, 160)}
+            self.history(e, "forward_quiet_unread", n=n, why=land_trim(why, 160))
+            if n < LAND_FORWARD_DIRECT_TRIES:
+                self.save(e)
+                return
+            # no read of the PR at all: no word on a state nobody read (forward_follow's give-up reads it live)
+            e["forwardQuiet"] = {"since": since, "at": self.now, "unread": True}
+            self.history(e, "forward_quiet", waited=round(self.now - since), read=False, told=False, direct=n)
+            self.save(e)
+            log({"event": "land-forward-quiet", "key": key, "waited": round(self.now - since), "read": False,
+                 "told": False, "direct": n})
+            return
+        state = str(data.get("state") or "")
+        if state in ("MERGED", "CLOSED"):
+            e["forwardQuiet"] = {"since": since, "at": self.now, "ended": state, "direct": direct}
+            self.save(e)
+            log({"event": "land-forward-quiet", "key": key, "ended": state, "direct": direct})
+            return
+        if state != "OPEN":
+            return
+        pin, live = self.forward_pin(e), str(data.get("headRefOid") or "").lower()
+        if SHA40.fullmatch(live) and SHA40.fullmatch(pin) and land_head_moved(pin, live) \
+                and self.own_base_update(pin, who):
+            host = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
+            waited = round(self.now - since)
+            e["forwardQuiet"] = {"since": since, "at": self.now, "repinned": live, "pin": pin, "direct": direct}
+            self.history(e, "forward_quiet", repinned=live[:12], pin=pin[:12], waited=waited, read=True,
+                         told=False, direct=direct)
+            log({"event": "land-forward-quiet", "key": key, "repinned": live, "pin": pin, "waited": waited,
+                 "direct": direct})
+            self.forward_reland(e, live, host, land_executor(self.config()) is not None,
+                                why=f"{host} held it pinned at {pin[:12]}, and the queue's own base update made "
+                                    f"{live[:12]} on it: re-pinned there and landed here again")
+            return
+        self.forward_quiet_tell(e, since, data, True, who=who, direct=direct)
+
+    def forward_quiet_tell(self, e: dict, since: float, data: dict, read: bool, who: dict | None = None,
+                           direct: bool = False) -> None:
+        """Under the lock. Tell E's requester once per PR (forwardQuietTold) that its forward has no verdict and its
+        PR reads open, with the command that queues it again pinned at the live head."""
+        key = e["key"]
         to = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
-        head = str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "")
+        head = self.forward_pin(e)
         live = str(data.get("headRefOid") or "").lower()
         mins = round((self.now - since) / 60)
+        moved = bool(SHA40.fullmatch(live) and SHA40.fullmatch(head) and land_head_moved(head, live))
         seen = f"the PR still reads open at {live[:12]}" if live else "the PR still reads open"
         nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
-        e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read)}
-        e["forwardQuietTold"] = {"at": self.now, "since": since, "to": to}
-        self.history(e, "forward_quiet", to=to, head=head[:12], waited=round(self.now - since), read=bool(read))
+        e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read),
+                             **({"live": live} if moved else {}), **({"direct": True} if direct else {})}
+        e["forwardQuietTold"] = {"at": self.now, "since": since, "to": to, **({"live": live} if moved else {})}
+        self.history(e, "forward_quiet", to=to, head=head[:12], waited=round(self.now - since), read=bool(read),
+                     **({"live": live[:12]} if moved else {}), **({"direct": True} if direct else {}))
         self.save(e)
         log({"event": "land-forward-quiet", "key": key, "to": to, "head": head, "waited": round(self.now - since),
-             "read": bool(read), "state": state or None})
-        self.notify(e, e.get("requester") or "",
-                    f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago"
+             "read": bool(read), "state": str(data.get("state") or "") or None, **({"live": live} if moved else {}),
+             **({"direct": True} if direct else {})})
+        if moved:
+            by = (who or {}).get("a") or (who or {}).get("c") or ""
+            why = (f"its head moved from the pinned {head[:12]} to {live[:12]}"
+                   + (f" ({by}'s commit, not this queue's base update of the pin)" if by else "")
+                   + ", so the land pinned there cannot merge; re-pin it at the live head")
+            text = (f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago at {head[:12]} and no verdict has "
+                    f"come back: {why}: {nxt}")
+        else:
+            text = (f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago"
                     + (f" at {head[:12]}" if head else "") + f" and no verdict has come back ({seen}); "
-                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}",
+                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}")
+        self.notify(e, e.get("requester") or "", text,
                     cls=LAND_FORWARD_FYI_CLASS)  # an inbox fyi, never a blocker (notice-flood.md rule 1)
 
     def retire_ended(self) -> None:
@@ -21081,7 +21261,8 @@ class LandQueue:
             self.forward_give_up(e, "", host, executor, f"its state could not be read {fails} times: "
                                  f"{land_trim(why, 160)}")
 
-    def forward_reland(self, e: dict, head: str, host: str, executor: bool, bound: bool = False) -> None:
+    def forward_reland(self, e: dict, head: str, host: str, executor: bool, bound: bool = False,
+                       why: str = "") -> None:
         """Under the lock. E's PR is still open at HEAD past its give-up: this host lands it again itself, pinned at
         HEAD, as a fresh request from E's own requester (a new request id, so a far queue that holds the old one
         applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request).
@@ -21109,7 +21290,7 @@ class LandQueue:
         self.apply(req, e["key"], e["repo"], int(e["number"]))
         e = self.entries[e["key"]]
         e["forwardRelanded"] = {"at": self.now, "head": head, "n": n, "from": host}
-        why = f"still open with no outcome from {host} past the give-up: landed here again, pinned"
+        why = why or f"still open with no outcome from {host} past the give-up: landed here again, pinned"
         if bound:
             e["forwardBound"] = b
             e["forwardTakenBack"] = {"at": self.now, "head": head, "from": host, "far": far, "held": held_s}

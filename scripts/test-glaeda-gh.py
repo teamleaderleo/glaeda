@@ -36680,12 +36680,114 @@ class LandTest(Base):
         self.assertEqual(self.quiet_notices(), [])
         self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
         self.assertEqual(self.quiet_notices(), [])
+        # the cached read missed: a direct read of the PR is tried LAND_FORWARD_DIRECT_TRIES times (here it fails
+        # every time: fresh_head None) before the unread record
+        for _ in range(gg.LAND_FORWARD_DIRECT_TRIES - 1):
+            self.tick(gg.LAND_FORWARD_DIRECT_EVERY + 1)
+        self.assertEqual(self.w.refreshed.count(self.KEY), gg.LAND_FORWARD_DIRECT_TRIES)
         e = self.q.entries[self.KEY]
         self.assertTrue(e["forwardQuiet"]["unread"])
         self.assertNotIn("forwardQuietTold", e)
         for _ in range(3):
             self.tick(gg.LAND_FORWARD_QUIET)
         self.assertEqual(self.quiet_notices(), [])
+        self.assertEqual(self.w.refreshed.count(self.KEY), gg.LAND_FORWARD_DIRECT_TRIES)
+
+    # 2026-11-27: manaflow-ai/cmux#60557 (53 min) and a private repo's land (~45 min) ended on forward_quiet
+    # read=False told=False; on #60557 the far queue's own bot had merged the base into the branch, so the pin was
+    # stale and nothing could merge it. A missed cached read is followed by a direct read; an open PR at another
+    # head is re-pinned (the queue's own base update) or its requester told once with `--sha LIVE`.
+
+    def quiet_missed(self) -> float:
+        """Hand a land off at LA, let its one cached read go unanswered past LAND_FORWARD_READ_WAIT; the hand-off's
+        time."""
+        e = self.handed_off()
+        at = float(e.get("forwardFirst") or e["handedOff"]["at"])
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.assertEqual(self.w.refreshed, [], "no direct read before the cached one had its wait")
+        self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        return at
+
+    def test_a_forward_whose_cached_read_misses_is_read_directly_and_its_requester_told(self):
+        self.fresh_head = LA  # the direct read answers: still open at the pin
+        at = self.quiet_missed()
+        self.assertEqual(self.w.refreshed, [self.KEY], "one direct read")
+        [sent] = self.quiet_notices()
+        self.assertIn(f"still reads open at {LA[:12]}", sent[-1])
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.assertEqual(sent[sent.index("--class") + 1], "fyi")
+        e = self.q.entries[self.KEY]
+        self.assertTrue(e["forwardQuiet"]["direct"])
+        self.assertLessEqual(self.t - at, gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 30)
+        print(f"forward-quiet bound (miss, direct read, told): {round(self.t - at)} s", file=sys.stderr)
+
+    def test_a_forward_whose_head_is_the_queues_own_base_update_is_repinned_and_handed_off_again(self):
+        self.fresh_head = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(
+            {"p": [LA, LC], "a": "cmux-agents-lander[bot]", "c": "web-flow"})
+        reland = self.q.forward_reland
+
+        def judged_at_lb(*a, **k):
+            self.w.answers.append(ok_answer(LB))  # the re-landed row is judged in full here at the new head
+            return reland(*a, **k)
+        self.q.forward_reland = judged_at_lb
+        at = self.quiet_missed()
+        self.assertEqual(self.quiet_notices(), [], "a re-pin tells nobody")
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e.get("pinSha"), LB, e.get("history"))
+        self.assertTrue(any(h.get("event") == "forward_quiet" and h.get("repinned") == LB[:12]
+                            for h in e["history"]), e["history"])
+        self.assertIn(e["state"], ("queued", "judging", "forwarded"), "landed here again, pinned at the new head")
+        repinned = self.t
+        self.pr(LB)
+        for _ in range(10):
+            e = self.tick(30)
+            if e["state"] == "forwarded":
+                break
+        self.assertEqual((e["state"], e["handedOff"]["head"]), ("forwarded", LB))
+        self.assertEqual(json.loads(self.handoffs()[-1][4]).get("sha"), LB, "handed off again at the new head")
+        self.assertLessEqual(repinned - at, gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 30)
+        print(f"forward-quiet bound (miss, direct read, re-pin): {round(repinned - at)} s", file=sys.stderr)
+        self.tick(gg.LAND_FORWARD_QUIET - 120)
+        self.assertEqual(self.quiet_notices(), [], "the new hand-off's quiet clock starts at the re-pin")
+
+    def test_a_forward_whose_head_someone_else_moved_tells_once_with_the_live_sha(self):
+        self.fresh_head = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})
+        self.quiet_missed()
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", sent[-1])
+        self.assertIn(f"moved from the pinned {LA[:12]} to {LB[:12]}", sent[-1])
+        e = self.q.entries[self.KEY]
+        self.assertNotEqual(e.get("pinSha"), LB, "a push by someone else is never followed here")
+        self.assertEqual(e["forwardQuietTold"]["live"], LB)
+        for _ in range(4):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        e = self.q.entries[self.KEY]  # a new hand-off of the same PR is no new word either
+        e["handedOff"]["at"] = e["forwardFirst"] = self.t
+        e.pop("forwardQuiet")
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        self.assertEqual(len(self.quiet_notices()), 1, "once per PR")
+        # a base merge of the pin by a person (the Update branch button) is no queue's: told, not followed
+        self.assertFalse(self.q.own_base_update(LA, {"p": [LA, LC], "a": "someone", "c": "web-flow"}))
+        self.assertTrue(self.q.own_base_update(LA, {"p": [LA, LC], "a": "cmux-agents-lander[bot]", "c": "web-flow"}))
+        self.assertFalse(self.q.own_base_update(LA, {"p": [LA], "a": "cmux-agents-lander[bot]", "c": "web-flow"}))
+
+    def test_a_forward_whose_pr_merged_or_closed_on_the_direct_read_says_nothing(self):
+        for state in ("MERGED", "CLOSED"):
+            with self.subTest(state=state):
+                self.setUp()
+                self.q.refresh = lambda key, state=state: self.w.set_pr(key, land_pr(LB, state=state), self.t)
+                self.quiet_missed()
+                e = self.q.entries[self.KEY]
+                self.assertEqual(self.quiet_notices(), [])
+                self.assertEqual(e["forwardQuiet"]["ended"], state)
+                self.assertNotIn("forwardQuietTold", e)
+                self.assertEqual([c for c in self.w.gh_calls("api") if "/commits/" in c[1]], [], "no commit read")
+                for _ in range(3):
+                    self.tick(gg.LAND_FORWARD_QUIET)
+                self.assertEqual(self.quiet_notices(), [])
 
     def test_a_requeue_after_a_no_verdict_notice_hands_the_land_off_again(self):
         # The notice says "queue it again", but owner_refused saw the same head handed off before and marked the row
