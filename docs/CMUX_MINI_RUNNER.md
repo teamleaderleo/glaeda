@@ -1684,6 +1684,16 @@ declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, a
   only when it could not connect; a connected session ends the loop whatever its status). The addresses are
   arguments, never script text, and no name is resolved, so the trust stays these declared addresses of one host,
   one port. A single string, or a list of one, keeps plain nc.
+- A LAN address is a DHCP lease: when it moves, a declared list goes dark, and the next device on an old lease answers
+  there instead (ssh refuses its host key, so the route is lost, not trusted). Beside `lanRelay`, an entry may declare
+  `"lanRelayFollow": {"tailnetIp": "100.x.y.z", "node": "<stable node ID>", "within": "A.B.C.0/24"}`
+  (`LAN_RELAY_FOLLOW`). Per connection the relay's loop then asks the mini's own tailscaled (LocalAPI `whois` over
+  `/var/run/tailscaled.socket`, with Apple's `/usr/bin/curl`; nothing leaves the Mac) for that node, checks the
+  answer's stable ID, and tries first every IPv4 endpoint the node itself advertises inside `within` (a private /8, /16
+  or /24), on `lanRelay`'s one port; then the declared addresses, in order. Apple's `/usr/bin/plutil` reads the
+  JSON. An endpoint outside the prefix, or not digits and dots, is never tried; another node's answer, or no
+  tailscaled, leaves only the declared addresses. The trust stays one host's own addresses on one port inside one
+  private prefix, and ssh still checks the host key it pins.
 - Refused: any address outside RFC 1918, an entry without `trustedRef` (so a pull request's code never runs beside the
   relay), and a member without `runner.dedicatedOnly` (so no other runner of the same user shares the Mac).
 - `glaeda-cmux-runner-fleet --apply --hosts M` installs it. Dropping the key, or `--uninstall`, boots it out and

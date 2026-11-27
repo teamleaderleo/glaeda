@@ -799,11 +799,12 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
     """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, trustedRef, trustedRepo,
-    yieldToExclusive, yieldToWaiters, lanRelay, user}], None), or ([], why
+    yieldToExclusive, yieldToWaiters, lanRelay, lanRelayFollow, user}], None), or ([], why
     the member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
     floor, or None for the member's disk.min_free_gib. lanRelay is the private LAN "IPv4:port" the entry's relay
     agent forwards to (LAN_RELAY), the list of one host's adapter addresses on one port it tries in order
-    (LAN_RELAY_ADAPTERS), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for the
+    (LAN_RELAY_ADAPTERS), or None. lanRelayFollow is the host's tailnet node whose own advertised LAN endpoints the
+    relay tries first (LAN_RELAY_FOLLOW), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for the
     member's own user."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
@@ -827,7 +828,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "yieldToFleetBuild", "yieldToWaiters", "lanRelay", "user"})
+                                       "yieldToFleetBuild", "yieldToWaiters", "lanRelay", "lanRelayFollow",
+                                       "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -916,6 +918,9 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                                runner.get("dedicatedOnly") is True)
         if why:
             return [], why
+        follow, why = lan_relay_follow(entry.get("lanRelayFollow"), where, relay)
+        if why:
+            return [], why
         user = entry.get("user")
         if user is not None:
             owner = host.get("ssh_user") or manifest.get("ssh_user")
@@ -934,7 +939,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
                     "yieldToFleetBuild": fleet_yields, "yieldToWaiters": waits,
-                    "lanRelay": relay, "user": user})
+                    "lanRelay": relay, "lanRelayFollow": follow, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
@@ -957,6 +962,51 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
 # one port", and no name is ever resolved.
 LAN_RELAY_RE = r"((?:[0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})"
 LAN_RELAY_MAX = 4
+# LAN_RELAY_FOLLOW: a host's LAN address is a DHCP lease, so a declared list breaks each time the lease moves (or a
+# third adapter appears), and the next device to take an old lease answers there instead. "lanRelayFollow":
+# {"tailnetIp": "100.x.y.z", "node": "<stable node ID>", "within": "A.B.C.0/24"} makes the relay ask the mini's own
+# tailscaled, per connection, for that tailnet node (LocalAPI whois over its Unix socket), check the answer is the
+# declared stable node ID, and try first every IPv4 endpoint the node itself advertises inside the declared private
+# prefix (/8, /16 or /24), on lanRelay's one port; then lanRelay's declared addresses, in order, as before. The
+# destinations stay that one host's own addresses on one port inside one private prefix, and ssh still checks the
+# host key it pins, so a wrong device on an old lease is refused, never trusted. It needs lanRelay (its port and its
+# fallback when tailscaled cannot answer).
+LAN_RELAY_FOLLOW_PREFIXES = (8, 16, 24)
+STABLE_NODE_ID_RE = r"[A-Za-z0-9]{6,64}"
+
+
+def lan_relay_follow(value: Any, where: str, relay: Any) -> tuple[dict[str, str] | None, str | None]:
+    """({"tailnetIp", "node", "within"}, None) for a valid lanRelayFollow, (None, None) when absent, or (None, why)."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict) or set(value) != {"tailnetIp", "node", "within"}:
+        return None, f"{where}.lanRelayFollow must be {{tailnetIp, node, within}}"
+    if relay is None:
+        return None, f"{where}.lanRelayFollow needs lanRelay (its port, and the addresses it falls back to)"
+    ip = value["tailnetIp"]
+    octets = [int(x) for x in ip.split(".")] if isinstance(ip, str) and re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", ip) else []
+    if not octets or any(x > 255 for x in octets) or not (octets[0] == 100 and 64 <= octets[1] <= 127):
+        return None, f"{where}.lanRelayFollow.tailnetIp must be a tailnet (100.64.0.0/10) IPv4 address"
+    if not isinstance(value["node"], str) or not re.fullmatch(STABLE_NODE_ID_RE, value["node"]):
+        return None, f"{where}.lanRelayFollow.node must be the tailnet node's stable ID ({STABLE_NODE_ID_RE})"
+    within = value["within"]
+    match = re.fullmatch(r"((?:[0-9]{1,3}\.){3}[0-9]{1,3})/([0-9]{1,2})", within) if isinstance(within, str) else None
+    net = [int(x) for x in match.group(1).split(".")] if match else []
+    bits = int(match.group(2)) if match else -1
+    if (not match or any(x > 255 for x in net) or bits not in LAN_RELAY_FOLLOW_PREFIXES
+            or any(net[bits // 8:])):
+        return None, f"{where}.lanRelayFollow.within must be a network A.B.C.D/N with N one of 8, 16, 24"
+    if not (net[0] == 10 or (net[0] == 172 and 16 <= net[1] <= 31 and bits >= 16) or (net[0] == 192 and net[1] == 168
+                                                                                     and bits >= 16)):
+        return None, f"{where}.lanRelayFollow.within must lie inside RFC 1918"
+    return {"tailnetIp": ".".join(map(str, octets)), "node": value["node"],
+            "within": ".".join(map(str, net)) + f"/{bits}"}, None
+
+
+def follow_prefix(within: str) -> str:
+    """The dotted string prefix every address inside `within` starts with: "10.1.2.0/24" -> "10.1.2."."""
+    net, bits = within.split("/")
+    return ".".join(net.split(".")[: int(bits) // 8]) + "."
 
 
 def lan_relay_address(value: Any, where: str) -> tuple[str | None, str | None]:
