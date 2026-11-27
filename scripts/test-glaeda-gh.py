@@ -37322,6 +37322,19 @@ class LandTest(Base):
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
         self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
+    def test_a_coordinator_is_never_sent_a_no_verdict_or_elsewhere_fyi(self):
+        # claude-sr2-coord, 2026-11-27: 36 of the 340 messages in its inbox in 2 h were land fyis ("merged at",
+        # "was handed to cmux-cp-2 N min ago and no verdict"), none needing an act. A coordinator that queued the land
+        # still hears its stops and own merges (class block); an fyi stays in the log and `land status`.
+        with mock.patch.object(gg, "fleet_registries", lambda: [{"coordinators": {"current": "host/lane"}}]):
+            self.handed_off()
+            self.tick(gg.LAND_FORWARD_QUIET + 20)
+            self.pr(LA)
+            self.tick()
+            self.assertEqual(self.quiet_notices(), [], "a coordinator gets no no-verdict fyi")
+            self.assertTrue(gg.land_is_coordinator("HOST/lane"))
+            self.assertFalse(gg.land_is_coordinator("host/other"))
+
     def test_a_forward_told_it_had_no_verdict_gives_up_with_no_second_notice(self):
         e = self.handed_off()
         e["forwardQuietTold"] = {"at": self.t, "since": self.t, "to": "huge-blue"}

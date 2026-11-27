@@ -18596,6 +18596,18 @@ def land_requester(given: str | None) -> str:
     return land_requester_from(given)[0]
 
 
+def land_is_coordinator(name: str) -> bool:
+    """Whether NAME (HOST/SESSION) is a fleet coordinator: the registry's coordinators.current, .fleet or a desk member."""
+    if not name:
+        return False
+    names = {registry_coordinator("current").lower(), registry_coordinator("fleet").lower()}
+    for doc in fleet_registries():
+        coords = doc.get("coordinators")
+        desk = coords.get("desk") if isinstance(coords, dict) else None
+        names.update(str(d).lower() for d in desk or [] if isinstance(d, str))
+    return name.lower() in names - {""}
+
+
 def land_notify_target(e: dict, requester: str) -> str:
     """Use the queued session's parent when the caller did not record a requester.
 
@@ -28695,6 +28707,13 @@ class LandQueue:
         to = land_notify_target(e, to)
         if not wake:
             log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
+            return
+        if cls == LAND_FORWARD_FYI_CLASS and land_is_coordinator(to):
+            # A coordinator that queued a land acts on its stops and own merges (class block), never on "merged
+            # elsewhere" or "no verdict yet": 36 such fyis were 11% of its 340 messages in 2 h (2026-11-27). They stay
+            # in the log and `land status`.
+            log({"event": "land-notice-quiet", "key": e["key"], "to": to, "why": "coordinator fyi",
+                 "message": land_trim(message, 300)})
             return
         if not to:
             # Nobody to tell (no --notify, no session in the queuing environment): still never silent.
