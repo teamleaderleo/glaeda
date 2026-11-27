@@ -20122,6 +20122,27 @@ class DedicatedRunnerTest(unittest.TestCase):
         hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
         self.assertIn(" --yield-to-exclusive", (hooks / "job-started.sh").read_text())
 
+    def test_an_entry_that_yields_to_the_fleet_build_passes_the_opt_in_to_its_hook(self) -> None:
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertFalse(good[0]["yieldToFleetBuild"])
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToFleetBuild": True}),
+                                                   "mini-std")
+        self.assertIsNone(why)
+        self.assertTrue(good[0]["yieldToFleetBuild"])
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToFleetBuild": bad}),
+                                                        "mini-std")
+                self.assertIn("yieldToFleetBuild", why or "")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "yieldToFleetBuild": True}),
+                                  "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
+        self.assertIn(" --yield-to-fleet-build", (hooks / "job-started.sh").read_text())
+
     def test_an_entry_that_yields_to_waiters_passes_the_opt_in_to_its_hook(self) -> None:
         """YIELD_TO_WAITERS: cmux15's trusted-main declares yieldToWaiters, so its job-started hook carries
         --yield-to-waiters, which its listener gate reads; an entry without it is unchanged."""
@@ -20686,6 +20707,83 @@ class DedicatedHookTest(unittest.TestCase):
             for fd in fds:
                 os.close(fd)
         self.assertIsNone(hook.exclusive_claim(capacity))
+
+    def test_a_dedicated_runner_that_yields_to_the_fleet_build_waits_for_the_writers_slot(self) -> None:
+        # hq#25856, 2026-11-26: cmux15's trusted-main runner (no host lock) ran Seed DerivedData jobs back to back, and
+        # the CAS writer's slot took host.lock in each 8-10 s gap and lost it to the next seed: 0 puts in 6 h. With
+        # runner.dedicated yieldToFleetBuild (--yield-to-fleet-build) the job waits while a fleet build holds host.lock
+        # and does not yield; the fill's slot is spent when it marks <host.lock>.yield, and then the job goes ahead.
+        fleet = self.dir / "fleet"
+        fleet.mkdir(exist_ok=True)
+        lock = fleet / "host.lock"
+        lock.touch()
+        path = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/main"})
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        base = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--dedicated-admit", os.fspath(admit), "--host-lock", os.fspath(lock))
+        yielding = (*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "1")
+        self.assertIsNone(hook.fleet_build_hold(os.fspath(lock)))
+        result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+        fd = hook.lock_file(lock, fcntl.LOCK_EX)  # the writer's slot holds the host
+        try:
+            self.assertEqual(hook.fleet_build_hold(os.fspath(lock)), hook.FLEET_BUILD_HOLDS_HOST)
+            started = time.monotonic()
+            result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)  # the bound admits, never refuses
+            self.assertGreaterEqual(time.monotonic() - started, 1.0)
+            self.assertIn("starts nothing beside it (YIELD_TO_FLEET_BUILD)", result.stdout)
+            # without the opt-in (every other runner) nothing changes: no wait
+            result = self.run_hook(*base, repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+            # a spent slot (or a catch-up fill outside one) marks itself yielding: it stops for this job, no wait
+            (fleet / f"host.lock{hook.YIELD_SUFFIX}").write_text(f"{os.getpid()}\n")
+            self.assertIsNone(hook.fleet_build_hold(os.fspath(lock)))
+            result = self.run_hook(*(*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "30"),
+                                   repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("YIELD_TO_FLEET_BUILD", result.stdout)
+            (fleet / f"host.lock{hook.YIELD_SUFFIX}").unlink()
+            # the slot ends while the job waits: the job starts then, well inside its bound
+            threading.Timer(1.5, os.close, (fd,)).start()
+            fd = None
+            started = time.monotonic()
+            result = self.run_hook(*(*base, "--yield-to-fleet-build", "--fleet-build-yield-wait", "60"),
+                                   repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertLess(time.monotonic() - started, 30.0)
+            self.assertIn("waiting: a fleet build holds the host lock", result.stdout)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_a_fleet_build_yielding_runners_gate_stops_listening_through_the_writers_slot(self) -> None:
+        runner = self.dir / "actions-runner-glaeda-trusted-main"
+        (runner / cr.HOOK_DIR).mkdir(parents=True)
+        script = runner / cr.HOOK_DIR / "job-started.sh"
+        lock = self.dir / "host.lock"
+        lock.touch()
+        gate = hook.Gate(runner, os.fspath(lock), os.fspath(self.dir / "reservation.json"), self.dir / "state",
+                         waiters=False)
+        base = "#!/bin/bash\nexec python3 hook job-started --allowed-repo manaflow-ai/cmux --dedicated-admit /x/a.sh"
+        fd = hook.lock_file(lock, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(hook.Gate, "low_disk", return_value=None), \
+                    mock.patch.object(hook.Gate, "dedicated_toolchain", return_value=None):
+                script.write_text(base + "\n")
+                self.assertIsNone(gate.fleet_build_yield())  # no opt-in: the pool's holds never reach it
+                self.assertIsNone(gate.claimed())
+                script.write_text(base + " --yield-to-fleet-build\n")
+                self.assertEqual(gate.fleet_build_yield(), hook.FLEET_BUILD_HOLDS_HOST)
+                self.assertEqual(gate.claimed(), hook.FLEET_BUILD_HOLDS_HOST)
+                os.close(fd)
+                fd = None
+                self.assertIsNone(gate.claimed())
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def test_the_gate_never_holds_a_dedicated_runner_for_the_pool(self) -> None:
         runner = self.dir / "actions-runner-glaeda-nightly-next"

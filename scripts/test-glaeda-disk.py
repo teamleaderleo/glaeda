@@ -15997,6 +15997,74 @@ class LaneVmFamiliesTest(unittest.TestCase):
         self.age(checkout, hours)
         return checkout
 
+    def git_cache(self) -> Path:
+        root = self.base / "var-cache-cmux-git-cache"
+        patcher = mock.patch.object(gd, "GIT_CACHE_ROOT", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return root
+
+    def git_cache_mirror(self, root: Path, repo: str, hours: float, partial: dict[str, float] | None = None) -> Path:
+        mirror = root / "lane-vm/github.com" / repo
+        pack = mirror / "objects/pack"
+        pack.mkdir(parents=True)
+        (mirror / "HEAD").write_text("ref: refs/heads/main\n")
+        (pack / "pack-a.pack").write_bytes(b"p" * 8192)
+        (pack / "pack-a.idx").write_bytes(b"i" * 1024)
+        self.age(mirror, hours)
+        for name, age in (partial or {}).items():
+            (pack / name).write_bytes(b"t" * 4096)
+            os.utime(pack / name, (time.time() - age * 3600,) * 2)
+        return mirror
+
+    def test_the_git_cache_gives_back_its_left_partial_packs_any_run_and_its_mirrors_under_pressure(self) -> None:
+        # fs-agent-lane-24, 2026-11-26: 24G in /var/cache/cmux/git-cache, 7.9G of it tmp_pack_* a stopped fetch's
+        # index-pack left; cmux-disk counted it "unclassified" and found 0.0G reclaimable at 83%
+        self.assertEqual(self.lane(gd.GIT_CACHE_MIRRORS), [], "no cache, no family")
+        root = self.git_cache()
+        cmux = self.git_cache_mirror(root, "manaflow-ai/cmux.git", 4,
+                                     {"tmp_pack_left": 4.5, "tmp_pack_live": 0.1, ".tmp-9-pack-old.pack": 2,
+                                      "tmp_pack_open": 3})
+        served = self.git_cache_mirror(root, "manaflow-ai/ghostty.git", 4)
+        fresh = self.git_cache_mirror(root, "teamleaderleo/glaeda.git", 0.1)
+        (root / "crates/dl/serde").mkdir(parents=True)
+        (root / "crates/dl/serde/1.0.0.crate").write_bytes(b"c" * 2048)
+        self.age(root / "crates", 4)
+        fams = self.lane()
+        ids = {f.id for f in fams}
+        self.assertTrue({gd.GIT_CACHE_MIRRORS, gd.GIT_CACHE_CRATES, gd.GIT_CACHE_PARTIAL} <= ids, ids)
+        cache_fams = [f for f in fams if f.id.startswith("git-cache-")]
+        opened = [str(cmux / "objects/pack/tmp_pack_open"), str(served / "objects/pack/pack-a.pack")]
+        items = self.survey(cache_fams, opened)
+        # partial writes: any run, once nothing wrote them for an hour and nothing holds them
+        self.assertEqual(items["tmp_pack_left"].verdict, "reclaimable", items["tmp_pack_left"].reasons)
+        self.assertEqual(items[".tmp-9-pack-old.pack"].verdict, "reclaimable")
+        self.assertEqual(items["tmp_pack_live"].verdict, "recent")
+        self.assertEqual(items["tmp_pack_open"].verdict, "in-use")
+        self.assertNotIn("pack-a.pack", items, "a real pack is never a partial-write item")
+        # whole mirrors and the crates store: kept outside a pressure run
+        for name in ("cmux.git", "ghostty.git", "glaeda.git", "dl"):
+            self.assertEqual(items[name].verdict, "kept", (name, items[name].reasons))
+        self.apply(cache_fams, list(items.values()), opened)
+        self.assertFalse((cmux / "objects/pack/tmp_pack_left").exists())
+        self.assertFalse((cmux / "objects/pack/.tmp-9-pack-old.pack").exists())
+        for kept in ("tmp_pack_live", "tmp_pack_open", "pack-a.pack", "pack-a.idx"):
+            self.assertTrue((cmux / "objects/pack" / kept).exists(), kept)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = self.survey(cache_fams, opened)
+            self.assertEqual(items["cmux.git"].verdict, "in-use", "a process holds a file in it")
+            self.assertEqual(items["ghostty.git"].verdict, "in-use", "an upload-pack serving it holds its pack")
+            self.assertEqual(items["glaeda.git"].verdict, "recent")
+            self.assertEqual(items["dl"].verdict, "reclaimable", items["dl"].reasons)
+            self.apply(cache_fams, list(items.values()), opened)
+            self.assertTrue(cmux.exists() and served.exists() and fresh.exists())
+            self.assertFalse((root / "crates/dl").exists())
+            items = self.survey(cache_fams, [])  # nothing open now: the idle mirrors go, the fresh one stays
+            self.assertEqual(items["ghostty.git"].verdict, "reclaimable", items["ghostty.git"].reasons)
+            self.apply(cache_fams, list(items.values()), [])
+        self.assertFalse(served.exists())
+        self.assertTrue(fresh.exists())
+
     def test_an_idle_wt_worktrees_cargo_target_goes_and_a_live_worktrees_stays(self) -> None:
         # fs-agent-lane-2, 2026-11-22: 178G under ~/.wt that no family reached ("unwalked"), 0 B reclaimable
         idle = self.wt_checkout("lane--idle", 8)

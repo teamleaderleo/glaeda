@@ -9345,6 +9345,68 @@ def yield_to_exclusive(capacity_dir: Path, owner: Any, cap: float | None) -> tup
     return True, ""
 
 
+# YIELD_TO_FLEET_BUILD (hq#25856, 2026-11-26): the CAS writer mini's catch-up fill (hq build-fleet/catch-up/fill-main.py)
+# is the only process that puts into the fleet's compile cache. When it is owed a slot it waits for a gap with no
+# Runner.Worker, takes host.lock exclusively and builds for at most its SLOT_MAX_HOLD (20 min), yielding meanwhile only
+# to a job past glaeda's admission; a job that arrives meanwhile is to wait in job-started. A ledger runner does
+# (take_host_lock). A dedicated runner takes no host lock, so its jobs went straight past: cmux15's trusted-main runner
+# ran Seed DerivedData jobs back to back with 8-10 s gaps, the slot took the lock in a gap and lost it to the next
+# seed (07:58:48Z, 08:17:22Z), and the store took 0 puts in 6 h. A runner.dedicated entry with yieldToFleetBuild
+# (--yield-to-fleet-build) therefore waits in job-started while a fleet build holds host.lock exclusively and has not
+# marked itself yielding (<host.lock>.yield: its slot is spent, and it stops for this job). The fill's own bound ends
+# the wait; YIELD_TO_FLEET_BUILD_WAIT_S is the backstop, after which the job is admitted (the fill then stops for it,
+# as before) rather than refused. The fill's catch-up builds outside a slot stop for any Worker, so they end the wait
+# within the fill's RUNNER_JOB_POLL. The wait is the backstop, as YIELD_TO_EXCLUSIVE's is: the runner's listener gate
+# reads the same hold (Gate.fleet_build_yield) and stops listening through it, so GitHub hands the shared label's job
+# (glaeda-trusted-std-xcode-26.6) to another runner instead of parking it here for the slot.
+YIELD_TO_FLEET_BUILD_WAIT_S = 30 * 60.0  # the slot's SLOT_MAX_HOLD (20 min) plus its lock wait and a margin
+
+
+def fleet_build_hold(host_lock: str) -> str | None:
+    """FLEET_BUILD_HOLDS_HOST while a fleet build holds host_lock exclusively and does not yield, else None. One
+    non-blocking shared flock, dropped at once; a missing or unreadable lock holds nothing."""
+    try:
+        fd = os.open(host_lock, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return None if yielding_pid(host_lock) is not None else FLEET_BUILD_HOLDS_HOST
+    finally:
+        os.close(fd)
+    return None
+
+
+def yields_to_fleet_build(runner_dir: Path) -> bool:
+    """Whether this runner's job-started hook runs with --yield-to-fleet-build."""
+    try:
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return re.search(r"\s--yield-to-fleet-build(?:\s|$)", text) is not None
+
+
+def yield_to_fleet_build(host_lock: str, owner: Any, cap: float | None) -> tuple[bool, str]:
+    """(True, note) once no fleet build holds host_lock without yielding, or after cap seconds
+    (YIELD_TO_FLEET_BUILD_WAIT_S when None), the note naming any wait; (False, ABANDONED) when the job is cancelled."""
+    bound = YIELD_TO_FLEET_BUILD_WAIT_S if cap is None else cap
+    start, shown = time.monotonic(), False
+    while (why := fleet_build_hold(host_lock)) is not None:
+        if owner is not None and owner.gone():
+            return False, ABANDONED
+        waited = time.monotonic() - start
+        if waited >= bound:
+            return True, f"; {why} past this dedicated runner's {waited:.0f} s bound: admitted (YIELD_TO_FLEET_BUILD)"
+        if not shown:
+            print(f"{PREFIX}: waiting: {why}; this dedicated runner starts nothing beside it (YIELD_TO_FLEET_BUILD)",
+                  flush=True)
+            shown = True
+        time.sleep(min(ADMIT_POLL_S, max(0.0, bound - waited)))
+    waited = time.monotonic() - start
+    return True, (f"; waited {waited:.0f} s for a fleet build's host lock (YIELD_TO_FLEET_BUILD)" if shown else "")
+
+
 def runner_scope(runner_dir: Path) -> RunnerScope:
     """RunnerScope from the hook script glaeda-cmux-runner wrote. The hook passes --instance; the directory's
     -K suffix (actions-runner-glaeda-K) is the fallback for hooks written before it always did."""
@@ -12228,9 +12290,11 @@ class Gate:
         if runner_scope(self.runner_dir).dedicated:
             # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
-            # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner), and on a
-            # yieldToWaiters runner a build waiting for the host lock (YIELD_TO_WAITERS)
-            return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield() or self.waiter_yield()
+            # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner, the writer's
+            # slot on a yieldToFleetBuild one), and on a yieldToWaiters runner a build waiting for the host lock
+            # (YIELD_TO_WAITERS)
+            return (self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
+                    or self.fleet_build_yield() or self.waiter_yield())
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = self.host_claim()
         if why is None and self.waiters and self.waiters_due():
@@ -12269,6 +12333,15 @@ class Gate:
             return exclusive_claim(self.capacity_dir)
         except Exception:  # noqa: BLE001
             return None
+
+    def fleet_build_yield(self) -> str | None:
+        """YIELD_TO_FLEET_BUILD at the listener: why a yieldToFleetBuild dedicated runner takes no job now (the CAS
+        writer's slot holds the host lock and does not yield: fleet_build_hold, job-started's own reading), or None.
+        A job taken meanwhile would wait in job-started for the slot, so the gate holds the listener off instead and
+        GitHub hands the job to another runner of its labels."""
+        if not runner_scope(self.runner_dir).dedicated or not yields_to_fleet_build(self.runner_dir):
+            return None
+        return fleet_build_hold(self.host_lock)
 
     def yields_to_waiters(self) -> bool:
         """Whether this gate reads the host's waiters: a pool gate unless started --no-waiters, and a dedicated
@@ -14003,7 +14076,7 @@ class Gate:
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.suite_first() or self.still_waiting() or self.still_reserved()
-                        or self.exclusive_yield() or ending):
+                        or self.exclusive_yield() or self.fleet_build_yield() or ending):
                     if not listener_went_online(self.runner_dir):
                         self.unclaim()
                         self.stop(why, finished)
@@ -14030,7 +14103,7 @@ class Gate:
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
                 # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
-                reserved = self.still_reserved() or self.draining() or self.exclusive_yield()
+                reserved = self.still_reserved() or self.draining() or self.exclusive_yield() or self.fleet_build_yield()
                 # A disk floor is advisory cleanup only: never watch or freeze a Worker for it. A full disk
                 # (DISK_FULL_NO_LISTEN) is not a floor: the next job would fail there, so the listener stops at this
                 # job's end as for a reservation, and starts again once reclaim or the other jobs' ends free room.
@@ -16517,6 +16590,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="job-started, a dedicated runner: read by its listener gate, which takes no job while a build "
                         "waits for the host lock (YIELD_TO_WAITERS); job-started itself admits as before")
     p.add_argument("--exclusive-yield-wait", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--yield-to-fleet-build", action="store_true",
+                   help="job-started, a dedicated runner: start no job while a fleet build (the CAS writer's catch-up "
+                        "fill) holds the host lock and does not yield (YIELD_TO_FLEET_BUILD)")
+    p.add_argument("--fleet-build-yield-wait", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
     p.add_argument("--nightly-runner", action="store_true",
@@ -17130,8 +17207,15 @@ def main(argv: list[str] | None = None) -> int:
                 held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
                 if note == ABANDONED:
                     return abandoned()
+            waited_note = ""
+            if held and args.yield_to_fleet_build:
+                held, waited_note = yield_to_fleet_build(args.host_lock, owner, args.fleet_build_yield_wait)
+                if waited_note == ABANDONED:
+                    return abandoned()
             if held:
                 held, note = dedicated_admission(args.dedicated_admit, args.min_free_gib)
+                if held:
+                    note += waited_note
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)
