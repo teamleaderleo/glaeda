@@ -691,7 +691,7 @@ WAITED_POOL_BUDGET = 50.0
 # 2026-11-27: 85-117 waited PRs, 54 stored a 600 s window (read pr 377.6 s of 531.6 s, ~7 s a PR), staleWaited.pr
 # 2,740-4,746 s all day from 06:30Z while the land-judge App pool had 9,303 of 12,500 left: not quota, the one serial
 # read loop. The staleness the stale alarm reports is what starts the pool: the alarm's cause is healed, not only said.
-WAITED_POOL_STALE_S = STALE_DATA_AFTER / 2
+WAITED_POOL_STALE_S = 300.0  # STALE_DATA_AFTER (600, defined below) / 2
 WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
