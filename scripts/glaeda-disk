@@ -1405,9 +1405,11 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "564206744d0c5f2e27d338ff597363ef02b4e3a943b05b6c01681fa747a3c7fc",
     "78c3d27524ce96a98d7ea914c56453b3ef29ed5fd481e0957a787209dd5174f9",
     "3921da1635191cfb276af97c9b26c958da208c45374345920c0cb0db7d0d5676",
-    "3ccfa80bae7974f2867ac7cbf5ff449158d4c9fda96ae7452563eac9866b861c",
     "6a47948dae3e9ed806e2d7c548dba5c96a629c667559c43decdeb98ec8104b30",
-    "a71fc7cf394ad59ec3d2ce391e308cc4875e29d068956df81b3d706803d21756",
+    "8e5b471e25981713d59c03435509aa08fb4c3135ef061ad67d296d64d603de81",
+    "cce703733549062e116dd3735b9c9ab404329e26090aecdbb1c81727dd2a9769",
+    "cffd38e9b8e60d31b87b66d0bade72659421212904f918a03cbf1c8fe429166c",
+    "8ef2e47ffd2a2d6055b6260dc49869b706bcedd6b469e7e79ed32697ff30392f",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2597,6 +2599,7 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    "tmp_transcript_hold_hours": 6.0,  # tmp_transcript_hold: a temp entry a recent agent transcript names stays
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
     # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
@@ -3272,6 +3275,16 @@ SIM_DEVICE_MIN_BYTES = 512 * 1024 ** 2  # dataPathSize under this: a fresh or er
 SIM_DEVICE_BUDGET_S = 300.0  # one pass erases for at most this long; the next pass continues
 
 
+def _device_plist_age_hours(home: str, now: float) -> float | None:
+    """Hours since CoreSimulator last rewrote HOME/device.plist, which it does on every state change (boot, shutdown,
+    erase). simctl on Xcode 26.6 and 27.2 (macOS 27) lists no lastBootedAt for any device: cmux21 2026-11-27, 0 of 32
+    devices, 16 GB held by 6 shutdown ones, so every device read "no last-boot time" and none was ever erased."""
+    try:
+        return (now - os.stat(os.path.join(home, "device.plist")).st_mtime) / 3600
+    except OSError:
+        return None
+
+
 def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: float | None = None,
                      leases: str | None = None) -> list[Item]:
     """Judge simulator devices (`simctl list devices -j`) for erasing. Reclaimable only when shutdown, available,
@@ -3292,6 +3305,10 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             sized = isinstance(size, int) and not isinstance(size, bool)
             size = size if sized else 0
             idle = _iso_age_hours(d.get("lastBootedAt"), now)
+            data = d.get("dataPath")
+            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
+            if idle is None and home is not None:
+                idle = _device_plist_age_hours(home, now)  # simctl lists no lastBootedAt: its last state change
             reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
             keep = []
             if d.get("state") != "Shutdown":
@@ -3304,8 +3321,6 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append("its data is already small")
             if idle is None:
                 keep.append("no last-boot time")
-            data = d.get("dataPath")
-            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
             if home is None:
                 keep.append("no data path")
             elif in_cwd(home, opened):
@@ -5771,9 +5786,15 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def worker_cargo_target(path: Path) -> bool:
+def worker_cargo_target(path: Path, _nested: bool = False) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
-    real directory (not a symlink) that holds no version control of its own."""
+    real directory (not a symlink) that holds no version control of its own; or a directory of nothing but such
+    targets, one per source tree.
+
+    The hq worker's CARGO_TARGET_DIR is cache/cmux-tui-target/src-<hash> (one target per source tree), so the family
+    item cache/cmux-tui-target holds targets and is none itself: it read "report-only" and "unchecked" under pressure
+    while cmux21 (24 GiB free) and cmux17 (21 GiB) sat under their gui-light disk floor with 8.5 GiB there and 0.0G
+    reclaimable (2026-11-27). Every in-use veto still holds the whole item while a cargo or rustc names it."""
     try:
         if path.is_symlink() or not path.is_dir():
             return False
@@ -5781,8 +5802,16 @@ def worker_cargo_target(path: Path) -> bool:
         return False
     if any(os.path.lexists(path / m) for m in VCS_MARKERS):
         return False
-    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
-            or (path / ".rustc_info.json").is_file())
+    if (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file()):
+        return True
+    if _nested:
+        return False
+    try:
+        entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(worker_cargo_target(Path(e.path), _nested=True) for e in entries)
 
 
 def worker_build_output(fam: Family, path: Path) -> bool:
@@ -8193,6 +8222,104 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
             except OSError:
                 continue
     return False
+
+
+# An agent session's own notes in the temp dir. A live Claude session kept a folder of 40 notes at /tmp/<name>, wrote
+# it last at 18:35Z, then waited on a model gateway outage for two hours; at 19:33Z the "tmp" family (one hour window)
+# found it idle, unheld (no process has a file open there between tool calls) and named by no running command, and
+# took it while the session was alive (2026-11-27). On that host the same pass took 64 top-level /tmp entries in 24 h,
+# and most of them are named in a transcript that went on being written after the delete. The session that writes a
+# path names it in its transcript, so a top-level temp entry a transcript names is held while that transcript was
+# written within the policy's tmp_transcript_hold_hours (6 by default): it goes once no session that named
+# it has written for that long. The index reads each transcript once and then only what was appended
+# (TRANSCRIPT_TMP_INDEX), so a pass costs the bytes written since the last one, not the transcripts' size.
+TMP_NAME_RE = re.compile(rb"/(?:private/)?tmp/([A-Za-z0-9._@+=-]{1,200})")
+_TRANSCRIPT_TMP_NAMES: dict[str, str] | None = None
+_TRANSCRIPT_TMP_AT = 0.0
+_TRANSCRIPT_TMP_HOME: Path | None = None
+TRANSCRIPT_TMP_FRESH_S = 30.0  # apply's fresh re-check rereads appended bytes at most this often, not once per item
+
+
+def transcript_tmp_index_path() -> Path:
+    return HOME / ".cache/glaeda-disk/transcript-tmp-names.json"
+
+
+def recent_transcripts(window_s: float, now: float | None = None) -> list[tuple[Path, os.stat_result]]:
+    """Claude (every config dir, subagents too) and Codex transcripts written within window_s."""
+    cutoff = (time.time() if now is None else now) - window_s
+    roots = [c / "projects" for c in claude_config_dirs()] + [HOME / ".codex/sessions"]
+    out = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    out.append((path, st))
+    return out
+
+
+def transcript_tmp_names(fresh: bool = False) -> dict[str, str]:
+    """Top-level temp entry name -> the newest recent transcript that names it, read incrementally (see above)."""
+    global _TRANSCRIPT_TMP_NAMES, _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME
+    if (_TRANSCRIPT_TMP_NAMES is not None and _TRANSCRIPT_TMP_HOME == HOME
+            and (not fresh or time.monotonic() - _TRANSCRIPT_TMP_AT < TRANSCRIPT_TMP_FRESH_S)):
+        return _TRANSCRIPT_TMP_NAMES
+    window_s = float(POLICY["tmp_transcript_hold_hours"]) * 3600
+    index_path = transcript_tmp_index_path()
+    try:
+        old = json.loads(index_path.read_text())
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    index: dict[str, dict] = {}
+    names: dict[str, tuple[float, str]] = {}
+    for path, st in recent_transcripts(window_s):
+        key = os.fspath(path)
+        prev = old.get(key) if isinstance(old.get(key), dict) else {}
+        same = prev.get("ino") == st.st_ino and isinstance(prev.get("offset"), int) and prev["offset"] <= st.st_size
+        offset = prev["offset"] if same else 0
+        found = set(prev.get("names", [])) if same else set()
+        if offset < st.st_size:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(st.st_size - offset)
+            except OSError:
+                chunk = b""
+            end = chunk.rfind(b"\n") + 1  # a line still being written is read whole next pass
+            found.update(m.decode("ascii", "replace") for m in TMP_NAME_RE.findall(chunk[:end]))
+            offset += end
+        index[key] = {"ino": st.st_ino, "offset": offset, "names": sorted(found)}
+        for n in found:
+            if n not in names or names[n][0] < st.st_mtime:
+                names[n] = (st.st_mtime, key)
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index_path.with_name(f"{index_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(index))
+        os.replace(tmp, index_path)
+    except OSError:
+        pass  # an unwritten index only costs the next pass a full read
+    _TRANSCRIPT_TMP_NAMES = {n: k for n, (_m, k) in names.items()}
+    _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME = time.monotonic(), HOME
+    return _TRANSCRIPT_TMP_NAMES
+
+
+def tmp_transcript_hold(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why a top-level temp entry is held by an agent session that names it ("" when none does)."""
+    if fam.id not in ("tmp", STALE_TMP_SCRATCH) or path.parent != fam.root:
+        return ""
+    transcript = transcript_tmp_names(fresh).get(path.name)
+    if not transcript:
+        return ""
+    hours = float(POLICY["tmp_transcript_hold_hours"])
+    return f"named by an agent session written in the last {hours:g}h ({Path(transcript).name})"
 
 
 # A Linux lane VM's own families (lane_vm_families). One reached 100% (4.2 GB free of 495 GB) and its tests failed
@@ -13314,6 +13441,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
+        if (why := tmp_transcript_hold(fam, path)):
+            reasons.append(why)
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
         if fam.id == WT_CARGO_TARGET and not blind and (why := wt_checkout_hold(path, opened, cmds)):
@@ -16700,6 +16829,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
+                or tmp_transcript_hold(fam, p, fresh=True)
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
                 or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
@@ -19790,6 +19920,10 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if DEAD_MOUNTS:  # paths a walk skipped on ENOTCONN/ESTALE/EIO: a dying drive or a dead mount, as a count and names
+        # (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md), not only a line on stderr
+        row["unreadable_entries"] = len(DEAD_MOUNTS)
+        row["unreadable_examples"] = sorted(DEAD_MOUNTS)[:5]
     if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
         row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass

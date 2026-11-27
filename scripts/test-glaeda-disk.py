@@ -9419,6 +9419,28 @@ class SimDeviceTest(unittest.TestCase):
         self.assertEqual(v["iPhone 17"], ("kept", ["no last-boot time"]))
         self.assertEqual(v["pushopen-kit"], ("kept", ["simctl lists it unavailable"]))
 
+    @twelve_hour_ages
+    def test_no_last_boot_time_falls_back_to_the_device_plist(self) -> None:
+        """cmux21 2026-11-27 (Xcode 26.6, macOS 27): simctl listed no lastBootedAt for any of 32 devices, so 16 GB of
+        shutdown devices were never erased. The device.plist's mtime (rewritten on every boot, shutdown and erase)
+        stands in; no plist still keeps it."""
+        home = "/Users/cmux/Library/Developer/CoreSimulator/Devices/7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5"
+        ages = {home: 30.0}
+        with mock.patch.object(gd, "_device_plist_age_hours", side_effect=lambda h, now: ages.get(h)) as age:
+            self.assertEqual(self.verdicts()["iPhone 17"], ("reclaimable", []))
+            ages[home] = 0.5
+            self.assertEqual(self.verdicts()["iPhone 17"], ("recent", []))
+            ages.clear()
+            self.assertEqual(self.verdicts()["iPhone 17"], ("kept", ["no last-boot time"]))
+        self.assertNotIn("/Users/cmux/Library/Developer/CoreSimulator/Devices/11592F6E-1A41-4215-BF7D-8BE182D2922E",
+                         [c.args[0] for c in age.call_args_list], "a listed lastBootedAt wins")
+        plist = Path(self.tmp.name) / "dev" / "device.plist"
+        plist.parent.mkdir()
+        plist.write_text("x")
+        os.utime(plist, (SIM_NOW - 7200, SIM_NOW - 7200))
+        self.assertAlmostEqual(gd._device_plist_age_hours(str(plist.parent), SIM_NOW), 2.0)
+        self.assertIsNone(gd._device_plist_age_hours(str(plist.parent / "gone"), SIM_NOW))
+
     def test_a_job_or_lease_that_names_a_device_keeps_it(self) -> None:
         udid = "11592F6E-1A41-4215-BF7D-8BE182D2922E"
         home = f"/Users/cmux/Library/Developer/CoreSimulator/Devices/{udid}"
@@ -15925,6 +15947,94 @@ class EvictLockQueueTest(unittest.TestCase):
         self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
 
 
+class TmpTranscriptHoldTest(unittest.TestCase):
+    """A live agent session's notes folder in the temp dir stays while a transcript that names it is being written: the
+    "tmp" family took /tmp/<notes> (40 files, an hour untouched) under a live session that waited on a model gateway
+    outage, because nothing held a file open there between tool calls (2026-11-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        self.transcripts = self.home / ".claude/projects/-home-x"
+        self.transcripts.mkdir(parents=True)
+        self.saved = (gd.HOME, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.DARWIN, gd.ROLE = self.home, False, "devbox"
+        gd._TRANSCRIPT_TMP_NAMES = None
+        gd._DISCOVERED.clear()
+        for name, value in (("stale_tmp_enabled", lambda: False), ("TRANSCRIPT_TMP_FRESH_S", 0.0)):
+            patcher = mock.patch.object(gd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fam = gd.Family("tmp", self.fake_tmp, True, "agent scratch under the temp dir", files=True,
+                             max_idle_hours=1.0, git_disposable=True, owner="agents and tools", rebuild_minutes=0.5)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.DARWIN, gd.ROLE = self.saved
+        gd._TRANSCRIPT_TMP_NAMES = None
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def entry(self, name: str, hours: float = 2.0) -> Path:
+        d = self.fake_tmp / name
+        d.mkdir()
+        (d / "notes.md").write_bytes(b"n" * 4096)
+        t = time.time() - hours * 3600
+        os.utime(d / "notes.md", (t, t))
+        os.utime(d, (t, t))
+        return d
+
+    def transcript(self, name: str, text: str, hours: float = 0.0) -> Path:
+        t = self.transcripts / f"{name}.jsonl"
+        t.write_text(text)
+        os.utime(t, (time.time() - hours * 3600,) * 2)
+        return t
+
+    def survey(self) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {Path(i.path).name: i for i in gd.survey([self.fam], 0.5, 0)}
+
+    def test_a_folder_a_live_session_names_stays_and_an_unnamed_one_goes(self) -> None:
+        self.entry("notes-10919")
+        self.entry("left-behind")
+        self.transcript("live", json.dumps({"cmd": f"cat > {self.fake_tmp}/x; ls /tmp/notes-10919/a.md"}) + "\n")
+        items = self.survey()
+        self.assertEqual(items["notes-10919"].verdict, "in-use")
+        self.assertIn("named by an agent session written in the last 6h (live.jsonl)", items["notes-10919"].reasons)
+        self.assertEqual(items["left-behind"].verdict, "reclaimable", items["left-behind"].reasons)
+
+    def test_a_session_silent_past_the_hold_no_longer_holds_it(self) -> None:
+        self.entry("notes-old", hours=9.0)
+        self.transcript("gone", '{"cmd": "ls /tmp/notes-old"}\n', hours=7.0)
+        self.assertEqual(self.survey()["notes-old"].verdict, "reclaimable")
+
+    def test_the_index_reads_only_appended_whole_lines(self) -> None:
+        t = self.transcript("live", '{"cmd": "ls /tmp/first"}\n{"cmd": "ls /tmp/half')
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"first"})
+        index = json.loads(gd.transcript_tmp_index_path().read_text())
+        self.assertEqual(index[os.fspath(t)]["offset"], len('{"cmd": "ls /tmp/first"}\n'))
+        with open(t, "a") as f:
+            f.write('-done"}\n')
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"first", "half-done"})
+        t.write_text('{"cmd": "ls /tmp/other"}\n')  # rewritten smaller: read again from the start
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"other"})
+
+    def test_apply_rechecks_a_name_written_after_the_survey(self) -> None:
+        notes = self.entry("notes-late")
+        items = self.survey()
+        self.assertEqual(items["notes-late"].verdict, "reclaimable")
+        self.transcript("live", '{"cmd": "mkdir -p /tmp/notes-late"}\n')
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value="ps"):
+            gd.apply(list(items.values()), {self.fam.id: self.fam}, receipt, None, 0.5)
+        self.assertTrue(notes.exists())
+        self.assertFalse(receipt.exists() and "reclaimed" in receipt.read_text())
+
+
 class LaneVmFamiliesTest(unittest.TestCase):
     """A Linux lane VM's own scratch, one item per session or tree: a dead acpmux session's TMPDIR, an abandoned
     /tmp/wt-* worktree and /tmp/bsz go once nothing holds them and nothing below changed for 6 h; a live, unknown,
@@ -17339,6 +17449,44 @@ class PressureHeldBytesTest(unittest.TestCase):
             self.assertEqual([r["outcome"] for r in rec], ["reclaimed"])
             self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, rec[0]["reasons"])
 
+    def test_the_workers_per_source_targets_dir_is_build_output_under_pressure(self) -> None:
+        # the hq worker's layout: cache/cmux-tui-target/src-<hash> is the CARGO_TARGET_DIR, with .rustc_info.json and
+        # no CACHEDIR.TAG; cmux21 and cmux17 (2026-11-27) read 0.0G reclaimable under their disk floor with 8.5 GiB there
+        cache = self.root / "cache"
+        per_source = cache / "cmux-tui-target"
+        src = per_source / "src-681de312a68b64a3"
+        (src / "release/deps").mkdir(parents=True)
+        (src / "release/deps/libx.rlib").write_bytes(b"\0" * 1024 * 1024)
+        (src / ".rustc_info.json").write_text("{}")
+        (src / ".source").write_text("x")
+        self.age(per_source, 2.0)
+        mixed = cache / "mixed"  # a target beside something that is none: not build output
+        (mixed / "src-a").mkdir(parents=True)
+        (mixed / "src-a" / ".rustc_info.json").write_text("{}")
+        (mixed / "notes").mkdir()
+        self.age(mixed, 2.0)
+        (cache / "empty").mkdir()
+        self.age(cache / "empty", 2.0)
+        hq = gd.hq_cache_family(cache)
+        artifacts = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True,
+                              reference_root=self.root, platform="macos")
+        self.assertTrue(gd.worker_cargo_target(per_source))
+        self.assertFalse(gd.worker_cargo_target(mixed))
+        self.assertFalse(gd.worker_cargo_target(cache / "empty"))
+        self.assertFalse(gd.worker_cargo_target(cache), "one level of nesting only")
+        with mock.patch.object(gd, "owner_retired", return_value=False), \
+                mock.patch.object(gd, "family_git_state", return_value="unchecked"):
+            self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "report-only")
+            with mock.patch.object(gd, "PRESSURE_WORKER_BUILD_OUTPUT", True):
+                on = self.verdicts([hq, artifacts])
+                for fid in (hq.id, "fleet-artifacts"):
+                    self.assertEqual(on[(fid, "cmux-tui-target")].verdict, "reclaimable", fid)
+                self.assertEqual(on[(hq.id, "mixed")].verdict, "report-only")
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([], f"cargo build --target-dir {src}\n")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use",
+                                     "a live build in one source's target keeps the whole item")
+
     def test_the_newest_seed_goes_under_pressure_only_when_nothing_holds_it(self) -> None:
         seeds = self.root / "ci" / "seeds"
         old = make(seeds / "seed-old", age_hours=60)
@@ -17839,6 +17987,31 @@ class DeadMountTests(unittest.TestCase):
             with mock.patch("os.stat", fake):
                 self.assertEqual(gd.wt_cargo_targets(root), [])
             self.assertTrue(any(p.endswith("dead") or "/dead/" in p for p in gd.DEAD_MOUNTS))
+
+    def test_an_eio_on_stat_is_skipped_and_counted_in_the_run_line(self):
+        """A failing drive (EIO from stat, cmux-lawrence's X10 Pro 2026-11-27) is skipped like a dead mount, and the
+        run line counts it, so a dying disk is a number a reader sees, not a crash or a line on stderr."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.fspath(Path(tmp) / "bad")
+            real = os.stat
+
+            def fake(path, *a, **k):
+                if os.fspath(path).startswith(bad):
+                    raise OSError(errno.EIO, "Input/output error", os.fspath(path))
+                return real(path, *a, **k)
+
+            self.addCleanup(gd.DEAD_MOUNTS.clear)
+            gd.DEAD_MOUNTS.clear()
+            with mock.patch("os.stat", fake):
+                self.assertFalse(Path(bad).is_dir())
+                self.assertFalse(Path(bad, "x").exists())
+            self.assertEqual(len(gd.DEAD_MOUNTS), 2)
+            log = Path(tmp) / "runs.jsonl"
+            with mock.patch.object(gd, "RUN_LOG", log), mock.patch.object(gd, "_home_free", return_value=None):
+                gd.write_run_line(time.time(), None)
+            row = json.loads(log.read_text().splitlines()[-1])
+            self.assertEqual(row["unreadable_entries"], 2)
+            self.assertIn(bad, row["unreadable_examples"])
 
     def test_other_errors_still_raise(self):
         with mock.patch("os.stat", side_effect=OSError(errno.EACCES, "denied")):

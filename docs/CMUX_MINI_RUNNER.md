@@ -838,7 +838,14 @@ What `--apply` does:
      re-registers or retires it and removes the marker. A runner on a busy label used
      to take its next job seconds after each one ended, so the retries never saw it
      idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
-     land, so an older gate reloads one that reads the marker.
+     land, so an older gate reloads one that reads the marker. Nothing on the mini runs
+     that next `--apply`, so an apply's marker is bounded on the idle side too
+     (`APPLY_DRAIN_IDLE_BOUND`): once the listener has stood stopped under it for
+     `APPLY_DRAIN_IDLE_MAX_S` (10 min; `GLAEDA_APPLY_DRAIN_IDLE_MAX_S=0` turns it off),
+     the gate moves it aside to `.glaeda-drain.waived`, logs `APPLY_DRAIN_STALE` and
+     listens under the registration it has (cmux24, 2026-11-27: six dedicated runners
+     held idle up to an hour behind a blind re-register no apply came back for). Hand
+     drains and cmux-ci's lend drain are left to their writers.
    - job-started still refuses a job handed over in the moment before a stop.
    - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
      nightly, fast and dedicated runners included). When every runner on a mini has a live
@@ -2253,7 +2260,8 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
   to R2. Runs that fetch and prune nothing are not logged.
 - **Storage.** Each seed is kept as `/Volumes/glaeda-seed-archive/seeds/<KEY>.tar.zst`: the zstd stream
   exactly as cmux15 sent it, about 2.1-2.4 GB against 9 GB unpacked, so serving it is a read. The volume is
-  an APFS sparse bundle on the ExFAT X10 Pro (`glaeda-seed-archive.sparsebundle`, attached by each run).
+  an APFS sparse bundle on the ExFAT T5 EVO (`glaeda-seed-archive.sparsebundle`, attached by each run; on the
+  X10 Pro until 2026-11-27, when that disk failed reads at more LBAs each hour).
   macOS privacy lets a launchd job write into an attached image but not onto the external disk itself. The filler checks every file before renaming it into place: all entries
   under `KEY/`, and the seed manifest present. A seed whose entry reads EIO is renamed to `.corrupt-<name>` (never
   deleted or repaired) and reported as `unreadable` in the run record; the run goes on. The image is unencrypted, so

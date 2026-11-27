@@ -181,7 +181,7 @@ class ArchiveTest(unittest.TestCase):
         real = archive.os.scandir
 
         class Entry:
-            def __init__(self, entry): self.entry, self.name = entry, entry.name
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
             def is_file(self, follow_symlinks=True):
                 if self.name == bad.name:
                     raise OSError(5, "Input/output error")
@@ -207,12 +207,231 @@ class ArchiveTest(unittest.TestCase):
         self.assertTrue((self.archive / (KEYS[1] + archive.SUFFIX)).exists())
         self.assertEqual([f["outcome"] for f in record["fetched"]], ["fetched"])
 
+    def eio_on_stat(self, bad: set[str], rename_fails: bool = False):
+        """Patch the module's scandir so each entry named in BAD raises EIO from stat() (the 2026-11-27 traceback:
+        entry.stat(follow_symlinks=False) on a failing X10 Pro), and optionally its quarantine rename too."""
+        real_scandir, real_rename = archive.os.scandir, archive.os.rename
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def __getattr__(self, attr): return getattr(self.entry, attr)  # is_dir, inode, ... as the real one
+            def is_file(self, follow_symlinks=True): return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True):
+                if self.name in bad:
+                    raise OSError(5, "Input/output error", self.path)
+                return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def rename(src, dst):
+            if rename_fails and Path(src).name in bad:
+                raise OSError(5, "Input/output error", src)
+            return real_rename(src, dst)
+
+        def restore():
+            archive.os.scandir, archive.os.rename = real_scandir, real_rename
+
+        def scandir(path="."):
+            # archive.os is the os module itself: every other caller (tearDown's rmtree, which passes an fd) gets
+            # the real listing, and the cleanup that restores it runs only after tearDown
+            if not isinstance(path, (str, os.PathLike)) or Path(path) != self.archive:
+                return real_scandir(path)
+            return Listing(Entry(e) for e in real_scandir(path))
+
+        archive.os.scandir = scandir
+        archive.os.rename = rename
+        self.addCleanup(restore)
+        return restore
+
+    def main_once(self) -> dict:
+        """main(["--apply"]) against the test archive, its log and state kept in the test's tree."""
+        real_run, real_log = archive.run, archive.LOG
+        archive.run = lambda apply: real_run(apply, self.archive, mounted=True, min_free=0)
+        archive.LOG = Path(self.tmp.name) / "log.jsonl"
+        out = io.StringIO()
+        real_stdout, sys.stdout = sys.stdout, out
+        try:
+            archive.main(["--apply"])
+        finally:
+            sys.stdout, archive.run, archive.LOG = real_stdout, real_run, real_log
+        return json.loads(out.getvalue())
+
+    def disk_errors_file(self) -> dict:
+        return json.loads((archive.STATE.parent / "disk-errors" / archive.DISK_ERRORS_NAME).read_text())
+
+    def test_a_stat_that_reads_eio_is_skipped_counted_and_reported(self):
+        # cmux-lawrence 2026-11-27: entry.stat() raised EIO on 19 of 341 seeds and the job restarted every 15 s.
+        for i, key in enumerate(KEYS[:3]):
+            self.keep(key, 100 + i)
+        self.main_once()
+        self.assertEqual(self.disk_errors_file()["unreadable"], 0)
+        bad = {KEYS[0] + archive.SUFFIX, KEYS[1] + archive.SUFFIX}
+        self.eio_on_stat(bad, rename_fails=True)
+        record = self.main_once()
+        self.assertEqual(record["state"], "applied", record)
+        self.assertEqual(sorted(i["key"] for i in record["unreadable"]), sorted(KEYS[:2]))
+        self.assertEqual(record["archive_seeds"], 1)  # the readable seed is still counted and served
+        report = self.disk_errors_file()
+        self.assertEqual(report["schema"], "glaeda-disk-errors/v1")
+        self.assertEqual((report["unreadable"], report["still_unreadable"], report["quarantined"]), (2, 2, 0))
+        self.assertIn("errno 5", report["examples"][0])
+        self.assertEqual(report["root"], os.fspath(self.archive))
+
+    def test_a_quarantined_seed_still_counts_as_a_disk_error_on_later_runs(self):
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.main_once()
+        restore = self.eio_on_stat({KEYS[0] + archive.SUFFIX})
+        first = self.main_once()
+        restore()  # the seed fetched again in place of the quarantined one reads fine
+        self.assertTrue(first["unreadable"][0]["quarantined"], first)
+        self.assertEqual(self.disk_errors_file()["quarantined"], 1)
+        again = self.main_once()  # the bad seed now sits aside as .corrupt-*: not re-read, still reported
+        self.assertNotIn("unreadable", again)
+        report = self.disk_errors_file()
+        self.assertEqual((report["unreadable"], report["quarantined"]), (0, 1))
+
+    def test_a_run_that_did_not_list_the_archive_keeps_the_last_count(self):
+        self.keep(KEYS[0], 100)
+        self.main_once()
+        path = archive.STATE.parent / "disk-errors" / archive.DISK_ERRORS_NAME
+        path.write_text(json.dumps({"schema": "glaeda-disk-errors/v1", "unreadable": 7, "at": 1}))
+        archive.pm.lan_config = lambda path=None: None  # an error record before any listing
+        self.main_once()
+        self.assertEqual(json.loads(path.read_text())["unreadable"], 7)
+
     def test_a_quarantine_that_fails_too_is_reported_and_not_fetched_over(self):
         self.keep(KEYS[0], 100)
         unreadable = {KEYS[0]: "OSError errno 5: Input/output error"}
         [item] = archive.quarantine(self.archive, unreadable, True)  # nothing to rename: fails like a bad entry
         self.assertFalse(item["quarantined"])
         self.assertIn("quarantine_error", item)
+
+    def test_an_entry_that_stays_unreadable_is_not_read_again(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro under the archive image failed reads; several seeds read EIO and
+        # their quarantine rename read EIO too. Every 15 s run read each bad entry three times (the fill's listing,
+        # prune's and the count's), each read 20 kernel retries: about 5,000 kernel I/O error lines a minute.
+        # An entry that stays unreadable is recorded and never read again.
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        bad = KEYS[0] + archive.SUFFIX
+        real_scandir, real_rename = archive.os.scandir, archive.os.rename
+        reads = []
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                if self.name == bad:
+                    reads.append(self.name)
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def rename(src, dst):
+            if Path(src).name == bad:
+                reads.append("rename")
+                raise OSError(5, "Input/output error")
+            return real_rename(src, dst)
+
+        archive.os.scandir = lambda path: Listing(Entry(e) for e in real_scandir(path))
+        archive.os.rename = rename
+        try:
+            first = self.run_archive()
+            after_first = len(reads)
+            second = self.run_archive()
+        finally:
+            archive.os.scandir, archive.os.rename = real_scandir, real_rename
+        self.assertEqual(first["state"], "applied", first)
+        self.assertGreater(after_first, 0)
+        self.assertEqual(reads[after_first:], [], "the second run read the known-bad entry again")
+        self.assertEqual(second["state"], "applied", second)
+        self.assertEqual(second.get("known_unreadable"), [KEYS[0]])
+        self.assertEqual(second["fetched"], [])  # never fetched over it
+
+    def test_a_known_unreadable_key_the_archive_no_longer_lists_is_dropped_and_fetched_again(self):
+        # cmux-lawrence 2026-11-27: the archive moved from the failing X10 Pro to a copy on the T5 EVO without the
+        # keys the X10 copy had read EIO, and unreadable.json kept all 20, so the fill never fetched them again.
+        # A known key the listing does not name is gone from this disk: it is dropped and fetched like any other.
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        (self.archive / (KEYS[0] + archive.SUFFIX)).unlink()  # the new disk never had it
+        archive.remember_unreadable({KEYS[0], KEYS[1]})  # KEYS[1] is still on this disk: stays known
+        plan = self.run_archive(apply=False)
+        self.assertEqual(plan.get("unreadable_dropped"), [KEYS[0]], plan)
+        self.assertEqual(archive.known_unreadable(), {KEYS[0], KEYS[1]})  # a plan writes nothing
+        record = self.run_archive()
+        self.assertEqual(record["state"], "applied", record)
+        self.assertEqual(record.get("unreadable_dropped"), [KEYS[0]])
+        self.assertEqual(record.get("known_unreadable"), [KEYS[1]])
+        self.assertEqual([f["key"] for f in record["fetched"]], [KEYS[0]])
+        self.assertEqual(archive.known_unreadable(), {KEYS[1]})
+
+    def test_a_failed_listing_drops_no_known_unreadable_key(self):
+        self.keep(KEYS[0], 100)
+        self.run_archive()
+        archive.remember_unreadable({KEYS[0]})
+        real_scandir = archive.os.scandir
+
+        def scandir(path):
+            raise OSError(5, "Input/output error")
+
+        archive.os.scandir = scandir
+        try:
+            record = self.run_archive()
+        finally:
+            archive.os.scandir = real_scandir
+        self.assertNotIn("unreadable_dropped", record)
+        self.assertEqual(archive.known_unreadable(), {KEYS[0]})
+
+    def test_the_server_skips_known_unreadable_seeds_and_lists_the_rest(self):
+        # 2026-11-27: one seed that read EIO emptied the archive's whole seed-list-v1 answer (the listing's
+        # comprehension raised), and every mini's ask re-read the bad entry: 20 kernel retries each. The server
+        # leaves the archive's known-unreadable keys alone and lists every other seed.
+        serve = load("glaeda_seed_serve_for_test", SERVE)
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.keep(KEYS[2], 102)
+        self.run_archive()
+        known, odd = KEYS[0] + archive.SUFFIX, KEYS[2] + archive.SUFFIX
+        archive.remember_unreadable({KEYS[0]})
+        serve.KNOWN_UNREADABLE = archive.STATE / "unreadable.json"
+        touched = []
+        real_scandir, real_open = serve.os.scandir, serve.os.open
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                touched.append(self.name)
+                if self.name in (known, odd):
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        def opener(path, flags, mode=0o777, *, dir_fd=None):
+            touched.append(os.fspath(path))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        serve.os.scandir = lambda path: [Entry(e) for e in real_scandir(path)]
+        serve.os.open = opener
+        try:
+            listed = [key for key, _ in serve.listing("archive", Path("/nonexistent"), self.archive)]
+            found = serve.archive_find(self.archive, [KEYS[0], KEYS[1]])
+        finally:
+            serve.os.scandir, serve.os.open = real_scandir, real_open
+        self.assertEqual(listed, [KEYS[1]])  # the odd EIO one is left out too, not the whole answer
+        self.assertNotIn(known, touched)
+        self.assertIsNotNone(found)
+        fd, key = found
+        os.close(fd)
+        self.assertEqual(key, KEYS[1])
 
     def test_an_eio_anywhere_in_a_run_is_an_error_record(self):
         real = archive.run
@@ -268,6 +487,15 @@ class ArchiveTest(unittest.TestCase):
             self.assertFalse(agent.exists())
         finally:
             archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = saved
+
+    def test_the_archive_image_lives_on_the_t5_not_the_failing_x10(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro failed reads at more LBAs each hour (1,877 final errors in
+        # ten minutes at the worst), several under this image. The archive moved to the T5 EVO; the X10 is
+        # only the first version's old folder, which install still empties.
+        self.assertEqual(archive.HOST_VOLUME, Path("/Volumes/T5 EVO"))
+        self.assertEqual(archive.IMAGE, Path("/Volumes/T5 EVO/glaeda-seed-archive.sparsebundle"))
+        self.assertEqual(archive.MOUNT, Path("/Volumes/glaeda-seed-archive"))
+        self.assertEqual(archive.OLD_ARCHIVE, Path("/Volumes/X10 Pro/glaeda-seed-archive"))
 
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))

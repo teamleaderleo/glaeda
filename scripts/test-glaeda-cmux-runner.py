@@ -14095,6 +14095,52 @@ class GateTest(unittest.TestCase):
         marker.unlink()
         self.assertIsNone(gate.draining())
 
+    def test_an_apply_drain_with_no_job_ends_within_its_bound_and_alerts(self) -> None:
+        """APPLY_DRAIN_IDLE_BOUND (cmux24, 2026-11-27): an apply marked six dedicated runners draining for a relabel,
+        their jobs ended, no apply came back, and the gates held the idle listeners off for up to an hour. A stopped
+        listener under an apply's marker listens again APPLY_DRAIN_IDLE_MAX_S later, and the gate says so."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        reason = "a relabel to glaeda-hq-fleet-route,glaeda-runner-cmux24-hq-fleet-route"
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        held = f"draining for {reason}"
+        logs: list[str] = []
+        start = time.time()
+        with mock.patch.object(hook, "gate_log", side_effect=logs.append):
+            gate.child = mock.Mock()  # a listener still runs (its job, or one about to stop): the drain holds
+            self.assertEqual(gate.draining(), held)
+            self.assertFalse(hook.apply_drain_idle_file(self.state, self.runner).exists(), "no clock under a job")
+            gate.child = None
+            self.assertEqual(gate.draining(), held)
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S - 30):
+                self.assertEqual(gate.draining(), held, "inside the bound the apply's look may still come")
+                # a reload or restart of the gate keeps the clock
+                again = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+                self.assertEqual(again.draining(), held)
+            self.assertEqual(logs, [])
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S + 1):
+                self.assertIsNone(again.draining(), "past the bound with no job: the listener serves again")
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.runner / (hook.RUNNER_DRAIN_FILE + ".waived")).exists(), "kept as evidence")
+        self.assertEqual(len(logs), 1, logs)
+        self.assertTrue(logs[0].startswith(hook.APPLY_DRAIN_STALE), logs)
+        self.assertIn("glaeda-cmux-runner-fleet --apply", logs[0])
+        # a new marker (the apply came back and still needs the runner idle) starts a new clock
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3500}))
+        self.assertEqual(gate.draining(), held)
+        # a hand drain and cmux-ci's are their writers' to end: no bound here
+        for by in ("a hand drain", hook.CMUX_CI_DRAIN_BY):
+            marker.write_text(json.dumps({"by": by, "reason": "r", "until": time.time() + 3000}))
+            self.assertEqual(gate.draining(), "draining for r")
+            with mock.patch.object(hook.time, "time", return_value=time.time() + hook.APPLY_DRAIN_IDLE_MAX_S * 2):
+                self.assertEqual(gate.draining(), "draining for r", by)
+        self.assertTrue(marker.exists())
+        # the off switch keeps the marker's expiry as the only end
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        with mock.patch.object(hook, "APPLY_DRAIN_IDLE_MAX_S", 0.0), \
+                mock.patch.object(hook.time, "time", return_value=time.time() + 2000):
+            self.assertEqual(gate.draining(), held)
+
     def test_a_reservation_released_before_the_job_ends_keeps_the_listener(self) -> None:
         gate, stops = self.gate([None] * 3, busy=[True])
         self.reserve(gate)
@@ -18532,7 +18578,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("glaeda-ios-sim", labels[0])
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
         self.assertEqual([l.count("glaeda-macos-27") for l in labels], [1, 1, 1], "every runner, gui included, names its OS")
-        self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
+        self.assertEqual([x for x in labels[2] if x.startswith("glaeda-runner-")], [cr.runner_label("mini-std-glaeda-4")],
+                         "its own handle, so HQ's paired probes can place a pair on two idle gui runners")
         started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
@@ -18687,13 +18734,14 @@ class RunnerTest(unittest.TestCase):
             alone, _ = self.fast_labels(shape, "nightly-alone", ios_sim=True, nightly_slot=True)
         self.assertEqual(["glaeda-nightly-std-xcode-26.6" in labels for labels in alone],
                          [False, False, True, False, False, False], "without a freshness slot: the first side instance")
-        # Every nightly slot carries its own glaeda-runner-<name> label, and no side, gui or fast runner gains one.
+        # Every nightly slot and gui runner carries its own glaeda-runner-<name> label, and no side or fast runner
+        # gains one (a gui runner's for HQ's paired probes, which place a pair on two idle gui runners).
         for labels in (*both, *alone):
             pins = [label for label in labels if label.startswith("glaeda-runner-")]
-            if "glaeda-nightly-std-xcode-26.6" in labels:
-                self.assertEqual(len(pins), 1, f"a nightly slot without its pin label: {labels}")
+            if "glaeda-nightly-std-xcode-26.6" in labels or any("-gui-" in label for label in labels):
+                self.assertEqual(len(pins), 1, f"a nightly slot or gui runner without its pin label: {labels}")
             elif not any(label.startswith("glaeda-root-") for label in labels):
-                self.assertEqual(pins, [], f"only roots and the nightly slot are pinned: {labels}")
+                self.assertEqual(pins, [], f"only roots, gui runners and the nightly slot are pinned: {labels}")
         self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-2").nightly)
         self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").nightly)
 
@@ -19468,17 +19516,40 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
         self.assertEqual(len(self.config_argvs()), 1, "no re-registration")
 
-    def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
+    def test_an_unreadable_label_set_skips_the_relabel_and_drains_nothing(self) -> None:
+        # LABELS_UNREAD_SKIPS, 2026-11-27 13:37Z cmux24: a fleet apply's runner list failed, so no --github-labels
+        # came, and every dedicated runner was re-registered blind with the supplied token: three idle ones in place,
+        # six busy ones drained for "a relabel" to the labels GitHub already held (labels == previousLabels in each
+        # receipt). The drains held them off beside their own queue for up to an hour. No reading: skip the relabel.
         with mock.patch.object(cr, "xcode_present", return_value=True):
-            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
             (self.state / "fail-list").touch()
+            configs = len(self.config_argvs())
             receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                                 "--member", "mini-std", stdin=REG_TOKEN, expect=1)
-        register = self.by_kind(receipt)["register"]
-        self.assertEqual(register["state"], "updated", register)
-        self.assertIn("--replace", self.config_argvs()[-1])
-        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "failed")
-        self.assertFalse(receipt["ready"])
+                                  "--member", "mini-std", stdin=REG_TOKEN, expect=1)  # verify reads the broken list
+            register = self.by_kind(receipt)["register"]
+            self.assertEqual(register["state"], "unchanged", register)
+            self.assertTrue(register.get("labelsUnread"), register)
+            self.assertIn("skipped the relabel", register["note"])
+            self.assertEqual(len(self.config_argvs()), configs, "no re-registration")
+            self.assertFalse((Path(first["runnerDir"]) / cr.RUNNER_DRAIN_FILE).exists())
+            # the fleet's own read failed: it says why, and a busy runner is not drained either
+            worker = f"{first['runnerDir']}/bin.2.338.0/Runner.Worker spawnclient 148 151"
+            real_run = subprocess.run
+            def ps(argv, *args, **kwargs):
+                if list(argv[:2]) == ["/bin/ps", "-axww"]:
+                    return subprocess.CompletedProcess(argv, 0, f"/sbin/launchd\n{worker}\n", "")
+                return real_run(argv, *args, **kwargs)
+            with mock.patch.object(cr.subprocess, "run", side_effect=ps):
+                busy = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                   "--github-labels-unread=repos/o/r/actions/runners: GitHub rate limit: HTTP 403",
+                                   stdin=REG_TOKEN, expect=1)
+        register = self.by_kind(busy)["register"]
+        self.assertEqual(register["state"], "unchanged", register)
+        self.assertIn("GitHub rate limit", register["note"])
+        self.assertFalse(register.get("draining"), register)
+        self.assertFalse((Path(first["runnerDir"]) / cr.RUNNER_DRAIN_FILE).exists(), "nothing drains on no reading")
+        self.assertEqual(len(self.config_argvs()), configs)
 
     def test_apply_never_re_registers_a_self_updated_runner_with_a_job(self) -> None:
         # 2026-10-27 02:09:59Z: a runner that updated itself runs bin.2.338.0/Runner.Worker; a pgrep for
@@ -19492,9 +19563,9 @@ class RunnerTest(unittest.TestCase):
                 if list(argv[:2]) == ["/bin/ps", "-axww"]:
                     return subprocess.CompletedProcess(argv, 0, f"/sbin/launchd\n{worker}\n", "")
                 return real_run(argv, *args, **kwargs)
-            with mock.patch.object(cr.subprocess, "run", side_effect=ps):
-                receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                                      "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+            with mock.patch.object(cr.subprocess, "run", side_effect=ps):  # GitHub holds an older set: a relabel
+                receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--github-labels=self-hosted,glaeda-mini", stdin=REG_TOKEN, expect=1)
         register = self.by_kind(receipt)["register"]
         self.assertEqual(register["state"], "blocked", register)
         self.assertIn("running a job", register["note"])
@@ -19509,8 +19580,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(hook.runner_drain(Path(first["runnerDir"]), time.time()), f"draining for {drain['reason']}")
         self.assertEqual((cr.RUNNER_DRAIN_FILE, cr.DRAIN_TTL_S), (hook.RUNNER_DRAIN_FILE, hook.DRAIN_TTL_S))
         with mock.patch.object(cr, "xcode_present", return_value=True):
-            idle = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                               "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+            idle = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                               "--github-labels=self-hosted,glaeda-mini", stdin=REG_TOKEN, expect=1)
         self.assertEqual(self.by_kind(idle)["register"]["state"], "updated", self.by_kind(idle)["register"])
         self.assertTrue(self.by_kind(idle)["register"].get("drainEnded"))
         self.assertFalse(marker.exists(), "re-registered idle: the runner takes jobs again")
@@ -24313,9 +24384,7 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("HQ checkout", self.install(hook.HQ_DISPATCH_REPO))
         shim_dir = Path(self.path_file.read_text().strip())
         shim = shim_dir / "git"
-        if refused_socket:
-            shim.write_text(shim.read_text().replace("http://127.0.0.1:18434", proxy))
-        else:
+        if not refused_socket:  # a refused socket on any loopback port is a fleet tunnel (job 140669807034: 18435)
             curl = self.dir / "curl"
             curl.write_text('#!/bin/sh\nprintf "%s" "$TEST_CONNECT"\nexit "$TEST_CURL_EXIT"\n')
             curl.chmod(0o755)
@@ -24534,12 +24603,12 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60", argv.read_text())
         self.assertEqual(self.log(), ["github"])
 
-    def proxied(self, curl_exit: int, first_fetch_error: str = "") -> tuple[Path, Path, dict]:
+    def proxied(self, curl_exit: int, first_fetch_error: str = "", port: int = 18434) -> tuple[Path, Path, dict]:
         """A mini's setup: github.com through a loopback CONNECT proxy (mini-rollout.sh's http.<url>.proxy), a curl
         whose CONNECT probe exits curl_exit, and a git that logs its argv (and fails its first fetch with
         first_fetch_error when given). Returns the git argv log, the curl argv log and the env."""
         with self.gitconfig.open("a") as f:
-            f.write('[http "https://github.com/"]\n\tproxy = http://127.0.0.1:18434\n')
+            f.write(f'[http "https://github.com/"]\n\tproxy = http://127.0.0.1:{port}\n')
         self.install()
         argv, curl_argv = self.dir / "argv", self.dir / "curl-argv"
         bindir = self.dir / "bin"
@@ -24604,6 +24673,18 @@ class GitShimTest(unittest.TestCase):
         self.assertFalse((self.temp / f"{hook.GIT_SHIM_LOG}.direct").exists())  # no failure mark for later calls
         self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
         # a lazy blob fetch from any other command in the same repository skips it too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
+
+    def test_a_token_fetch_skips_any_loopback_tunnel_not_only_18434(self) -> None:
+        # mini-rollout.sh writes 18435 or 18436 when the cp forward is down; the shim matched 18434 alone, so a token
+        # fetch rode a dead 18435 tunnel (cmuxterm-hq onboarding-new-person-production job 140667177526, 2026-11-27)
+        argv, curl_argv, env = self.proxied(curl_exit=0, port=18435)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        result = self.checkout_fetch(self.pr_sha, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("this fetch carries the job's token, so it goes direct to github.com", result.stderr)
+        self.assertFalse(curl_argv.exists())
         other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
         self.assertEqual(other.stdout.strip(), "", other.stderr)
 
