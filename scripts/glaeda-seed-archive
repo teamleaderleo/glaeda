@@ -122,6 +122,25 @@ def prefetch_module():
 pm = prefetch_module()
 
 
+def known_unreadable() -> set[str]:
+    """The seeds whose entry read EIO and could not be moved aside: never read again (STATE/unreadable.json).
+
+    2026-11-27, cmux-lawrence: the X10 Pro under the archive image failed reads. Each 15 s run read every bad entry
+    three times, each read 20 kernel retries: about 5,000 kernel I/O error lines a minute on a failing disk.
+    """
+    try:
+        return set(json.loads((STATE / "unreadable.json").read_text()))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def remember_unreadable(keys: set[str]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    staged = STATE / f"unreadable.json.{os.getpid()}"
+    staged.write_text(json.dumps(sorted(keys)))
+    staged.replace(STATE / "unreadable.json")
+
+
 def archived(archive: Path, unreadable: dict[str, str] | None = None,
              aside: list[str] | None = None) -> dict[str, os.stat_result]:
     """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst).
@@ -129,8 +148,10 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None,
     A seed whose entry cannot be read (EIO from a bad disk image or volume) is left out and, when UNREADABLE is
     given, recorded there as KEY -> error: one bad seed must not crash the run (the daemon did, 2026-11-21).
     ASIDE, when given, gets the name of every seed quarantine() moved aside (.corrupt-*), read from the same listing.
+    A seed in known_unreadable() is left out unread.
     """
     found = {}
+    skip = known_unreadable()
     try:
         entries = list(os.scandir(archive))
     except OSError as error:
@@ -141,7 +162,7 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None,
         key = entry.name[:-len(SUFFIX)]
         if aside is not None and entry.name.startswith(CORRUPT):
             aside.append(entry.name)
-        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key):
+        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key) and key not in skip:
             try:
                 if entry.is_file(follow_symlinks=False):
                     found[key] = entry.stat(follow_symlinks=False)
@@ -356,6 +377,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         if why:
             return {**record, "state": "error", "reason": why}
         unreadable: dict[str, str] = {}
+        known = known_unreadable()
         aside: list[str] = []
         have = archived(archive, unreadable, aside)
         record["quarantined_aside"] = len(aside)
@@ -364,6 +386,13 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
             for item in record["unreadable"]:
                 if item.get("quarantined"):
                     unreadable.pop(item["key"])
+            if apply and set(unreadable) - known - {""}:
+                known |= set(unreadable) - {""}
+                remember_unreadable(known)
+        if known:
+            record["known_unreadable"] = sorted(known)
+        for key in known:
+            unreadable.setdefault(key, "known unreadable")
         # A seed still sitting unreadable is not fetched over (the rename would hit the same bad entry).
         missing = list(dict.fromkeys(key for key, _ in kept if key not in have and key not in unreadable))
         record["seeder_kept"] = len(kept)

@@ -181,7 +181,7 @@ class ArchiveTest(unittest.TestCase):
         real = archive.os.scandir
 
         class Entry:
-            def __init__(self, entry): self.entry, self.name = entry, entry.name
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
             def is_file(self, follow_symlinks=True):
                 if self.name == bad.name:
                     raise OSError(5, "Input/output error")
@@ -308,6 +308,52 @@ class ArchiveTest(unittest.TestCase):
         [item] = archive.quarantine(self.archive, unreadable, True)  # nothing to rename: fails like a bad entry
         self.assertFalse(item["quarantined"])
         self.assertIn("quarantine_error", item)
+
+    def test_an_entry_that_stays_unreadable_is_not_read_again(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro under the archive image failed reads; several seeds read EIO and
+        # their quarantine rename read EIO too. Every 15 s run read each bad entry three times (the fill's listing,
+        # prune's and the count's), each read 20 kernel retries: about 5,000 kernel I/O error lines a minute.
+        # An entry that stays unreadable is recorded and never read again.
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        bad = KEYS[0] + archive.SUFFIX
+        real_scandir, real_rename = archive.os.scandir, archive.os.rename
+        reads = []
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                if self.name == bad:
+                    reads.append(self.name)
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def rename(src, dst):
+            if Path(src).name == bad:
+                reads.append("rename")
+                raise OSError(5, "Input/output error")
+            return real_rename(src, dst)
+
+        archive.os.scandir = lambda path: Listing(Entry(e) for e in real_scandir(path))
+        archive.os.rename = rename
+        try:
+            first = self.run_archive()
+            after_first = len(reads)
+            second = self.run_archive()
+        finally:
+            archive.os.scandir, archive.os.rename = real_scandir, real_rename
+        self.assertEqual(first["state"], "applied", first)
+        self.assertGreater(after_first, 0)
+        self.assertEqual(reads[after_first:], [], "the second run read the known-bad entry again")
+        self.assertEqual(second["state"], "applied", second)
+        self.assertEqual(second.get("known_unreadable"), [KEYS[0]])
+        self.assertEqual(second["fetched"], [])  # never fetched over it
 
     def test_an_eio_anywhere_in_a_run_is_an_error_record(self):
         real = archive.run
