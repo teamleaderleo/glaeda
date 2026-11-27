@@ -108,6 +108,32 @@ class SeedPrefetchTest(PrefetchBase):
         self.assertEqual(again, head)
         self.assertFalse((own / "objects/info/alternates").exists())
 
+    def test_main_comes_from_the_borrowed_git_mirror_not_github(self):
+        mirror = Path(sp.GIT_MIRROR_DIR) / "cmux.git"
+        for n in range(5):
+            (self.repo / f"f{n}").write_bytes(os.urandom(64 * 1024))
+            self.commit()
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        head = subprocess.run(["git", "-C", os.fspath(mirror), "rev-parse", "refs/heads/main"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        # GitHub (REPO_URL) has moved on and is unreachable: the git mirror's main is the one read, with no fetch
+        # from origin, and no object is copied (the mirror's are borrowed).
+        self.commit()
+        sp.REPO_URL = (Path(self.tmp.name) / "gone").as_uri()
+        work = self.state / ".prefetch"
+        own, got = sp.main_head(work)
+        self.assertEqual(got, head)
+        packed = sum(p.stat().st_size for p in (own / "objects").rglob("*") if p.is_file()
+                     and "info" not in p.parts)
+        self.assertLess(packed, 64 * 1024, "a fetch from the borrowed mirror copied objects")
+        # A mirror without main (mid-repair): GitHub, as before.
+        subprocess.run(["git", "-C", os.fspath(own), "remote", "set-url", "origin", self.repo.as_uri()], check=True)
+        subprocess.run(["git", "-C", os.fspath(mirror), "update-ref", "-d", "refs/heads/main"], check=True)
+        _, got = sp.main_head(work)
+        self.assertEqual(got, subprocess.run([*self.git, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                             check=True).stdout.strip())
+
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")
