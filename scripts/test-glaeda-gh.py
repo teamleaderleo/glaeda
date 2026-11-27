@@ -18773,6 +18773,23 @@ class PostTest(unittest.TestCase):
         self.assertEqual((t.calls, asked), ([], []))
         self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
 
+    def test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_app_in_a_pause(self) -> None:
+        """Before: every cmux PR waited the login's create pause (9 queued, head held 14+ min, 2026-11-27 11:0xZ). After:
+        a PR whose base is not main (no CLA check there) is made by the lander App; a main-base one still waits."""
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.queue("pr", "manaflow-ai/cmux", "--head", "lane/x", "--base", "feat-cmux-next", "--title", "t",
+                        "--body", "b")
+        d, t = self.daemon((201, {}, {"number": 8, "html_url": "https://github.com/manaflow-ai/cmux/pull/8"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[:2] for c in t.calls], [("POST", "/repos/manaflow-ai/cmux/pulls")])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
+        self.assertEqual(asked, [["broker-actor", "create", "manaflow-ai/cmux", "--base", "feat-cmux-next"]])
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+
     def test_app_creates_off_keeps_prs_and_issues_on_the_login(self) -> None:
         self.no_env_token()
         asked = self.app_writer("lander")
@@ -26064,6 +26081,21 @@ class StaleDataTest(Base):
         self.assertEqual([p for p in served if p.startswith("rules/branches/")], [], served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
 
+    def test_concurrent_direct_part_saves_keep_every_answer(self) -> None:
+        """Waits and land workers on one host end together; each saved by writing back the file it had read before the
+        others' answers, so a base's rulesets one just read was lost and read again. Saves from many threads keep all."""
+        import threading
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        paths = [f"/repos/o/r{i}/rules/branches/main?per_page=100" for i in range(12)]
+        threads = [threading.Thread(target=gg.direct_parts_save,
+                                    args=({p: {"at": now, "part": {"doc": [], "etag": "x"}}}, now)) for p in paths]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(gg.direct_parts_load(now)), sorted(paths))
+
     def test_a_direct_read_through_the_broker_gates_on_the_controllers_rollup(self) -> None:
         """rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 09:43-11:43Z: glaeda-upstream (every lane VM's direct
         reads) asked commits/{sha}/check-suites 3,401 times in 2 h after #2730, because a direct read's Daemon has
@@ -27974,7 +28006,8 @@ class LandWorld:
                                   capture_output=True, text=True, timeout=timeout,
                                   env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
                                        "GIT_CONFIG_NOSYSTEM": "1",
-                                       **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
+                                       **{k: v for k, v in env.items()
+                                          if k.startswith("GIT_AUTHOR_") or k == "GIT_INDEX_FILE"}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"] and "outcomes" in json.loads(argv[4]):
@@ -28971,6 +29004,30 @@ class LandTest(Base):
             self.assertIn("content-pause", (root / "calls").read_text())
             self.w.answers.append(ok_answer(LA))
             self.tick(e["wakeAt"] - self.t + 1)
+            self.assert_merged_at(LA)
+
+    def test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause(self):
+        # Before: green cmux#61194 and hq#32880 were held 30+ min by the login's create pause although `pr merge` is a
+        # lander write. After: gh_app_token.py route says lander, so the merge goes out at once.
+        root = Path(self.tmp.name) / "pause"
+        root.mkdir()
+        cmd = root / "content-pause-cmd"
+        cmd.write_text(f'#!/bin/sh\necho \'{{"blocked_until": {NOW + 3000}, "level": 3}}\'\n')
+        cmd.chmod(0o755)
+        tool = Path(self.tmp.name) / "gh_app_token.py"
+        tool.write_text("")
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "route" not in argv:
+                return real(argv, timeout, **kw)
+            return subprocess.CompletedProcess(argv, 0, "lander\tpr merge is a lander write\thold\n", "")
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}), \
+                mock.patch.object(gg, "app_pool_tool", return_value=tool), \
+                mock.patch.object(gg, "run_bounded", side_effect=run):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
             self.assert_merged_at(LA)
 
     def test_wait_pr_then_merge(self):
@@ -33240,6 +33297,66 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
 
+    def test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes(self):
+        # manaflow-ai/cmux#60119 and #60384, 2026-11-27 (LAND_UNION_PUSH_DEADLINE's comment): gh-quota held the
+        # update-branch ("queued", exit 0), the queue made the clean base merge itself, and its push timed out (124:
+        # the pre-push hook's pr-owner read ran past 120 s) with nothing sent. Both rows then waited out
+        # LAND_UPDATE_ONCE and stopped "update_branch_no_new_head: the update-branch sent at a35cc7bc612f 3778 s ago
+        # made no new head the queue could read; it is sent once per head". Now the same merge is pushed again once
+        # the head wait passes, and the land goes on at the new head, minutes after the send, not an hour.
+        head, base = self.queued_update_origin("goals/y.md")
+        real, pushes = self.w.run, []
+
+        def run(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if argv[0] == "/fake/git" and "push" in argv:
+                pushes.append(timeout)
+                if len(pushes) == 1:  # the first push is killed at its deadline before anything reached origin
+                    return subprocess.CompletedProcess(argv, 124, "", "timed out")
+            return real(argv, timeout, env)
+        self.w.run = run
+        self.q = self.queue()
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # the timed-out push sent nothing
+        self.assertIn("union_merge_unknown", [h["event"] for h in e["history"]])
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e.get("stop")), ("waiting", None))
+        self.assertEqual(pushes, [gg.LAND_UNION_PUSH_DEADLINE] * 2)  # past the pre-push hook's 150 s cap
+        self.assertGreater(gg.LAND_UNION_PUSH_DEADLINE, 150)
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertIn("union_push_retry", [h["event"] for h in e["history"]])
+        self.assertLess(self.t - start, 3 * (gg.LAND_HEAD_TIMEOUT + 120))  # minutes, not LAND_UPDATE_ONCE
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers[:] = [ok_answer(merged)]
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_a_base_merge_push_that_never_answers_stops_naming_the_push_not_after_an_hour(self):
+        head, _ = self.queued_update_origin("goals/y.md")
+        real, pushes = self.w.run, []
+
+        def run(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if argv[0] == "/fake/git" and "push" in argv:
+                pushes.append(timeout)
+                return subprocess.CompletedProcess(argv, 124, "", "timed out")
+            return real(argv, timeout, env)
+        self.w.run = run
+        self.q = self.queue()
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_no_new_head"), e.get("stop"))
+        self.assertEqual(len(pushes), gg.LAND_UNION_PUSH_TRIES)
+        self.assertIn("each push timed out", e["stop"]["reason"])
+        self.assertIn("git merge origin/main", e["stop"]["next"])
+        self.assertLess(self.t - start, gg.LAND_UPDATE_ONCE / 2)
+
     def test_an_update_with_no_new_head_and_a_true_conflict_stops_conflict_with_its_hunks(self):
         head, _ = self.queued_update_origin("", attrs="docs/*.md merge=union\n")  # same file, no union: a conflict
         e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
@@ -35605,7 +35722,8 @@ class LandTest(Base):
                         'request-branch","status":"422"}')
 
     def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md",
-                     main_path: str = "", same: bool = False) -> tuple[str, str]:
+                     main_path: str = "", same: bool = False,
+                     texts: tuple[str, str, str] | None = None) -> tuple[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
         line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. With MAIN_PATH,
         main appends to that file instead, so git merges the two cleanly. With SAME, main appends the lane's own
@@ -35625,18 +35743,24 @@ class LandTest(Base):
         git("config", "receive.denyCurrentBranch", "ignore")
         (origin / ".gitattributes").write_text(attrs)
         (origin / path).parent.mkdir(parents=True, exist_ok=True)
-        (origin / path).write_text("- 10:00Z goal set\n")
+        (origin / path).write_text(texts[0] if texts else "- 10:00Z goal set\n")
         git("add", "-A")
         git("commit", "-qm", "init")
         git("checkout", "-qb", "lane/x")
-        with open(origin / path, "a") as f:
-            f.write("- 11:00Z the lane's line\n")
+        if texts:  # TEXTS: PATH's whole text at the fork, on the lane, on main
+            (origin / path).write_text(texts[1])
+        else:
+            with open(origin / path, "a") as f:
+                f.write("- 11:00Z the lane's line\n")
         git("commit", "-qam", "the lane appends")
         head = git("rev-parse", "HEAD")
         git("checkout", "-q", "main")
         (origin / (main_path or path)).parent.mkdir(parents=True, exist_ok=True)
-        with open(origin / (main_path or path), "a") as f:
-            f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
+        if texts:
+            (origin / path).write_text(texts[2])
+        else:
+            with open(origin / (main_path or path), "a") as f:
+                f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
         git("add", "-A")
         git("commit", "-qam", "main appends")
         base = git("rev-parse", "HEAD")
@@ -35718,6 +35842,33 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
+
+    def test_a_union_merge_names_each_goal_frontmatter_key_once(self):
+        """LAND_UNION_ONE_KEY, cmuxterm-hq 2026-11-27: two handoff PRs each rewrote goals/ci-min-per-pr-140.md's
+        `next_step:` line, the union merge kept both, and main read three (test_repo_records_parse red). Before: both
+        lines; after: one per key, the head's where both sides changed it, main's where only main did, notes kept."""
+        fork = '---\ngoal: g\nblocked_by: "none"\nnext_step: "start"\nowner: a/b\n---\n\n- 10:00Z goal set\n'
+        lane = fork.replace('"start"', '"the lane\'s step"') + "- 11:00Z the lane's line\n"
+        main = (fork.replace('"start"', '"main\'s step"').replace('"none"', '"main\'s blocker"')
+                + "- 11:05Z another PR's line, landed first\n")
+        head, base = self.union_origin(texts=(fork, lane, main))
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        text = self.origin_git("show", f"{merged}:goals/x.md")
+        self.assertEqual(text.splitlines()[:6], ["---", "goal: g", 'blocked_by: "main\'s blocker"',
+                                                 'next_step: "the lane\'s step"', "owner: a/b", "---"])
+        self.assertIn("- 11:00Z the lane's line", text)
+        self.assertIn("- 11:05Z another PR's line, landed first", text)
+
+    def test_land_one_line_per_key_keeps_list_lines_and_leaves_single_keys(self):
+        merged = "---\npre:\n  - a\nk: 1\npre:\n  - b\n---\nbody\n"
+        self.assertEqual(gg.land_one_line_per_key(merged, "---\npre:\n  - a\nk: 1\n---\n",
+                                                  "---\npre:\n  - a\nk: 1\n---\n", "---\npre:\n  - b\nk: 1\n---\n"),
+                         "---\npre:\n  - b\nk: 1\n---\nbody\n")
+        same = "---\nk: 1\n---\nk: 2\n"
+        self.assertEqual(gg.land_one_line_per_key(same, None, None, None), same)
 
     def test_a_pr_that_changes_no_file_is_reported_superseded_instead_of_merged(self):
         # LAND_ZERO_DIFF: teamleaderleo/glaeda#2447's 5 conflicting hunks all resolved to main's side, because main

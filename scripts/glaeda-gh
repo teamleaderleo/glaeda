@@ -4023,6 +4023,19 @@ APP_CREATES_ENV = "GLAEDA_APP_CREATES"
 APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
 APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
 APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+# ... but only for a PR into main: cla.yml runs on `pull_request_target branches: [main]`, so a PR into feat-cmux-next has
+# no CLA check and an App opener signs nothing (app/cmux-agent's #61277 and 20+ more merged that way). A PR whose base is
+# not main asks broker-actor with --base; machines/gh-app-roles.json bot_authored_write_bases decides (Leo, 2026-11-27
+# 08:12Z: "aren't we using mosly the quota goblin pool intead of my persoal login?"; 9 cmux creates held 14+ min).
+# Detector: test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_app_in_a_pause.
+APP_CREATE_MAIN_BASES = frozenset({"", "main"})
+
+
+def app_create_never(item: dict) -> bool:
+    """Whether ITEM's create must stay on the login: a repo in APP_CREATE_NEVER, unless its base is not main."""
+    if str(item.get("repo") or "").lower() not in APP_CREATE_NEVER:
+        return False
+    return str(item.get("base") or "").strip().lower() in APP_CREATE_MAIN_BASES
 APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
 
 # Comments on a POOL of poster Apps (Leo, 2026-11-24: "but i already have github apps made. quota-goblin... etc. well,
@@ -8356,7 +8369,7 @@ class Daemon:
         op = APP_CREATE_OP.get(str(item.get("kind")))
         if not op or not app_creates_on() or item.get("appCreates") is False:
             return False
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+        if app_create_never(item) or item.get("appRefused"):
             return False
         return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
 
@@ -8450,7 +8463,7 @@ class Daemon:
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+        if op != "comment" and app_create_never(item):
             return None
         role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
@@ -8476,13 +8489,17 @@ class Daemon:
         tool = app_pool_tool()
         if not tool:
             return None
-        key = (op, str(item["repo"]).lower())
+        base = str(item.get("base") or "").strip() if str(item.get("repo") or "").lower() in APP_CREATE_NEVER else ""
+        key = (op, str(item["repo"]).lower(), base)
         cached = self.app_actors.get(key)
         if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
             return cached[1]
         actor = None
         try:
-            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
+            argv = [sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]]
+            if base:
+                argv += ["--base", base]
+            result = run_bounded(argv, timeout=12)
             found = json.loads(result.stdout) if not result.returncode else None
             if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
                     re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
@@ -17359,6 +17376,83 @@ LAND_READY_ONCE = "readySent"
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# The push of a base merge this queue made (union_push) runs the host's pre-push hook, and leo-workspace
+# tools/git-hooks/pre-push gives pr-owner's GitHub read up to PR_OWNER_CAP (150 s) before it lets the push through: a
+# 120 s deadline (LAND_GH_DEADLINE) killed that push at 120 s whenever GitHub reads were slow. manaflow-ai/cmux#60119
+# and #60384 on air-blue, 2026-11-27: the update-branch was held by gh-quota (its content-pause authority on cmux-cp-1
+# did not answer) and answered exit 0 "queued", the queue made the clean base merge itself after LAND_HEAD_TIMEOUT, and
+# its push exited 124 at 120 s with nothing sent (union_merge_unknown); the row then waited out LAND_UPDATE_ONCE and
+# stopped "update_branch_no_new_head ... 3778 s ago" (4715 s for #60384), the base merge it had already tried counted
+# as done. A person pushed the same clean merge by hand and #60119 merged at once. Now the push has the hook's cap and
+# a margin, and a push that timed out is pushed again (the same commit: a fast-forward of the head, or nothing when it
+# did reach GitHub) once the head wait after it (LAND_HEAD_TIMEOUT) passes with no new head, LAND_UNION_PUSH_TRIES in
+# all; only then does it stop, naming the push. Detector: test-glaeda-gh.py
+# test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes.
+LAND_UNION_PUSH_DEADLINE = 240.0
+LAND_UNION_PUSH_TRIES = 2
+
+# LAND_UNION_ONE_KEY: a union merge of two sides that each rewrote one frontmatter line keeps both lines. goals/*.md
+# merge by union for their dated notes (cmuxterm-hq .gitattributes), and on 2026-11-27 goals/ci-min-per-pr-140.md
+# reached cmuxterm-hq main with three `next_step:` lines, so test_now_goals.test_repo_records_parse went red (hq#32408
+# fixed the record; hq#32592 the broker's own union merge). Union is right for a record's body, never for its keys:
+# union_plan keeps one entry per frontmatter key in each path git's plain merge conflicts on, the side's that changed
+# it from the merge base, the head's when both did (it lands after the base).
+LAND_FRONT_KEY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:\s|$)")
+
+
+def land_front_entries(text: str | None) -> tuple[list[tuple[str | None, list[str]]], int] | None:
+    """TEXT's frontmatter as (key, its lines) entries, a key's indented or list lines with it, and the index of the
+    closing --- line among TEXT's lines; None when TEXT has no frontmatter."""
+    lines = text.split("\n") if isinstance(text, str) else []
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    entries: list[tuple[str | None, list[str]]] = []
+    for i, line in enumerate(lines[1:], 1):
+        if line.rstrip() == "---":
+            return entries, i
+        if LAND_FRONT_KEY.match(line):
+            entries.append((line.split(":", 1)[0], [line]))
+        elif entries:
+            entries[-1][1].append(line)
+        else:
+            entries.append((None, [line]))
+    return None
+
+
+def land_front_entry(text: str | None, key: str) -> list[str] | None:
+    """The lines of TEXT's first frontmatter entry for KEY, or None when it has none."""
+    got = land_front_entries(text)
+    return next((lines for k, lines in (got[0] if got else []) if k == key), None)
+
+
+def land_one_line_per_key(merged: str, base: str | None, head: str | None, other: str | None) -> str:
+    """MERGED (the union merge of HEAD and OTHER, forked at BASE) with each frontmatter key it names twice or more
+    named once, where its first entry was: HEAD's entry when HEAD changed it from BASE, else OTHER's, else (neither
+    side's entry is among MERGED's) the first (LAND_UNION_ONE_KEY)."""
+    got = land_front_entries(merged)
+    if not got:
+        return merged
+    entries, close = got
+    seen: dict[str, int] = {}
+    for k, _ in entries:
+        if k:
+            seen[k] = seen.get(k, 0) + 1
+    doubled = {k for k, n in seen.items() if n > 1}
+    if not doubled:
+        return merged
+    out: list[str] = []
+    done: set[str] = set()
+    for k, lines in entries:
+        if k not in doubled:
+            out.extend(lines)
+        elif k not in done:
+            done.add(k)
+            mine, was, theirs = land_front_entry(head, k), land_front_entry(base, k), land_front_entry(other, k)
+            pick = mine if mine is not None and mine != was else theirs
+            have = [ls for kk, ls in entries if kk == k]
+            out.extend(pick if pick in have else have[0])
+    return "\n".join(["---", *out, *merged.split("\n")[close:]])
+
 # A lane VM's union mirror is filled only by the broker's fetch (lane-gh fetch), which names the mirror's own tips as
 # had. A lane VM, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
 # commits back), so every base merge's fetch asked for five weeks of history and the broker refused it in 13 s ("HTTP
@@ -25934,12 +26028,30 @@ class LandQueue:
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
+    def merge_on_app(self, e: dict) -> bool:
+        """Whether `gh pr merge` of E goes out on the lander App (gh_app_token.py route says so): the App's token has its
+        own quota and no login's content-creation pause, so the pause never holds it. cmux#61194 and hq#32880 sat held
+        on the login's pause for over 30 min, 2026-11-27 (Leo: "aren't we using mosly the quota goblin pool intead of
+        my persoal login?"). A refusal of the App falls back to the login's shim, which parks it as before.
+        GLAEDA_APP_CREATES=0 turns it off. Detector: test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause."""
+        tool = app_pool_tool()
+        if not tool or not app_creates_on():
+            return False
+        try:
+            got = run_bounded([sys.executable, "-I", str(tool), "route", "pr", "merge", str(e["number"]), "-R",
+                               str(e["repo"])], timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return got.returncode == 0 and got.stdout.split("\t", 1)[0].strip() == "lander"
+
     def held_by_create_pause(self, e: dict, kind: str, head: str) -> bool:
         """Whether the login's create pause holds KIND at HEAD now (create_pause): then E is parked until it ends, as
         the shim's own refusal would park it (park_quota on its words), and nothing is sent. Never counted toward a
         stop, nor is the judgment after it (stepQuotaParked)."""
         until = self.create_pause(self.now)
         if until <= self.now:
+            return False
+        if kind == "merge" and self.merge_on_app(e):
             return False
         with self.lock:
             self.history(e, "step_held", kind=kind, head=head[:12], why="the login's create pause")
@@ -26471,6 +26583,9 @@ class LandQueue:
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        tree, why = self.union_one_key(gitdir, tree, paths, head, base_sha)
+        if why:
+            return "", "", "", why
         base_tree = (self.union_git(gitdir, "rev-parse", f"{base_sha}^{{tree}}").stdout or "").strip()
         if SHA40.fullmatch(base_tree) and base_tree == tree:
             # LAND_ZERO_DIFF: the merge resolves to the base's own tree, so the merge commit (and the land after it)
@@ -26502,8 +26617,53 @@ class LandQueue:
         sha = (commit.stdout or "").strip()
         if commit.returncode != 0 or not SHA40.fullmatch(sha):
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
-        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
+        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir, branch=branch)
         return sha, branch, base_sha, ""
+
+    def union_one_key(self, gitdir: str, tree: str, paths: list[str], head: str, base: str) -> tuple[str, str]:
+        """(TREE with each of PATHS naming each frontmatter key once (land_one_line_per_key), "") or ("", why not)
+        (LAND_UNION_ONE_KEY). Writes only objects into this host's union mirror, through a scratch index."""
+        fork = self.union_git(gitdir, "merge-base", head, base)
+        fork_sha = (fork.stdout or "").split()[0] if fork.returncode == 0 and (fork.stdout or "").split() else ""
+
+        def read(commit: str, path: str) -> str | None:
+            if not commit:
+                return None
+            got = self.union_git(gitdir, "cat-file", "blob", f"{commit}:{path}")
+            return got.stdout if got.returncode == 0 and isinstance(got.stdout, str) else None
+
+        fixed: dict[str, str] = {}
+        for path in paths:
+            text = read(tree, path)
+            if text is None or "\r" in text:
+                continue
+            one = land_one_line_per_key(text, read(fork_sha, path), read(head, path), read(base, path))
+            if one != text:
+                fixed[path] = one
+        if not fixed:
+            return tree, ""
+        with tempfile.TemporaryDirectory(prefix="glaeda-union-key-") as tmp:
+            index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            got = self.union_git(gitdir, "read-tree", tree, extra=index)
+            if got.returncode != 0:
+                return "", f"git read-tree {tree[:12]} failed: {land_trim(got.stderr or '', 160)}"
+            for n, (path, text) in enumerate(sorted(fixed.items())):
+                blob_file = os.path.join(tmp, f"blob-{n}")
+                with open(blob_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                blob = self.union_git(gitdir, "hash-object", "-w", blob_file)
+                listed = self.union_git(gitdir, "ls-tree", tree, "--", path)
+                oid, mode = (blob.stdout or "").strip(), ((listed.stdout or "").split() or ["100644"])[0]
+                if blob.returncode != 0 or not SHA40.fullmatch(oid):
+                    return "", f"git hash-object of {path} failed: {land_trim(blob.stderr or '', 160)}"
+                got = self.union_git(gitdir, "update-index", "--cacheinfo", f"{mode},{oid},{path}", extra=index)
+                if got.returncode != 0:
+                    return "", f"git update-index of {path} failed: {land_trim(got.stderr or '', 160)}"
+            wrote = self.union_git(gitdir, "write-tree", extra=index)
+            out = (wrote.stdout or "").strip()
+            if wrote.returncode != 0 or not SHA40.fullmatch(out):
+                return "", f"git write-tree failed: {land_trim(wrote.stderr or '', 160)}"
+        return out, ""
 
     def union_merge(self, e: dict, head: str) -> None:
         """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
@@ -26541,8 +26701,16 @@ class LandQueue:
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, kind, head, said, why, tried)
             return
+        self.union_push(e, head, sha, branch, base_sha, kind, said)
+
+    def union_push(self, e: dict, head: str, sha: str, branch: str, base_sha: str, kind: str, said: str) -> None:
+        """Push SHA, the base merge union_plan made on top of HEAD, to the PR's BRANCH and wait for the new head
+        (LAND_UNION_PUSH_DEADLINE's comment). A push that timed out is recorded in e["updateSent"]["union"], so
+        update_branch pushes it again after the head wait instead of waiting out LAND_UPDATE_ONCE."""
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
+            tries = int((e.get("unionMerge") or {}).get("pushTries") or 0) + 1
+            e["unionMerge"].update(merge=sha, branch=branch, pushTries=tries)
             self.claim(e, "update_branch", before=head, form="union_merge", merge=sha)
             e["updateSent"] = {"head": head, "at": self.now}
             self.save(e)
@@ -26550,16 +26718,17 @@ class LandQueue:
             # The broker pushes only a branch this lane pushed before: another lane's PR is refused, and stops below.
             argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--base",
                     str(e["unionMerge"].get("baseRef") or ""), "--rev", sha, "--dir", gitdir]
-            got = self.call(argv, LAND_GH_DEADLINE, e)
+            got = self.call(argv, LAND_UNION_PUSH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
-                                 timeout=LAND_GH_DEADLINE)
+                                 timeout=LAND_UNION_PUSH_DEADLINE)
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             self.nudge(e["key"])
             if got.returncode == 124:  # sent, unanswered: it may have reached GitHub (push_step keeps it sent too)
-                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12])
+                e["updateSent"].update(union=sha, branch=branch, base=base_sha, tries=tries)
+                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12], tries=tries)
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
                 return
             if got.returncode != 0:
@@ -27194,6 +27363,33 @@ class LandQueue:
             return ""
         return f"its override names {', '.join(sorted(named)[:6])}, none of the PR's {len(files)} changed files"
 
+    def union_push_again(self, e: dict, head: str, sent: dict, waited: float) -> None:
+        """LAND_UNION_PUSH_DEADLINE's comment: this queue's push of its base merge at HEAD timed out and the head wait
+        after it passed with no new head. Push the same merge again, LAND_UNION_PUSH_TRIES in all; then stop, naming
+        the push and the hand command, never waiting out LAND_UPDATE_ONCE on it."""
+        repo, number = e["repo"], str(e["number"])
+        sha, branch = str(sent.get("union") or ""), str(sent.get("branch") or "")
+        tries = int(sent.get("tries") or 1)
+        tried = e.get("unionMerge") or {}
+        gitdir = str(tried.get("gitdir") or "")
+        kind = str(tried.get("kind") or "update_branch")
+        have = bool(gitdir) and self.union_git(gitdir, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
+        if tries < LAND_UNION_PUSH_TRIES and have and branch:
+            with self.lock:
+                self.history(e, "union_push_retry", head=head[:12], merge=sha[:12], waited=round(waited),
+                             why="the push of the base merge timed out and no new head showed: pushed again")
+                self.save(e)
+            self.union_push(e, head, sha, branch, str(sent.get("base") or ""), kind, str(tried.get("out") or ""))
+            return
+        with self.lock:
+            self.stop(e, "update_branch_no_new_head",
+                      f"the base merge {sha[:12]} this queue made on {head[:12]} (git merges the base cleanly) was "
+                      f"pushed {tries} time(s) and each push timed out after {LAND_UNION_PUSH_DEADLINE:.0f} s; "
+                      f"{waited:.0f} s after the last one the head is still {head[:12]}"
+                      + ("" if have else f" (the merge commit is gone from {gitdir or 'the union mirror'})"),
+                      f"gh pr checkout {number} -R {repo}; git merge origin/{tried.get('baseRef') or '<its base>'}; "
+                      f"git push; then glaeda-gh land {repo}#{number} --sha <the new head>")
+
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
         tried = e.get("unionMerge") or {}
@@ -27249,6 +27445,9 @@ class LandQueue:
             # it makes; with none by the bound, stop and say so.
             waited = self.now - float(sent.get("at") or 0)
             if sent.get("answered") and self.update_noop(e, head, sent, waited):
+                return
+            if sent.get("union") and waited >= LAND_HEAD_TIMEOUT:
+                self.union_push_again(e, head, sent, waited)
                 return
             with self.lock:
                 if waited >= LAND_UPDATE_ONCE:
@@ -35098,15 +35297,22 @@ def direct_parts_load(now: float) -> dict[str, dict]:
 
 
 def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
-    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read)."""
+    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read).
+    The load, merge and write are one step under a lock: several waits and land workers on a host end within seconds
+    of each other, and unlocked each wrote back the file it had read before the others' answers, so a base's rulesets
+    one of them had just read was dropped and the next direct read asked GitHub for it again."""
     try:
-        kept = direct_parts_load(now)
-        for path, v in repo_parts.items():
-            if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
-                    and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
-                kept[path] = v
-        newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
-        write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(BASE / (DIRECT_PARTS + ".lock"), 2.0) as held:
+            if not held:
+                return  # a sibling is writing: its merge keeps the older answers; ours are read again at worst
+            kept = direct_parts_load(now)
+            for path, v in repo_parts.items():
+                if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
+                        and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
+                    kept[path] = v
+            newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
+            write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
     except (OSError, ValueError, TypeError):
         pass
 
