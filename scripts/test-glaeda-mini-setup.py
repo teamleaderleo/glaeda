@@ -1080,6 +1080,44 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
 
+    def test_update_only_installs_a_recurring_updater_on_linux(self) -> None:
+        self.linux()
+        unrelated = self.home / ".config/systemd/user/glaeda-custom.service"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("[Service]\nExecStart=/opt/glaeda-custom\n")
+        before = unrelated.read_bytes()
+        receipt = self.invoke("--update-only", "--apply")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        self.assertEqual(receipt["profile"], "update")
+        self.assertEqual(sorted(p.name for p in unrelated.parent.iterdir()),
+                         ["glaeda-custom.service", "glaeda-update.service", "glaeda-update.timer"])
+        self.assertEqual(unrelated.read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()), ["glaeda-update"])
+        config = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertEqual(config["setupArgs"], ["--update-only"])
+        self.assertFalse((self.home / "Projects").exists())
+        self.assertFalse((self.home / ".local/share/glaeda/gh-daemon.json").exists())
+        self.assertEqual(self.states(self.invoke("--update-only", "--apply")), {"unchanged"})
+
+    def test_update_only_installs_only_the_launchd_updater(self) -> None:
+        before = self.tree()
+        planned = self.invoke("--update-only")
+        self.assertEqual(self.tree(), before, "planning must not enroll a host")
+        receipt = self.invoke("--update-only", "--apply")
+        labels = [a["label"] for a in receipt["actions"] if a["kind"] == "agent"]
+        self.assertEqual(labels, [ms.LABEL_PREFIX + "update"])
+        plist = plistlib.loads((self.home / "Library/LaunchAgents" / (labels[0] + ".plist")).read_bytes())
+        self.assertGreater(plist["StartInterval"], 0)
+        self.assertIn("--apply", plist["ProgramArguments"])
+        self.assertEqual({a["kind"] for a in planned["actions"]}, {"dir", "tool", "agent", "config"})
+
+    def test_update_only_does_not_narrow_an_existing_profile(self) -> None:
+        self.invoke("--gh-only", "--apply")
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
     def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
         """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and
         glaeda-disk's pressure pass, which acts only below the floor (Leo, 2026-11-08: "on every machine")."""
