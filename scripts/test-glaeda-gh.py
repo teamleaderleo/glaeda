@@ -48617,7 +48617,7 @@ class AppPoolChainTest(unittest.TestCase):
             gg.APP_POOL_SPARES, gg.BASE, gg.APP_POOL_DISCOVER = saved
 
     def test_every_held_read_pool_follows_the_listed_chain(self) -> None:
-        """NOW 2026-11-27 22:31Z: this daemon was the login's top GraphQL spender (3852 on cmux-cp-1) while
+        """NOW 2026-11-27 22:31Z: this daemon was the login's top GraphQL spender (3852 on the controller host) while
         quota-goblin-9016 and the other read pools pushed to the host were on no chain. Leo: "use the apps we have"."""
         doc = {"roles": {
             "ci-watch": {"writes": []},

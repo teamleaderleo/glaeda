@@ -3972,7 +3972,7 @@ APP_POOL_ROLE = "ci-watch"
 APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
 # Then every other read pool this host holds (Leo, 2026-11-27: "use the apps we have"): NOW 22:31Z had this daemon the
-# login's top GraphQL spender, 3852 points on cmux-cp-1 and 928 on cmux16, while quota-goblin-9002, -9005, -9014 and
+# login's top GraphQL spender, 3852 points on the controller host and 928 on another, while quota-goblin-9002, -9005, -9014 and
 # -9016 (lw#13144), read pools of machines/gh-app-roles.json pushed to the hosts, were on no chain here. A role marked
 # `pool` and not `read_pool: false` or `actions_only` (runner-pool-1's bucket is the workflows') whose key or pushed
 # token is on this host goes after the listed chain, in the file's order. GLAEDA_GH_APP_SPARES set (even "") is the
