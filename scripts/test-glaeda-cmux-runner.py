@@ -5043,6 +5043,8 @@ class HookTest(unittest.TestCase):
                  # the bare Mac test jobs build on the mini; only their -fleet client twins run here
                  ("fast-tier", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("swift-test", self.FAST_TIER, "manaflow-ai/cmux"),
+                 # the mac fallback client is admitted only from cmux-next.yml
+                 ("fast-tier-fleet-mac", other, "manaflow-ai/cmux"),
                  ("daemon-test", self.FAST_TIER, "manaflow-ai/cmux"),
                  # the bare id of a -fleet client builds on a Mac
                  ("app-compile", other, "manaflow-ai/cmux"),
@@ -5082,6 +5084,7 @@ class HookTest(unittest.TestCase):
                               ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
                               ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
                               ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab"),
+                              ("cmux-next.yml", "fast-tier-fleet-mac"),
                               # GATEWAY_FLEET_SUFFIX: a -fleet job id from any home-repository workflow
                               ("cmux-next-ios-kit.yml", "link-ffi-fleet"), ("other.yml", "new-client-fleet")):
             with self.subTest(workflow=workflow, job=job):

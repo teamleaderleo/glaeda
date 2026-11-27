@@ -814,6 +814,11 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # token still bounds the clients, a signing job still takes both tokens, and the gate still stops the listener while
 # a fleet build holds host.lock exclusively, so no new client starts beside a claimed build; one already waiting
 # keeps waiting at no cost.
+# fast-tier-fleet-mac: cmux-next's "fast tier (build fleet, mac fallback)", the old gateway client of fast-tier-fleet,
+# runs on the gateway runner macos-placement names and only submits the suites with cmux-ci. Its id ends in -mac, not
+# -fleet, so every gateway runner refused it in about a second: 5 of 5 runs from 2026-11-26 01Z to 2026-11-27 01Z
+# (job 139885902634 on cmux10s-mac-mini-glaeda-18, run 45806514798), each a Mac fast-tier setup refusal
+# (cmuxterm-hq goals/mac-fast-tier-setup-refusals.md).
 GATEWAY_CLASS = "gateway"
 GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
 # six since hq#17742 (MAX_GATEWAY_RUNNERS): the fleet route of the fast tier needs an idle gateway runner
@@ -828,7 +833,8 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
                           ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
                           ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
-                          ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab")})
+                          ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab"),
+                          ("cmux-next.yml", "fast-tier-fleet-mac")})
 GATEWAY_FLEET_SUFFIX = "-fleet"
 
 
