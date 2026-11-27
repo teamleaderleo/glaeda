@@ -15038,6 +15038,26 @@ class CacheBudgetTest(unittest.TestCase):
         gd.POLICY["cache_budget_free"] = "0"  # the share alone: under it, nothing to give back
         self.assertEqual(gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]["over"], 0)
 
+    def test_a_fleet_cas_over_its_cap_closes_a_free_shortfall_no_survey_item_can(self) -> None:
+        # cmux17, 2026-11-27: 36 GiB free on a 228 GB mini, 16 GiB of fleet CAS, nothing else reclaimable; the
+        # volume read over 0, so fleet_cas_budget_cap never ran and every floor eviction freed 0.0 GiB
+        fs = gd.Fs(self.dev, "/", 36 * gd.GIB, 228 * 10**9, 100 * gd.GIB, 150 * gd.GIB)
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        cas = {"at": 1000.0, "dev": self.dev, "bytes": 16 * gd.GIB}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, {}, cas, now=1000.0, reclaimable={})[self.dev]
+        excess = 16 * gd.GIB - gd.fleet_cas_cap_bytes(fs.total)
+        self.assertGreater(excess, 0)
+        self.assertEqual(row["over"], excess)
+        self.assertEqual(row["free_short_left"], row["free_short"] - excess)
+        # a CAS under its cap closes nothing: the volume stays not over, as before
+        small = {**cas, "bytes": gd.fleet_cas_cap_bytes(fs.total)}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, {}, small, now=1000.0, reclaimable={})[self.dev]
+        self.assertEqual(row["over"], 0)
+        # no free shortfall: the share alone decides, the CAS excess adds nothing
+        roomy = gd.Fs(self.dev, "/", 150 * gd.GIB, 228 * 10**9, 100 * gd.GIB, 150 * gd.GIB)
+        row = gd.cache_budget_state([fam], {self.dev: roomy}, {}, cas, now=1000.0, reclaimable={})[self.dev]
+        self.assertEqual(row["over"], 0)
+
     def test_reclaimable_counts_only_reclaimable_budget_family_items_once(self) -> None:
         dd = gd.Family("xcode-derived-data", self.root, True, "")
         r = os.fspath(self.root)

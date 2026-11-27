@@ -2400,8 +2400,13 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
         except ValueError:
             free_need = 0
         row["free_short"] = max(0, free_need - fs.free)
+        # the fleet compilation cache above its budget cap closes a shortfall too: fleet_cas_budget_cap takes it back
+        # with a fetch, never a rebuild. No survey item counts it, so a mini whose only slack was its CAS (cmux17,
+        # 2026-11-27: 16 GiB of CAS, 36 GiB free under the runner gate's 41.8 GiB floor) read over 0 and every
+        # floor eviction freed 0.0 GiB while its gui-light runner stayed held.
+        cas_excess = max(0, row["families"].get("fleet-cas", 0) - fleet_cas_cap_bytes(fs.total))
         closable = (max(0, row["free_short"] - (unclosable or {}).get(dev, 0)) if reclaimable is None
-                    else min(row["free_short"], reclaimable.get(dev, 0)))
+                    else min(row["free_short"], reclaimable.get(dev, 0) + cas_excess))
         row["free_short_left"] = row["free_short"] - closable
         row["over"] = min(row["used"], max(over_share, closable))
     return out
@@ -19359,6 +19364,16 @@ FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 FLEET_CAS_BUDGET_SHARE = 0.025
 
 
+def fleet_cas_cap_gib(total: int) -> float:
+    """The cap each fleet-cas store gets over the cache budget on a volume of TOTAL bytes, in GiB."""
+    return max(2.0, round(total * FLEET_CAS_BUDGET_SHARE / GIB, 1))
+
+
+def fleet_cas_cap_bytes(total: int) -> int:
+    """What both fleet-cas stores may hold together under their budget cap (node store and local CAS each)."""
+    return int(2 * fleet_cas_cap_gib(total) * GIB)
+
+
 def _fleet_cas_prune(root: Path, prune: Path, args: list[str]) -> dict[str, Any] | None:
     """One glaeda-fleet-cas-prune run (ARGS) bounded by FLEET_CAS_PRUNE_TIMEOUT_S: its JSON line, None when the prune or
     fleet-cas is absent, or the run failed."""
@@ -19446,7 +19461,7 @@ def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     RUN["fleet_cas_budget_cap"] = True
     counted = CACHE_BUDGET[dev].get("families", {}).get("fleet-cas", 0)
     before = read_fleet_cas_record()
-    freed = fleet_cas_node_cap(root, cap_gib=max(2.0, round(fss[dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1)))
+    freed = fleet_cas_node_cap(root, cap_gib=fleet_cas_cap_gib(fss[dev].total))
     after = read_fleet_cas_record()
     if after and after.get("dev") == dev and after["at"] > (before.get("at", 0.0) if before else 0.0):
         shrank = max(0, counted - after["bytes"])
