@@ -49862,6 +49862,50 @@ class HeadReadsSizedByMeasuredCost(unittest.TestCase):
     def entries(self, n):
         return [{"key": f"head:{self.REPO}@{i:040x}", "cache": {}} for i in range(1, n + 1)]
 
+    def test_inner_queries_yield_the_heads_share_and_retry_only_unread_heads(self):
+        d, clock = self.daemon(3.0)
+        d.head_secs = {self.REPO: 3.0}  # two heads per query, six seconds each
+        d.head_until, d.tick_deadline = 40.0, 90.0
+        d.deferred, d.defer_why = set(), {}
+        heads = self.entries(100)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_heads(heads))
+            self.assertEqual(clock[0], 42.0)  # at most the in-flight query exceeds the share
+            self.assertEqual(d.stored, [e["key"] for e in heads[:14]])
+            self.assertEqual(d.deferred, {e["key"] for e in heads[14:]})
+            self.assertEqual(d.refunded_keys, [e["key"] for e in heads[14:]])
+            self.assertIn("heads' share", d.defer_why["head"][1])
+            # The unread entries retain no fabricated freshness. A later unrestricted pass finishes them.
+            d.head_until, d.tick_deadline = None, float("inf")
+            self.assertIsNone(d.fetch_heads(heads))
+        self.assertEqual(len(d.stored), 100)
+        self.assertEqual(len(set(d.stored)), 100)
+        self.assertEqual(clock[0], 300.0)
+
+    def test_inner_queries_preserve_first_query_when_share_is_already_spent(self):
+        d, clock = self.daemon(3.0)
+        d.head_secs = {self.REPO: 3.0}
+        d.head_until, d.tick_deadline = 0.0, 90.0
+        d.deferred, d.defer_why = set(), {}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_heads(self.entries(10)))
+        self.assertEqual(d.sent, [2])
+        self.assertEqual(len(d.deferred), 8)
+
+    def test_inner_queries_stop_at_tick_deadline_without_a_heads_share(self):
+        for deadline, reads in ((0.0, 0), (10.0, 4)):
+            with self.subTest(deadline=deadline):
+                d, clock = self.daemon(3.0)
+                d.head_secs = {self.REPO: 3.0}
+                d.head_until, d.tick_deadline = None, deadline
+                d.deferred, d.defer_why = set(), {}
+                heads = self.entries(10)
+                with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+                    self.assertIsNone(d.fetch_heads(heads))
+                self.assertEqual(len(d.stored), reads)
+                self.assertEqual(d.deferred, {e["key"] for e in heads[reads:]})
+                self.assertEqual(d.refunded_keys, [e["key"] for e in heads[reads:]])
+
     def test_a_slow_repos_heads_go_few_to_a_query_after_one_timeout(self):
         d, clock = self.daemon(2.5)
         lines = []

@@ -12790,6 +12790,15 @@ class Daemon:
             return None
         size = self.head_size(entries)
         for i in range(0, len(entries), size):
+            # batched() bounds outer chunks; measured cost can split one into many queries.
+            # Keep its first-query guarantee, then yield to waited PRs/runs at the same deadline.
+            if time.monotonic() >= getattr(self, "tick_deadline", float("inf")):
+                self.defer(entries[i:])
+                return None
+            until = getattr(self, "head_until", None)
+            if i and until is not None and time.monotonic() >= until:
+                self.defer(entries[i:], "the heads' share of the tick, waited reads due")
+                return None
             error = self.fetch_head_chunk(entries[i:i + size])
             if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
                 if error is not None:
