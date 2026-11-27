@@ -10010,6 +10010,42 @@ class TickBudgetTest(Base):
         self.assertEqual(self.order([plain, merged, fresh, old, head, older])[:2], [old["key"], head["key"]])
         self.assertIsNone(self.daemon.starved_lead([fresh, plain, merged, head]))
 
+    def test_stale_waited_keys_are_read_over_rest_oldest_first_when_graphql_is_stopped_and_the_share_is_zero(self) -> None:
+        """cmux-cp-1 2026-11-27: GraphQL under its reserve, restShare 0 ("0 of 0"), 4,373 REST left: waited PR data
+        reached 13,380 s and the valve restarted the daemon in a loop. read_stale_direct reads the oldest waited keys
+        past STALE_DATA_AFTER over REST, STALE_DIRECT_PER_TICK a tick and STALE_DIRECT_MAX an hour, and not when
+        GraphQL can read, REST is stopped, or the key was just tried."""
+        def pr(n: int, age: float, waited: bool = True) -> dict:
+            return {"key": f"pr:o/r#{n}", "waitedAt": NOW if waited else None, "consumers": {},
+                    "cache": {"data": {"state": "OPEN"}, "dataAt": NOW - age, "fetchedAt": NOW - age}}
+        entries = [pr(1, 700), pr(2, 13380), pr(3, 5000), pr(4, 90000, waited=False), pr(5, 100), pr(6, 9000), pr(7, 800)]
+        d, got = self.daemon, []
+        d.now, d.stale_direct_at, d.waited_tried = NOW, [], {}
+        d.tick_deadline = float("inf")
+        modes = {"graphql": "stop", "rest": "normal"}
+        with mock.patch.object(gg.Daemon, "rest_fetch", property(lambda _: {"pr": lambda e: got.append(e["key"])})), \
+                mock.patch.object(d, "mode", side_effect=lambda b: modes[b]), \
+                mock.patch.object(d, "rest_above_floor", return_value=True), \
+                mock.patch.object(d, "rest_room", return_value=False):
+            d.secondary_until = 0.0
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, ["pr:o/r#2", "pr:o/r#6", "pr:o/r#3"], "oldest first, three a tick, unwaited never")
+            got.clear()
+            d.read_stale_direct(entries, set())  # tried within WAITED_FRESH: the next oldest
+            self.assertEqual(got, ["pr:o/r#7", "pr:o/r#1"], "then the rest past the bound; the 100 s one is fresh")
+            got.clear()
+            d.waited_tried = {}
+            d.stale_direct_at = [NOW] * gg.STALE_DIRECT_MAX
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "STALE_DIRECT_MAX an hour")
+            d.stale_direct_at = []
+            modes["graphql"] = "normal"
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "GraphQL can read: its own paths do")
+            modes.update(graphql="stop", rest="stop")
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "REST stopped")
+
     def test_held_staleness_alarms_past_the_held_bound_without_a_restart(self) -> None:
         """huge-blue 2026-11-20: "held" all day at 39,600 s, each quota or deferral explanation re-arming it. Up to
         STALE_HELD_MAX it stays held; past it the alarm goes out with verdict "held", and nothing restarts for it."""
