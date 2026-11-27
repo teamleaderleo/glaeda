@@ -315,6 +315,18 @@ def main_head(work: Path) -> tuple[Path, str]:
         git(mirror, "remote", "add", "origin", REPO_URL)
     if source is not None and not borrow_state(mirror)[0]:
         borrow(mirror, source)  # earlier objects stay until the mirror is next rebuilt; they are small (trees)
+    if source is not None:
+        # main comes from the git mirror it borrows, which glaeda-git-mirror keeps within a minute of GitHub's.
+        # A --depth fetch from GitHub sends every tree of DEPTH commits whatever this mirror already holds
+        # (100+ MB of cmux), so on a slow route each try ran into FETCH_TIMEOUT and the next run downloaded it
+        # all again: one mini pulled 106 MB through its egress route and timed out every 8 minutes for hours
+        # (2026-11-26 23:07Z to 00:53Z). From the borrowed mirror the objects are already here: nothing moves.
+        try:
+            git(mirror, "fetch", "-q", "--no-tags", f"--depth={DEPTH}", str(Path(GIT_MIRROR_DIR) / "cmux.git"),
+                "+refs/heads/main:refs/remotes/origin/main")
+            return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass  # a mirror mid-repair or without main: GitHub, as before
     git(mirror, "fetch", "-q", "--filter=blob:none", f"--depth={DEPTH}", "origin",
         "+refs/heads/main:refs/remotes/origin/main")
     return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()
