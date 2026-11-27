@@ -1364,6 +1364,8 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
         return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
     if current is None:
         return {**act, "state": "create", "value": update_config(ctx)}
+    if not isinstance(current, dict):
+        return {**act, "state": "blocked", "note": "update config must be an object"}
     value = dict(current)
     # A headless migration must persist the service domain for the OTA updater.
     # Without this, the first successful update silently reinstalls GUI agents
@@ -2506,6 +2508,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.update_only:
         if args.uninstall or args.gh_only or args.hygiene_only:
             print("glaeda-mini-setup: --update-only cannot combine with uninstall or another profile", file=sys.stderr)
+            return 2
+        if isinstance(prior, dict) and prior.get("profile") != "update":
+            print("glaeda-mini-setup: preserve the recorded setup profile; restore its updater config", file=sys.stderr)
             return 2
         existing = update_config_action(ctx)
         if existing.get("state") == "blocked":

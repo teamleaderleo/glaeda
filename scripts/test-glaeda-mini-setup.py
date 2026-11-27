@@ -1117,7 +1117,8 @@ class MiniSetupTest(unittest.TestCase):
         ctx.hygiene_only = True
         ctx.profile_flag = "--update-only"
         ctx.skip_launchctl = False
-        actions = ms.plan_install(ctx)
+        with mock.patch.object(ms, "agent_loaded", return_value=False):
+            actions = ms.plan_install(ctx)
 
         def start(context, path):
             config = json.loads(context.update_config.read_text())
@@ -1130,6 +1131,23 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_update_only_does_not_narrow_an_existing_profile(self) -> None:
         self.invoke("--gh-only", "--apply")
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
+    def test_update_only_preserves_prior_ownership_when_config_is_missing(self) -> None:
+        self.invoke("--gh-only", "--apply")
+        (self.home / ".config/glaeda/update.json").unlink()
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
+    def test_update_only_refuses_non_object_config_without_mutation(self) -> None:
+        path = self.home / ".config/glaeda/update.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("[]")
         before = self.tree()
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
