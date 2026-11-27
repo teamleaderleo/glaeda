@@ -1639,6 +1639,12 @@ it. Its Seed DerivedData jobs build from the same local CAS as the catch-up fill
 writer, and the label's other servers (cmux7s-mac-mini, ultra1) take the job meanwhile. Without the key nothing
 changes. A `user` entry cannot declare it (the waiter spans are the member user's state).
 
+The same gate also stays off while the yielding build itself holds `host.lock` (`<host lock>.yield`, the fill), not
+only while it waits (`YIELDER_KEEPS_ITS_TURN`). Before this, a pool gate's rule that a yielding holder leaves the host
+free let the listener take the next seed the moment the fill got the lock, and that job preempted it. Seeds come back
+to back, so the fill never finished. The hold is bounded per holder by `GATE_YIELDER_MAX_HOLD_S` (20 min, then waived
+for `GATE_WAITER_WAIVE_S`; 0 turns it off). Pool runners and the nightly slot still listen through a yielding holder.
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and

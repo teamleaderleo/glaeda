@@ -13912,6 +13912,41 @@ class GateTest(unittest.TestCase):
                         lsof.return_value = set()
                         self.assertIsNone(gate.claimed())
 
+    def test_a_waiter_yielding_dedicated_runner_stays_off_while_the_yielding_fill_holds_the_lock(self) -> None:
+        """YIELDER_KEEPS_ITS_TURN, cmux15 2026-11-26 23:10Z: the fill took host.lock after its wait, the gate read the
+        yielding holder as a free host and the next seed preempted it. The hold is bounded per holder, logged once
+        past the bound, starts over for a new holder, and is off without --yield-to-waiters or on the nightly slot."""
+        for flags, held in ((" --yield-to-waiters", True), ("", False)):
+            with self.subTest(flags=flags):
+                write_hook(self.runner, f"exec python3 /hook job-started --dedicated-admit /x/a.sh{flags}\n")
+                gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                                 waiters=False)
+                logs: list[str] = []
+                with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                        mock.patch.object(hook, "yielding_pid", return_value=88), \
+                        mock.patch.object(hook, "process_identity", return_value="ps:a"), \
+                        mock.patch.object(hook, "gate_yields", return_value=True) as yields, \
+                        mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                        mock.patch.object(hook.time, "monotonic", return_value=1000.0) as clock:
+                    self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)" if held else None)
+                    if not held:
+                        self.assertEqual(yields.call_count, 0)
+                        continue
+                    clock.return_value += hook.GATE_YIELDER_MAX_HOLD_S - 1
+                    self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)")
+                    clock.return_value += 2
+                    self.assertIsNone(gate.claimed(), "past the bound the seeds come back")
+                    self.assertIsNone(gate.claimed())
+                    self.assertEqual(len(logs), 1, logs)
+                    self.assertIn("has held the host for", logs[0])
+                    with mock.patch.object(hook, "process_identity", return_value="ps:b"):
+                        self.assertEqual(gate.claimed(), f"{hook.YIELDER_HOLDS} (pid 88)", "a new holder")
+                    yields.return_value = False  # the fill only waits behind someone else, or let go
+                    self.assertIsNone(gate.claimed())
+                    yields.return_value = True
+                    gate.nightly_slot = True
+                    self.assertIsNone(gate.claimed(), "the nightly slot listens through it")
+
     def test_a_waiter_seen_during_a_job_stops_a_waiter_yielding_dedicated_listener_as_the_job_ends(self) -> None:
         """A seed job that ends while the fill's slot waits must not hand the next seed to the same listener."""
         for flags, stopped in ((" --yield-to-waiters", True), ("", False)):
