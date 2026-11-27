@@ -91,6 +91,11 @@ What `--apply` does:
      CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
      An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
      `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     A checkout whose git carries the job's token (`actions/checkout`'s `http.<url>.extraheader`, in the
+     repository's config or its included credentials file) skips the tunnel with no probe (`this checkout carries
+     the job's token`): the tunnel is there for anonymous fetches, which GitHub blocked from the office address.
+     The cmux wrapper does the same for its fetches and other commands (`this fetch carries the job's token`), but
+     not for `git submodule update`, whose clones are other repositories with no token.
      The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
      disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
