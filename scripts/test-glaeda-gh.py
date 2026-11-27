@@ -10930,11 +10930,15 @@ class WatchdogTest(unittest.TestCase):
 
     def test_a_loop_stuck_holding_stdout_still_ends(self) -> None:
         """End to end: the tick blocks inside a write to a pipe nobody reads, so it holds the stdout
-        lock the watchdog's own log line needs. The faulthandler backstop ends the process anyway."""
+        lock the watchdog's own log line needs. The watchdog gives that row WATCHDOG_WRITE_WAIT, then
+        exits EXIT_WATCHDOG with the row and the main thread's frames on stderr. Before, its write
+        blocked with the tick's and only the backstop ended the process (status 1, no row: on one lane
+        VM, 10 of the unit's 21 deaths in three days)."""
         with tempfile.TemporaryDirectory() as tmp:
             code = CHILD_PRELUDE + """
 gg.WATCHDOG_AFTER = 1.0
-gg.WATCHDOG_BACKSTOP = 1.0
+gg.WATCHDOG_BACKSTOP = 8.0
+gg.WATCHDOG_WRITE_WAIT = 0.5
 class Stuck:
     def tick(self):
         while True:
@@ -10943,14 +10947,77 @@ gg.Daemon = Stuck
 gg.serve(foreground_ok=True)
 """
             began = time.monotonic()
-            with subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+            err = Path(tmp) / "stderr"
+            with err.open("w") as sink, \
+                    subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                     stdout=subprocess.PIPE, stderr=sink) as child:
                 try:
                     code_ = child.wait(timeout=30)
                 finally:
                     child.kill()
             self.assertLess(time.monotonic() - began, 20)
-            self.assertEqual(code_, 1, "faulthandler's exit, not a hang")
+            self.assertEqual(code_, gg.EXIT_WATCHDOG, "the watchdog's own exit, not the backstop's status 1")
+            text = err.read_text()
+            self.assertIn("The watchdog row was not written", text)
+            self.assertIn('"event": "watchdog"', text)
+            self.assertRegex(text, r'"main": \[[^]]*tick', "the row names what the main thread was stuck in")
+
+    def test_a_watchdog_row_names_the_main_threads_frames(self) -> None:
+        """A loop stuck where no request is (a hung disk write: inCall null) is still named in the row."""
+        clock, exits, done = [100.0], [], threading.Event()
+        dog = gg.Watchdog(300, clock=lambda: clock[0], exit=exits.append)
+        clock[0] += 301
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            checker = threading.Thread(target=lambda: (dog.check(), done.set()))
+            checker.start()
+            done.wait(10)  # the main thread is here while the row is written: it names this test
+            checker.join(10)
+        line = json.loads(out.getvalue().splitlines()[0])
+        self.assertTrue(any("test_a_watchdog_row_names_the_main_threads_frames" in f for f in line["main"]), line)
+        self.assertEqual(exits, [gg.EXIT_WATCHDOG])
+
+    def test_an_alarm_handed_over_by_a_re_exec_does_not_kill_the_new_daemon(self) -> None:
+        """execve keeps ITIMER_REAL and resets SIGALRM to its default action (end the process). On one lane VM,
+        2026-11-25..26, 6 deaths by SIGALRM, each 30-75 s after a script-wake re-exec from a read phase under
+        hard_deadline. The new image here starts with such an alarm armed: serve disarms it and names it on its start
+        row, and the daemon lives until its watchdog."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code = CHILD_PRELUDE + """
+import signal
+gg.WATCHDOG_AFTER = 3.0
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.setitimer(signal.ITIMER_REAL, 1.0)  # what the last image's hard_deadline left armed
+class Stuck:
+    def tick(self):
+        time.sleep(120)
+gg.Daemon = Stuck
+gg.serve(foreground_ok=True)
+"""
+            child = subprocess.run([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                   capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(child.returncode, -signal.SIGALRM, "killed by the handed-over alarm")
+            self.assertEqual(child.returncode, gg.EXIT_WATCHDOG, child.stderr[-2000:])
+            start = next(json.loads(line) for line in child.stdout.splitlines() if '"start"' in line)
+            self.assertGreater(start.get("inheritedAlarmS", 0), 0)
+
+    def test_a_re_exec_from_another_thread_hands_no_alarm_over(self) -> None:
+        """ScriptWake's thread re-execs while the main thread sits in hard_deadline: the new image starts with no alarm."""
+        probe = "import signal, sys; print(signal.getitimer(signal.ITIMER_REAL)[0]); sys.stdout.flush()"
+        code = CHILD_PRELUDE + f"""
+import threading
+def jump():
+    time.sleep(0.2)
+    gg.exec_serve([sys.executable, "-c", {probe!r}])
+with gg.hard_deadline(30):
+    threading.Thread(target=jump).start()
+    time.sleep(10)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            child = subprocess.run([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                   capture_output=True, text=True, timeout=60)
+        self.assertEqual(child.returncode, 0, child.stderr[-2000:])
+        self.assertEqual(float(child.stdout.strip().splitlines()[-1]), 0.0)
 
     def test_a_hung_tick_ends_the_process_and_frees_the_lock(self) -> None:
         """End to end: serve() with a tick stuck in a blocking call exits EXIT_WATCHDOG on its own,
@@ -19610,6 +19677,25 @@ class PostTest(unittest.TestCase):
         self.assertEqual(t.calls[1][1], "/repos/o/r/pulls?state=open&head=o%3Alane/x&base=main")
         state = gg.post_state(item["id"])
         self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/3"))
+
+    def test_a_filled_auto_drafts_ready_mark_goes_on_a_poster_app_when_the_login_made_the_create(self) -> None:
+        """Before: the ready mark of a filled auto-draft was the login's GraphQL whenever no App made the create
+        (cmux#61434, 2026-11-27: "API rate limit already exceeded for user"). After: a free poster App makes it."""
+        self.no_env_token()
+        asked = self.app_writer("quota-goblin")
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "mine")
+        exists = (422, {}, {"message": "Validation Failed",
+                            "errors": [{"message": "A pull request already exists for o:lane/x."}]})
+        draft = {"html_url": "https://github.com/o/r/pull/3", "number": 3, "node_id": "PR_3", "draft": True,
+                 "body": gg.AUTO_DRAFT_MARK + "\nDraft opened automatically"}
+        ready = (200, {}, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"number": 3, "isDraft": False}}}})
+        d, t = self.daemon(exists, (200, {}, [draft]), (200, {}, {"number": 3}), ready)
+        d.transport, seen = self.authed(t)
+        self.step(d, NOW)
+        self.assertEqual(t.calls[3][1], "/graphql")
+        self.assertEqual(seen[3], "Bearer " + self.APP_TOKEN)
+        self.assertIn(["broker-actor", "post", "o/r"], asked)
+        self.assertIn("marked ready", gg.post_state(item["id"])["note"])
 
     def test_an_open_auto_draft_for_the_head_is_filled_in_and_marked_ready(self) -> None:
         """2026-11-26: cmux#59774 and cmuxterm-hq#30522 were opened by `cmux-gh post pr ... --body-file` (wt push's
@@ -33662,6 +33748,7 @@ class LandTest(Base):
         self.assertEqual(updates, [f"expected_head_sha={LA}"])
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_again_unnamed"))
         self.assertIn(LB[:12], e["stop"]["reason"])
+        self.assertIn("refusal code stale_green", e["stop"]["reason"])  # it names the land-judge code that sent it
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
