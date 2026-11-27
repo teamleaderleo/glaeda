@@ -4951,12 +4951,12 @@ def load_feed_view() -> dict | None:
 
 
 def feed_view(key: str, data: dict | None, doc: dict | None, now: float) -> dict | None:
-    """What this host's feed says about PR KEY, for a downstream's land_feed_quiet (upstream_feed_quiet): since when
+    """What this host's feed says about PR or head KEY, for a downstream's land_feed_quiet (upstream_feed_quiet): since when
     the feed has answered without a gap (liveSince), when it last answered (at), and the newest event it delivered for
     the PR, the head this host's copy names, or its branch (eventAt, None for none). None, so the downstream holds
     nothing quiet, unless the feed answers now (CONTROLLER_FRESH) and covers the repository (FED_REPO_KEEP), as
     Daemon.fed asks."""
-    if not key.startswith("pr:") or not isinstance(doc, dict):
+    if not key.startswith(("pr:", "head:")) or not isinstance(doc, dict):
         return None
     live, ok = doc.get("liveSince"), doc.get("okAt")
     if not _finite(live) or not _finite(ok) or not 0 <= now - ok <= CONTROLLER_FRESH:
@@ -4971,9 +4971,17 @@ def feed_view(key: str, data: dict | None, doc: dict | None, now: float) -> dict
         return None
     marks = doc.get("marks") if isinstance(doc.get("marks"), dict) else {}
     data = data if isinstance(data, dict) else {}
-    head = str(data.get("headRefOid") or "").lower()
-    names = [f"pr:{repo}#{number}"] + ([f"sha:{repo}@{head}"] if head else []) \
-        + ([f"branch:{repo}@{data['headRefName']}"] if data.get("headRefName") else [])
+    if key.startswith("head:"):
+        # A commit's checks (head key): the feed marks its runs, suites and statuses as sha:REPO@SHA, the mark
+        # head_feed_quiet trusts on the broker host. Before, a lane VM's wait on a head had no view and re-read the
+        # commit's check-runs, status and check-suites every UPSTREAM_DIRECT_AFTER (2026-11-27 01:10-03:10Z: 1,861 of
+        # glaeda-upstream's 4,460 App requests an hour were those three per-commit reads).
+        head = str(number).lower()
+        names = [f"sha:{repo}@{head}"]
+    else:
+        head = str(data.get("headRefOid") or "").lower()
+        names = [f"pr:{repo}#{number}"] + ([f"sha:{repo}@{head}"] if head else []) \
+            + ([f"branch:{repo}@{data['headRefName']}"] if data.get("headRefName") else [])
     events = [marks[m] for m in names if _finite(marks.get(m))]
     return {"liveSince": live, "at": ok, "eventAt": max(events) if events else None, "head": head or None}
 

@@ -3470,6 +3470,23 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + 4)
         self.assertIsNone(self.daemon.feed_live_since, "a feed that is out vouches for nothing")
 
+    def test_a_head_keys_feed_view_is_its_commits_mark(self) -> None:
+        """A lane VM's wait on a commit's checks (head key) had no feed view, so it re-read check-runs, status and
+        check-suites every UPSTREAM_DIRECT_AFTER: 1,861 of glaeda-upstream's 4,460 App requests an hour. Its view is
+        the feed's sha mark, which head_feed_quiet trusts on the broker host."""
+        sha = "c" * 40
+        key = f"head:o/r@{sha}"
+        doc = {"liveSince": NOW - 7200, "okAt": NOW - 1, "fedRepos": {"o/r": NOW - 1}, "marks": {}}
+        view = gg.feed_view(key, None, doc, NOW)
+        self.assertEqual(view, {"liveSince": NOW - 7200, "at": NOW - 1, "eventAt": None, "head": sha})
+        self.assertTrue(gg.upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", NOW - 60, NOW))
+        doc["marks"] = {f"sha:o/r@{sha}": NOW - 10, f"sha:o/r@{'d' * 40}": NOW - 5}
+        view = gg.feed_view(key, None, doc, NOW)
+        self.assertEqual(view["eventAt"], NOW - 10, "its own commit's mark only")
+        self.assertFalse(gg.upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", NOW - 60, NOW),
+                         "a run for the commit after the copy: read it")
+        self.assertIsNone(gg.feed_view(f"head:x/y@{sha}", None, doc, NOW), "a repository the feed does not cover")
+
     def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
         """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
         feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
