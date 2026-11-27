@@ -16820,7 +16820,8 @@ class BrokerLogTest(BrokerBase):
                 self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
             written = log.read_text()
             self.assertEqual(len(written.splitlines()), 1, repr(bad))
-            self.assertRegex(written, r"^\S+ ppid-\d+ pr view pr:o/r#7\n$", repr(bad))
+            # a bad session id is never written: the parent's tool (broker_parent_tool), else its pid
+            self.assertRegex(written, r"^\S+ (?:ppid-\d+|tool:[A-Za-z0-9_.@-]{1,64}) pr view pr:o/r#7\n$", repr(bad))
         log.unlink(missing_ok=True)
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "session-1.2:3"}):
             self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
@@ -19322,6 +19323,49 @@ class PostTest(unittest.TestCase):
                              "<!-- review-run=run-1 --> Review finished.", "--status-key", "review-run=run-1")
         self.assertIsNone(d.status_editable(verdict))  # the App's comment is not the login's to edit
         self.assertEqual(d.poster_actor(verdict)["role"], "quota-goblin")
+
+    def test_a_comment_the_login_tried_moves_to_the_pool_after_a_look_on_an_app(self) -> None:
+        """cmux-cp-2, 2026-11-27: a router-review verdict the login sent into its secondary limit (attempts 3,
+        uncertain) sat at the outbox head 25+ min while the poster Apps were free: poster_due kept a comment the login
+        had tried on the login forever. Now a look on a poster App's token finds it not there, and the App posts it."""
+        self.no_env_token()
+        asked, tokens = self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "verdict")
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        gg.write_json(path, {**item, "uncertain": True, "attempts": 3, "throttled": 2})
+        made = {"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-7", "id": 7, "node_id": "IC_7"}
+        d, t = self.daemon((200, {}, []), (201, {}, made))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        d.secondary_until = NOW + 900  # the login is held: nothing may go on it
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls][:1], ["GET"])  # looked first, on the App
+        self.assertNotIn("Bearer " + TOKEN, seen)
+        for _ in range(3):
+            if gg.post_state(item["id"]).get("state") == "posted":
+                break
+            d.now = d.now + gg.POST_SPACING + 1
+            self.step(d, d.now)
+        self.assertEqual([c[0] for c in t.calls], ["GET", "POST"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(gg.post_state(item["id"])["appWriter"], "quota-goblin")
+        self.assertEqual(set(seen), {"Bearer " + tokens["quota-goblin"]})
+
+    def test_a_comment_the_login_tried_that_landed_is_finished_never_posted_again(self) -> None:
+        self.no_env_token()
+        self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "verdict")
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        gg.write_json(path, {**item, "uncertain": True, "attempts": 1})
+        found = {"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-5", "body": "verdict"}
+        d, t = self.daemon((200, {}, [found]))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        d.secondary_until = NOW + 900
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertNotIn("Bearer " + TOKEN, seen)
 
     def test_an_uncertain_poster_comment_is_looked_up_not_sent_again_on_another_identity(self) -> None:
         self.no_env_token()
@@ -24926,6 +24970,38 @@ class PrProbeTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a partial PR is read in full again")
 
+    def test_a_head_past_one_page_of_suites_is_probed_partial_not_read_in_full_each_cycle(self) -> None:
+        """The control-plane host, 2026-11-27: 153 of 683 open PRs held "more than 100 check suites" and no fingerprint,
+        so each was read in full every cycle (2.6-7 s of GitHub's time a cmux PR) and waited PR data reached 2,489 s.
+        That partial is the head's shape: it keeps its fingerprint, a matching probe confirms it, and it stays partial."""
+        node = self.gh.prs[("o", "r", 7)]
+        sha = node["headRefOid"]
+        self.gh.suites[sha] = [{"id": "S1", "latest": 1, "more": True}]
+        self.daemon.tick(NOW)
+        first = gg.read_cache("pr:o/r#7")
+        self.assertEqual(first["data"]["checksPageError"], gg.SUITES_PAST_ONE_PAGE)
+        self.assertIsInstance(first["fp"], str)
+        self.assertNotEqual(gg.check_verdict(first["data"], "green"), gg.EXIT_OK, "partial: never green")
+        full = self.gh.full_reads
+        later = NOW + gg.CYCLE
+        self.daemon.tick(later)
+        after = gg.read_cache("pr:o/r#7")
+        self.assertEqual(self.gh.full_reads, full, "an unchanged partial head costs a probe, not a full read")
+        self.assertEqual((after["via"], after["dataAt"]), ("graphql-probe", later))
+        self.assertEqual(after["data"]["checksPageError"], gg.SUITES_PAST_ONE_PAGE, "confirmed partial, never greener")
+        self.gh.suites[sha].append({"id": "S2", "latest": 1, "more": True})  # one more suite: a change
+        self.daemon.tick(later + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a changed suite count is read in full")
+
+    def test_a_partial_read_past_a_suite_page_and_a_null_context_is_never_probed(self) -> None:
+        node = self.gh.prs[("o", "r", 7)]
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 1, "more": True}]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].append(None)
+        self.daemon.tick(NOW)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["fp"])
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a transient partial is read in full again")
+
     def test_an_upstream_answer_is_never_confirmed_against_this_hosts_fingerprint(self) -> None:
         """Review of glaeda#1950 (F2): an upstream's answer kept this host's fp, fullAt and via."""
         self.daemon.tick(NOW)
@@ -27102,6 +27178,31 @@ class FallbackNeverOnLoginTest(Base):
                          (1, 1, 0))
         saved = gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))
         self.assertTrue(any("gh-shim" in k for rows in saved.values() for k in rows), saved)
+
+    def test_a_fallback_reader_hands_back_only_what_it_sent_not_the_hour_it_read(self) -> None:
+        # 2026-11-27 21:28Z: rest_breakdown summed glaeda:outbox rows of 892775259368767916. Each Daemon built outside
+        # the serving one loaded spend.json, and the whole of it went back through spend-side.json: every row doubled
+        # each run. Now only the rows it sent go back; the serving daemon's counts rise by exactly those.
+        key = "rest\tPOST /repos/{owner}/{repo}/issues/{id}/comments\toutbox\to/r"
+        minute = int(self.daemon.clock() // 60)
+        self.daemon.spend = {minute: {key: [7, 7, 0]}}
+        self.daemon.spend_dirty = True
+        self.daemon.save_spend(force=True)
+        for _ in range(3):
+            reader = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+            row = reader.spend.setdefault(minute, {}).setdefault(key, [0, 0, 0])
+            row[0] += 1
+            row[1] += 1
+            gg.spend_side_add(gg.spend_new(reader))
+            self.daemon.save_spend(force=True)
+        self.assertEqual(self.daemon.spend[minute][key], [10, 10, 0])
+        self.assertEqual(gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))[minute][key], [10, 10, 0])
+
+    def test_a_spend_row_past_any_real_count_is_dropped_on_load(self) -> None:
+        doc = {"minutes": {"100": {"rest\tGET /x\toutbox\to/r": [892775259368767916, 892775259368767916, 0],
+                                   "rest\tGET /z\trun\to/r": [33684, 33684, 0],
+                                   "rest\tGET /y\trun\to/r": [4, 3, 0]}}}
+        self.assertEqual(gg.load_spend(doc), {100: {"rest\tGET /y\trun\to/r": [4, 3, 0]}})
 
     def test_a_direct_read_on_an_app_books_its_spend(self) -> None:
         class Fake:
@@ -37392,6 +37493,38 @@ class LandTest(Base):
         self.assertEqual(e["state"], "forwarded")
         self.broker = False
 
+    BROKER_REFUSED = ("land-judge: refused: tool error: base_red_excuse.py at " + LA + " (exit 3) sent a query the "
+                      "lane-gh broker refuses on every call, so no red was judged: lane-gh call get manaflow-ai/glaeda: "
+                      "refused: manaflow-ai/glaeda is not a repo gcp-agent-lane-15 may use; did you mean "
+                      "teamleaderleo/glaeda. No wait or retry clears it: read that repo under one this VM's broker "
+                      "grant names")
+
+    def test_a_tool_error_the_broker_refused_on_a_lane_vm_hands_the_land_to_the_broker_host(self):
+        # teamleaderleo/glaeda#3133, 2026-11-27: on gcp-agent-lane-15 land_judge stopped tool_error because the
+        # classifier's read of a repo outside the VM's broker grant was refused ("next: none"); the broker host reads it
+        # with its own login and was handed the land by hand.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(refusal("tool_error", LA, {"kind": "stop"}, reason=self.BROKER_REFUSED))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual(e["state"], "forwarded")
+        self.broker = False
+
+    def test_a_tool_error_naming_no_broker_refusal_or_off_a_lane_vm_stays_a_stop_here(self):
+        self.broker = True
+        e = {"state": "waiting"}
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertTrue(self.q.unjudgeable_here(e, {"code": "tool_error", "reason": self.BROKER_REFUSED}, {}, LA))
+            self.assertEqual(self.q.unjudgeable_here(
+                e, {"code": "tool_error", "reason": "land-judge: refused: tool error: something else"}, {}, LA), "")
+            self.assertEqual(self.q.unjudgeable_here(e, {"code": "ci", "reason": self.BROKER_REFUSED}, {}, LA), "")
+        self.broker = False
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "tool_error", "reason": self.BROKER_REFUSED}, {}, LA), "")
+
     def test_a_land_tier_stop_stays_local_on_a_host_with_its_own_login(self):
         for code in ("land_tier_pending", "full_tier_label"):
             self.assertEqual(self.q.unjudgeable_here({"state": "waiting"}, {"code": code, "reason": "x"}, {}, LA), "")
@@ -46302,6 +46435,48 @@ class AuditByCallerTest(Base):
             self.assertEqual(gg.broker_caller(), "tool:base_red_watch.py")
         with mock.patch.dict(os.environ, {"GH_QUOTA_CALLER": "tool:a b\nforged", "CLAUDE_SESSION_ID": "abc"}):
             self.assertEqual(gg.broker_caller(), "abc")
+
+    def test_a_call_with_no_session_names_its_parents_tool_not_a_pid(self) -> None:
+        cmdline = b"/usr/bin/python3\0-I\0/home/u/tools/delivery_cancel_guard.py\0--once\0"
+        real_read = Path.read_bytes
+
+        def read_bytes(path: Path) -> bytes:
+            return cmdline if os.fspath(path) == "/proc/4242/cmdline" else real_read(path)
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GH_QUOTA_CALLER", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "XPC_SERVICE_NAME")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gg.os, "getppid", return_value=4242), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            self.assertEqual(gg.broker_caller(), "tool:delivery_cancel_guard.py")
+        with mock.patch.dict(os.environ, {**env, "XPC_SERVICE_NAME": "ai.leo-workspace.now-live"}, clear=True), \
+                mock.patch.object(gg.os, "getppid", return_value=999999999):
+            self.assertEqual(gg.broker_caller(), "tool:ai.leo-workspace.now-live")  # no /proc entry: the launchd job
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gg.os, "getppid", return_value=999999999):
+            self.assertEqual(gg.broker_caller(), "ppid-999999999")  # nothing to name it by: the pid, as before
+
+    def test_by_caller_reads_the_gh_quota_log_that_names_callers(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "calls.jsonl").write_text("\n".join([
+            json.dumps({"at": 1795812512.9, "caller": "session:glaeda-land", "call": "api repos/o/r/actions/runs/4/jobs"}),
+            json.dumps({"at": 1795812513.0, "caller": "session:glaeda-land", "call": "pr view 7"}),
+            json.dumps({"at": 1795812513.1, "caller": "tool:now_live.py", "call": "api graphql"}),
+            json.dumps({"at": 1795812513.2, "caller": "tool:unknown", "call": "api graphql"}),
+            json.dumps({"at": 1795812513.3, "event": "move"}),  # an audit record, no call: not counted
+            "not json"]) + "\n")
+        (tmp / "guard.log").write_text("2026-11-22T17:43:18Z ppid-47147 api repos/o/r/actions/runs/4/jobs\n")
+        with mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(tmp), "CMUX_GH_LOG": os.fspath(tmp / "guard.log")}):
+            source, lines = gg.audit_caller_source(None, 0)
+            self.assertEqual(source, tmp / "calls.jsonl")
+            rows = gg.audit_by_caller(lines)
+            self.assertEqual([(r["caller"], r["calls"]) for r in rows],
+                             [("session:glaeda-land", 2), ("tool:now_live.py", 1), ("unnamed (ppid)", 1)])
+            self.assertEqual(len(gg.audit_caller_source(None, 2)[1]), 2)  # --last keeps the newest
+            # --log names the log; the guard's calls.log is still read as before
+            source, lines = gg.audit_caller_source(tmp / "guard.log", 0)
+            self.assertEqual([r["caller"] for r in gg.audit_by_caller(lines)], ["unnamed (ppid)"])
+            (tmp / "calls.jsonl").unlink()
+            self.assertEqual(gg.audit_caller_source(None, 0)[0], tmp / "guard.log")  # no shim log: the guard's
 
 
 class StragglerTest(unittest.TestCase):

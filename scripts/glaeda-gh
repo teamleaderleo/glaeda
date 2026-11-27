@@ -1633,6 +1633,18 @@ SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt c
 ... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
+# A head with more check suites than one page shows (a cmux head has 100+): its last-real-attempt read stops there, so
+# every full read of such a PR is partial, the same way, until its suites change. A partial read stored no fingerprint,
+# and probe_ok refuses a PR with none, so each was read in full every cycle and never probed. The control-plane host,
+# 2026-11-27 20:2xZ: 153 of 683 open PRs held this error and no fingerprint, land refreshes refused 20-23 of each 30
+# rows a probe as "no-fp", a full cmux read cost 2.6-7 s of GitHub's time, and ticks spent 410-484 s of each 600 s in
+# "read pr" while waited PR data reached 2,489 s. This partial is the head's shape, not a failed read: a full read of
+# the same fingerprint (which counts the suites, so one more or fewer is a change) comes back partial the same way. So
+# it keeps its fingerprint, and a probe that matches confirms it (still partial, never greener: checksPageError stays).
+SUITES_PAST_ONE_PAGE = "graphql: last real attempt: more than 100 check suites on one commit"
+STABLE_PARTIAL = frozenset({SUITES_PAST_ONE_PAGE})
+
+
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
     """The ids of COMMIT's check suites whose newest attempt ran no check run (an older attempt may have run some:
     last_real_contexts reads them); an error message when COMMIT has more suites than one page shows (one past it
@@ -1644,7 +1656,7 @@ def ran_nothing_suites(commit: dict | None) -> list[str] | str:
         # GitHub answers a field it failed to read as null beside an error: an unread field is never "none ran nothing"
         return "graphql: last real attempt: the commit's check suites could not be read"
     if (suites.get("pageInfo") or {}).get("hasNextPage"):
-        return "graphql: last real attempt: more than 100 check suites on one commit"
+        return SUITES_PAST_ONE_PAGE
     nodes = suites.get("nodes")
     if not isinstance(nodes, list):
         return "graphql: last real attempt: malformed check suites (no node list)"
@@ -1951,8 +1963,16 @@ def route_of(method: str, path: str) -> str:
     return f"{method} {'/'.join(out)}" + ("?" + "&".join(names) if names else "")
 
 
+# No one minute's row of one key sends this many requests (the whole REST pool is 5000 an hour). A row past it is a
+# miscount, not spend: 2026-11-27 21:28Z cmux-cp-1's rest_breakdown summed glaeda:outbox rows of 892775259368767916,
+# a row a fallback reader had folded back into spend.json each time it ran (spend_new), doubling every key (about 55x
+# in 9 min by 21:37Z: glaeda:run 612 -> 33684). load_spend drops
+# such a row, so a spend.json that holds one heals on the daemon's next save.
+SPEND_ROW_MAX = 5_000  # the whole pool's hour, in one minute of one key
+
+
 def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
-    """SPEND_FILE's minutes, the well-formed rows only."""
+    """SPEND_FILE's minutes, the well-formed rows only (none past SPEND_ROW_MAX)."""
     minutes = doc.get("minutes") if isinstance(doc, dict) else None
     out: dict[int, dict[str, list[int]]] = {}
     for minute, rows in (minutes if isinstance(minutes, dict) else {}).items():
@@ -1960,7 +1980,8 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
             continue
         for key, row in rows.items():
             if (isinstance(key, str) and isinstance(row, list) and len(row) == 3
-                    and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in row)):
+                    and all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= SPEND_ROW_MAX
+                            for n in row)):
                 out.setdefault(int(minute), {})[key] = list(row)
     return out
 
@@ -1982,6 +2003,24 @@ def no_login_reader(daemon: "Daemon") -> bool:
     """Whether DAEMON is a fallback reader with no login (fallback_no_login), so a read its App chain does not take
     returns DIRECT_NO_LOGIN before it is tried rather than failing inside the transport."""
     return getattr(daemon, "token_source", None) is fallback_no_login
+
+
+def spend_new(daemon: Any) -> dict[int, dict[str, list[int]]] | None:
+    """DAEMON's spend rows less those it read from SPEND_FILE when it was built (Daemon.spend_base): what this process
+    sent. A Daemon built outside the serving one starts from the whole of spend.json, so handing its whole spend to
+    spend_side_add folded the hour back in and doubled every row each run (SPEND_ROW_MAX)."""
+    spend = getattr(daemon, "spend", None)
+    if not spend:
+        return spend
+    base = getattr(daemon, "spend_base", None) or {}
+    out: dict[int, dict[str, list[int]]] = {}
+    for minute, rows in spend.items():
+        for key, row in rows.items():
+            was = (base.get(minute) or {}).get(key) or [0, 0, 0]
+            sent = [max(0, int(row[i]) - int(was[i])) for i in range(3)]
+            if any(sent):
+                out.setdefault(minute, {})[key] = sent
+    return out
 
 
 def spend_side_add(spend: dict[int, dict[str, list[int]]] | None) -> None:
@@ -7084,6 +7123,7 @@ class Daemon:
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         # the spend log (SPEND_FILE): minute -> "bucket\troute\tkind\trepo" -> [requests, counted, points]
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
+        self.spend_base = {m: {k: list(r) for k, r in rows.items()} for m, rows in self.spend.items()}  # spend_new
         self.spend_saved_at = float("-inf")
         self.spend_dirty = False
         self.caller: tuple[str, ...] = ("other", "", "")  # what the request being sent is for (calling)
@@ -8649,7 +8689,8 @@ class Daemon:
             return False
         saved = item.get("appWriter")
         if saved is None:
-            return not (item.get("uncertain") or item.get("attempts"))  # a first send the login attempted stays its own
+            # A first send the login attempted stays its own until handoff_check looked and found it not there.
+            return not (item.get("uncertain") or item.get("attempts")) or bool(item.get("handoffChecked"))
         return saved not in APP_NON_POSTER_ROLES
 
     def poster_actor(self, item: dict) -> dict | None:
@@ -8814,6 +8855,15 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
+            # A comment the login attempted (a throttle, a lost answer) moves to the poster pool once a look on an
+            # App finds it not there. cmux-cp-2, 2026-11-27 21:18Z: a router-review verdict on cmux#52386 the login
+            # sent into its secondary limit sat at the head of the outbox 25+ min, throttled twice, then held by the
+            # login's create pause, its lost-answer look refused on the login, while the poster Apps sat free.
+            if item.get("kind") == "comment" and not item.get("appWriter") and not item.get("handoffChecked") \
+                    and (item.get("uncertain") or item.get("attempts")) \
+                    and self.poster_due({**item, "uncertain": False, "attempts": 0}) \
+                    and self.handoff_check(path, item) == "done":
+                continue  # it had already landed: finished, never made twice
             actor = self.poster_actor(item)
             if actor:
                 pass  # a poster App: no pause, hold or spacing of the login's applies
@@ -8857,11 +8907,18 @@ class Daemon:
         """A create the login already tried (attempts, uncertain: a throttle, a 5xx) and that its pause now holds may
         move to the App of its purpose, but never blind: look first for the PR (open, for its head) or the issue (same
         title and body since queued) it would make. Found: finish it with that URL ("done"). The look got no answer:
-        keep the login ("wait"). Not there: mark handoffChecked so outbox_actor lets the App make it ("ok")."""
-        if item.get("kind") not in ("pr", "issue") or item.get("appWriter") or item.get("handoffChecked") \
+        keep the login ("wait"). Not there: mark handoffChecked so outbox_actor lets the App make it ("ok"). A comment
+        the login tried moves to the poster pool the same way (poster_due). The look goes on a poster App's token when
+        one is free (the login is paused or throttled, which is why the write is moving), else on the login."""
+        if item.get("kind") not in ("pr", "issue", "comment") or item.get("appWriter") or item.get("handoffChecked") \
                 or not (item.get("uncertain") or item.get("attempts")):
             return "ok"
-        found, answered = self.post_find(item, None)
+        looker = self.poster_for_repo(str(item["repo"])) if self.upstream() is None else None
+        if item["kind"] == "comment" and looker is None:
+            return "ok"  # no poster App free to make it: it stays the login's, looked up by post_one as before
+        found, answered = self.post_find(item, looker)
+        if not answered and looker is not None:
+            found, answered = self.post_find(item, None)
         if found:
             self.post_finish(path, item, url=found.get("html_url"), number=found.get("number"),
                              note="already made by the login's earlier send; found before moving it to its App")
@@ -8869,6 +8926,7 @@ class Daemon:
         if not answered:
             return "wait"
         item["handoffChecked"] = True
+        item["uncertain"] = False  # the look just answered "not there": post_one need not look again
         write_json(path, item)
         log({"event": "post-handoff-checked", "id": item["id"], "kind": item["kind"], "attempts": item.get("attempts")})
         return "ok"
@@ -12654,11 +12712,15 @@ class Daemon:
                 if kind == "pr" and snap is None and self.pr_head_key(e, node) is not None \
                         and not first_page_more(node):
                     snap = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
+                stable = False  # partial only by the head's shape (STABLE_PARTIAL): it keeps its fingerprint
                 if kind == "pr":
-                    page_error = self.extend_pr_contexts(e, node)
-                    page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
+                    pages_error = self.extend_pr_contexts(e, node)
+                    suites_partial = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error)
+                    page_error = suites_partial or pages_error
                     # a context GitHub could not read may be a red one: partial, never greener
                     page_error = page_error or (null_contexts_error(nulls[i]) if nulls.get(i) else None)
+                    stable = (suites_partial in STABLE_PARTIAL and pages_error is None and not nulls.get(i)
+                              and f"{alias}{i}" not in limits)
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if kind == "pr" and f"{alias}{i}" in limits:
                     # a field GitHub gave up on is null here, wherever it sits: the PR reads pending, never green
@@ -12667,7 +12729,7 @@ class Daemon:
                     parsed[i]["checksPageError"] = page_error
                     split_unread(parsed[i])  # a required name past the pages read is unread, not missing
                 if kind == "pr":
-                    fps[i] = None if page_error else pr_fingerprint(node)
+                    fps[i] = None if page_error and not stable else pr_fingerprint(node)
                 if i in captured:
                     self.save_rollup(e["key"], node, captured[i], fps[i])
                 if snap is not None and not page_error:
@@ -13031,7 +13093,8 @@ class Daemon:
         # (an answer from an upstream keeps this host's old fp: never confirmed against it)
         if c.get("source") == "upstream":
             return "upstream"
-        if not isinstance(data, dict) or data.get("checksPageError") or data.get("state") != "OPEN":
+        if not isinstance(data, dict) or data.get("checksPageError") not in (None, *STABLE_PARTIAL) \
+                or data.get("state") != "OPEN":
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"
@@ -16088,7 +16151,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
             why = f"{describe(failure)} at {error_site(failure)}"
             errors.update({k: why for k in todo if k not in errors})
         finally:
-            spend_side_add(getattr(daemon, "spend", None))
+            spend_side_add(spend_new(daemon))
     for k in todo:
         cached = read_cache(k) or {}
         if (cached.get("dataAt") or 0) >= daemon.now:
@@ -17178,6 +17241,15 @@ LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unread
 # land adds land-ci): its add went through the broker as pr_edit, which a glaeda job with no lane session cannot
 # lease and whose pr_labels never list land-ci (hq#23688, 2026-11-24, "lease acquisition requires a lane session").
 LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
+# And land_judge's tool_error whose read the lane-gh broker refused (leo-workspace tools/land_judge/engine.py
+# TOOL_ERROR_LEAD: "... sent a query the lane-gh broker refuses on every call"): the VM's broker grant (a repo it may not
+# read, "REPO is not a repo VM may use") or the broker's query allowlist refused one of the judgment's reads, the same
+# on every call, so no retry here helps and the grant is never widened for it. The broker host's land queue reads with
+# its own login, through no broker, so it judges the same rules in full. teamleaderleo/glaeda#3133, 2026-11-27: the
+# classifier's base-verdict read of the base repo was refused on gcp-agent-lane-15 and the land stopped tool_error
+# ("next: none") on a PR the broker host merges; handed off by hand. A refusal that names no broker stays a stop.
+LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error"})
+LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: ")
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
 # live judgments within LAND_EARLY_HANDOFF_WINDOW read nothing for a transient reason (LAND_HANDOFF_UNREAD,
@@ -26059,10 +26131,13 @@ class LandQueue:
         worker for minutes and reads nothing again. gcp-agent-lane-10, 2026-11-22: manaflow-ai/cmux#48064 at
         1ebd272819aa answered "unreadable" after 5m9s (store 22 s, GraphQL and REST timed out), about 25 green lands
         sat behind such answers, all 8 workers busy, none ever handed off. The broker host judges it with its own
-        fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. A host with its own login,
-        a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
+        fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. So is a tool_error whose
+        read the lane-gh broker refused (LAND_HANDOFF_BROKER_REFUSED): the broker host reads with its own login. A host
+        with its own login, a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
         code = str(answer.get("code") or "")
-        if code not in LAND_HANDOFF_UNREAD | LAND_HANDOFF_BROKER_ONLY or answer.get("cacheOnly") \
+        refused = code in LAND_HANDOFF_BROKER_REFUSED_CODES \
+            and bool(LAND_HANDOFF_BROKER_REFUSED.search(str(answer.get("reason") or "")))
+        if (code not in LAND_HANDOFF_UNREAD | LAND_HANDOFF_BROKER_ONLY and not refused) or answer.get("cacheOnly") \
                 or not SHA40.fullmatch(head):
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
@@ -33111,7 +33186,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
                     state, doc = "error", "out of time"
                 out[path] = doc if state == "fresh" else str(doc)
     finally:
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     return out
 
 
@@ -36076,7 +36151,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     finally:
         if broker is not None:
             direct_parts_save(daemon.repo_parts, daemon.now)
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     if error:
         return error
     cached = read_cache(key) or {}
@@ -39663,7 +39738,28 @@ def broker_caller() -> str:
     named = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
     if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named):
         return named
-    return f"ppid-{os.getppid()}"
+    return broker_parent_tool(os.getppid()) or f"ppid-{os.getppid()}"
+
+
+# The words of a command line that say how a tool was started, not which tool it is (the gh-quota shim's own list).
+BROKER_WRAPPER_RE = re.compile(r"(?i)(?:ba|z|da|)sh|python3?(?:\.\d+)?|env|xargs|parallel|timeout|nice|gh|glaeda-gh|-.*|\d+")
+
+
+def broker_parent_tool(ppid: int) -> str:
+    """`tool:NAME` for the program the parent process PPID runs (its first argv word no wrapper is), else the launchd job
+    this runs in, else "". A /proc read, no fork, so a Mac with no /proc names only its launchd jobs. Before this a gh
+    that skipped the gh-quota shim logged `ppid-N`, a pid gone before anyone reads the log: a control-plane host's
+    calls.log, 2026-11-27, 92,569 of 92,569 calls `unnamed (ppid)` in `audit --by caller`."""
+    with contextlib.suppress(OSError, ValueError):
+        for word in Path(f"/proc/{int(ppid)}/cmdline").read_bytes().decode(errors="replace").split("\0"):
+            base = word.rsplit("/", 1)[-1]
+            if base and not BROKER_WRAPPER_RE.fullmatch(base):
+                name = re.sub(r"[^A-Za-z0-9_.@-]", "-", base)[:64]
+                return f"tool:{name}"
+    job = os.environ.get("XPC_SERVICE_NAME") or ""
+    if job and job != "0":
+        return f"tool:{re.sub(r'[^A-Za-z0-9_.@-]', '-', job)[:64]}"
+    return ""
 
 
 # A read worth holding when the same caller repeats it: the ones a polling loop is written out of,
@@ -42636,16 +42732,58 @@ def audit_by_caller(lines: list[str], top: int = 3) -> list[dict]:
     return rows
 
 
-def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20) -> int:
+def gh_quota_calls_log() -> Path:
+    """The gh-quota shim's own call log (leo-workspace tools/gh_quota.py append_call): one JSON line per gh call the shim
+    let through or refused, its `caller` the `session:NAME` or `tool:NAME` it charged."""
+    return Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota") / "calls.jsonl"
+
+
+def audit_quota_lines(path: Path, last: int) -> list[str]:
+    """gh-quota's calls.jsonl as AUDIT_LINE lines (`STAMP CALLER CALL`), the last LAST (0: all); a line with no call
+    word (an audit record) is skipped. Read by line, so a 40 MB log is never held whole."""
+    keep: deque[str] = deque(maxlen=last or None)
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                with contextlib.suppress(ValueError, TypeError, AttributeError):
+                    row = json.loads(raw)
+                    call, caller = str(row.get("call") or "").strip(), str(row.get("caller") or "")
+                    if not call:
+                        continue
+                    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row.get("at") or 0)))
+                    caller = caller if re.fullmatch(r"(?:session|tool):[A-Za-z0-9_.@/-]{1,96}", caller) else "unknown"
+                    keep.append(f"{stamp} {'unknown' if caller == 'tool:unknown' else caller} {' '.join(call.split())}")
+    except OSError as error:
+        raise WatchError(f"cannot read {path}: {describe(error)}") from error
+    return list(keep)
+
+
+def audit_caller_source(log: Path | None, last: int) -> tuple[Path, list[str]]:
+    """(the log read, its lines as AUDIT_LINE) for `audit --by caller`: --log as given (a .jsonl one read as gh-quota's),
+    else gh-quota's calls.jsonl when this host has one, else the PATH guard's calls.log. The shim names every caller
+    in calls.jsonl (session:X, tool:X); calls.log is written only by a gh that bypassed the shim, so on a host with the
+    shim it holds the few calls nobody named (a control-plane host, 2026-11-27: 92,569 lines, every one `ppid-N`, its
+    newest five hours old, while calls.jsonl named 30 callers for the same traffic)."""
+    if log is not None:
+        return log, (audit_quota_lines(log, last) if log.suffix == ".jsonl" else audit_lines(log, last))
+    quota = gh_quota_calls_log()
+    if quota.is_file():
+        return quota, audit_quota_lines(quota, last)
+    path = guard_log()
+    return path, audit_lines(path, last)
+
+
+def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20, source: Path | None = None) -> int:
     """`audit --by caller`: who on this host makes its gh calls, and what each mostly reads."""
     rows = audit_by_caller(lines)
     total = sum(r["calls"] for r in rows)
     if not total:
-        raise WatchError("no gh calls logged")
+        raise WatchError("no gh calls logged" + (f" in {source}" if source else ""))
     if as_json:
-        print(json.dumps({"calls": total, "byCaller": rows}, sort_keys=True))
+        print(json.dumps({"calls": total, "byCaller": rows, "log": os.fspath(source) if source else None},
+                         sort_keys=True))
         return EXIT_OK
-    print(f"gh calls by caller: {total}")
+    print(f"gh calls by caller: {total}" + (f" (from {source})" if source else ""))
     for r in rows[:top]:
         cats = "; ".join(f"{c['category']} {c['calls']}" for c in r["top"])
         print(f"  {r['calls']:>7}  {100 * r['calls'] / total:5.1f}%  {r['caller']}  ({cats})")
@@ -42653,8 +42791,9 @@ def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20) -> int:
         print(f"  ... {len(rows) - top} more callers: {sum(r['calls'] for r in rows[top:])} calls")
     unnamed = next((r["calls"] for r in rows if r["caller"] == "unnamed (ppid)"), 0)
     if unnamed:
-        print(f"{unnamed} calls name only a parent pid: logged before the gh-quota shim exported GH_QUOTA_CALLER, or "
-              "by a gh that skipped the shim")
+        print(f"{unnamed} calls name no session or tool: a parent pid (logged before the gh-quota shim exported "
+              "GH_QUOTA_CALLER, or by a gh that skipped the shim and whose parent was gone or not readable) or "
+              "tool:unknown (the shim found no tool in its parent's command line)")
     return EXIT_OK
 
 
@@ -45413,7 +45552,9 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--json", action="store_true")
     b.add_argument("--local", action="store_true", help="this host's daemon only: no read of the other hosts")
     a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
-    a.add_argument("--log", type=Path, default=None, help="the call log to read (default the PATH guard's)")
+    a.add_argument("--log", type=Path, default=None,
+                   help="the call log to read (default the PATH guard's; with --by caller, the gh-quota shim's "
+                        "calls.jsonl when this host has one, which names every caller; a .jsonl --log is read as that)")
     a.add_argument("--last", type=int, default=200000, metavar="N",
                    help="only the last N lines (default 200000; 0 reads all of it)")
     a.add_argument("--json", action="store_true")
@@ -46496,7 +46637,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
             if args.by == "caller":
-                return cmd_audit_by_caller(audit_lines(args.log or guard_log(), args.last), args.json)
+                source, lines = audit_caller_source(args.log, args.last)
+                return cmd_audit_by_caller(lines, args.json, source=source)
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             if args.kind == "errors":
