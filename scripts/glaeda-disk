@@ -8669,6 +8669,199 @@ def git_cache_families(root: Path) -> list[Family]:
     return fams
 
 
+# The container image store (docker's /var/lib/docker; containerd's /var/lib/containerd, where docker's containerd
+# image store keeps its content blobs and snapshots). A lane VM builds its runner image there (leo-workspace
+# tools/lane_host_runners.py), so on one 63G lane VM (2026-11-26) the census filed 18.5G of these two roots under
+# "unclassified" and nothing ever gave any of it back: one image came to 3.87G by docker's count and 6.3G in
+# containerd. The store is root's and only docker's own commands may change it, so this is no Family (a Family walks
+# and renames files; nothing here ever touches the store's files):
+# - DOCKER_IMAGES: one item per image and tag, its bytes as `docker system df -v` counts them (unique to it). A
+#   tagged image stays (docker image prune takes only untagged ones; a tag's owner prunes its own tags, as
+#   lane_host_runners.py prune does); an image any container uses, running or stopped, stays whatever its tag; an
+#   untagged ("<none>") image nothing uses goes under pressure only, by `docker image prune --force` (untagged and
+#   unused only, by docker's own rule).
+# - DOCKER_BUILD_CACHE: BuildKit's cache, one item. Under pressure, `docker builder prune --force --keep-storage`
+#   trims it to DOCKER_BUILD_CACHE_KEEP_BYTES, so the next build of the same image still finds its base layers.
+# Apply reads the store again first (an image a container took since the survey stays), and stops for a docker
+# build that runs now (DOCKER_BUILD_RUN), the run's halt, or a filesystem back at its target. Each command is one
+# receipt line with the bytes before and after. The census names both roots with DOCKER_STORE_OWNER, so their bytes
+# read as this store's, not "unclassified".
+DOCKER_IMAGES = "docker-images"
+DOCKER_BUILD_CACHE = "docker-build-cache"
+DOCKER_STORE_ROOTS = (Path("/var/lib/docker"), Path("/var/lib/containerd"))
+DOCKER_STORE_KIND = "container-store"
+DOCKER_STORE_OWNER = ("docker and containerd's image store (cmux-disk's docker-images and docker-build-cache: under "
+                      "pressure, docker image prune for untagged images and docker builder prune --keep-storage)")
+DOCKER_BUILD_CACHE_KEEP_BYTES = 4 * GIB
+DOCKER_TIMEOUT_S = 120
+DOCKER_BUILD_RUN = re.compile(r"(?:^|[\s/])(?:docker|docker-buildx)(?:\s+buildx)?\s+(?:image\s+|builder\s+)?"
+                              r"(?:build|bake)(?:\s|$)|(?:^|[\s/])docker\s+compose\s+(?:\S+\s+)*build(?:\s|$)")
+_DOCKER_SIZE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKMGTP]?)(i?)B\s*$")
+_DOCKER_ARGV: list[str] | None = None
+
+
+def docker_bytes(text: Any) -> int:
+    """docker's human size ("3.87GB", "645.7MB", "0B": decimal units, as docker prints them) in bytes; 0 if unread."""
+    m = _DOCKER_SIZE.match(str(text))
+    if not m:
+        return 0
+    power = " kMGTP".index(m.group(2).replace("K", "k") or " ")
+    return int(float(m.group(1)) * (1024 if m.group(3) else 1000) ** power)
+
+
+def docker_store_present() -> bool:
+    """Whether this Linux host has a container image store and a docker CLI to ask about it."""
+    return not DARWIN and bool(shutil.which("docker")) and any(os.path.isdir(r) for r in DOCKER_STORE_ROOTS)
+
+
+def docker_argv() -> list[str] | None:
+    """How to reach the docker daemon here: `docker` when this account may (the docker group), else `sudo -n docker`
+    where sudo needs no password; None when neither answers. Probed once per run."""
+    global _DOCKER_ARGV
+    if _DOCKER_ARGV is None:
+        _DOCKER_ARGV = []
+        for argv in (["docker"], ["sudo", "-n", "docker"] if sudo_reads() else None):
+            if argv is None:
+                continue
+            try:
+                r = subprocess.run([*argv, "version", "--format", "{{.Server.Version}}"], capture_output=True,
+                                   text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if r.returncode == 0 and r.stdout.strip():
+                _DOCKER_ARGV = argv
+                break
+    return _DOCKER_ARGV or None
+
+
+def docker_run(args: list[str], timeout: float = DOCKER_TIMEOUT_S) -> tuple[int, str]:
+    """One docker command (exit code, stdout); (-1, why) when docker cannot be reached or does not answer in time."""
+    argv = docker_argv()
+    if argv is None:
+        return -1, "no docker daemon this account can reach"
+    try:
+        r = subprocess.run([*argv, *args], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, e.__class__.__name__
+    return r.returncode, r.stdout if r.returncode == 0 else (r.stderr.strip()[:200] or f"exit {r.returncode}")
+
+
+def docker_store_items(pressure: bool = False) -> list[Item] | None:
+    """The image store's items (see DOCKER_IMAGES), judged for a pressure pass or not; None when docker cannot say."""
+    code, out = docker_run(["system", "df", "--verbose", "--format", "{{json .}}"])
+    if code != 0:
+        return None
+    try:
+        df = json.loads(out.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+    if not isinstance(df, dict):
+        return None
+    items: list[Item] = []
+    for img in df.get("Images") or []:
+        if not isinstance(img, dict):
+            continue
+        repo, tag = str(img.get("Repository") or "<none>"), str(img.get("Tag") or "<none>")
+        untagged = repo == "<none>" or tag == "<none>"
+        name = (f"{repo}:{tag}" if not untagged else
+                f"<none>@{str(img.get('ID') or '?').removeprefix('sha256:')[:12]}")
+        try:
+            users = int(str(img.get("Containers") or "0"))
+        except ValueError:
+            users = -1  # an unread count keeps it, as a user would
+        size = docker_bytes(img.get("UniqueSize") or img.get("Size"))
+        why = [f"{gib(docker_bytes(img.get('Size'))).strip()} with shared layers, created "
+               f"{img.get('CreatedSince') or img.get('CreatedAt') or '?'}"]
+        if users != 0:
+            verdict = "in-use"
+            why.insert(0, f"{users} containers use it" if users > 0 else "its container count is unreadable")
+        elif not untagged:
+            verdict = "kept"
+            why.insert(0, "a tagged image: docker image prune takes only untagged ones, and its tag's owner prunes it")
+        elif not pressure:
+            verdict = "kept"
+            why.insert(0, "an untagged image nothing uses: it goes under pressure (docker image prune)")
+        else:
+            verdict = "reclaimable"
+            why.insert(0, "an untagged image no container uses (docker image prune)")
+        items.append(Item(DOCKER_IMAGES, f"docker-image:{name}", size, 0.0, verdict, why, platform="linux"))
+    cache = [c for c in df.get("BuildCache") or [] if isinstance(c, dict)]
+    if cache:
+        total = sum(docker_bytes(c.get("Size")) for c in cache)
+        in_use = sum(docker_bytes(c.get("Size")) for c in cache if c.get("InUse") in (True, "true"))
+        over = max(0, total - max(in_use, DOCKER_BUILD_CACHE_KEEP_BYTES))
+        why = [f"{len(cache)} records, {gib(in_use).strip()} in use by a build"]
+        if over and pressure:
+            verdict = "reclaimable"
+            why.insert(0, f"{gib(over).strip()} past its {gib(DOCKER_BUILD_CACHE_KEEP_BYTES).strip()} keep "
+                          "(docker builder prune --keep-storage)")
+        else:
+            verdict = "kept"
+            why.insert(0, f"within its {gib(DOCKER_BUILD_CACHE_KEEP_BYTES).strip()} keep" if not over else
+                       f"{gib(over).strip()} past its keep: trimmed under pressure (docker builder prune)")
+        items.append(Item(DOCKER_BUILD_CACHE, "docker-build-cache", total, 0.0, verdict, why, platform="linux"))
+    return items
+
+
+def docker_store_dev() -> int | None:
+    for root in DOCKER_STORE_ROOTS:
+        with contextlib.suppress(OSError):
+            return os.stat(root).st_dev
+    return None
+
+
+def apply_docker_store(receipt: Path, halt=None, below_target=None, families: frozenset[str] | None = None) -> int:
+    """Under pressure, give back the image store's reclaimable bytes by docker's own commands (DOCKER_IMAGES says
+    which and when); returns the bytes released by docker's own count (a fresh read before and after)."""
+    released = 0
+    for fam, command in ((DOCKER_IMAGES, ["image", "prune", "--force"]),
+                         (DOCKER_BUILD_CACHE, ["builder", "prune", "--force",
+                                               f"--keep-storage={DOCKER_BUILD_CACHE_KEEP_BYTES}"])):
+        if families and fam not in families:
+            continue
+        if below_target is not None and not below_target():
+            break
+        fresh = docker_store_items(pressure=True)
+        if fresh is None:
+            break  # docker does not answer: nothing to judge by
+        due = [i for i in fresh if i.family == fam and i.verdict == "reclaimable"]
+        if not due:
+            continue
+        why = halt() if halt is not None else ""
+        if not why:
+            try:
+                _, cmds = process_evidence()
+            except NoEvidence as e:
+                why = f"no process evidence: {e}"
+            else:
+                run = next((line for line in cmds.splitlines() if DOCKER_BUILD_RUN.search(line)), "")
+                if run:
+                    why = f"a docker build runs ({run.strip()[:120]})"
+        before = sum(i.bytes for i in fresh if i.family == fam)
+        after = before
+        if why:
+            outcome = f"stopped:{why[:60]}"
+        else:
+            code, out = docker_run(command, timeout=900)
+            outcome = "reclaimed" if code == 0 else f"incomplete:{out[:60]}"
+            again = docker_store_items(pressure=True)
+            if again is not None:
+                after = sum(i.bytes for i in again if i.family == fam)
+            freed = max(0, before - after)
+            released += freed
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": fam, "command": "docker " + " ".join(command), "bytes_before": before,
+               "bytes_after": after, "items": [asdict(i) for i in due], "sweep": "pressure",
+               "rebuild": "docker pulls or builds the image again; BuildKit rebuilds the cache on the next build"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(max(0, before - after))}  {fam} (docker {' '.join(command)})")
+        if why:
+            break
+    return released
+
+
 DELETING_PREFIX =".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
 DELETING_RE = re.compile(re.escape(DELETING_PREFIX) + r".+-([0-9]+)")  # ...<name>-<pid of the deleter>
 
@@ -13546,7 +13739,16 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     (str(HOME / "Applications"), "user-installed apps"),
     (str(HOME / ".rustup"), "rustup toolchains (home-caches reclaims stale ones)"),
     (str(HOME / ".local"), "installed tools (glaeda's bin among them)"),
+    *((str(root), DOCKER_STORE_OWNER) for root in DOCKER_STORE_ROOTS),
 )
+
+
+def census_kind(label: str, kind: str) -> str:
+    """A census row's kind as shown: a sized tree in the container image store is that store's (DOCKER_STORE_KIND),
+    not "unclassified"; every other kind as the census wrote it."""
+    if kind == "unclassified" and any(label == str(r) or label.startswith(f"{r}/") for r in DOCKER_STORE_ROOTS):
+        return DOCKER_STORE_KIND
+    return kind
 
 
 def census_owner(path: str) -> str:
@@ -14224,8 +14426,10 @@ def pwd_name(uid: int) -> str:
 def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, list[Any]] = {}
     for key, row in census["rows"].items():
-        label = _census_label(key, str(row[1]))
-        hit = merged.setdefault(label, [0, row[1]])
+        shown = _census_label(key, str(row[1])).split(":", 1)[1]
+        kind = census_kind(shown, str(row[1]))
+        label = f"{kind}:{shown}"
+        hit = merged.setdefault(label, [0, kind])
         hit[0] += int(row[0])
     ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
     children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
@@ -14558,8 +14762,9 @@ def root_census_coverage(census: dict[str, Any]) -> list[dict[str, Any]]:
         label = _root_label(key)
         account = row[3] if len(row) > 3 and row[3] else ""
         owner = census_owner(label) or (f"{account}'s files" if account else "")
-        children.append({"category": f"{row[1]}:{label}", "bytes": size, "private": False,
-                         "classification": str(row[1]), **({"owner": owner} if owner else {}),
+        kind = census_kind(label, str(row[1]))
+        children.append({"category": f"{kind}:{label}", "bytes": size, "private": False,
+                         "classification": kind, **({"owner": owner} if owner else {}),
                          **({"account": account} if account else {})})
     rest = sum(size for size, _, _ in ranked[CENSUS_ROWS_SHOWN:])
     if rest:
@@ -18560,12 +18765,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
     tmp_residue = tmp_test_residue_census() if not RUNNER_CACHE_PROFILE else None
-    fill_holds([*items, *tooling])
+    # the container image store, by image and tag (DOCKER_IMAGES): a report lists it; an apply asks docker again
+    docker_items = ((docker_store_items(pressure=bool(a.pressure and under)) or [])
+                    if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and docker_store_present() else [])
+    fill_holds([*items, *tooling, *docker_items])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
                           "cmux_acts": ROLE == "devbox" and cmux_build_caches_on(),
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
+                          "docker": [asdict(i) for i in docker_items],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
                           "held": held_summary(items),
@@ -18586,6 +18795,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print("\nXcode copies and simulator runtimes")
         for t in tooling:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
+        if docker_items:
+            print("\nContainer image store (docker's own commands reclaim it, under pressure only)")
+        for t in sorted(docker_items, key=lambda i: -i.bytes):
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
         RUN["io_priority"] = lower_io_priority()
@@ -18666,6 +18879,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if PRESSURE_SIM_RUNTIMES and sim_job_host() is False:
             logical_released += apply_runtimes(simulator_runtimes(unrouted=True), a.receipt, halt, unrouted=True,
                                                below_target=short_of_target)
+        # the container image store under pressure, after every family, by docker's own commands (DOCKER_IMAGES), when
+        # the store sits on a filesystem this pass is short on. A running CI job does not defer it: docker never
+        # prunes an image a container uses, and apply_docker_store stops for a docker build itself
+        docker_families = frozenset({DOCKER_IMAGES, DOCKER_BUILD_CACHE})
+        if (a.pressure and under and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
+                and not DEAD_MODE and (not a.family or docker_families & set(a.family))
+                and docker_store_present() and docker_store_dev() in {fs.dev for fs in shown}):
+            logical_released += apply_docker_store(a.receipt, halt, below_target=short_of_target,
+                                                   families=frozenset(a.family) & docker_families if a.family
+                                                   else None)
         RUN["released"] = logical_released
         blocked: dict[str, int] = {}
         for i in items:

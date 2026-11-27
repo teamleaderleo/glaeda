@@ -17723,5 +17723,142 @@ class DeadMountTests(unittest.TestCase):
                 Path("/x").is_dir()
 
 
+class DockerStoreTest(unittest.TestCase):
+    """The container image store (DOCKER_IMAGES): by image and tag, reclaimed only by docker's own commands."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.receipt = self.base / "receipt.jsonl"
+        self.calls: list[list[str]] = []
+        self.images = [
+            # a lane VM, 2026-11-26: the runner image 3.87GB by docker's count, an older untagged build beside it
+            {"Repository": "lane-host-runners", "Tag": "b2", "ID": "sha256:" + "a" * 64, "Containers": "3",
+             "Size": "3.87GB", "UniqueSize": "1.2GB", "CreatedSince": "2 hours ago"},
+            {"Repository": "lane-host-runners", "Tag": "b1", "ID": "sha256:" + "b" * 64, "Containers": "0",
+             "Size": "3.86GB", "UniqueSize": "600MB", "CreatedSince": "1 day ago"},
+            {"Repository": "<none>", "Tag": "<none>", "ID": "sha256:" + "c" * 64, "Containers": "0",
+             "Size": "3.8GB", "UniqueSize": "900MB", "CreatedSince": "2 days ago"},
+            {"Repository": "<none>", "Tag": "<none>", "ID": "sha256:" + "d" * 64, "Containers": "1",
+             "Size": "3.8GB", "UniqueSize": "700MB", "CreatedSince": "3 days ago"},
+        ]
+        self.cache = [{"ID": "x", "Size": "6GB", "InUse": False}, {"ID": "y", "Size": "1GB", "InUse": True}]
+
+    def fake_docker(self, args: list[str], timeout: float = 0) -> tuple[int, str]:
+        self.calls.append(list(args))
+        if args[:2] == ["system", "df"]:
+            return 0, json.dumps({"Images": self.images, "Containers": [], "Volumes": [],
+                                  "BuildCache": self.cache}) + "\n"
+        if args[:2] == ["image", "prune"]:
+            self.images = [i for i in self.images if not (i["Repository"] == "<none>" and i["Containers"] == "0")]
+            return 0, "Total reclaimed space: 900MB\n"
+        if args[:2] == ["builder", "prune"]:
+            self.cache = [{"ID": "x", "Size": "3GB", "InUse": False}, self.cache[-1]]
+            return 0, "Total: 3GB\n"
+        return 1, "unexpected"
+
+    def items(self, pressure: bool) -> dict[str, "gd.Item"]:
+        with mock.patch.object(gd, "docker_run", self.fake_docker):
+            return {i.path: i for i in gd.docker_store_items(pressure=pressure)}
+
+    def apply(self, cmds: str = "", halt=None, below=None) -> int:
+        with mock.patch.object(gd, "docker_run", self.fake_docker), \
+                mock.patch.object(gd, "process_evidence", lambda: ([], cmds)):
+            return gd.apply_docker_store(self.receipt, halt, below_target=below)
+
+    def receipts(self) -> list[dict]:
+        return [json.loads(line) for line in self.receipt.read_text().splitlines()] if self.receipt.exists() else []
+
+    def test_docker_sizes_read_in_docker_decimal_units(self) -> None:
+        self.assertEqual(gd.docker_bytes("3.87GB"), 3_870_000_000)
+        self.assertEqual(gd.docker_bytes("645.7MB"), 645_700_000)
+        self.assertEqual(gd.docker_bytes("12kB"), 12_000)
+        self.assertEqual(gd.docker_bytes("0B"), 0)
+        self.assertEqual(gd.docker_bytes("2GiB"), 2 * gd.GIB)
+        self.assertEqual(gd.docker_bytes("N/A"), 0)
+
+    def test_the_store_reports_each_image_and_tag_and_its_build_cache(self) -> None:
+        items = self.items(pressure=False)
+        used = items["docker-image:lane-host-runners:b2"]
+        self.assertEqual((used.family, used.verdict, used.bytes), (gd.DOCKER_IMAGES, "in-use", 1_200_000_000))
+        self.assertIn("3 containers use it", used.reasons[0])
+        self.assertEqual(items["docker-image:lane-host-runners:b1"].verdict, "kept", "a tag is its owner's to prune")
+        self.assertEqual(items["docker-image:<none>@cccccccccccc"].verdict, "kept", "untagged goes under pressure only")
+        self.assertEqual(items["docker-image:<none>@dddddddddddd"].verdict, "in-use")
+        cache = items["docker-build-cache"]
+        self.assertEqual((cache.family, cache.verdict, cache.bytes), (gd.DOCKER_BUILD_CACHE, "kept", 7_000_000_000))
+        self.assertEqual(self.calls, [["system", "df", "--verbose", "--format", "{{json .}}"]], "a report only reads")
+        pressured = self.items(pressure=True)
+        self.assertEqual(pressured["docker-image:<none>@cccccccccccc"].verdict, "reclaimable")
+        self.assertEqual(pressured["docker-image:<none>@dddddddddddd"].verdict, "in-use", "a container uses it")
+        self.assertEqual(pressured["docker-image:lane-host-runners:b1"].verdict, "kept", "pressure never takes a tag")
+        self.assertEqual(pressured["docker-build-cache"].verdict, "reclaimable")
+
+    def test_a_build_cache_within_its_keep_stays_under_pressure(self) -> None:
+        self.cache = [{"ID": "x", "Size": "1GB", "InUse": False}]
+        self.assertEqual(self.items(pressure=True)["docker-build-cache"].verdict, "kept")
+
+    def test_no_docker_answer_is_no_items(self) -> None:
+        with mock.patch.object(gd, "docker_run", lambda args, timeout=0: (-1, "no docker daemon")):
+            self.assertIsNone(gd.docker_store_items(pressure=True))
+            self.assertEqual(gd.apply_docker_store(self.receipt), 0)
+        self.assertFalse(self.receipt.exists())
+
+    def test_apply_prunes_by_docker_only_with_a_receipt_and_the_bytes_docker_gave_back(self) -> None:
+        freed = self.apply()
+        prunes = [c for c in self.calls if c[0] != "system"]
+        keep = f"--keep-storage={gd.DOCKER_BUILD_CACHE_KEEP_BYTES}"
+        self.assertEqual(prunes, [["image", "prune", "--force"], ["builder", "prune", "--force", keep]],
+                         "untagged images only (no --all) and the cache trimmed to its keep, nothing else")
+        self.assertEqual(freed, 900_000_000 + 3_000_000_000)
+        recs = self.receipts()
+        self.assertEqual([(r["family"], r["outcome"]) for r in recs],
+                         [(gd.DOCKER_IMAGES, "reclaimed"), (gd.DOCKER_BUILD_CACHE, "reclaimed")])
+        self.assertEqual(recs[0]["bytes_before"] - recs[0]["bytes_after"], 900_000_000)
+        self.assertEqual([i["path"] for i in recs[0]["items"]], ["docker-image:<none>@cccccccccccc"])
+        left = {i["Repository"] + ":" + i["Tag"] + i["ID"][-1] for i in self.images}
+        self.assertEqual(left, {"lane-host-runners:b2a", "lane-host-runners:b1b", "<none>:<none>d"},
+                         "the tags and the untagged image a container uses stay")
+
+    def test_apply_reads_again_and_skips_an_image_a_container_took_since(self) -> None:
+        self.images[2]["Containers"] = "1"
+        self.cache = [{"ID": "x", "Size": "1GB", "InUse": False}]
+        self.assertEqual(self.apply(), 0)
+        self.assertEqual([c for c in self.calls if c[0] != "system"], [])
+        self.assertEqual(self.receipts(), [])
+
+    def test_a_running_docker_build_stops_the_pass(self) -> None:
+        for cmd in ("/usr/bin/docker build -t lane-host-runners:b3 .", "docker buildx build --load .",
+                    "docker compose -f x.yml build", "docker-buildx bake"):
+            self.assertTrue(gd.DOCKER_BUILD_RUN.search(cmd), cmd)
+        for cmd in ("docker ps", "docker run --rm img build", "cargo build", "/usr/bin/dockerd --group docker"):
+            self.assertFalse(gd.DOCKER_BUILD_RUN.search(cmd), cmd)
+        self.assertEqual(self.apply(cmds="python3 tools/lane_host_runners.py\ndocker build -t r:b3 ."), 0)
+        self.assertEqual([c for c in self.calls if c[0] != "system"], [])
+        recs = self.receipts()
+        self.assertEqual(len(recs), 1)
+        self.assertTrue(recs[0]["outcome"].startswith("stopped:a docker build runs"), recs[0]["outcome"])
+
+    def test_the_halt_and_a_filesystem_at_its_target_stop_it(self) -> None:
+        self.assertEqual(self.apply(halt=lambda: "a job waits"), 0)
+        self.assertEqual(self.receipts()[0]["outcome"], "stopped:a job waits")
+        self.calls.clear()
+        self.assertEqual(self.apply(below=lambda: False), 0)
+        self.assertEqual(self.calls, [], "back at its target: docker is not even asked")
+
+    def test_the_census_names_the_store_its_own_not_unclassified(self) -> None:
+        # a lane VM, 2026-11-26: 18.5G of these two roots read "unclassified" in cmux-disk report
+        census = {"complete": True, "at": 1.0, "rows": {
+            "/var/lib/containerd": [6 * gd.GIB, "unclassified", True],
+            "/var/lib/docker": [2 * gd.GIB, "unclassified", True],
+            "/var/lib/dockerx": [gd.GIB, "unclassified", True]}}
+        children = {c["category"]: c for c in gd.census_coverage_row(census)["children"]}
+        for root in ("/var/lib/containerd", "/var/lib/docker"):
+            child = children[f"{gd.DOCKER_STORE_KIND}:{root}"]
+            self.assertEqual((child["classification"], child["owner"]), (gd.DOCKER_STORE_KIND, gd.DOCKER_STORE_OWNER))
+        self.assertIn("unclassified:/var/lib/dockerx", children)
+        self.assertEqual(gd.census_kind("/var/lib/docker/overlay2", "unreadable"), "unreadable")
+
+
 if __name__ == "__main__":
     unittest.main()
