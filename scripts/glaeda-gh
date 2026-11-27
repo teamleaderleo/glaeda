@@ -24631,7 +24631,7 @@ class LandQueue:
                 # incomplete base-red search; take() checks the target and uses the ordinary pinned merge.
                 self.history(e, "override_merge", code=answer["code"], head=head[:12], **land_override_history(e))
                 act = {**act, "kind": "merge", "sha": head}
-                answer = {**answer, "ok": True, "code": "ok", "action": act}
+                answer = {**answer, "ok": True, "code": "ok", "via": "override_receipted_base_red", "action": act}
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
                 bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
                     and bool(LAND_UNREAD_TRANSIENT.search(reason))
@@ -25002,7 +25002,8 @@ class LandQueue:
                              **land_override_history(e))
             log({"event": "land-override-carried", "key": e["key"], "head": head[:12],
                  "code": str(answer.get("code") or kind), "override": (e.get("override") or {}).get("reason")})
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_carried",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if land_override_waited(e, act, answer, head, self.now):
             # LAND_OVERRIDE_WAIT_CODES' comment: the check never posted within its wait, and the override answers it
@@ -25010,7 +25011,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              waited=round(self.now - float(e["overrideWait"]["since"])), **land_override_history(e))
                 e.pop("overrideWait", None)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_waited",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
             # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
@@ -25029,7 +25031,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              carried="pinned", **land_override_history(e))
                 self.save(e)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_pinned",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
@@ -25042,7 +25045,8 @@ class LandQueue:
                 # the queue's own update-branch's head included, as a pinned merge carrying it
                 with self.lock:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
-                self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                self.do_merge(e, head, {**answer, "ok": True, "via": "override_takes",
+                                        "action": {"v": 1, "kind": "merge", "sha": head}})
                 return
             if (str(answer.get("code") or "") == "conflicts_base" or cls == "conflict") and self.base_merge_first(
                     e, head, "base", land_reason(why), land_trim(nxt or answer.get("next"))):
@@ -26566,7 +26570,7 @@ class LandQueue:
                     self.history(e, "override_pin_merge", head=head[:12],
                                  why="a pinned override row is merged at its pin, never base-updated")
                     self.save(e)
-                self.do_merge(e, head, {"pinned": True})
+                self.do_merge(e, head, {"pinned": True, "via": "override_pin"})
                 return
         sent = e.get("updateSent") or {}
         if head and sent.get("head") == head:
@@ -27057,8 +27061,10 @@ class LandQueue:
         lease = self.merge_lease(e, sha)
         if lease is False:
             return
+        snapshot = (self.cache_of(e["key"]) or {}).get("data")  # a file read, off the lock
         with self.lock:
             self.claim(e, "merge", sha=sha)
+            judged = land_merge_record(e, sha, answer, snapshot, self.now)
         if self.broker_client():
             got = self.broker_land(e, sha)
         else:
@@ -27084,7 +27090,7 @@ class LandQueue:
         with self.lock:
             self.finish(e, got, verified=state)
             if state == "MERGED":
-                self.merged(e, merge_sha, "merged pinned")
+                self.merged(e, merge_sha, "merged pinned", judged=judged)
                 return
             if self.ended(e, state, merge_sha, "the read after its merge shows it"):
                 return  # CLOSED: closed unmerged, no refusal counted
@@ -27233,10 +27239,13 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True) -> None:
-        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here."""
+    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True, judged: dict | None = None) -> None:
+        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here. JUDGED:
+        this queue's own merge's record (LAND_MERGE_RECORD), on the entry and its "merged" row."""
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
-        self.history(e, "merged", sha=merge_sha, how=how)
+        if judged is not None:
+            e["landJudge"] = judged
+        self.history(e, "merged", sha=merge_sha, how=how, **({"landJudge": judged} if judged is not None else {}))
         self.save(e)
         # LAND_MERGED_ELSEWHERE_FYI: only this queue's own merge is news that wakes its requester. A merge read from a
         # copy (a hand merge, another host's queue that told it already) reaches it as an inbox fyi with its next news.
@@ -28359,6 +28368,44 @@ def land_override_history(e: dict) -> dict:
     of at most 240 characters)."""
     o = e.get("override")
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
+
+
+# LAND_MERGE_RECORD: the daemon's own merge history names what let each merge through. Before, its "merged" row said
+# only the SHA and "merged pinned": a merge past a red or pending check left no trace of which check, under which
+# verdict, or the override's reason (the queue's entries on one land host, 2026-11-26/27: four such merges, two past a
+# red ws-check and two past a pending one, each read back as a plain merge). leo-workspace#12618 closed the same hole
+# in the gh shim's landing record (land_judge.{verdict, excused[], override_reason}); this mirrors that record on the
+# entry ("landJudge") and its "merged" history row. It is written from what the queue already held at the merge (the
+# judgment it acted on and the check snapshot at the merged head): it reads nothing new and changes no decision.
+# Detector: test-glaeda-gh.py test_a_merge_past_a_red_or_pending_check_records_its_verdict_and_each_excused_check.
+LAND_RECORD_EXCUSED_MAX = 40
+
+
+def land_merge_record(e: dict, sha: str, answer: dict, data: dict | None, now: float) -> dict:
+    """What let E's merge at SHA through, as the shim's landing record words it: {verdict, excused[{name, state, why}],
+    override_reason?}. VERDICT is how the queue reached the merge (land_judge's ok code, or the override path, "via");
+    EXCUSED each check the snapshot DATA shows red or unfinished at SHA; an override's reason when one rode the merge."""
+    via = str(answer.get("via") or "")
+    code = str(answer.get("code") or ("ok" if answer.get("ok") else ""))
+    verdict = f"{via} ({code})" if via and code and code != "ok" else via or code or "unjudged"
+    o = e.get("override")
+    reason = str(o.get("reason") or "") if isinstance(o, dict) else ""
+    why = (f"override: {reason}" if via.startswith("override") and reason
+           else f"land_judge {verdict}: {land_reason(answer.get('reason'))}" if answer.get("reason")
+           else f"land_judge {verdict} at this head")
+    excused: list[dict] = []
+    data = data or {}
+    if str(data.get("headRefOid") or "").lower() == sha.lower():
+        groups = classify(data, now)
+        for state, cs in (("red", groups["failed"]), ("held", groups["held"]), ("pending", groups["pending"])):
+            for c in cs:
+                excused.append({"name": land_trim(c.get("name"), 200), "state": state, "why": land_trim(why, 400)})
+    out: dict = {"verdict": land_trim(verdict, 80), "excused": excused[:LAND_RECORD_EXCUSED_MAX]}
+    if data and str(data.get("headRefOid") or "").lower() != sha.lower():
+        out["checksUnread"] = True  # the snapshot was of another head: no check list, said so rather than "none"
+    if reason:
+        out["override_reason"] = land_trim(reason, 500)
+    return out
 
 
 # A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only

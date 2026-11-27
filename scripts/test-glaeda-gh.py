@@ -33899,6 +33899,44 @@ class LandTest(Base):
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
 
+    def test_a_merge_past_a_red_or_pending_check_records_its_verdict_and_each_excused_check(self):
+        # LAND_MERGE_RECORD: four merges on one land host went past a red or pending ws-check and the "merged" row said
+        # only "merged pinned". Each own merge now names its verdict, every non-green check at the head and why, and an
+        # override's reason, as leo-workspace#12618's landing record does.
+        cases = (("red, judged ok", [("ws-check", "COMPLETED", "FAILURE"), ("ci", "COMPLETED", "SUCCESS")], None,
+                  ok_answer(LA), "ok", [("ws-check", "red")]),
+                 # a pending status context land_judge let through (a running one keeps the queue waiting)
+                 ("pending, judged ok", [("ws-check", "PENDING", None, "runs when ready-to-land is added")], None,
+                  ok_answer(LA), "ok",
+                  [("ws-check", "pending")]),
+                 ("red, override", [("ws-check", "COMPLETED", "FAILURE")], dict(self.OVERRIDE),
+                  refusal("own_red", LA, {"kind": "rerun_failed", "runs": [7]}), "override_pinned (own_red)",
+                  [("ws-check", "red")]),
+                 ("all green", [("ci", "COMPLETED", "SUCCESS")], None, ok_answer(LA), "ok", []))
+        for name, checks, override, answer, verdict, excused in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=checks)
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                                **({"override": override} if override else {}))
+                self.w.answers.append(answer)
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                [row] = [h for h in e["history"] if h["event"] == "merged"]
+                said = row.get("landJudge")
+                self.assertIsNotNone(said, "the merged row names no verdict")
+                self.assertEqual(said, e.get("landJudge"))
+                self.assertEqual(said["verdict"], verdict)
+                self.assertEqual([(x["name"], x["state"]) for x in said["excused"]], excused)
+                if override:
+                    self.assertEqual(said["override_reason"], override["reason"])
+                    self.assertTrue(all(x["why"] == "override: " + override["reason"] for x in said["excused"]))
+                else:
+                    self.assertNotIn("override_reason", said)
+                    self.assertTrue(all(x["why"].startswith("land_judge ok") for x in said["excused"]))
+
     def test_land_override_pinned_row_merges_at_its_pin_past_the_merge_trains_retry(self):
         # manaflow-ai/cmux#58296, 2026-11-26: queued pinned at 30061064 with an override at 12:11:43Z, judged
         # red_not_excused step=retry (train=boarded) at 12:16:04Z and woken for another retry, never merged. The merge
