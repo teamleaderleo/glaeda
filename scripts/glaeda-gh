@@ -15297,6 +15297,37 @@ def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
     return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
 
 
+# LAND_UNLABEL_KEEP: a row's owed removal first reads when LAND_UNLABEL was last added (one read-only GraphQL read, the
+# form a lane VM's broker takes). An add after the row ended is another land's or a lane's re-arm, never this row's
+# leftover, so the label stays (`label_kept`). cmux#57755, 2026-11-27: ready-to-land came off six times in 5 h
+# (00:13Z..04:41Z, as yap-goblin-9000 and quota-goblin-9000, the hosts' gh pool), each 6-30 min after a live land
+# re-added it, with no add after: an older stopped row on another host owed its removal and sent it under the live
+# land, whose iOS-matrix carry needs the label (leo-workspace#12563), so the land stopped again. An unread read keeps
+# the removal as before (the label's CI cost is the reason it exists). Detector: test-glaeda-gh.py -k unlabel_keeps.
+LAND_UNLABEL_ADDS = ("query($owner: String!, $name: String!, $n: Int!) { repository(owner: $owner, name: $name) { "
+                     "issueOrPullRequest(number: $n) { ... on PullRequest { timelineItems(last: 30, itemTypes: "
+                     "[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } } } } } }")
+
+
+def land_label_adds_args(repo: str, number: str) -> list[str]:
+    """The gh argv that reads REPO#NUMBER's newest label adds (LAND_UNLABEL_KEEP)."""
+    owner, _, name = repo.partition("/")
+    return ["api", "graphql", "-f", f"query={LAND_UNLABEL_ADDS}", "-f", f"owner={owner}", "-f", f"name={name}",
+            "-F", f"n={number}"]
+
+
+def land_label_added_at(text: str, label: str = "ready-to-land") -> float | None:
+    """The newest add of LABEL in a land_label_adds_args answer, as epoch seconds; None when unread or never added."""
+    try:
+        doc = json.loads(text or "")
+        nodes = doc["data"]["repository"]["issueOrPullRequest"]["timelineItems"]["nodes"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    times = [iso_epoch(n.get("createdAt")) for n in nodes or () if isinstance(n, dict)
+             and ((n.get("label") or {}).get("name") or "") == label]
+    return max((t for t in times if t is not None), default=None)
+
+
 def land_pulse_args(repo: str, number: str, label: str, broker: bool) -> list[list[str]]:
     """The two gh argvs of a relabel pulse (LAND_COMMAND_PULSE's comment): LABEL off REPO#NUMBER, then on again. A
     broker client (a lane VM) sends the broker's `pr edit` forms; a host with its own login GitHub's REST DELETE and
@@ -21713,6 +21744,13 @@ class LandQueue:
                 return False  # it re-arms by itself, and lands with its label
         return self.now - float(st.get("at") or 0) >= LAND_UNLABEL_AFTER
 
+    def unlabel_ended_at(self, e: dict) -> float:
+        """When E's land ended: its cancel, else its stop, else its last update (LAND_UNLABEL_KEEP compares to it)."""
+        if e.get("state") == "cancelled":
+            return max((float(h.get("at") or 0) for h in e.get("history") or [] if h.get("event") == "cancelled"),
+                       default=float(e.get("updated") or 0))
+        return float((e.get("stop") or {}).get("at") or e.get("updated") or 0)
+
     def unlabel_start(self, keys: list[str]) -> None:
         """Send the owed label removals (unlabel_owed), LAND_UNLABEL_BATCH at most, off the pass thread."""
         if not keys or (self.unlabel_thread is not None and self.unlabel_thread.is_alive()):
@@ -21735,6 +21773,22 @@ class LandQueue:
             try:
                 e = self.entries.get(key)
                 if e is None:
+                    continue
+                read = self.call([gh, *land_label_adds_args(str(e["repo"]), str(e["number"]))], LAND_GH_DEADLINE, None)
+                added = land_label_added_at(read.stdout or "") if read.returncode == 0 else None
+                ended = self.unlabel_ended_at(e)
+                if added is not None and added > ended:
+                    with self.lock:
+                        if self.entries.get(key) is not e or int(e.get("gen") or 0) != gen \
+                                or e.get("state") not in ("stopped", "cancelled"):
+                            continue
+                        at = dt.datetime.fromtimestamp(added, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        e["unlabeled"] = {"head": str(e.get("head") or ""), "at": self.now, "kept": at}
+                        e.pop("unlabelFail", None)
+                        self.history(e, "label_kept", label=LAND_UNLABEL,
+                                     note=f"re-added at {at}, after this land ended: another land's, not this row's")
+                        self.save(e)
+                    log({"event": "land-unlabel-kept", "key": key, "added": added, "ended": ended})
                     continue
                 argv = land_unlabel_args(str(e["repo"]), str(e["number"]), self.broker_client())
                 got = self.call([gh, *argv], LAND_GH_DEADLINE, None)
@@ -26138,6 +26192,10 @@ class LandQueue:
             self.save(e)
         removed = self.call([gh, *off], LAND_GH_DEADLINE, e)
         got = self.call([gh, *on], LAND_GH_DEADLINE, e)
+        if removed.returncode == 0 and got.returncode not in (0, 124):
+            # the label is off and the add was refused: one more add now, so a refused add (quota, a pool app's 502)
+            # never leaves the PR without the label its land and its iOS-matrix carry read (cmux#57755, 2026-11-27)
+            got = self.call([gh, *on], LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
             if got.returncode not in (0, 124):

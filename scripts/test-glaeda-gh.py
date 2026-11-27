@@ -29144,6 +29144,27 @@ class LandTest(Base):
             e = self.tick(gg.NUDGE_MIN * 3 + 1)
         self.assertEqual(len(self.w.gh_calls("api")), 2)
 
+    def test_the_relabel_pulse_sends_its_add_again_when_the_first_add_is_refused(self):
+        # cmux#57755, 2026-11-27: a pulse whose add a pool app refused left the PR without ready-to-land, and its land's
+        # iOS-matrix carry (which reads the label) stopped matrix_missing.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.pulse_refusal(LA))
+        real, refused = self.q.call, []
+
+        def call(argv, *a, **k):
+            if "POST" in argv and not refused:
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            return real(argv, *a, **k)
+        self.q.call = call
+        e = self.tick()
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(self.w.gh_calls("api"), [
+            ["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"],
+            ["api", "-X", "POST", "repos/o/r/issues/1/labels", "-f", "labels[]=ready-to-land"]])
+        self.assertEqual((e["lastAction"]["kind"], e["lastAction"]["exit"], e["labelSent"]["head"]), ("label", 0, LA))
+
     def test_the_relabel_pulse_on_a_lane_vm_goes_through_the_brokers_pr_edit_not_a_hand_off(self):
         self.broker = True
         self.pr(LA)
@@ -32071,6 +32092,40 @@ class LandTest(Base):
         self.assertIsNone(e.get("unlabeled"))
         self.tick(gg.LAND_UNLABEL_AFTER + 1)
         self.assertEqual(len(self.unlabels()), 2)
+
+    def label_adds(self, *ats: float) -> None:
+        """GitHub's answer to the queue's read of the PR's ready-to-land adds (gg.land_label_adds_args), at ATS."""
+        nodes = [{"createdAt": dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "label": {"name": "ready-to-land"}} for at in ats]
+        nodes.append({"createdAt": "2030-01-01T00:00:00Z", "label": {"name": "risk:normal"}})  # another label's add
+        self.w.gh_out["other"] = json.dumps({"data": {"repository": {"issueOrPullRequest": {
+            "timelineItems": {"nodes": nodes}}}}})
+
+    def test_unlabel_keeps_a_ready_to_land_re_added_after_the_row_ended(self):
+        # cmux#57755, 2026-11-27: ready-to-land came off six times in 5 h, each 6-30 min after a live land re-added it:
+        # an older stopped row owed its removal and sent it under the live land, whose iOS-matrix carry needs the label.
+        e = self.stopped_on("block")
+        self.label_adds(e["stop"]["at"] - 600, e["stop"]["at"] + gg.LAND_UNLABEL_AFTER - 60)
+        e = self.tick(gg.LAND_UNLABEL_AFTER + 10)
+        self.assertEqual(self.unlabels(), [])
+        self.assertEqual(len(self.w.gh_calls("api", "graphql")), 1)
+        self.assertIn("kept", e["unlabeled"])
+        self.assertEqual(e["history"][-1]["event"], "label_kept")
+        self.tick(gg.LAND_UNLABEL_AFTER)
+        self.assertEqual((self.unlabels(), len(self.w.gh_calls("api", "graphql"))), ([], 1))  # read once, kept once
+
+    def test_unlabel_keeps_nothing_when_the_newest_add_is_the_rows_own(self):
+        e = self.stopped_on("block")
+        self.label_adds(e["stop"]["at"] - 600)
+        e = self.tick(gg.LAND_UNLABEL_AFTER + 10)
+        self.assertEqual(self.unlabels(), [["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"]])
+        self.assertEqual(e["history"][-1]["event"], "label_removed")
+
+    def test_unlabel_keeps_reads_the_adds_as_a_lane_vms_broker_takes_them(self):
+        argv = gg.land_label_adds_args("manaflow-ai/cmux", "57755")
+        self.assertEqual((argv[:2], argv[-2:]), (["api", "graphql"], ["-F", "n=57755"]))
+        self.assertIsNone(gg.land_label_added_at(""))
+        self.assertIsNone(gg.land_label_added_at('{"errors": [{"message": "x"}]}'))
 
     def test_unlabel_on_a_lane_vm_goes_through_the_brokers_pr_edit(self):
         # 2026-11-26 (ci-min-per-pr-30): a broker client skipped the removal, so lane VMs' queues never took a label off
