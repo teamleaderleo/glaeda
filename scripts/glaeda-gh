@@ -1924,6 +1924,12 @@ def fallback_no_login() -> str:
     raise WatchError(DIRECT_NO_LOGIN)
 
 
+def no_login_reader(daemon: "Daemon") -> bool:
+    """Whether DAEMON is a fallback reader with no login (fallback_no_login), so a read its App chain does not take
+    returns DIRECT_NO_LOGIN before it is tried rather than failing inside the transport."""
+    return getattr(daemon, "token_source", None) is fallback_no_login
+
+
 def spend_side_add(spend: dict[int, dict[str, list[int]]] | None) -> None:
     """Merge SPEND (Daemon.spend's shape) into SPEND_SIDE_FILE, under its lock. Best effort: never raises."""
     if not spend:
@@ -32870,8 +32876,8 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
         daemon.rollup_controller = direct_rollup_controller()
     else:
         daemon = Daemon(controller=None, upstream=None, token=fallback_no_login)
-        if not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
-            return {p: DIRECT_NO_LOGIN for p in paths}
+    if no_login_reader(daemon) and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
+        return {p: DIRECT_NO_LOGIN for p in paths}
     if login_stopped(daemon, "rest") and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
         return {p: DIRECT_QUOTA for p in paths}
     daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as direct_read: a session's read)
@@ -35813,7 +35819,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             daemon = Daemon(controller=None, upstream=None, token=fallback_no_login)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
-    if broker is None and not app_reads_key(daemon, key, bucket):
+    if no_login_reader(daemon) and not app_reads_key(daemon, key, bucket):
         return DIRECT_NO_LOGIN  # the wait goes on waiting for the daemon, which reads (and logs) it
     # The login's stop holds only a read that would go on the login (app_reads_key): one an App pool answers is sent.
     if login_stopped(daemon, bucket) and not app_reads_key(daemon, key, bucket):
