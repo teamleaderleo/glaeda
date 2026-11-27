@@ -43015,6 +43015,8 @@ class LandForwardTest(Base):
     stale_why = None
     upstream = False
     fresh_head = None
+    broker = False  # LandTest.queue reads these: not a broker client, not held for draining (LandQueue.held_handoff)
+    held = False
 
     EXEC = ["reach", "big-exec", ".local/bin/glaeda-gh", "land", "serve"]
 
