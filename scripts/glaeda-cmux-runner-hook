@@ -593,6 +593,12 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # persistent-dd: cmux18-glaeda-3") with the host's CPU idle.
                         ("pr-router.yml", "mac"): "isolated", ("pr-router.yml", "mac-fallback"): "isolated",
                         ("pr-router.yml", "ios"): "simulator-step",
+                        # `ios-fast` (the iOS fast verdict: xcodebuild build-for-testing of the changed kit and app
+                        # targets, then their tests in one booted simulator) under both its callers. As an unknown
+                        # job it was a compile (5 units, persistent-dd and a canonical root), so a busy mini turned
+                        # it away and it queued on Blacksmith: cmux#61812 waited 6 min there, then built cold.
+                        ("pr-router.yml", "ios-fast"): "simulator-step",
+                        ("ios-fast-verdict-dispatch.yml", "ios-fast"): "simulator-step",
                         # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
                         # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
                         ("fast-checks.yml", "checks-mac"): "isolated",
@@ -6307,7 +6313,12 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # Measured 2026-11-26 22:5xZ on six minis: github.com 200 direct in 0.19-0.22 s against 0.7-4.2 s through
 # the tunnel; cmux info/refs (7.2 MB) 0.36-0.66 s direct against 2.4-10.4 s, and a 30 s timeout on a relayed mini;
 # a depth-1 clone 1.4-1.6 s direct against 8.2-19.9 s; twenty direct info/refs in a row, all 200 (cmuxterm-hq#27837).
-GIT_SHIM_TUNNEL = "http://127.0.0.1:18434"
+# Any loopback proxy is one of those tunnels: github-egress/mini-rollout.sh now writes the first of 18434 (the cp
+# forward), 18435 or 18436 (mini-hetzner-tunnel.sh's ssh -L to hetzner-1/-2) that answers. The shims matched 18434
+# alone, so on a mini set to 18435 they skipped the probe and the token's direct route, and a dead tunnel failed
+# actions/checkout at once ("Failed to connect to 127.0.0.1 port 18435 after 0 ms" three times, cmuxterm-hq
+# onboarding-new-person-production job 140667177526, 2026-11-27 20:09Z). So the shims match this prefix.
+GIT_SHIM_TUNNEL = "http://127.0.0.1:"
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6352,7 +6363,7 @@ case $sub in fetch|ls-remote|submodule) ;; *)
   [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   # one config read on this hot path: a token's call skips the tunnel (GIT_SHIM_TUNNEL), anything else keeps it
   http=$("$real" "${globals[@]}" config --get-urlmatch http https://github.com/ 2>/dev/null) &&
-    printf '%s\n' "$http" | grep -qxF "http.proxy $tunnel" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
+    printf '%s\n' "$http" | grep -q "^http.proxy $tunnel[0-9]*\$" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
     exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   exec "$real" "${orig[@]}" ;; esac
 shift
@@ -6513,7 +6524,7 @@ go_direct() {  # $1: why. This attempt, the rest and the job's later git calls s
 if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
-elif [ "$proxy" = "$tunnel" ] && [ "$kind" != submodule ] && authed; then
+elif [[ $proxy == "$tunnel"* ]] && [ "$kind" != submodule ] && authed; then
   # not a submodule update: its clones are other repositories, with no token, and -c reaches them
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "this fetch carries the job's token, so it goes direct to github.com (the tunnel $proxy is for anonymous fetches)"
@@ -6626,6 +6637,9 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 # 127.0.0.1 port 18434" three times, cmuxterm-hq job 140064510755, 2026-11-26 17:30Z). So any
 # github.com origin an actions/checkout step fetches in an HQ job takes the same probe and mark.
 # A checkout whose git carries the job's token (its extraheader) goes direct with no probe, as the cmux shim's does.
+# Any loopback proxy is a fleet tunnel, not only 18434: a fleet Mac's git config names 127.0.0.1:18435, and with
+# the exact-port test the shim passed that dead tunnel through ("Failed to connect to 127.0.0.1 port 18435"
+# three times, cmuxterm-hq job 140669807034, 2026-11-27 20:14Z, the feature-flows walk).
 HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
@@ -6640,7 +6654,7 @@ case "$url" in
 esac
 "$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
 proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
-[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+case "$proxy" in http://127.0.0.1:[0-9]*|http://localhost:[0-9]*) ;; *) passthrough ;; esac  # any fleet tunnel port
 case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
 if authed; then  # checkout's fetch carries the job's token: the tunnel is only for anonymous fetches (GIT_SHIM_TUNNEL)
   echo "glaeda git shim: this checkout carries the job's token; using direct HTTPS for ${url#https://github.com/}" >&2
