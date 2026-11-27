@@ -35914,10 +35914,21 @@ def free_account_reading(now: float, make: Callable[[], Any] | None = None) -> d
     if daemon.rate_limit_at < now:  # read_rate_limit stamps this only when /rate_limit answered
         why = next((e for e in reversed(daemon.errors) if e.startswith("rate_limit: ")), None)
         return {"error": why[len("rate_limit: "):] if why else "/rate_limit gave no reading"}
-    # budget.json was loaded at construction, so only a bucket this answer refreshed is reported: its seenAt is NOW.
-    out = {b: {**r, "seenAt": now} for b in ("rest", "graphql")
-           if isinstance(r := daemon.budget.get(b), dict) and isinstance(r.get("remaining"), int)
-           and float(r.get("seenAt") or 0) >= now}
+    # budget.json was loaded at construction, so only a counter this answer refreshed is reported: its seenAt is NOW.
+    # The settled reading is not enough: for GraphQL it is the counter the daemon's own queries last drew from
+    # (settle_counters), whose seenAt is that query's, so a /rate_limit that answered fine left budget["graphql"] older
+    # than NOW and this said "named no core or graphql resource" (cmux-cp-2, 2026-11-27 02:58Z, while
+    # `glaeda-gh gh api /rate_limit` read GraphQL 2653/5000). The settled reading when this read refreshed it, else the
+    # poorest counter this read refreshed.
+    out = {}
+    for bucket, key in (("rest", "restCounters"), ("graphql", "graphqlCounters")):
+        r = daemon.budget.get(bucket)
+        if isinstance(r, dict) and isinstance(r.get("remaining"), int) and float(r.get("seenAt") or 0) >= now:
+            out[bucket] = {**r, "seenAt": now}
+            continue
+        fresh = [c for c in rest_counters(daemon.budget, key) if float(c.get("seenAt") or 0) >= now]
+        if fresh:
+            out[bucket] = {**min(fresh, key=lambda c: c["remaining"]), "seenAt": now}
     return {"readings": out} if out else {"error": "/rate_limit named no core or graphql resource"}
 
 

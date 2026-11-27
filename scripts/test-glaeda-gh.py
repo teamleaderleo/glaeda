@@ -8781,6 +8781,19 @@ class FleetBudgetTest(Base):
         doc = self.swept(self.no_graphql(now), now, answer)
         self.assertIn("next: ask a host that holds the login", gg.account_unknown("graphql", doc))
 
+        class Drawn(FakeDaemon):
+            def read_rate_limit(self):  # /rate_limit answered; the settled GraphQL reading is the drawn counter, older
+                self.rate_limit_at = self.now
+                drawn = {"remaining": 900, "limit": 5000, "reset": self.now + 900, "seenAt": self.now - 300}
+                fresh = {"remaining": 2653, "limit": 5000, "reset": self.now + 1800, "seenAt": self.now}
+                self.budget = {"graphql": dict(drawn), "graphqlCounters": [drawn, fresh],
+                               "rest": {"remaining": 4185, "limit": 5000, "reset": self.now + 600, "seenAt": self.now}}
+
+        with mock.patch.object(gg, "upstream_command", return_value=None):
+            answer = self.real_free(now, make=Drawn)  # cmux-cp-2, 2026-11-27: "named no core or graphql resource"
+        self.assertEqual(answer["readings"]["graphql"]["remaining"], 2653)
+        self.assertEqual(answer["readings"]["rest"]["remaining"], 4185)
+
     def test_account_bucket_is_what_the_wait_side_asks(self) -> None:
         """The one function a caller needs to name the bucket a read spends and when it resets, so a stale wait can
         say "GraphQL 0/5000 until 10:38Z" instead of naming the invocation that just failed. It answers from the kept
