@@ -355,6 +355,48 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(second.get("known_unreadable"), [KEYS[0]])
         self.assertEqual(second["fetched"], [])  # never fetched over it
 
+    def test_the_server_skips_known_unreadable_seeds_and_lists_the_rest(self):
+        # 2026-11-27: one seed that read EIO emptied the archive's whole seed-list-v1 answer (the listing's
+        # comprehension raised), and every mini's ask re-read the bad entry: 20 kernel retries each. The server
+        # leaves the archive's known-unreadable keys alone and lists every other seed.
+        serve = load("glaeda_seed_serve_for_test", SERVE)
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.keep(KEYS[2], 102)
+        self.run_archive()
+        known, odd = KEYS[0] + archive.SUFFIX, KEYS[2] + archive.SUFFIX
+        archive.remember_unreadable({KEYS[0]})
+        serve.KNOWN_UNREADABLE = archive.STATE / "unreadable.json"
+        touched = []
+        real_scandir, real_open = serve.os.scandir, serve.os.open
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                touched.append(self.name)
+                if self.name in (known, odd):
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        def opener(path, flags, mode=0o777, *, dir_fd=None):
+            touched.append(os.fspath(path))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        serve.os.scandir = lambda path: [Entry(e) for e in real_scandir(path)]
+        serve.os.open = opener
+        try:
+            listed = [key for key, _ in serve.listing("archive", Path("/nonexistent"), self.archive)]
+            found = serve.archive_find(self.archive, [KEYS[0], KEYS[1]])
+        finally:
+            serve.os.scandir, serve.os.open = real_scandir, real_open
+        self.assertEqual(listed, [KEYS[1]])  # the odd EIO one is left out too, not the whole answer
+        self.assertNotIn(known, touched)
+        self.assertIsNotNone(found)
+        fd, key = found
+        os.close(fd)
+        self.assertEqual(key, KEYS[1])
+
     def test_an_eio_anywhere_in_a_run_is_an_error_record(self):
         real = archive.run
         archive.run = lambda apply: (_ for _ in ()).throw(OSError(5, "Input/output error", "/Volumes/x"))
