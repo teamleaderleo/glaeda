@@ -141,6 +141,7 @@ RUNNER_CACHE_KEEP = 2  # versions kept after a download; older ones are removed 
 API_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")  # the gh-free path's optional API auth, sent on curl's stdin
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
+GATE_RETRY_S = 300  # GATE_RETRY: how long a runner runs without its dead gate before a fresh gate is tried
 DEDICATED_ADMIT = "dedicated-admit.sh"  # a --dedicated runner's own admission, which job-started runs
 DEDICATED_ENV_KEYS = ".glaeda-dedicated-env.json"  # the .env keys keep_runner_env wrote, so a removed key goes too
 HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
@@ -943,8 +944,42 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         " this runner's registration; leaving the retry to a fresh gate\"\n"
         "    exit 1\n"
         "fi\n"
-        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
-        "exec ./run.sh\n"
+        # GATE_RETRY: the runner without its gate was meant for a gate that cannot run, but it ran until run.sh
+        # exited, which a healthy runner never does: cmux22-glaeda-13's gate died on a full disk (exit 120,
+        # 2026-11-26 22:48Z) and the runner then listened ungated for 14 h, taking jobs during a fleet lease (and
+        # past capacity) only for job-started to refuse each one (cmux run 45970667586 "frames": refused, green on
+        # re-run elsewhere). So the ungated runner is bounded: every GATE_RETRY_S, once the hook answers and the
+        # runner is idle (the same frozen busy look as above), its listener stops and this wrapper exits 1, so
+        # launchd starts a fresh gate. A hook that still cannot answer keeps the runner as before.
+        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it"
+        f" until a fresh gate can run (a retry every {GATE_RETRY_S} s)\"\n"
+        "./run.sh &\n"
+        "runner=$!\n"
+        "trap 'stopping=1; kill -TERM \"$runner\" 2>/dev/null' TERM INT\n"
+        f"retry_s=${{GLAEDA_GATE_RETRY_S:-{GATE_RETRY_S}}}\n"
+        "retry_at=$((SECONDS + retry_s))\n"
+        "retried=\n"
+        "while kill -0 \"$runner\" 2>/dev/null; do\n"
+        "    if [ -z \"$stopping\" ] && [ \"$SECONDS\" -ge \"$retry_at\" ]; then\n"
+        "        freeze; frozen=$?\n"
+        f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
+        "        if [ \"$frozen\" -eq 0 ] && [ \"$busy\" -eq 3 ]; then\n"
+        "            echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the hook answers and the ungated runner is"
+        " idle; stopping it so a fresh gate starts\"\n"
+        "            retried=1\n"
+        "            /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" ||\n"
+        "                /usr/bin/pkill -TERM -f \"$re/run\"\n"
+        "        else\n"
+        "            retry_at=$((SECONDS + retry_s))\n"
+        "        fi\n"
+        "        /usr/bin/pkill -CONT -f \"$sup\"\n"
+        "    fi\n"
+        "    sleep 1 & wait $!\n"
+        "done\n"
+        "wait \"$runner\"\n"
+        "rc=$?\n"
+        "[ -n \"$retried\" ] && [ -z \"$stopping\" ] && exit 1  # launchd restarts this wrapper: a fresh gate\n"
+        "exit \"$rc\"\n"
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
     roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
