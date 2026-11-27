@@ -1113,10 +1113,34 @@ class FleetOps(unittest.TestCase):
             self.loaded.discard(args[1])
         return 0, ""
 
-    def run_ops(self, apply: bool = True, hold: str = "", eligible: str = "") -> dict:
+    def run_ops(self, apply: bool = True, hold: str = "", eligible: str = "", ec2: bool = False) -> dict:
         return heal.fleet_ops_pass(self.path, T0, apply, ops_dir=self.ops_dir, plist_dir=self.plists, root=False,
-                                   hold=lambda now: hold, eligible=lambda d: eligible, ctl=self.ctl,
+                                   hold=lambda now: hold, eligible=lambda d: eligible, ec2=lambda: ec2, ctl=self.ctl,
                                    ledger=self.ledger, wait=lambda s: None)
+
+    def test_an_ec2_mac_keeps_its_installed_ops_current_and_installs_no_other(self) -> None:
+        # aws-m4pro-7, 2026-11-27: the pass held every EC2 Mac, so an op installed there by hand never got a newer
+        # body and each change took another hand install.
+        (self.ops_dir / "seed-root").write_bytes(b"#!/bin/bash\n# older\n")
+        out = self.run_ops(ec2=True)
+        self.assertIn("EC2", out["scope"])
+        self.assertEqual(out["installed"], ["seed-root"])
+        self.assertEqual((self.ops_dir / "seed-root").read_bytes(), self.doc["ops"]["seed-root"]["body"].encode())
+        self.assertEqual(self.loaded, {"system/ai.manaflow.seed-root"})
+        for name in ("console-unlock-guard", "symbol-cache-cap"):
+            self.assertFalse((self.ops_dir / name).exists(), name)
+            self.assertFalse((self.plists / f"ai.manaflow.{name}.plist").exists(), name)
+            self.assertEqual(out["ops"][name]["state"], "missing")
+        self.calls.clear()
+        self.assertEqual(self.run_ops(ec2=True)["installed"], [])
+        self.assertEqual([c[0] for c in self.calls], ["print"], "a current EC2 Mac: only is its op loaded")
+
+    def test_the_sandboxd_reboot_still_never_takes_an_ec2_mac_but_the_ops_pass_does(self) -> None:
+        with mock.patch.object(heal.sys, "platform", "darwin"), mock.patch.object(heal, "is_ec2_mac", return_value=True):
+            self.assertIn("EC2", heal.fleet_ops_eligible(self.ops_dir))
+            self.assertEqual(heal.fleet_ops_dir_eligible(self.ops_dir), "")
+        with mock.patch.object(heal.sys, "platform", "darwin"), mock.patch.object(heal, "is_ec2_mac", return_value=False):
+            self.assertEqual(heal.fleet_ops_eligible(self.ops_dir), "")
 
     def test_shipped_ops_are_pinned_to_their_source(self) -> None:
         doc = heal.load_fleet_ops(OPS_BYTES)
