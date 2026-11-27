@@ -7807,7 +7807,7 @@ class ClientTest(Base):
         self.assertEqual(gg.parse_since(None, now), (None, now))
 
     def test_a_comment_wait_the_daemon_never_reads_reads_directly_then_ends_never_read(self) -> None:
-        # fs-agent-lane-6 2026-11-27: 3600 s of "no data yet" on a key the upstream never answered, then no-progress
+        # a lane VM 2026-11-27: 3600 s of "no data yet" on a key the upstream never answered, then no-progress
         calls: list[dict] = []
         reply = (200, "yap-goblin-9000[bot]", "nightly-readback answer (match) cluster c-1", time.time() + 1)
 

@@ -36027,7 +36027,7 @@ def comment_matches(c: dict, author: str | None, pattern: re.Pattern | None, sin
 
 
 # A comment wait whose target the daemon never reads waited out its whole timeout on "no data yet" and ended
-# `ended_by: no-progress`, as if the thread had gone quiet. fs-agent-lane-6 2026-11-27 07:36-08:36Z: `wait comment
+# `ended_by: no-progress`, as if the thread had gone quiet. a lane VM 2026-11-27 07:36-08:36Z: `wait comment
 # teamleaderleo/leo-workspace#12615 --match ...` printed "no data yet" for 3600 s on a lane VM whose upstream never
 # answered that key (no cache entry at all), while the readback it waited for had in fact never been posted. A
 # starved comment wait now reads the thread itself (direct_read, REST, the broker's GET on a lane VM) once
