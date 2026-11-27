@@ -22409,6 +22409,29 @@ class JobTelemetryTest(unittest.TestCase):
         rss_only.add(None, split, 10.0, rss_kib=1024)  # off Darwin: no footprint, so null and never 0
         self.assertIsNone(rss_only.summary(60.0)["rss_footprint_peak_mib"])
 
+    def test_summary_carries_the_job_cpu_meter_fields(self) -> None:
+        split = (1.0, 0.0, 0.0, {}, {})
+        samples = self.hook.JobSamples({}, 14, 0.0)
+        self.assertEqual(samples.summary(60.0)["cpu_s"], None, "nothing read: unknown, not 0")
+        samples.add(None, split, 10.0)
+        samples.add_cpu({10: (1.0, 0.5), 11: (2.0, 0.3)})
+        samples.add_cpu({10: (3.0, 1.0)})  # pid 11 exited: its last reading stays in the sum
+        samples.add_cpu({11: (0.1, 0.0)})  # a reused pid restarts at a lower total: the old process still counts
+        record = samples.summary(60.0)
+        self.assertEqual((record["cpu_user_s"], record["cpu_sys_s"], record["cpu_s"]), (5.1, 1.3, 6.4))
+        self.assertEqual((record["cpu_src"], record["wall_s"], record["provider"], record["schema_minor"]),
+                         ("tree-sampled", 60.0, "mac-mini", 1))
+        self.assertEqual(record["schema"], "glaeda-cmux-job/v1")
+
+    def test_xcode_version_comes_from_the_developer_dir(self) -> None:
+        self.assertIsNone(self.hook.xcode_version_of(None))
+        self.assertEqual(self.hook.xcode_version_of("/Applications/Xcode_26.6.app/Contents/Developer"), "26.6")
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "Xcode-beta.app"
+            (app / "Contents").mkdir(parents=True)
+            (app / "Contents" / "version.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "27.0"}))
+            self.assertEqual(self.hook.xcode_version_of(str(app / "Contents" / "Developer")), "27.0")
+
     def test_tree_kib_sums_nonzero_readings_of_the_tree(self) -> None:
         self.assertEqual(self.hook.tree_kib([1, 2, 3], {1: 10, 2: 0, 4: 99}), 10)
         self.assertIsNone(self.hook.tree_kib([1, 2], {1: 0, 2: 0}), "zombies only: unknown, not 0")

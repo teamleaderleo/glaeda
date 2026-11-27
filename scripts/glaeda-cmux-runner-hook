@@ -14616,6 +14616,7 @@ def job_rss_kib(rows: list[tuple[int, int, float, str, str]], rss: dict[int, int
 RUSAGE_INFO_V0 = 0
 RUSAGE_V0_WORDS = 12
 RUSAGE_V0_FOOTPRINT = 9
+RUSAGE_V0_USER, RUSAGE_V0_SYSTEM = 2, 3  # after the 16-byte uuid
 _LIBSYSTEM: list[Any] = []
 
 
@@ -14651,6 +14652,64 @@ def phys_footprints_kib(pids: list[int]) -> dict[int, int]:
         except (OSError, ctypes.ArgumentError, OverflowError):
             continue
     return out
+
+
+_MACH_TIMEBASE: list[tuple[int, int]] = []
+
+
+def mach_ticks_to_seconds(ticks: int) -> float:
+    """ri_user_time and ri_system_time are mach absolute-time ticks: 1:1 ns on Intel, 125:3 on Apple silicon."""
+    if not _MACH_TIMEBASE:
+        numer, denom = 1, 1
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                info = (ctypes.c_uint32 * 2)()
+                if ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info(ctypes.byref(info)) == 0 and info[1]:
+                    numer, denom = int(info[0]), int(info[1])
+            except (OSError, AttributeError, ImportError):
+                pass
+        _MACH_TIMEBASE.append((numer, denom))
+    numer, denom = _MACH_TIMEBASE[0]
+    return ticks * numer / denom / 1e9
+
+
+def tree_cpu_seconds(pids: list[int]) -> dict[int, tuple[float, float]]:
+    """Each pid's (user, system) CPU seconds so far (Darwin proc_pid_rusage), for the pids this user may read.
+    Empty off Darwin."""
+    fn = _proc_pid_rusage()
+    if fn is None:
+        return {}
+    import ctypes
+    out: dict[int, tuple[float, float]] = {}
+    buf = (ctypes.c_uint64 * RUSAGE_V0_WORDS)()
+    for pid in pids:
+        try:
+            if fn(pid, RUSAGE_INFO_V0, ctypes.byref(buf)) == 0:
+                out[pid] = (mach_ticks_to_seconds(int(buf[RUSAGE_V0_USER])), mach_ticks_to_seconds(int(buf[RUSAGE_V0_SYSTEM])))
+        except (OSError, ctypes.ArgumentError, OverflowError):
+            continue
+    return out
+
+
+def xcode_version_of(developer_dir: str | None) -> str | None:
+    """The Xcode version the job's DEVELOPER_DIR names (<app>/Contents/Developer): the app's version.plist
+    CFBundleShortVersionString, else the number in the app's name (Xcode_26.6.app); None when neither reads."""
+    if not developer_dir:
+        return None
+    path = Path(developer_dir)
+    app = next((p for p in (path, *path.parents) if p.suffix == ".app"), None)
+    if app is None:
+        return None
+    try:
+        with (app / "Contents" / "version.plist").open("rb") as f:
+            version = plistlib.load(f).get("CFBundleShortVersionString")
+        if isinstance(version, str) and version:
+            return version[:20]
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    found = re.search(r"([0-9]+(?:\.[0-9]+)+)", app.name)
+    return found.group(1) if found else None
 
 
 def load_average() -> float | None:
@@ -15024,6 +15083,26 @@ class JobSamples:
         self.rss_peak_kib: int | None = None
         # and of its summed physical footprint (Darwin proc_pid_rusage), which counts shared pages once
         self.footprint_peak_kib: int | None = None
+        # per-job CPU meter (record minor 1): the last (user, system) seconds read for every pid the job's tree had,
+        # kept after the pid exits, so the sum includes children that ended. A process that lives and dies between
+        # two samples is missed, so this is a floor of the tree's CPU (cpu_src says so).
+        self.cpu_by_pid: dict[int, tuple[float, float]] = {}
+        self.cpu_gone: tuple[float, float] = (0.0, 0.0)  # pids whose counters restarted (pid reuse): their earlier total
+
+    def add_cpu(self, readings: dict[int, tuple[float, float]]) -> None:
+        for pid, (user, system) in readings.items():
+            old = self.cpu_by_pid.get(pid)
+            if old is not None and user + system < old[0] + old[1]:  # a new process under a reused pid
+                self.cpu_gone = (self.cpu_gone[0] + old[0], self.cpu_gone[1] + old[1])
+            self.cpu_by_pid[pid] = (user, system)
+
+    def cpu_fields(self) -> dict[str, Any]:
+        if not self.cpu_by_pid:
+            return {"cpu_user_s": None, "cpu_sys_s": None, "cpu_s": None, "cpu_src": None}
+        user = self.cpu_gone[0] + sum(u for u, _ in self.cpu_by_pid.values())
+        system = self.cpu_gone[1] + sum(sy for _, sy in self.cpu_by_pid.values())
+        return {"cpu_user_s": round(user, 1), "cpu_sys_s": round(system, 1), "cpu_s": round(user + system, 1),
+                "cpu_src": "tree-sampled"}
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
@@ -15112,6 +15191,10 @@ class JobSamples:
             "rss_footprint_peak_mib": (None if self.footprint_peak_kib is None
                                        else round(self.footprint_peak_kib / 1024, 1)),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
+            # per-job CPU meter, schema minor 1 (added fields only): CPU seconds of the job's process tree, wall
+            # seconds (same as seconds), the provider; start_sampler adds runner_labels and xcode_version
+            "schema_minor": 1, "wall_s": round(ended - self.started, 1), "provider": "mac-mini",
+            **self.cpu_fields(),
         }
 
 
@@ -15366,6 +15449,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
                 tree = job_tree_pids(rows, watch_pid, skip, test_apps)
+                samples.add_cpu(tree_cpu_seconds(tree))
                 samples.add(load_average(), split, interval, queue, *disk_busy,
                             free=free_or_none(disk_path) if disk_path else None,
                             rss_kib=tree_kib(tree, rss), footprint_kib=tree_kib(tree, phys_footprints_kib(tree)))
@@ -15437,6 +15521,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
+        with contextlib.suppress(Exception):
+            labels = runner_labels(state_dir, meta.get("runner"))
+            record["runner_labels"] = sorted(labels) if labels else None
+            record["xcode_version"] = xcode_version_of(os.environ.get("DEVELOPER_DIR"))
         if written_max is not None:
             record[JOB_OWN_WRITTEN_FIELD] = round(written_max, 1)
         final, gui = holdings
