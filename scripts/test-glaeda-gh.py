@@ -30769,6 +30769,31 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertNotIn("staleLive", e)
 
+    def test_a_lagging_pr_head_judged_each_pass_still_stops_at_the_bound(self):
+        # 2026-11-26, 18:17Z to 23:34Z: a row stale_head_kept 52 times, every 300 s, never pr_head_lags_branch. The
+        # cache's read of the older copy carried no parents, so each pass judge() went ahead (base_merge_due), and
+        # its start dropped staleLive before the worker's base_merge_check kept the pin again: every keep was n=1,
+        # its clock new. The bound now counts from the first keep of the same head and pin across judgments.
+        self.pinned_and_waiting()
+        self.older_copy(parents=None)
+        for k in ("headParents", "headParent"):
+            self.w.cache[self.KEY]["data"].pop(k, None)
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        self.w.api[f"repos/o/r/commits/{self.LE}"] = json.dumps([self.LD])
+        e = self.tick(30)
+        kept = 0
+        for _ in range(int(gg.LAND_STALE_LIVE_MAX // gg.LAND_HEAD_TIMEOUT) * 3):
+            if e["state"] == "stopped":
+                break
+            kept = max(kept, int((e.get("staleLive") or {}).get("n") or 0))
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        keeps = [h for h in e["history"] if h["event"] == gg.LAND_STALE_LIVE]
+        self.assertGreater(kept, 1)  # one clock across the judgments, not a new one each pass
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "pr_head_lags_branch"))
+        self.assertLessEqual(len(keeps), int(gg.LAND_STALE_LIVE_MAX // gg.LAND_HEAD_TIMEOUT) + 1)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
