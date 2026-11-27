@@ -866,6 +866,22 @@ UPSTREAM_DIRECT_AFTER = 120
 # 2026-11-22 08:14-09:14Z: 7,888 glaeda-upstream GETs, 80% a path read before (pulls/N 4,010 of 4,837), and one wait
 # on gcp-codex-lane-5 (cmux#50040, all checks done, --max 4800) re-read its PR every 120 s for the whole wait.
 DIRECT_QUIET_MAX = 600.0
+# While the shared GraphQL quota is under the reserve this daemon keeps for lands, a waited PR has a second source
+# that does not share that pool: REST's own core budget (GET /repos/O/R/pulls/N and its head's checks, every request
+# conditional, so a quiet PR answers 304 for nothing). A waited, unfinished PR is read over it at least this often,
+# by the daemon (read_waited_rest) and by a starved wait itself (wait_starved), and no quiet doubling stretches it.
+# huge-blue, 2026-11-27: `cmux-gh wait pr manaflow-ai/cmux#59916 --until merged --timeout 7000` printed "OPEN ...
+# head 585b17ea8a" beside "the shared GraphQL quota for this login is spent (0 of 5000 left, under the 1000 this
+# daemon keeps back for lands, resets 01:41:47Z)" for its whole timeout and exited 124, while the PR had merged at
+# 01:36:47Z and REST had 3436 of 5000 left: no read of any kind was sent for it while GraphQL was held
+# (cmuxterm-hq docs/handbook/measurement-unknown-when-shared-quota-spent.md).
+QUOTA_HELD_REST_EVERY = 300.0
+# ... at most this many such daemon reads an hour (each a few requests, most of them free 304s): the daemon's own REST
+# share is spent too in the case this is for, so these go past it, as asked heads do (HEAD_DIRECT_MAX).
+QUOTA_HELD_REST_MAX = 120
+# Once the reset a held wait was told about (quotaReset) has passed by this much, its next direct read is due at once,
+# not a doubled gap later: the daemon's first ticks after a reset have a backlog, the wait has one PR.
+QUOTA_RESET_GRACE = 15.0
 # After the quota stops explaining old waited data (staleExplainedAt), the daemon has this long to read the backlog
 # before the data counts as starved. huge-blue, 2026-11-11 to 11-15: the shared GraphQL pool sat under the reserve
 # for 10 to 20 minutes before each hourly reset (the alarm rightly "held"), and on the first tick after the reset, at
@@ -6810,6 +6826,9 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.waited_rest_at: list[float] = []  # read_waited_rest's reads in the last hour (QUOTA_HELD_REST_MAX)
+        self.waited_rest_tried: dict[str, float] = {}  # key -> when read_waited_rest last read it
+        self.waited_rest_tried_now: list[str] = []  # the keys read_waited_rest read this tick
         self.heads_between_seen: frozenset = frozenset()  # keys the tick's watch read listed
         self.heads_between_since = float("inf")  # wall time of this tick's watch read: later asks are read between
         self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
@@ -10535,13 +10554,18 @@ class Daemon:
         through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
         self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
         self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
+        if self.mode("graphql") == "stop" and self.secondary_until <= self.now:
+            # GraphQL held (the reserve, the hard reserve or a back-off on that bucket alone): REST's own budget is a
+            # second source for what a wait is blocked on, whichever way the GraphQL pass below goes
+            self.read_waited_rest(entries, read)
+            read = read | set(self.waited_rest_tried_now)
         if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
                 or self.waited_points() >= WAITED_PER_MINUTE):
             return
         self.waived = True
         try:
             if self.mode("graphql") == "stop":
-                return  # under the part of the reserve kept for lands
+                return  # under the part of the reserve kept for lands (read_waited_rest read them over REST)
             # (a key never read has no dataAt: first in line, and a lane VM's wait on a new PR is filled at once)
             data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
             # Not a kind REST reads on its full cycle (route() sent it there and REST is normal): that is fresh already.
@@ -10603,6 +10627,37 @@ class Daemon:
             return  # the tick's budget is spent: the next tick goes on
         finally:
             self.waived = False
+
+    def read_waited_rest(self, entries: list[dict], read: set[str]) -> None:
+        """The unfinished PRs a wait is blocked on, read over REST while GraphQL is held, each at most every
+        QUOTA_HELD_REST_EVERY and QUOTA_HELD_REST_MAX an hour in all, oldest data first: a second source that does not
+        share the spent pool (QUOTA_HELD_REST_EVERY's comment). Past the daemon's own REST share, which is what keeps
+        route() from moving PRs to REST in this case, but never while REST itself is at stop or a secondary hold
+        holds both buckets. READ: the keys this tick already read. Fills waited_rest_tried_now."""
+        self.waited_rest_tried_now = []
+        if self.mode("rest") == "stop" or self.secondary_until > self.now:
+            return
+        self.waited_rest_at = [t for t in self.waited_rest_at if self.now - t < 3600]
+        self.waited_rest_tried = {k: t for k, t in self.waited_rest_tried.items()
+                                  if self.now - t < QUOTA_HELD_REST_EVERY}
+        data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
+        stale = [e for e in entries if e["key"].startswith("pr:") and self.waited(e) and e["key"] not in read
+                 and not (e["cache"] or {}).get("missing") and not terminal("pr", (e["cache"] or {}).get("data"))
+                 and self.now - data_at(e) >= QUOTA_HELD_REST_EVERY and e["key"] not in self.waited_rest_tried]
+        stale.sort(key=lambda e: (data_at(e), e["key"]))
+        for e in stale:
+            if len(self.waited_rest_at) >= QUOTA_HELD_REST_MAX or time.monotonic() >= self.tick_deadline:
+                return
+            self.waited_rest_tried[e["key"]] = self.now
+            self.waited_rest_at.append(self.now)
+            self.waited_rest_tried_now.append(e["key"])
+            try:
+                with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
+                    self.fetch_pr_rest(e)
+            except OutOfTime:
+                return
+            except Exception as error:  # noqa: BLE001  one PR's fault never stops the others
+                self.errors.append(f"{e['key']}: waited over REST: {describe(error)}")
 
     def waited_points(self) -> int:
         return sum(p for t, p in self.waited_log if self.now - t < 60)
@@ -32963,7 +33018,25 @@ def progress_state(key: str, entry: dict | None, until: str = "done", grace: flo
     mismatch = pin_mismatch(pin, (entry or {}).get("data"))
     state = f"{state}; {mismatch}" if mismatch else state
     blocked = None if fresh else blocked_now(split_key(key)[0])
-    return f"{state}; {blocked['text']}" if blocked is not None else state
+    if blocked is None:
+        return state
+    # Which source this held state came from and when (a clock, not an age, so an unchanged copy says the same words
+    # and the progress line stays quiet): "OPEN" beside a spent quota reads as live otherwise.
+    if isinstance(at, (int, float)) and not isinstance(at, bool):
+        via = {"rest": "REST", "graphql": "GraphQL", "graphql-probe": "GraphQL"}.get((entry or {}).get("via"), "")
+        state = f"{state}; as read{' over ' + via if via else ''} at {utc_clock(at)}"
+    return f"{state}; {blocked['text']}"
+
+
+def read_source(entry: dict | None, now: float | None = None) -> str:
+    """Which source answered the copy a wait rules on, and how old it is: "over REST at 01:38:36Z (12s ago)"."""
+    now = time.time() if now is None else now
+    at = (entry or {}).get("dataAt")
+    via = {"rest": "over REST", "graphql": "over GraphQL", "graphql-probe": "confirmed unchanged over GraphQL"}.get(
+        (entry or {}).get("via"), "from the daemon's copy")
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return f"{via}, never read"
+    return f"{via} at {utc_clock(at)} ({int(max(0.0, now - at))}s ago)"
 
 
 def progress_line(req: dict, state: str, now: float | None = None) -> str:
@@ -34104,6 +34177,22 @@ def note_direct_quiet(req: dict, before: str | None, after: str | None, error: s
         req.pop("directQuiet", None)
 
 
+def second_route_open(kind: str | None, blocked: dict | None) -> bool:
+    """Whether a wait's direct read has a route the held bucket does not hold: a PR whose GraphQL is what BLOCKED
+    (read_blocked) names, while the login's REST is not at stop (daemon.json's modes; the daemon's own REST share does
+    not hold a wait's read, _read_one). A secondary hold stops both, so it has none."""
+    if kind != "pr" or not isinstance(blocked, dict) or blocked.get("bucket") != "graphql":
+        return False
+    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
+    return isinstance(modes, dict) and modes.get("rest") != "stop"
+
+
+def quota_held_rest(kind: str | None, now: float) -> bool:
+    """A wait whose own bucket the shared quota holds (read_blocked: exhausted) and that has REST beside it."""
+    blocked = blocked_now(kind or "", now)
+    return blocked is not None and bool(blocked.get("exhausted")) and second_route_open(kind, blocked)
+
+
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     """How old the data a wait is blocked on is, when it is starved: the wait has run STALE_DATA_AFTER and nothing was
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
@@ -34127,9 +34216,17 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     if never_read and not req.get("diagnosed") and bound > WAIT_DIAGNOSE_AFTER \
             and blocked_now(req.get("kind"), now) is None:
         bound = WAIT_DIAGNOSE_AFTER
+    gap = None
+    if quota_held_rest(req.get("kind"), now):
+        # GraphQL held, REST not: read over REST every QUOTA_HELD_REST_EVERY, never doubled (its comment)
+        bound = gap = min(bound, QUOTA_HELD_REST_EVERY)
+    reset = req.get("quotaReset")
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool) and now >= reset + QUOTA_RESET_GRACE \
+            and float(req.get("directAt") or float("-inf")) < reset:
+        bound = gap = 0.0  # the reset this wait was told about has passed: read now, not a doubled gap later
     if now - began < bound:
         return None
-    if now - float(req.get("directAt") or float("-inf")) < direct_gap(req, bound):
+    if now - float(req.get("directAt") or float("-inf")) < (direct_gap(req, bound) if gap is None else gap):
         return None
     seen = (entry or {}).get("dataAt")
     view = (entry or {}).get("upstreamFeed")
@@ -34139,7 +34236,7 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
         # (huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of 11,257 glaeda-upstream GETs a path that VM had read before).
         return None
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
-    return age_s if age_s > bound else None
+    return age_s if age_s > bound or bound == 0.0 else None
 
 
 def _direct_read(req: dict) -> str | None:
@@ -34216,6 +34313,12 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
     # The login's stop holds only a read that would go on the login (app_reads_key): one an App pool answers is sent.
+    # A PR whose GraphQL is held that way still has REST's own budget, which does not share the spent pool
+    # (QUOTA_HELD_REST_EVERY): the read goes there rather than being refused.
+    over_rest = False
+    if kind == "pr" and bucket == "graphql" and login_stopped(daemon, bucket) \
+            and not app_reads_key(daemon, key, bucket):
+        bucket, over_rest = "rest", True
     if login_stopped(daemon, bucket) and not app_reads_key(daemon, key, bucket):
         return DIRECT_QUOTA
     # A wait's own read is a session's request, not the daemon's polling: it is not charged to the daemon's REST share,
@@ -34233,7 +34336,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
         daemon.repo_parts.update(direct_parts_load(daemon.now))
     try:
         with daemon.calling(*caller_of(key), "tool:glaeda-gh wait (direct read)"):
-            if kind == "pr" and broker is not None:
+            if kind == "pr" and (broker is not None or over_rest):
                 daemon.fetch_pr_rest(entry)
                 error = None
             elif kind == "pr":
@@ -34383,7 +34486,9 @@ def poll_wait(req: dict) -> int:
                 req["directAt"] = time.time()
                 req["diagnosed"] = True
                 blocked = blocked_now(req["kind"])
-                if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
+                req.pop("quotaReset", None)
+                if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"] \
+                        and not second_route_open(req["kind"], blocked):
                     # The files already say why, and a direct read over that bucket is refused before it is sent:
                     # say the bucket and the reset rather than spend a call to be told the same thing. Only when the
                     # spent bucket is the one this read would go over: a kind the daemon's own spent REST share holds
@@ -34391,6 +34496,8 @@ def poll_wait(req: dict) -> int:
                     say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
                                 f"{int(starved)}s (its heartbeat is fresh, its data is not), because "
                                 f"{blocked['text']}.")
+                    if blocked.get("reset") is not None:
+                        req["quotaReset"] = float(blocked["reset"])  # read again once it passes (wait_starved)
                 else:
                     say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
                                 f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub "
@@ -34398,7 +34505,8 @@ def poll_wait(req: dict) -> int:
                     before = wait_progress_print(req["kind"], read_cache(req["key"]))
                     error = direct_read(req)
                     note_direct_quiet(req, before, wait_progress_print(req["kind"], read_cache(req["key"])), error)
-                    say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
+                    say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else
+                                                             f"answered {read_source(read_cache(req['key']))}") + "."
                                 # a read that answered needs no restart: wait_step rules on what it stored
                                 + ("" if not error or error in (DIRECT_QUOTA, DIRECT_UPSTREAM)
                                    or upstream_command() is not None else "\nnext: glaeda-gh restart"))

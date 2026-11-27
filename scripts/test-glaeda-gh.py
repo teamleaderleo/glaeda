@@ -10257,7 +10257,8 @@ class TickBudgetTest(Base):
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
         left, and `checks --consumer merge-hold` said "unread (not read yet)" until the hour turned. A head with no
-        answer is read over REST then, within HEAD_DIRECT_MAX an hour; an answered one and the PRs still wait."""
+        answer is read over REST then, within HEAD_DIRECT_MAX an hour; an answered one still waits. A waited PR is read
+        over REST too (read_waited_rest, once per QUOTA_HELD_REST_EVERY: cmux#59916); an unwaited one waits."""
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2129, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
         self.daemon.rest_minutes = {int(NOW // 60): 10000}  # the share is spent
@@ -10267,11 +10268,12 @@ class TickBudgetTest(Base):
         gg.write_json(gg.cache_dir() / gg.file_name(f"head:o/r@{old}"), {"key": f"head:o/r@{old}", "data": {"found": {}}, "dataAt": NOW - 5000,
                                                           "fetchedAt": NOW - 5000})
         gg.register("pr:o/r#1", waited=True)
+        gg.register("pr:o/r#2")
         read: list[str] = []
         with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
                 mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
             self.daemon.tick(NOW)
-            self.assertEqual(read, [f"head:o/r@{sha}"])
+            self.assertEqual(read, [f"head:o/r@{sha}", "pr:o/r#1"])
             self.assertEqual(len(self.daemon.head_direct_at), 1)
             # the hourly bound holds: none more past it
             read.clear()
@@ -25662,6 +25664,96 @@ class StaleDataTest(Base):
         self.assertIn("MERGED", out.getvalue())
         self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
 
+    def spend_graphql(self, now: float) -> None:
+        """The login's GraphQL at 0 of 5000 (under the reserve kept for lands), resetting in 30 minutes; REST has
+        3436 left but the daemon's own REST share is spent: huge-blue, 2026-11-27 01:3xZ (cmux#59916)."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 0, "reset": now + 1800, "seenAt": now},
+            "rest": {"limit": 5000, "remaining": 3436, "reset": now + 1800, "seenAt": now}})
+        gg.write_json(gg.BASE / "daemon.json", {
+            "at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
+            "modes": {"graphql": "stop", "rest": "lean"},
+            "paths": {"pr": "graphql", "run": "graphql", "comment": "graphql", "head": "graphql"},
+            "restShare": {"capped": True}})
+
+    def test_a_wait_on_spent_graphql_reads_the_pr_over_rest_and_ends(self) -> None:
+        """cmux#59916, huge-blue 2026-11-27: `wait pr --until merged --timeout 7000` printed "OPEN ... head 585b17ea8a"
+        beside "the shared GraphQL quota for this login is spent ... nothing is read for a pr until then" to its
+        timeout (exit 124) while the PR had merged and REST had 3436 of 5000 left. The wait reads it over REST."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        self.spend_graphql(time.time())
+        began = time.time() - gg.STALE_DATA_AFTER - 60
+        # a short timeout, so the old code fails in seconds rather than hanging: it never read the PR at all
+        rid = gg.write_wait_request("pr", "o/r#9", "merged", gg.STALE_DATA_AFTER + 68, False, False, None, True,
+                                    gg.RESCUE_GRACE, os.getpid(), began=began)
+        # handed back already, as #59916's was ("has not refreshed ... for 1226s; reading GitHub directly once")
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        gg.write_json(gg.waits_dir() / f"{rid}.json", {**req, "stale": 1226})
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000)  # OPEN, 50 minutes old
+        self.gh.prs[("o", "r", 9)] = pr_node(9, state="MERGED", rollup="SUCCESS", checks=[check_run("a")])
+        self.gh.throttle["graphql"] = (403, {}, b'{"message": "API rate limit exceeded"}')  # GraphQL answers nothing
+        real = gg.Daemon
+        direct = lambda **kw: real(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)  # noqa: E731
+        said, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(gg, "Daemon", side_effect=direct), mock.patch.object(gg, "block") as block, \
+                self.diagnostics_in(said), contextlib.redirect_stdout(out):
+            code = gg.resume_wait(rid)
+        block.assert_not_called()
+        self.assertEqual(code, gg.EXIT_OK, said.getvalue() + out.getvalue())
+        self.assertIn("MERGED", out.getvalue())
+        self.assertEqual(self.gh.gql_calls(), [], "the spent pool was asked")
+        self.assertTrue([c for c in self.gh.rest_calls() if "/pulls/9" in c[1]], self.gh.calls)
+        self.assertRegex(said.getvalue(), r"direct read answered over REST at \d\d:\d\d:\d\dZ \(\d+s ago\)")
+        self.assertEqual(gg.read_cache("pr:o/r#9")["via"], "rest")
+
+    def test_a_held_wait_rereads_every_bound_and_once_the_reset_passes(self) -> None:
+        """While GraphQL is held and REST is not, a starved wait reads every QUOTA_HELD_REST_EVERY, never a doubled
+        gap; with REST held too it reads nothing, and once the reset it was told about passes it reads at once."""
+        now = time.time()
+        self.spend_graphql(now)
+        req = {"kind": "pr", "key": "pr:o/r#9", "began": now - 3600, "directAt": now - gg.QUOTA_HELD_REST_EVERY - 1,
+               "directQuiet": 6}
+        entry = {"dataAt": now - 3000, "data": gg.parse_pr(pr_node(9))}
+        self.assertIsNotNone(gg.wait_starved(req, entry, now), "a quiet streak stretched the held gap")
+        req["directAt"] = now - gg.QUOTA_HELD_REST_EVERY + 5
+        self.assertIsNone(gg.wait_starved(req, entry, now))
+        gg._blocked_memo.clear()
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        doc["modes"]["rest"] = "stop"
+        gg.write_json(gg.BASE / "daemon.json", doc)
+        req["directAt"] = now - gg.QUOTA_HELD_REST_EVERY - 1
+        self.assertIsNone(gg.wait_starved(req, entry, now), "no second route: the doubled gap holds")
+        req["quotaReset"] = now - gg.QUOTA_RESET_GRACE - 1
+        req["directAt"] = now - 30  # read (refused) before the reset: due at once once it passes
+        self.assertIsNotNone(gg.wait_starved(req, entry, now))
+        req["directAt"] = now - 5  # read since the reset: the ordinary gap again
+        self.assertIsNone(gg.wait_starved(req, entry, now))
+
+    def test_the_daemon_reads_waited_prs_over_rest_while_graphql_is_held(self) -> None:
+        """The daemon side of cmux#59916: GraphQL under the hard reserve, the daemon's REST share spent (so route()
+        keeps PRs on GraphQL): a waited, unfinished PR is still read, over REST, once per QUOTA_HELD_REST_EVERY."""
+        key = gg.parse_key("pr", "o/r#9")
+        self.put(key, gg.parse_pr(pr_node(9)), at=NOW - 3000)
+        gg.register(key, waited=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, state="MERGED", rollup="SUCCESS", checks=[check_run("a")])
+        self.gh.throttle["graphql"] = (403, {}, b'{"message": "API rate limit exceeded"}')
+        self.daemon.budget = {"graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800, "seenAt": NOW},
+                              "rest": {"limit": 5000, "remaining": 3436, "reset": NOW + 1800, "seenAt": NOW}}
+        with mock.patch.object(self.daemon, "rest_capped", return_value=True), \
+                mock.patch.object(self.daemon, "past_share", return_value=True), \
+                mock.patch.object(self.daemon, "refresh_budget"):
+            self.daemon.tick(NOW)
+            cached = gg.read_cache(key)
+            self.assertEqual(cached["data"]["state"], "MERGED", cached)
+            self.assertEqual(cached["via"], "rest")
+            self.assertEqual(self.gh.gql_calls(), [])
+            before = len(self.gh.rest_calls())
+            self.daemon.tick(NOW + gg.TICK)  # terminal now: not read again
+            self.assertEqual(len(self.gh.rest_calls()), before)
+
     def broker_get(self, served: list[str]) -> Callable[..., subprocess.CompletedProcess]:
         """run_bounded as `lane-gh call get REPO -` answers on a lane VM: the broker's GET of one repo path, from
         self.gh's REST view. Records each path in SERVED; any other program is a test failure."""
@@ -26086,13 +26178,23 @@ class StaleDataTest(Base):
     def test_a_direct_read_heeds_the_daemons_stop(self) -> None:
         gg.BASE.mkdir(parents=True, exist_ok=True)
         gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30,
-                                                "modes": {"graphql": "stop", "rest": "normal"}})
+                                                "modes": {"graphql": "stop", "rest": "stop"}})
         real = gg.Daemon
         with mock.patch.object(gg, "Daemon", side_effect=lambda **kw: real(
                 transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)):
             error = gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "began": time.time() - 700})
         self.assertIn("quota", error)
         self.assertEqual(self.gh.calls, [])
+        # GraphQL stopped and REST not: a PR has a second route (QUOTA_HELD_REST_EVERY), and the stop holds GraphQL
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30,
+                                                "modes": {"graphql": "stop", "rest": "normal"}})
+        self.gh.prs[("o", "r", 9)] = pr_node(9, state="MERGED", rollup="SUCCESS", checks=[check_run("a")])
+        with mock.patch.object(gg, "Daemon", side_effect=lambda **kw: real(
+                transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)):
+            error = gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "began": time.time() - 700})
+        self.assertIsNone(error)
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertEqual(gg.read_cache("pr:o/r#9")["via"], "rest")
 
     def land_refresh_reads(self, keys: list[str], batched: bool) -> tuple[int, dict]:
         """GraphQL queries sent to read KEYS as land refreshes, one land_direct_read each or one land_direct_read_many,
