@@ -372,7 +372,9 @@ script `~/.cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune`, using the same
 atomic replacement and newer-operator-copy protection as the seed scripts.
 It creates no CAS role, storage, binary, wrapper or unit and restarts no CAS
 service. The installer remains responsible for those surfaces through its
-registry deploy runner. `converge.json` exposes `running.casScripts` and
+registry deploy runner. Operator symlinks at the script, install directory, or
+source stamp are preserved; linked scripts remain unknown in convergence.
+`converge.json` exposes `running.casScripts` and
 `running.libexecScripts` with installed/release SHA-256 identities; a differing
 service script makes convergence false, including a protected operator copy.
 The launch directory's `.glaeda-source.json` records the source release identity.

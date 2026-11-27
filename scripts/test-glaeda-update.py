@@ -603,6 +603,49 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("kept", gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"])
         self.assertFalse(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
 
+    def test_service_script_refresh_preserves_operator_symlinks(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        scripts = gu.generation(self.state, entry["tag"]) / "glaeda/scripts"
+        for key, relative, name in (
+            ("casScripts", ".cache/glaeda-fleet-cas/launch", "glaeda-fleet-cas-prune"),
+            ("libexecScripts", str(gu.LIBEXEC_RELATIVE), "glaeda-seed-archive"),
+        ):
+            with self.subTest(family=key):
+                target = home / relative
+                target.mkdir(parents=True)
+                (scripts / name).write_text("release bytes")
+                operator = self.root / (name + "-operator")
+                operator.write_text("operator bytes")
+                dest = target / name
+                dest.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertEqual(operator.read_text(), "operator bytes")
+                row = gu.observe(self.state, self.bin, home, staged)[key][name]
+                self.assertIsNone(row["installedSha256"])
+                self.assertFalse(row["current"])
+                operator.unlink()  # dangling links remain operator-owned and visible
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+                dest.unlink()
+                dest.write_text("old installed bytes")
+                stamp = target / gu.SOURCE_STAMP
+                stamp.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(stamp.is_symlink())
+                self.assertEqual(dest.read_text(), "old installed bytes")
+                stamp.unlink()
+                moved = target.with_name(target.name + "-operator")
+                target.rename(moved)
+                target.symlink_to(moved, target_is_directory=True)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(target.is_symlink())
+                self.assertEqual((moved / name).read_text(), "old installed bytes")
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+
     def test_a_hand_installed_seed_script_is_refreshed_and_a_role_is_never_added(self) -> None:
         libexec = self.root / "home/.local/libexec"
         self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "absent")  # no seed role: nothing made
