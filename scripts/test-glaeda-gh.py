@@ -39123,6 +39123,24 @@ class LandTest(Base):
         self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
                                                     "have been met, add the --auto flag"))
 
+    def test_a_lane_vm_update_branch_is_not_held_by_the_logins_create_pause(self):
+        # On a lane VM the update-branch goes to the broker's land tool, which no create pause holds (the shim admits
+        # it: gh_quota.py broker_lands). The queue's own read of the pause held it anyway: 39 of 85 base_update
+        # update-branches in a day on one lane VM were step_held. Sent now; a retarget is still held.
+        self.broker = True
+        self.q = self.queue()
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--match-head-commit", LA]])
+        self.assertNotIn("step_held", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stepQuotaParked"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
     def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
         # one lane VM, 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
         # "content writes are paced until reset (60s ...)", each a refusal row on the fleet's paced count (goal
@@ -40852,6 +40870,30 @@ class LandTest(Base):
         e = self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)
         self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_check_completed_event_judges_a_wait_whose_pr_the_cache_holds_no_copy_of(self):
+        """LAND_WAKE_NO_COPY. manaflow-ai/cmux#61813, 2026-11-27: first judged why=no_data (checks_running, 30 min
+        wait), green and CLEAN by 13:55Z, judged only at 14:09Z; leo-workspace#13493 and glaeda#3083 the same. With no
+        copy the row had no head in the queue's heads (so the feed's event matched nothing) and no_data_wait_holds
+        held it to its wake. Now the verdict's head is what the event is matched to, and the event judges it."""
+        self.feed()
+        done, _, asked = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.land()  # no self.pr(): the cache holds no copy of the PR
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        for _ in range(4):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertEqual(self.q.heads[self.KEY][1], LA)  # what Daemon.nudge_lands matches the event against
+        for _ in range(5):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)  # no event: the wait stands
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual([h.get("why") for h in e["history"] if h.get("event") == "judged"][-1], "checks_done")
+        self.assertEqual(asked, [LA])
 
     def test_a_green_rollup_judges_a_checks_wait_whose_copy_still_shows_a_check_running(self):
         """LAND_ROLLUP_READY. manaflow-ai/cmuxterm-hq#28474, 2026-11-26: judged checks_running at 09:49Z, every check
