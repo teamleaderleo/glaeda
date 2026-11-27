@@ -10003,14 +10003,6 @@ def mirror_archive() -> Path:
     return HOME / "archive" / "glaeda-disk"
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def drop_unused_archives(written: list[Path]) -> None:
     """Delete the archives this pass wrote for a mirror item that then stayed (in use, or not all of it could be
     archived), and their manifest lines. The tree still holds everything they hold. Without this, a warm cache that
@@ -11706,16 +11698,6 @@ def owner_retired(fam: Family) -> bool:
                 return False
         except (OSError, subprocess.SubprocessError):
             return False  # unknown: say nothing rather than call a live owner retired
-    return True
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # someone else's live process
     return True
 
 
@@ -15368,6 +15350,8 @@ def _owner_command(pid: int) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
+    """One definition for the whole file: an earlier copy (PermissionError read as alive) was shadowed by this one,
+    which every caller already ran (Python keeps the last top-level def)."""
     if pid <= 0:
         return False
     try:
@@ -17834,7 +17818,9 @@ def _file_key(st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
 
-def _sha256(path: str) -> str:
+def _sha256(path: str | os.PathLike[str]) -> str:
+    """One definition for the whole file: an earlier `_sha256(path: Path)` at the archive code was shadowed by this
+    one (Python keeps the last top-level def), so its callers already ran this; open() takes a str or a Path."""
     import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
