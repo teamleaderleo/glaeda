@@ -1359,11 +1359,9 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     try:
         current = json.loads(path.read_text())
     except FileNotFoundError:
-        current = None
+        return {**act, "state": "create", "value": update_config(ctx)}
     except (OSError, ValueError):
         return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
-    if current is None:
-        return {**act, "state": "create", "value": update_config(ctx)}
     if not isinstance(current, dict):
         return {**act, "state": "blocked", "note": "update config must be an object"}
     value = dict(current)

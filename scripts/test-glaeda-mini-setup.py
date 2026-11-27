@@ -1147,11 +1147,13 @@ class MiniSetupTest(unittest.TestCase):
     def test_update_only_refuses_non_object_config_without_mutation(self) -> None:
         path = self.home / ".config/glaeda/update.json"
         path.parent.mkdir(parents=True)
-        path.write_text("[]")
-        before = self.tree()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
-        self.assertEqual(self.tree(), before)
+        for value in ([], None, "invalid", 7):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value))
+                before = self.tree()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+                self.assertEqual(self.tree(), before)
 
     def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
         """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and
