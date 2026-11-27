@@ -35215,7 +35215,7 @@ def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
 def poll_wait(req: dict) -> int:
     """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
     A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
-    timeout, jobs = req["timeout"], req["jobs"]
+    timeout, jobs = min(req["timeout"], wait_max(req)), req["jobs"]
     start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     said = time.monotonic()
@@ -35230,7 +35230,7 @@ def poll_wait(req: dict) -> int:
                     print_json_error("daemon-down", "the daemon is not running, so nothing is polling GitHub",
                                      down_message().rpartition("\nnext: ")[2])
                 return EXIT_DOWN
-            time.sleep(WAIT_POLL)
+            time.sleep(min(WAIT_POLL, max(0.0, start + timeout - time.monotonic())))
             continue
         down_since = None
         broken = daemon_failing()
@@ -35283,7 +35283,7 @@ def poll_wait(req: dict) -> int:
                 state = progress_update(seen, req, read_cache(req["key"]), time.time())
                 if state is not None:
                     say_waiting(progress_line(req, state))
-        time.sleep(min(WAIT_POLL, max(0.1, wait_deadline(req) - time.time())))
+        time.sleep(min(WAIT_POLL, max(0.0, wait_deadline(req) - time.time())))
 
 
 WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
@@ -45557,9 +45557,9 @@ def main(argv: list[str] | None = None) -> int:
             # running (resume_wait, poll_wait) never comes back through here, so a row queued mid-wait never cuts one
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
+            leash = Leash(args.timeout, args.max)
             row = land_row_watched_here(pr_key, args.sha)
             if row is not None and args.until in (None, "merged"):
-                leash = Leash(args.timeout, args.max)
                 code = land_row_wait(pr_key, row, leash, args.json)
                 if code is not None:
                     return code

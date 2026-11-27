@@ -179,14 +179,19 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
             queue.save(row)
 
         wait = functools.partial(gg.land_row_wait, sleep=tick)
+        # The local daemon forwards at t=3, then the ordinary waiter takes its daemon-down fallback.
+        # Its normal poll interval (3 s) is longer than the remaining 2 s.
+        out = io.StringIO()
         with mock.patch.object(gg.time, "monotonic", lambda: queue.now), \
-                mock.patch.object(gg, "land_row_wait", wait), \
-                mock.patch.object(gg, "subscribe_wait", return_value=gg.EXIT_TIMEOUT) as follow:
-            code, _ = self.wait_cli(66, "--until", "merged", "--timeout", "4", "--max", "5")
-        self.assertEqual(code, gg.EXIT_TIMEOUT)
-        args = follow.call_args.args
-        self.assertEqual((args[2], args[3], args[9]), ("merged", 4, 2))
-        self.assertEqual(gg.wait_max({"timeout": args[3], "max": args[9]}), 2)
+                mock.patch.object(gg.time, "time", lambda: queue.now), \
+                mock.patch.object(gg.time, "sleep", tick), mock.patch.object(gg, "land_row_wait", wait), \
+                mock.patch.object(gg, "serving_waits", return_value=False), \
+                mock.patch.object(gg, "daemon_running", side_effect=lambda **kw: queue.now < 3), \
+                mock.patch.object(gg, "say_waiting"), contextlib.redirect_stdout(out):
+            code = gg.main(["wait", "pr", f"{REPO}#66", "--until", "merged", "--timeout", "4", "--max", "5", "--json"])
+        self.assertEqual(code, gg.EXIT_DOWN, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["code"], "daemon-down")
+        self.assertEqual(queue.now, 5)
 
     def test_the_row_wait_ends_with_the_row_merged_or_stopped(self) -> None:
         for end, want in (("merged", gg.EXIT_OK), ("stopped", gg.EXIT_FAIL), ("cancelled", gg.EXIT_FAIL)):
