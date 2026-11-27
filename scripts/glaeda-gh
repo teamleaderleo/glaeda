@@ -13722,7 +13722,7 @@ class Daemon:
         incomplete). No GitHub request."""
         if not PR_REST_SUITES_FROM_CONTROLLER:
             return None
-        doc = self.controller_rollup_doc(root, sha)
+        doc = self.rollup_doc_once(root, sha)
         return None if doc is None else rollup_suites(doc, sha)
 
     def controller_head_parts(self, root: str, sha: str) -> dict[str, dict] | None:
@@ -13730,10 +13730,15 @@ class Daemon:
         incomplete). No GitHub request."""
         if not PR_REST_HEAD_FROM_CONTROLLER:
             return None
+        doc = self.rollup_doc_once(root, sha)
+        return None if doc is None else rollup_head_parts(doc, sha, root)
+
+    def rollup_doc_once(self, root: str, sha: str) -> dict | None:
+        """controller_rollup_doc, asked once a read (self.now) per head: the REST gate's suites and status and the full
+        read's check runs are one answer."""
         if self.rollup_memo is None or self.rollup_memo[:3] != (root, sha, self.now):
             self.rollup_memo = (root, sha, self.now, self.controller_rollup_doc(root, sha))
-        doc = self.rollup_memo[3]
-        return None if doc is None else rollup_head_parts(doc, sha, root)
+        return self.rollup_memo[3]
 
     def status_part(self, old: dict, parts: dict, root: str, sha: str) -> Any:
         """The head's first status page in slim_status_page's terms, kept in PARTS: the controller's rollup when it can
