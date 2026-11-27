@@ -717,6 +717,11 @@ class Base(unittest.TestCase):
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
+        # The waited-PR pool reads through its own Daemon (land_direct_read_many), past these tests' fakes of
+        # batched and fetch: off here, and the pool's own tests turn it back on.
+        pool_off = mock.patch.object(gg, "WAITED_POOL_WORKERS", 0)
+        pool_off.start()
+        self.addCleanup(pool_off.stop)
         for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
                             ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
@@ -10440,6 +10445,68 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW)
         order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
         self.assertEqual(set(order[:2]), cheap, order)
+
+    def test_many_waited_prs_are_read_by_a_bounded_pool_beside_the_serial_reads(self) -> None:
+        """The land host, 2026-11-27: ~330 waited PRs read one query at a time stored 22-50 a window. From WAITED_POOL_MIN
+        due, workers read up to WAITED_POOL_WORKERS chunks of WAITED_POOL_CHUNK beside the tick; the serial read gets the
+        rest and a key a worker could not read is deferred, not lost."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: (None if k.endswith("#1") else "no data stored") for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "oldest_waited_age", return_value=gg.WAITED_POOL_STALE_S + 1), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(len(pooled), 1, pooled)
+        self.assertLessEqual(len(pooled[0]), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(len(pooled[0]), total, "all of them fit one worker's chunk")
+        self.assertEqual(serial, [], "what a worker took is not read twice")
+        self.assertNotIn("pr:o/r#1", self.daemon.deferred)
+        self.assertIn("pr:o/r#2", self.daemon.deferred)
+
+    def test_the_waited_pool_waits_until_the_serial_reads_fall_behind(self) -> None:
+        """cmux-cp-2, 2026-11-27: the pool is the heal for stale waited PR data, so it starts only once the oldest waited
+        PR's data is WAITED_POOL_STALE_S old; while the serial reads keep up (fresh watches here) they read them all."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: None for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(pooled, [], "fresh data: no pool")
+        self.assertEqual(len([k for k in serial if k.startswith("pr:")]), total, serial)
+        old = {"key": "pr:o/r#1", "cache": {"dataAt": NOW - 900}}
+        with mock.patch.object(self.daemon, "waited", return_value=True):
+            self.daemon.now = NOW
+            self.assertGreaterEqual(self.daemon.oldest_waited_age([old]), 900)
 
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
@@ -25640,6 +25707,29 @@ class ReexecDrainTest(Base):
         self.assertEqual(gg.reexec_due(True, False, 100.0, limit, finish_until=limit + 60), "reexec", "it ended")
         self.assertEqual(gg.reexec_due(True, True, 100.0, limit - 1, finish_until=limit + 60), "defer")
 
+    def test_with_handover_an_update_neither_holds_nor_finishes(self) -> None:
+        # a controller, 2026-11-27 13:10-14:10Z: each glaeda merge waited out hold, drain and finish behind 20-27 busy land
+        # workers (fast-patch lockWaitS 670-998 s, merge to live 675-1043 s, the swap 0.75 s). With handover on, a
+        # re-exec drops no judgment and cuts no claimed step (REEXEC_HANDED): only the drain of claimed steps not yet
+        # handed is left, REEXEC_DRAIN_MAX at most.
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0, handover=True), "defer")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0), "hold", "no handover: the hold stands")
+        self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0, handover=True), "reexec")
+        late = gg.reexec_due(True, True, 100.0, 100.0 + gg.REEXEC_DRAIN_MAX, up=120.0, handover=True)
+        self.assertNotIn(late, (None, "hold", "defer", "finish", "reexec"))
+        d = gg.Daemon.__new__(gg.Daemon)
+        q = mock.Mock(handover=True)
+        q.finishing.return_value = time.monotonic() + 200
+        d.land_queue = q
+        self.assertTrue(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0, "a handed judgment outlives the re-exec: nothing to finish")
+        q.handover = False
+        self.assertFalse(d.land_handover())
+        self.assertGreater(d.land_finishing(), 0.0, "no handover: a judgment past half its bound still finishes")
+        d.land_queue = None
+        self.assertFalse(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0)
+
     def test_same_bytes_reinstalled_do_not_reexec(self) -> None:
         """A lane VM, 2026-11-21..22: 40 of 175 release installs left glaeda-gh byte-identical, and each re-exec'd the
         daemon on its mtime. Only a change of content does now; the file is hashed only when its stat moved."""
@@ -25866,6 +25956,9 @@ class ReexecDrainTest(Base):
                 return {"modes": {}, "paths": {}, "errors": []}
 
             def land_busy(self) -> bool:
+                return False
+
+            def land_handover(self) -> bool:
                 return False
 
         execs: list = []
@@ -26283,6 +26376,13 @@ class StaleDataTest(Base):
         ctl.bodies = {}
         self.assertTrue(served_by(row(30, mergeable=None)))  # mergeability not computed yet: GitHub
         self.assertTrue(served_by(None))  # no row: GitHub
+        # no PR row at all, but the hub's kept pull body proven current (a separate store the broker serves from):
+        # it answers, with no pulls/N; proven not current, or on no head, GitHub does
+        ctl.bodies = {("o/r", 9): {"current": True, "pull": body}}
+        self.assertEqual(served_by(None), [])
+        ctl.bodies = {("o/r", 9): {"current": False, "pull": body}}
+        self.assertTrue(served_by(None))
+        ctl.bodies = {}
         merged = row(90000, state="closed", merged=True, merged_at="2026-11-25T01:00:00Z", mergeable=None)
         self.assertEqual(served_by(merged), [])
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["state"], "MERGED")
@@ -33076,6 +33176,30 @@ class LandTest(Base):
         self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
         self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
+    def test_a_wait_on_a_head_with_a_pending_status_wakes_within_the_status_bound(self):
+        # cmux#61127, 2026-11-27: waiting from 12:05:16Z on `risk evidence` and the cheap-tier cmux/land-tier status;
+        # the run finished 12:11:43Z and the feed carries no event for it, so the row slept to the 1 h wake and was
+        # judged only when a person relabelled at 12:19Z. With a status pending it wakes within LAND_WAIT_STATUS.
+        said = "Cheap tier: the full tier runs when ready-to-land or full-ci is added"
+        self.assertLessEqual(gg.LAND_WAIT_STATUS, 600.0)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        e = self.tick()
+        self.assertEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertLessEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_STATUS)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "COMPLETED", "SUCCESS"),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_WAIT_STATUS + 1)
+        self.assertEqual(self.w.answers, [], "judged at the wake, not left to the 1 h one")
+
+    def test_a_wait_with_no_pending_status_keeps_the_default_wake(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None)])
+        self.land()
+        e = self.tick()
+        self.assertGreaterEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_DEFAULT - 5)
+
     def test_a_waiting_row_whose_checks_finish_but_the_label_gated_one_is_judged_at_the_next_read(self):
         # cmux#61127, 2026-11-27: waiting on `risk evidence` (12:05Z); it finished 12:11Z, leaving only
         # cmux/land-tier ("Cheap tier: ... runs when ready-to-land ... is added"). No feed event follows a status or
@@ -34155,6 +34279,64 @@ class LandTest(Base):
         self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
         self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
+
+    def test_a_base_update_is_not_deferred_on_another_landers_pending_verdict(self):
+        # LAND_LANDER_VERDICT: manaflow-ai/cmux#61375 at b62e921d (2026-11-27). land_judge named the base_update merge at
+        # 11:59Z; every check run at the head had finished, and the one unfinished context was next-autoland's verdict
+        # status, so the update was deferred for the whole wait until a person ran it at 12:43Z.
+        real = {"headRefOid": LA, "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+                "isDraft": False, "checksTruncated": False, "checkCounts": None,
+                "checks": [{"name": "CI fast guards", "workflow": "CI", "id": "CR_a", "runId": 1,
+                            "status": "COMPLETED", "conclusion": "SUCCESS"},
+                           {"name": "cmux/land-tier", "workflow": None, "status": "COMPLETED", "conclusion": "SUCCESS",
+                            "description": "Land tier runs here: full"},
+                           {"name": "next-autoland / verdict", "workflow": None, "status": "PENDING",
+                            "conclusion": None, "url": None,
+                            "description": "next-autoland did not judge this head within 60m; queued for next pass"}]}
+        self.assertTrue(gg.land_checks_running(real, LA))  # a merge still waits on the status, as before
+        base = refusal("base_update", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                           "needs_newer_base": ["land-judge base update"]},
+                       reason="land-judge: refused: base update needed")
+
+        def judged(data):
+            shutil.rmtree(gg.land_dir(), ignore_errors=True)
+            self.w = LandWorld(self.tmp.name)
+            self.q = self.queue()
+            self.w.set_pr(self.KEY, data, self.t)
+            self.land()
+            self.tick()
+            e = self.q.entries[self.KEY]
+            self.w.answers.append(base)
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            sent = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+            return len(sent), "update_deferred" in [h["event"] for h in e["history"]]
+
+        self.assertEqual(judged(real), (1, False), "the named base merge is sent at once")
+        self.assertFalse(gg.land_update_held(real, LA))  # a base merge does not wait on it
+        # a pool job's pending status still defers it: a new head would restart that job
+        job = {**real, "checks": [*real["checks"], {"name": "ws-check", "workflow": None, "status": "PENDING",
+                                                    "conclusion": None, "description": "cmux-ci run 1 running"}]}
+        self.assertTrue(gg.land_update_held(job, LA))
+        self.assertEqual(judged(job), (0, True))
+        # and so does a run in progress
+        run = {**real, "checks": [*real["checks"], {"name": "build", "workflow": "CI", "id": "CR_x",
+                                                    "status": "IN_PROGRESS", "conclusion": None}]}
+        self.assertEqual(judged(run), (0, True))
+
+    def test_a_base_update_the_merge_train_holds_says_so_in_its_judged_row(self):
+        # manaflow-ai/cmux#61375, 2026-11-27: four "judged base_update step=retry" rows with no update read as the
+        # daemon's miss; each was land_judge's merge-train wait (its action carried "train"/"board_train").
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        for act, said in (({"kind": "retry", "after_s": 300, "train": "boarded"}, "boarded"),
+                          ({"kind": "retry", "after_s": 300, "board_train": {"label": "merge-train"}}, "board")):
+            self.w.answers.append(refusal("base_update", LA, act, reason="land-judge: refused: base update needed"))
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            row = [h for h in e["history"] if h["event"] == "judged"][-1]
+            self.assertEqual((row["code"], row["step"], row.get("train")), ("base_update", "retry", said))
+        self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
 
     def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
         # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
@@ -37054,6 +37236,41 @@ class LandTest(Base):
         self.assertEqual(e["state"], "merged", e.get("history"))
         self.assertEqual([c for c in self.w.sent()[sent:] if "--class" in c and c[c.index("--class") + 1] == "block"],
                          [], "no blocker for a PR the far queue merged")
+
+    def test_a_row_the_far_queue_holds_queued_and_unjudged_is_taken_back_and_its_requester_told(self):
+        # cmuxterm-hq#32917, 2026-11-27: cmux-cp-1 held it "queued" for 19 min under a full worker pool; the lane VM
+        # said only forward_quiet. Queued past LAND_FORWARD_STALLED it comes back, once told, at most twice a PR.
+        self.forwarded_row()
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t, "stop": None}}
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["state"], "forwarded", "inside the bound: the far queue may judge it yet")
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1, "stop": None}}
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["forwardStalled"]["n"], 1, e["history"][-4:])
+        self.assertNotEqual(e["state"], "forwarded")
+        self.assertEqual(e["forwardReclaimed"]["from"], "huge-blue")
+        self.assertTrue([h for h in e["history"] if h.get("event") == "forward_stalled"])
+        told = [c for c in self.w.sent()[sent:] if "without a judgment" in c[-1]]
+        self.assertEqual(len(told), 1)
+        self.assertIn("taken back to be judged here", told[0][-1])
+
+    def test_a_queued_and_unjudged_row_of_a_tokenless_vm_is_handed_off_again_twice_then_held(self):
+        self.own_pool = False
+        self.forwarded_row()
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1, "stop": None}}
+        for _ in range(8):
+            self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+            self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1,
+                                         "stop": None}}
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["forwardStalled"]["n"], len(self.handoffs())), ("forwarded",
+                         gg.LAND_FORWARD_STALL_TAKES, 1 + gg.LAND_FORWARD_STALL_TAKES), e["history"][-5:])
+        self.assertEqual(e["forwardHeld"]["state"], "queued")
 
     def test_a_broker_that_does_not_know_outcomes_leaves_the_row_forwarded(self):
         self.handed_off()
@@ -41975,6 +42192,39 @@ class LandTest(Base):
         self.assertEqual([r["n"] for r in rows if r["event"] == "land-refresh-batch"], [50, 10, 3])
         for key in keys:
             self.assertFalse(self.due(key), "read: fresh")
+
+    def test_a_deferred_refresh_is_owed_and_read_first_oldest_copy_first(self):
+        """cmux-cp-1, 2026-11-27 12:57-13:23Z: 147 of 524 land refreshes (28 %) came back "not read: deferred, the tick's
+        time ran out", their copies' median age 3,497 s (the read ones' 1,711 s), the oldest 33,869 s: the pass handed
+        the rows out in its own order, a deferred row then waited as long as one that was read, and went again at the
+        tail. A deferred row is owed (refreshDeferred): read again after LAND_REFRESH_DEFERRED_RETRY, and the pass hands
+        the owed rows first, then the oldest copies."""
+        deferred = gg.LAND_REFRESH_DEFERRED_PREFIX + "the tick's time (TICK_BUDGET) ran out before it was read"
+        batches, rows = self.batched_refresh_queue(answer=deferred)
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 61))
+        for n, key in enumerate(keys):  # the pass meets them newest copy last, oldest copy first on the highest number
+            self.w.cache[key]["dataAt"] = self.t - 3600 - n
+        for key in keys:
+            self.assertTrue(self.due(key))
+        self.q.flush_refreshes()
+        oldest = sorted(keys, key=lambda k: self.w.cache[k]["dataAt"])
+        self.assertEqual(batches[0], oldest[:gg.LAND_REFRESH_BATCH], "the oldest copies take the first batch")
+        for key in keys:
+            self.assertIsInstance(self.q.entries[key].get("refreshDeferred"), float, key)
+            self.assertFalse(self.due(key), "not at once")
+        self.q.now = self.t + gg.LAND_REFRESH_DEFERRED_RETRY + 1  # sooner than LAND_REFRESH_AFTER's 120 s
+        self.assertLess(gg.LAND_REFRESH_DEFERRED_RETRY, gg.LAND_REFRESH_AFTER)
+        for key in keys:
+            self.assertTrue(self.due(key), key)
+        # the rows the pass queues now: the longest owed first, whatever the age of the copy
+        self.q.refresh_queued.clear()
+        self.q.entries["pr:o/r#3"]["refreshDeferred"] = self.t - 500
+        self.q.refresh_queued["o/r"] = [k for k in keys]
+        batches.clear()
+        self.q.refresh_many = lambda ks: (batches.append(list(ks)), {k: None for k in ks})[1]
+        self.q.flush_refreshes()
+        self.assertEqual(batches[0][0], "pr:o/r#3")
+        self.assertNotIn("refreshDeferred", self.q.entries["pr:o/r#3"], "read: no longer owed")
 
     def test_a_batch_refused_for_quota_holds_refreshes_once(self):
         """A batch whose every read comes back DIRECT_QUOTA sets one hold (as one refused read does), not one a row."""
@@ -51383,6 +51633,39 @@ class MergeTrainTurnAway(unittest.TestCase):
         data = self.data()
         data["checks"][1]["workflow"] = "CI"
         self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["merge-train"])
+
+
+class RollupHeadPartsTest(unittest.TestCase):
+    """rollup_head_parts: a complete controller rollup is the REST head read's check runs and first status page
+    (glaeda-upstream asked GitHub for commits/SHA/check-runs 747 and /status 376 times an hour while the rollup that
+    answered its check-suites held both)."""
+
+    SHA = "a" * 40
+
+    def doc(self, runs: int = 3, **over: object) -> dict:
+        doc = {"sha": self.SHA, "complete": True, "check_runs_complete": True, "status_complete": True,
+               "check_runs": {"total_count": runs, "check_runs": [
+                   {"id": i + 1, "name": f"c{i}", "status": "completed", "conclusion": "success",
+                    "check_suite": {"id": 9}, "app": {"slug": "github-actions"}} for i in range(runs)]},
+               "status": {"state": "success", "total_count": 1, "statuses": [
+                   {"context": "ci", "state": "success", "target_url": None, "created_at": "t"}]}}
+        return {**doc, **over}
+
+    def test_a_complete_rollup_is_the_kept_parts(self) -> None:
+        parts = gg.rollup_head_parts(self.doc(150), self.SHA, "/repos/o/r")
+        self.assertEqual(sorted(parts), sorted([gg.check_runs_path("/repos/o/r", self.SHA),
+                                                gg.check_runs_path("/repos/o/r", self.SHA) + "&page=2",
+                                                gg.status_path("/repos/o/r", self.SHA)]))
+        first = parts[gg.check_runs_path("/repos/o/r", self.SHA)]["doc"]
+        self.assertEqual((first["total_count"], len(first["check_runs"]), first["check_runs"][0]["suite"]),
+                         (150, 100, 9))
+        self.assertEqual(first["check_runs"][0]["node_id"], "controller:run:1")
+        self.assertEqual(parts[gg.status_path("/repos/o/r", self.SHA)]["doc"]["statuses"][0]["context"], "ci")
+
+    def test_an_incomplete_or_disagreeing_rollup_is_none(self) -> None:
+        for doc in (self.doc(check_runs_complete=False), self.doc(status_complete=False), self.doc(complete=False),
+                    self.doc(sha="b" * 40), self.doc(5, check_runs={"total_count": 9, "check_runs": []})):
+            self.assertIsNone(gg.rollup_head_parts(doc, self.SHA, "/repos/o/r"))
 
 
 if __name__ == "__main__":

@@ -10184,6 +10184,52 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertEqual(hook.head_fit_units(None, frozenset(side), time.time()), None)
 
 
+    def slot_gate(self, held: int) -> hook.Gate:
+        """The nightly slot (--nightly-runner) on a 7-unit mini (cmux13s) with `held` units taken."""
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": ["glaeda-mini", self.NIGHTLY]}}))
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).parent.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 7 --instance 2 --nightly-runner\n")
+        (self.runner / hook.LISTEN_SCRIPT).write_text(f"listen --runner-dir {self.runner} &\n")
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()
+        for slot in range(held):
+            fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state, capacity_dir=capacity)
+        return self.gate
+
+    NIGHTLY = "glaeda-nightly-std-xcode-26.6"
+
+    def test_the_nightly_slot_never_takes_a_bounded_dev_compile_it_cannot_start(self) -> None:
+        # SLOT_BOUNDED_FIT, 2026-11-27: cmux run 45981963973's "cmux NEXT DEV Release compile" (a dev_daily dispatch,
+        # glaeda-nightly-std-xcode-26.6) reached cmux13s-mac-mini-glaeda-2, the nightly slot, which listens on a full
+        # mini; it was refused after DEV_COMPILE_CAPACITY_WAIT_S with "1 of 7 units free, cmux-scheme-compile
+        # (isolated) needs 3" on attempts 1 and 2, and passed on attempt 3 on another mini: false reds.
+        dev = dict(self.job("queued", ago=120, labels=[self.NIGHTLY]), name="cmux NEXT DEV Release compile")
+        need = hook.job_need(hook.job_class("cmux-scheme-compile", hook.DEFAULT_HOME_REPO,
+                                            workflow="cmux-next.yml")[0], "cmux-scheme-compile",
+                             hook.DEFAULT_HOME_REPO, workflow="cmux-next.yml").cores
+        self.assertGreater(need, 1, "the replay needs a DEV compile that needs more than the 1 free unit")
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), dev]
+        self.assertEqual(self.full(self.slot_gate(6)),
+                         f"only 1 of 7 capacity units on this mini are free; its next job needs {need}",
+                         "1 free, the DEV compile needs more: held, so the job stays queued in GitHub")
+        self.assertIsNone(self.full(self.slot_gate(7 - need)), "room for the DEV compile: it listens")
+        build = dict(self.job("queued", ago=60, labels=[self.NIGHTLY]), name="Build nightly app")
+        self.jobs = [dev, build]
+        self.assertIsNone(self.full(self.slot_gate(7)), "a nightly build queued too: listens on a full mini "
+                          "(NIGHTLY_SLOT), so it waits here first in line")
+        self.jobs = []
+        self.assertIsNone(self.full(self.slot_gate(7)), "nothing queued: today's rule, listen on a full mini")
+        self.jobs = [dev]
+        with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+            self.assertIsNone(self.full(self.slot_gate(7)), "an unreadable feed keeps today's rule")
+
     def test_head_fit_reads_every_known_cmux_next_job_from_its_display_name(self) -> None:
         # cmux#44472's "macOS fast tier" (run 44024082059, glaeda-side-std-xcode-26.6) was cancelled by its timeout
         # while waiting for units: HEAD_FIT knew six names and not this one.
@@ -14033,6 +14079,52 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.draining())
         marker.unlink()
         self.assertIsNone(gate.draining())
+
+    def test_an_apply_drain_with_no_job_ends_within_its_bound_and_alerts(self) -> None:
+        """APPLY_DRAIN_IDLE_BOUND (cmux24, 2026-11-27): an apply marked six dedicated runners draining for a relabel,
+        their jobs ended, no apply came back, and the gates held the idle listeners off for up to an hour. A stopped
+        listener under an apply's marker listens again APPLY_DRAIN_IDLE_MAX_S later, and the gate says so."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        reason = "a relabel to glaeda-hq-fleet-route,glaeda-runner-cmux24-hq-fleet-route"
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        held = f"draining for {reason}"
+        logs: list[str] = []
+        start = time.time()
+        with mock.patch.object(hook, "gate_log", side_effect=logs.append):
+            gate.child = mock.Mock()  # a listener still runs (its job, or one about to stop): the drain holds
+            self.assertEqual(gate.draining(), held)
+            self.assertFalse(hook.apply_drain_idle_file(self.state, self.runner).exists(), "no clock under a job")
+            gate.child = None
+            self.assertEqual(gate.draining(), held)
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S - 30):
+                self.assertEqual(gate.draining(), held, "inside the bound the apply's look may still come")
+                # a reload or restart of the gate keeps the clock
+                again = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+                self.assertEqual(again.draining(), held)
+            self.assertEqual(logs, [])
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S + 1):
+                self.assertIsNone(again.draining(), "past the bound with no job: the listener serves again")
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.runner / (hook.RUNNER_DRAIN_FILE + ".waived")).exists(), "kept as evidence")
+        self.assertEqual(len(logs), 1, logs)
+        self.assertTrue(logs[0].startswith(hook.APPLY_DRAIN_STALE), logs)
+        self.assertIn("glaeda-cmux-runner-fleet --apply", logs[0])
+        # a new marker (the apply came back and still needs the runner idle) starts a new clock
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3500}))
+        self.assertEqual(gate.draining(), held)
+        # a hand drain and cmux-ci's are their writers' to end: no bound here
+        for by in ("a hand drain", hook.CMUX_CI_DRAIN_BY):
+            marker.write_text(json.dumps({"by": by, "reason": "r", "until": time.time() + 3000}))
+            self.assertEqual(gate.draining(), "draining for r")
+            with mock.patch.object(hook.time, "time", return_value=time.time() + hook.APPLY_DRAIN_IDLE_MAX_S * 2):
+                self.assertEqual(gate.draining(), "draining for r", by)
+        self.assertTrue(marker.exists())
+        # the off switch keeps the marker's expiry as the only end
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        with mock.patch.object(hook, "APPLY_DRAIN_IDLE_MAX_S", 0.0), \
+                mock.patch.object(hook.time, "time", return_value=time.time() + 2000):
+            self.assertEqual(gate.draining(), held)
 
     def test_a_reservation_released_before_the_job_ends_keeps_the_listener(self) -> None:
         gate, stops = self.gate([None] * 3, busy=[True])
@@ -18432,7 +18524,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("glaeda-ios-sim", labels[0])
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
         self.assertEqual([l.count("glaeda-macos-27") for l in labels], [1, 1, 1], "every runner, gui included, names its OS")
-        self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
+        self.assertEqual([x for x in labels[2] if x.startswith("glaeda-runner-")], [cr.runner_label("mini-std-glaeda-4")],
+                         "its own handle, so HQ's paired probes can place a pair on two idle gui runners")
         started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
@@ -18587,13 +18680,14 @@ class RunnerTest(unittest.TestCase):
             alone, _ = self.fast_labels(shape, "nightly-alone", ios_sim=True, nightly_slot=True)
         self.assertEqual(["glaeda-nightly-std-xcode-26.6" in labels for labels in alone],
                          [False, False, True, False, False, False], "without a freshness slot: the first side instance")
-        # Every nightly slot carries its own glaeda-runner-<name> label, and no side, gui or fast runner gains one.
+        # Every nightly slot and gui runner carries its own glaeda-runner-<name> label, and no side or fast runner
+        # gains one (a gui runner's for HQ's paired probes, which place a pair on two idle gui runners).
         for labels in (*both, *alone):
             pins = [label for label in labels if label.startswith("glaeda-runner-")]
-            if "glaeda-nightly-std-xcode-26.6" in labels:
-                self.assertEqual(len(pins), 1, f"a nightly slot without its pin label: {labels}")
+            if "glaeda-nightly-std-xcode-26.6" in labels or any("-gui-" in label for label in labels):
+                self.assertEqual(len(pins), 1, f"a nightly slot or gui runner without its pin label: {labels}")
             elif not any(label.startswith("glaeda-root-") for label in labels):
-                self.assertEqual(pins, [], f"only roots and the nightly slot are pinned: {labels}")
+                self.assertEqual(pins, [], f"only roots, gui runners and the nightly slot are pinned: {labels}")
         self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-2").nightly)
         self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").nightly)
 
