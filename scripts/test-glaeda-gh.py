@@ -45073,6 +45073,33 @@ class QueuedNeverDoneTest(unittest.TestCase):
         self.assertEqual(gg.wait_step(req, self.now + 1, runs("completed"))[0], gg.EXIT_OK)
         self.assertEqual(len(reads), before)
 
+    def test_a_quiet_heads_runs_answer_outlives_the_reread(self) -> None:
+        """A done wait re-read `actions/runs?head_sha=` every HEAD_RUNS_REREAD however quiet the head was: 754 of
+        glaeda-upstream's 4,023 App requests an hour. While this host's feed delivered nothing for the head since the
+        answer was read, the answer stands; a run event for the head after it, or a failed read, reads again."""
+        key, head = "pr:o/r#5", "e" * 40
+        data = {"headRefOid": head, "url": "https://github.com/o/r/pull/5"}
+        reads: list[str] = []
+
+        def get(repo: str, paths: list[str]) -> dict:
+            reads.extend(paths)
+            return {p: {"total_count": 1, "workflow_runs": [{"id": 1, "name": "ci", "status": "queued"}]} for p in paths}
+        self.assertEqual(gg.head_runs_unfinished(key, data, NOW, get), ["ci"])
+        self.assertEqual(len(reads), 1)
+        later = NOW + gg.HEAD_RUNS_REREAD + 5
+        feed = {"liveSince": NOW - 7200, "okAt": later - 1, "fedRepos": {"o/r": later - 1}, "marks": {}}
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, feed)
+        self.assertEqual(gg.head_runs_unfinished(key, data, later, get), ["ci"], "a quiet head: the answer stands")
+        self.assertEqual(len(reads), 1)
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, {**feed, "marks": {f"sha:o/r@{head}": NOW + 3}})
+        gg.head_runs_unfinished(key, data, later, get)
+        self.assertEqual(len(reads), 2, "a run event for the head after the answer: read again")
+        gg.head_runs_path(key).unlink()
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, feed)
+        self.assertIsNone(gg.head_runs_unfinished(key, data, NOW, lambda repo, paths: {p: "HTTP 502" for p in paths}))
+        gg.head_runs_unfinished(key, data, later, get)
+        self.assertEqual(len(reads), 3, "a failed read is never kept past HEAD_RUNS_REREAD")
+
     def test_hq13397_jobs_queued_past_the_bound_are_inconclusive(self) -> None:
         """The same head read 30+ minutes on: 3 finished, 7 queued check runs with no runner. Never success."""
         data, get = self.head(13397, ["Socket Security: Pull Request Alerts", "CodeRabbit",

@@ -34111,6 +34111,13 @@ def head_runs_unfinished(key: str, data: dict, now: float,
     if isinstance(kept, dict) and kept.get("head") == head and now - num(kept.get("at")) < HEAD_RUNS_REREAD:
         # an answer, or a failed read, is kept as long: a read that keeps failing costs one GET a minute, not one a tick
         return [str(n) for n in kept["unfinished"]] if isinstance(kept.get("unfinished"), list) else None
+    if isinstance(kept, dict) and kept.get("head") == head and isinstance(kept.get("unfinished"), list) \
+            and own_feed_quiet(f"head:{repo}@{head}", None, num(kept.get("at")), now):
+        # An answer (never a failed read) outlives HEAD_RUNS_REREAD while this host's feed delivered no run, suite or
+        # status for the head since it was read: a run requested, started or finished there marks sha:REPO@HEAD
+        # (feed_mark). Before, a done wait re-read the list every minute however quiet the head was (2026-11-27
+        # 02:34-03:34Z: 754 of glaeda-upstream's 4,023 App requests an hour were `actions/runs`).
+        return [str(n) for n in kept["unfinished"]]
 
     def keep(unfinished: list[str] | None) -> None:
         with contextlib.suppress(OSError, ValueError, TypeError):
