@@ -2,6 +2,10 @@
 Description=Shared GitHub CI watcher: the one process that polls GitHub for this user (cmux-gh, formerly glaeda-gh; the unit keeps its name)
 Wants=network-online.target
 After=network-online.target
+# No start limit: with systemd's default (5 starts in 10 s) a crash that met a repair's own restart
+# parked the unit in failed (start-limit-hit), and Restart=always never ran again until someone
+# started it by hand. RestartSec=30 below already paces the restarts.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,6 +16,10 @@ ExecStart=/usr/bin/env python3 %h/.local/bin/glaeda-gh serve
 # the daemon re-executes itself when glaeda-gh changes; this covers crashes
 Restart=always
 RestartSec=30
+# Every stop leaves a row in the daemon's own log saying how it ended (systemd's SERVICE_RESULT,
+# EXIT_CODE, EXIT_STATUS: exit-code/killed/signal/watchdog, the status or signal), so a stop is
+# never found later with no trace beside the daemon's last heartbeat.
+ExecStopPost=/usr/bin/env python3 -c "import datetime as d,json,os;e=os.environ.get;print(json.dumps({'at':d.datetime.now(d.timezone.utc).isoformat(timespec='seconds'),'event':'service-exit','result':e('SERVICE_RESULT'),'exitCode':e('EXIT_CODE'),'exitStatus':e('EXIT_STATUS')}),flush=True)"
 StandardOutput=append:%h/.local/state/glaeda-gh.jsonl
 StandardError=append:%h/.local/state/glaeda-gh.err
 

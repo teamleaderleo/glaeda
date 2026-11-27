@@ -7806,6 +7806,38 @@ class ClientTest(Base):
         self.assertEqual(gg.parse_since("2026-09-25T18:00:00Z", now), (None, gg.iso_epoch("2026-09-25T18:00:00Z")))
         self.assertEqual(gg.parse_since(None, now), (None, now))
 
+    def test_a_comment_wait_the_daemon_never_reads_reads_directly_then_ends_never_read(self) -> None:
+        # a lane VM 2026-11-27: 3600 s of "no data yet" on a key the upstream never answered, then no-progress
+        calls: list[dict] = []
+        reply = (200, "yap-goblin-9000[bot]", "nightly-readback answer (match) cluster c-1", time.time() + 1)
+
+        def answered(req: dict) -> None:
+            calls.append(req)
+            self.put("comment:t/s#454", self.comments(reply))
+            return None
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), mock.patch.object(gg, "direct_read", answered):
+            code, text = self.wait_comment(timeout=2, match="nightly-readback answer")
+        self.assertEqual(code, 0, text)
+        self.assertEqual([c["kind"] for c in calls], ["comment"])
+        calls.clear()
+        self.put("comment:t/s#454", None)  # an entry with no data: never read
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), \
+                mock.patch.object(gg, "direct_read", lambda req: calls.append(req) or "HTTP 502"):
+            began = time.monotonic()
+            code, text = self.wait_comment(timeout=30, match="nothing")
+        self.assertEqual(code, 3)
+        self.assertLess(time.monotonic() - began, 10)  # at once, not after the 30 s timeout
+        self.assertIn("ended_by: never-read", text)
+        self.assertIn("HTTP 502", text)
+        self.assertIn("next: gh api repos/t/s/issues/454/comments", text)
+        # a fresh read (by the daemon) is not starved: no direct read
+        calls.clear()
+        self.put("comment:t/s#454", self.comments())
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), \
+                mock.patch.object(gg, "direct_read", lambda req: calls.append(req) or "HTTP 502"):
+            self.assertEqual(self.wait_comment(timeout=0.3, match="nothing")[0], 2)
+        self.assertEqual(calls, [])
+
     def test_wait_comment_on_a_missing_issue_fails(self) -> None:
         key = "comment:t/s#454"
         timer = threading.Timer(0.1, lambda: self.put(key, None, error="Could not resolve", missing=True))
@@ -9977,6 +10009,42 @@ class TickBudgetTest(Base):
         self.daemon.rest_tried[older["key"]] = NOW - 5  # tried (and failed): the next starved key leads
         self.assertEqual(self.order([plain, merged, fresh, old, head, older])[:2], [old["key"], head["key"]])
         self.assertIsNone(self.daemon.starved_lead([fresh, plain, merged, head]))
+
+    def test_stale_waited_keys_are_read_over_rest_oldest_first_when_graphql_is_stopped_and_the_share_is_zero(self) -> None:
+        """cmux-cp-1 2026-11-27: GraphQL under its reserve, restShare 0 ("0 of 0"), 4,373 REST left: waited PR data
+        reached 13,380 s and the valve restarted the daemon in a loop. read_stale_direct reads the oldest waited keys
+        past STALE_DATA_AFTER over REST, STALE_DIRECT_PER_TICK a tick and STALE_DIRECT_MAX an hour, and not when
+        GraphQL can read, REST is stopped, or the key was just tried."""
+        def pr(n: int, age: float, waited: bool = True) -> dict:
+            return {"key": f"pr:o/r#{n}", "waitedAt": NOW if waited else None, "consumers": {},
+                    "cache": {"data": {"state": "OPEN"}, "dataAt": NOW - age, "fetchedAt": NOW - age}}
+        entries = [pr(1, 700), pr(2, 13380), pr(3, 5000), pr(4, 90000, waited=False), pr(5, 100), pr(6, 9000), pr(7, 800)]
+        d, got = self.daemon, []
+        d.now, d.stale_direct_at, d.waited_tried = NOW, [], {}
+        d.tick_deadline = float("inf")
+        modes = {"graphql": "stop", "rest": "normal"}
+        with mock.patch.object(gg.Daemon, "rest_fetch", property(lambda _: {"pr": lambda e: got.append(e["key"])})), \
+                mock.patch.object(d, "mode", side_effect=lambda b: modes[b]), \
+                mock.patch.object(d, "rest_above_floor", return_value=True), \
+                mock.patch.object(d, "rest_room", return_value=False):
+            d.secondary_until = 0.0
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, ["pr:o/r#2", "pr:o/r#6", "pr:o/r#3"], "oldest first, three a tick, unwaited never")
+            got.clear()
+            d.read_stale_direct(entries, set())  # tried within WAITED_FRESH: the next oldest
+            self.assertEqual(got, ["pr:o/r#7", "pr:o/r#1"], "then the rest past the bound; the 100 s one is fresh")
+            got.clear()
+            d.waited_tried = {}
+            d.stale_direct_at = [NOW] * gg.STALE_DIRECT_MAX
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "STALE_DIRECT_MAX an hour")
+            d.stale_direct_at = []
+            modes["graphql"] = "normal"
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "GraphQL can read: its own paths do")
+            modes.update(graphql="stop", rest="stop")
+            d.read_stale_direct(entries, set())
+            self.assertEqual(got, [], "REST stopped")
 
     def test_held_staleness_alarms_past_the_held_bound_without_a_restart(self) -> None:
         """huge-blue 2026-11-20: "held" all day at 39,600 s, each quota or deferral explanation re-arming it. Up to
@@ -43649,6 +43717,89 @@ class LandForwardTest(Base):
         self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
         self.assertEqual(self.w.explains(), [])
         self.assertEqual(self.q.entries, {})
+
+    PAIR = ["reach", "pair-exec", ".local/bin/glaeda-gh", "land", "serve"]
+
+    def failover_queue(self, pair_down: bool = False) -> Any:
+        """A forwarding queue with land.json "fallback" naming PAIR; sends are recorded as (host, request)."""
+        self.routed: list[tuple[str, dict]] = []
+        self.pair_down = pair_down
+        def forward(cmd, req, deadline):
+            host = gg.land_forward_name(cmd)
+            if host == "pair-exec":
+                if self.pair_down:
+                    raise gg.WatchError("land executor: reach: ssh: connect to host pair-exec: Operation timed out")
+                self.routed.append((host, copy.deepcopy(req)))
+                return {"ok": True, "accepted": [r["id"] for r in req.get("requests") or []]}
+            answer = self.executor_serve(req)
+            self.routed.append((host, copy.deepcopy(req)))
+            return answer
+        self.w.config["executor"] = list(self.EXEC)
+        self.w.config["fallback"] = [list(self.EXEC), list(self.PAIR)]  # the executor's own entry is left out
+        return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                            nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                            config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                            behind=lambda *a: None, forward=forward)
+
+    def test_land_fallback_executors_reads_the_config_and_drops_the_executor_itself(self):
+        cfg = {"executor": list(self.EXEC), "fallback": [list(self.EXEC), list(self.PAIR), "bad", []]}
+        self.assertEqual(gg.land_fallback_executors(cfg), [self.PAIR])
+        self.assertEqual(gg.land_fallback_executors({"executor": list(self.EXEC)}), [])
+
+    def test_an_unreachable_executor_fails_over_to_the_fallback_and_back(self):
+        # cosmic-gray 2026-11-27: cmux-cp-1 unreachable on tailnet :22 on and off for 3.5 h, every land backing off
+        self.q = self.failover_queue()
+        self.exec_down = True
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()  # first failure: backoff, no failover yet
+        self.assertEqual(self.routed, [])
+        self.assertEqual(self.q.forward_fails, 1)
+        self.tick(gg.LAND_FORWARD_RETRY + 1)  # second failure in a row: the fallback takes it in the same pass
+        self.assertEqual([(h, [r["target"] for r in req["requests"]]) for h, req in self.routed],
+                         [("pair-exec", ["o/r#1"])])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+        doc = gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE)
+        self.assertEqual((doc["state"], doc["executor"], doc["failoverFrom"]), ("ok", "pair-exec", "big-exec"))
+        self.assertIn("land-forward-failover", [n[0] for n in self.w.notices])
+        # a new land inside the executor's backoff goes straight to the fallback, with no wait on the executor
+        self.land("o/r#3", requester="cosmic/coord")
+        self.tick(5)
+        self.assertEqual(self.routed[-1][0], "pair-exec")
+        self.assertEqual([r["target"] for r in self.routed[-1][1]["requests"]], ["o/r#3"])
+        self.assertEqual(self.q.forward_fails, 2)  # the executor was not asked
+        # the executor answers again once its backoff ends: it takes the next land and the failover ends
+        self.exec_down = False
+        self.land("o/r#5", requester="cosmic/coord")
+        self.tick(gg.LAND_FORWARD_RETRY_MAX + 1)
+        self.assertEqual(self.routed[-1][0], "big-exec")
+        self.assertEqual((self.q.forward_fails, self.q.failed_over), (0, None))
+        self.assertNotIn("failoverFrom", gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE))
+
+    def test_with_the_fallback_down_too_every_request_stays_here_and_backs_off(self):
+        self.q = self.failover_queue(pair_down=True)
+        self.exec_down = True
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.tick(gg.LAND_FORWARD_RETRY + 1)
+        self.assertEqual(self.routed, [])
+        self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 1)
+        doc = gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE)
+        self.assertEqual((doc["state"], doc["executor"]), ("failing", "big-exec"))
+        self.assertGreater(self.q.forward_after, self.t)
+        self.pair_down = False
+        self.tick(gg.LAND_FORWARD_RETRY_MAX + 1)
+        self.assertEqual([h for h, _ in self.routed], ["pair-exec"])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+
+    def test_no_fallback_keeps_todays_backoff(self):
+        self.q = self.failover_queue()
+        del self.w.config["fallback"]
+        self.exec_down = True
+        self.land("o/r#1", requester="cosmic/coord")
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_RETRY_MAX + 1)
+        self.assertEqual(self.routed, [])
+        self.assertEqual(self.q.forward_fails, 3)
 
     def test_cli_land_cancel_and_status_go_to_the_executor(self):
         self.w.config["executor"] = list(self.EXEC)
