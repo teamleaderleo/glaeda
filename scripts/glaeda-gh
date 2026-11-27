@@ -697,6 +697,12 @@ EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
 # (a full pipe, a hung disk) holds the stream lock it needs. faulthandler's own C thread needs neither
 # the GIL nor that lock: it ends the process (status 1) this long after the watchdog should have.
 WATCHDOG_BACKSTOP = 60
+# How long the watchdog waits for each of its own writes (the row on stdout, the stack dump on stderr) before it exits
+# EXIT_WATCHDOG anyway. Well under WATCHDOG_BACKSTOP: with the writes inline, a hung disk under the log (a lane VM,
+# 2026-11-27: the main thread in mkdir, the watchdog thread in log()'s print) held the watchdog itself until the
+# backstop ended the process with status 1 and no row; 10 of the unit's 21 deaths in three days were that.
+WATCHDOG_WRITE_WAIT = 10.0
+WATCHDOG_STACK_FRAMES = 8  # innermost frames of the main thread the watchdog row names (file:line function, no values)
 STALE_HEARTBEAT = 2 * WATCHDOG_AFTER  # a lock holder silent this long is hung; a waiting daemon takes over
 LOCK_RETRY = 15  # a daemon waiting for the lock looks at its holder this often
 TAKEOVER_GRACE = 10  # after SIGTERM, how long a hung holder has before SIGKILL
@@ -3006,6 +3012,26 @@ def hard_deadline(seconds: float, error: type[BaseException] = DeadlineTimeout):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+# execve keeps the caller's ITIMER_REAL and resets SIGALRM's handler to the default action, which ends the process.
+# ScriptWake re-execs serve from its own thread while the main thread is in a read phase, often inside hard_deadline's
+# armed alarm, so the new image died of SIGALRM when that alarm came due before its own first hard_deadline re-armed
+# it: on one lane VM, 2026-11-25..26, all 6 SIGALRM deaths of the unit came 30-75 s after a re-exec "from script-wake
+# in read direct" or "in reads", and no row named them. Every serve re-exec goes through exec_serve, which disarms the
+# alarm first; serve_daemon disarms one an older image still hands over (inherited_alarm).
+def disarm_alarm() -> float:
+    """Cancel this process's ITIMER_REAL (from any thread: it is per process). The seconds it had left, 0 if none."""
+    if not hasattr(signal, "setitimer"):
+        return 0.0
+    left, _ = signal.setitimer(signal.ITIMER_REAL, 0)
+    return left
+
+
+def exec_serve(argv: list[str]) -> None:
+    """os.execv for a re-exec of the daemon: no armed alarm is handed to the new image (disarm_alarm)."""
+    disarm_alarm()
+    os.execv(argv[0], argv)
 
 
 # Kept-alive connections. Every request used to open its own TCP and TLS connection (urllib's opener closes it after
@@ -8404,8 +8430,15 @@ class Daemon:
         turn. No token goes in the outbox."""
         if not self.poster_due(item):
             return None
+        return self.poster_for_repo(str(item["repo"]))
+
+    def poster_for_repo(self, repo: str) -> dict | None:
+        """The first free poster App for a write of REPO (broker-actor post), or None. poster_actor's lookup, for
+        writes that are no comment: the ready mark of a filled auto-draft (post_fill_auto_draft) was the login's
+        GraphQL ("API rate limit already exceeded for user", cmux#61434, 2026-11-27) while the posters sat idle."""
+        item = {"repo": repo}
         tool = app_pool_tool()
-        if not tool:
+        if not tool or not app_posts_on():
             return None
         skip = tuple(sorted(r for r, t in self.app_create_hold.items() if t > self.clock()))
         key = ("post", str(item["repo"]).lower(), skip)
@@ -9048,8 +9081,12 @@ class Daemon:
         try:
             if not node:
                 raise WatchError("the PR read has no node_id")
-            if actor:
-                status, h, doc = self.outbox_request("POST", "/graphql", query, actor)
+            # The App that made the create, else a free poster App (token +post makes markPullRequestReadyForReview,
+            # gh_app_token.py GRAPHQL_POOL_WRITES): the login's GraphQL hour only when no App is free. Detector:
+            # test_a_filled_auto_drafts_ready_mark_goes_on_a_poster_app_when_the_login_made_the_create.
+            ready_actor = actor or self.poster_for_repo(str(item["repo"]))
+            if ready_actor:
+                status, h, doc = self.outbox_request("POST", "/graphql", query, ready_actor)
             else:
                 status, h, doc = self.post_gql(READY_PR, {"id": node}, "outbox-ready")
         except (WatchError, OutOfTime) as error:
@@ -10387,6 +10424,11 @@ class Daemon:
         urgent = lambda e: self.waited(e) or self.head_unanswered(e)  # noqa: E731
         blocked = {kind: [e for e in due[kind] if urgent(e)] for kind in kinds}
         blocked["head"].sort(key=self.head_rank)  # the newest ask of a head never tried first (rest_order)
+        # The waited PRs a probe confirms (probe_ok: ~0.5 s each) go ahead of the ones that need a full read (1.5-4 s
+        # each, or a heavy partial read every cycle). The land host, 2026-11-27: ~330 waited PRs, ~22-50 stored a window
+        # at ~3 s each, staleWaited.pr 4,889 s, 142 probe-eligible ones unreached behind the full reads. The sort is
+        # stable, so the oldest deferral still leads within each group, and starved_lead still goes first below.
+        blocked["pr"].sort(key=lambda e: not self.probe_ok(e))
         # Only repos with a due waited PR get this fallback. A timeout switches their remaining PRs for
         # this tick; the next tick tries GraphQL again, even after a daemon restart.
         pr_timeout_rest = {caller_of(e["key"])[1].lower(): False for e in blocked["pr"]}
@@ -17168,7 +17210,11 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # was refused that way and stopped merge_draft instead of parking.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
                              r"|rate limit is spent|secondary rate limit|content-creation cooldown"
-                             r"|content writes are paced|\bAPI rate limit (?:already )?exceeded\b", re.I)
+                             r"|content writes are paced|\bAPI rate limit (?:already )?exceeded\b"
+                             # the shim's low-water guard: "gh-quota: refused: the shared GraphQL quota is under its
+                             # low-water floor (floor 500 of 50..; next: retry after 11:42Z ...". hq#33030, #31068 and
+                             # cmux#59603 stopped merge_draft on it instead of parking until the reset.
+                             r"|\bshared (?:REST |GraphQL )?quota is under its\b", re.I)
 # The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
 # next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
 # paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
@@ -18181,6 +18227,10 @@ LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "
 # 8.8 h, p90 15.5 h, p95 15.7 h, max 18.5 h; 45 of those 193 rows were still open. A shorter bound takes back rows
 # the far queue merges later (2 h would have taken back 87 % of those merges).
 LAND_FORWARD_HELD_BOUND = 16 * 3600.0
+# A far row "queued" (taken, never judged) that long is a full worker pool, not a judgment in progress: forward_stalled
+# takes it back, or hands it off again, at most this many times a PR, then the far host's own answer stands.
+LAND_FORWARD_STALLED = 900.0
+LAND_FORWARD_STALL_TAKES = 2
 
 
 # The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
@@ -19780,7 +19830,7 @@ class LandQueue:
                      stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
                      lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
-                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
+                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None, forwardStalled=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
@@ -21371,6 +21421,8 @@ class LandQueue:
                       f"{far.get('reason') or 'it gave no reason'}",
                       str(far.get("next") or f"glaeda-gh land status {key_name(e['key'])} on {host}"), tell="quiet")
             return True
+        if st == "queued" and self.forward_stalled(e, row or {}, host, since, executor):
+            return True
         if st in LAND_FORWARD_OPEN:
             e["forwardHeld"] = {"at": float(answer.get("at") or self.now), "state": st}
             e.pop("forwardMissing", None)
@@ -21398,6 +21450,43 @@ class LandQueue:
                                 f"{self.now - since:.0f} s after its hand-off: handed off again")
             return True
         self.forward_lost(e, host, c, since)
+        return True
+
+    def forward_stalled(self, e: dict, row: dict, host: str, since: float, executor: bool) -> bool:
+        """Under the lock. A lane VM's row HOST's queue took ("queued") and has not judged for LAND_FORWARD_STALLED:
+        its worker pool is full, and the answer "held" ended nothing for hours (a held row has a 16 h bound,
+        LAND_FORWARD_HELD_BOUND). Taken back to be judged here (forward_reclaim), or, on a VM with no token pool of
+        its own, handed to the broker again (it may name the other peer), at most LAND_FORWARD_STALL_TAKES times a PR;
+        the requester is told as an fyi. True when it did either. cmuxterm-hq#32917, 2026-11-27: handed to
+        cmux-cp-2 at 12:16Z (no row there 17 min on), re-sent to cmux-cp-1, which held it "queued" and unjudged
+        (ten land-judge runs, load 23) from 12:33Z, and this side answered only forward_quiet: a notice, no action."""
+        if executor or not (e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e)):
+            return False
+        stuck = max(float(row.get("updated") or 0), since)
+        if self.now - stuck < LAND_FORWARD_STALLED:
+            return False
+        stalls = e.get("forwardStalled") if isinstance(e.get("forwardStalled"), dict) else {}
+        n = int(stalls.get("n") or 0)
+        if n >= LAND_FORWARD_STALL_TAKES:
+            return False  # its far queue is the row's last word now: held, bounded by LAND_FORWARD_HELD_BOUND
+        head = str(e.get("pinSha") or (e.get("handedOff") or {}).get("head") or "").lower()
+        tokenless = self.tokenless()
+        if tokenless and not SHA40.fullmatch(head):
+            return False
+        mins = round((self.now - stuck) / 60)
+        why = f"{host}'s land queue has held it queued and unjudged for {mins} min"
+        e["forwardStalled"] = {"n": n + 1, "at": self.now, "host": host, "mins": mins}
+        log({"event": "land-forward-stalled", "key": e["key"], "to": host, "n": n + 1, "mins": mins})
+        if tokenless:
+            self.history(e, "forward_stalled", to=host, n=n + 1, mins=mins, how="handed off again")
+            self.hand_off_now(e, head, f"{why}: handed off again", "forward_resent")
+            how = "handed to the broker host's land queue again"
+        else:
+            self.history(e, "forward_stalled", to=host, n=n + 1, mins=mins, how="taken back")
+            self.forward_reclaim(e, host, why)
+            how = "taken back to be judged here"
+        self.notify(e, e.get("requester") or "", f"glaeda land: {self.url(e)} sat queued at {host} for {mins} min "
+                    f"without a judgment; {how}", cls=LAND_FORWARD_FYI_CLASS)
         return True
 
     def forward_lost(self, e: dict, host: str, c: dict, since: float) -> bool:
@@ -27513,7 +27602,11 @@ class LandQueue:
                     self.count("update_again_unnamed")
                     self.stop(e, "update_again_unnamed",
                               f"land_judge named a second base merge at {head[:12]}, the head this land's own update "
-                              "made, and named no check that needs a newer base; one base merge per land",
+                              f"made, for its refusal code {code or '?'}"
+                              + (" (a forced base_update: its need is the stock 'land-judge base update', and its reason "
+                                 "names no changed file the PR also changes)" if force or stock else "")
+                              + ", and named no check that needs a newer base; one base merge per land ("
+                              f"`land-judge explain {repo} {number} --json` shows the refusal and the check it waits on)",
                               f"glaeda-gh status pr {repo}#{number} (a check still to report: glaeda-gh land "
                               f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr "
                               f"update-branch {number} -R {repo}, then land the new head)")
@@ -29682,7 +29775,8 @@ def land_progress(entry: Any) -> Any:
     def strip(v: Any) -> Any:
         if isinstance(v, dict):
             return {k: strip(x) for k, x in v.items()
-                    if not (k.endswith("At") or k in ("at", "checked", "until", "now", "seen", "touched"))}
+                    if not (k.endswith("At") or k in ("at", "checked", "until", "now", "seen", "touched")
+                            or (v is entry and k == "updated"))}
         if isinstance(v, list):
             return [strip(x) for x in v]
         return v
@@ -30722,6 +30816,28 @@ def first_heartbeat(now: float | None = None) -> None:
                                       "heartbeat": HEARTBEAT_EVERY})
 
 
+def main_stack(limit: int | None = None) -> list[str]:
+    """The main thread's innermost frames, innermost last, as "file:line function" (no values): what the serve loop is
+    stuck in when no request is (the watchdog row's inCall is null for a hung disk write)."""
+    frame = sys._current_frames().get(threading.main_thread().ident or -1)
+    if frame is None:
+        return []
+    return [f"{Path(f.filename).name}:{f.lineno} {f.name}"
+            for f in traceback.extract_stack(frame)[-(limit or WATCHDOG_STACK_FRAMES):]]
+
+
+def within(run: Callable[[], Any], seconds: float) -> bool:
+    """Run RUN on its own thread and wait at most SECONDS: whether it ended. A write stuck on a hung disk or behind a
+    stream lock another thread holds is left behind, so the caller (the watchdog) still exits on time."""
+    def body() -> None:
+        with contextlib.suppress(Exception):  # stderr may not be a real file (tests)
+            run()
+    worker = threading.Thread(target=body, name="glaeda-gh-watchdog-write", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    return not worker.is_alive()
+
+
 class Watchdog:
     """Exits the process (EXIT_WATCHDOG) once the serve loop has not come round for `limit` seconds,
     so launchd (KeepAlive) or systemd (Restart=always) starts a fresh daemon. A thread, so it fires
@@ -30753,14 +30869,21 @@ class Watchdog:
         doing = None
         with contextlib.suppress(Exception):  # read from another thread: a best-effort snapshot
             doing = self.where() if self.where is not None else None
-        log({"event": "watchdog", "silentFor": int(lag), "limit": int(self.limit), "pid": os.getpid(),
-             **({"thread": "main", "inCall": doing.get("inCall"), "lastCall": doing.get("lastCall")}
-                if isinstance(doing, dict) else {})})
-        with contextlib.suppress(Exception):  # stderr may not be a real file (tests)
+        row = {"event": "watchdog", "silentFor": int(lag), "limit": int(self.limit), "pid": os.getpid(),
+               **({"thread": "main", "inCall": doing.get("inCall"), "lastCall": doing.get("lastCall"),
+                   **({"phase": doing["phase"]} if doing.get("phase") else {})}
+                  if isinstance(doing, dict) else {}),
+               "main": main_stack()}
+        logged = within(lambda: log(row), WATCHDOG_WRITE_WAIT)
+
+        def dump() -> None:
             print(f"glaeda-gh: watchdog: the serve loop has not come round for {int(lag)}s (limit {int(self.limit)}s); "
-                  f"exiting {EXIT_WATCHDOG} so the service manager restarts the daemon. Where each thread was:",
+                  f"exiting {EXIT_WATCHDOG} so the service manager restarts the daemon."
+                  + ("" if logged else f" The watchdog row was not written within {WATCHDOG_WRITE_WAIT:g}s: "
+                                       f"{json.dumps(row)}.") + " Where each thread was:",
                   file=sys.stderr, flush=True)
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        within(dump, WATCHDOG_WRITE_WAIT)
         self.exit(EXIT_WATCHDOG)
         return True
 
@@ -31369,6 +31492,7 @@ def serve(foreground_ok: bool = False) -> int:
 def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
     global LOG_STDOUT
     LOG_STDOUT = True  # the daemon's stdout is its log
+    alarm_left = disarm_alarm()  # an alarm an older image's re-exec handed over would end this one (exec_serve)
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
@@ -31385,11 +31509,13 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
             log({"event": "swept", "tempFiles": swept})
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {})})
+    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {}),
+         **({"inheritedAlarmS": round(alarm_left, 2)} if alarm_left else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
-                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
+                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call,
+                                       "phase": getattr(daemon, "phase_now", None)},
                         reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
     watchdog.start()
     with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
@@ -31402,7 +31528,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
              **({"from": where} if where else {}),
              **({"handedJudgments": handed} if handed else {}),
              **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
-        os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+        exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
 
     stop_forwards = threading.Event()
     forwarder = threading.Thread(target=land_forward_loop, args=(daemon, stop_forwards),
@@ -31440,7 +31566,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
             if daemon.valve_due is not None:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
-                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+                exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = script_changed(me, seen)
             if changed:
                 daemon.script_cut = False  # serve has seen it: the ticks a held or deferred re-exec runs are whole
@@ -31475,7 +31601,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
                 # this daemon still polls, but its lock is on a file nobody can see, so every client reads
                 # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
                 log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
-                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+                exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass
 
@@ -33435,7 +33561,7 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
         return timeout, ceiling, ""
     horizon = cache_warm_horizon(warm)
     life = "1 h" if warm == CACHE_WARM_WAIT else "5 min" if warm <= 300 else f"{warm:g}s-wait"
-    whole = max(float(timeout), default_wait_max(timeout) if ceiling is None else float(ceiling))
+    whole = wait_ceiling(timeout, ceiling)
     try:
         key = parse_key(kind, target) if kind in ("pr", "run", "comment") else f"{kind}:{target}"
     except Exception:  # noqa: BLE001 -- a bad target is the wait's own error to report, not this cap's
@@ -33489,7 +33615,7 @@ def land_agent_wait_cap(target: str, wait: float, ceiling: float | None) -> tupl
         return wait, ceiling, ""
     if os.environ.get("CLAUDECODE") != "1" and not any(os.environ.get(k) for k in READER_KEYS):
         return wait, ceiling, ""
-    whole = max(float(wait), default_wait_max(wait) if ceiling is None else float(ceiling))
+    whole = wait_ceiling(wait, ceiling)
     if wait <= 0 or whole <= LAND_AGENT_WAIT_CAP:
         return wait, ceiling, ""
     words = (f"glaeda-gh land: an agent's foreground wait ends by {LAND_AGENT_WAIT_CAP:g}s (asked {whole:g}s); the land "
@@ -33502,12 +33628,17 @@ def default_wait_max(timeout: float) -> float:
     return WAIT_MAX_TIMES * float(timeout)
 
 
+def wait_ceiling(timeout: float, ceiling: float | None) -> float:
+    """An explicit --max bounds the whole wait, even when shorter than its no-progress window."""
+    return default_wait_max(timeout) if ceiling is None else float(ceiling)
+
+
 def wait_max(req: dict) -> float:
-    """The wait's hard ceiling, seconds from its start: never under its --timeout."""
+    """The hard ceiling in a saved wait request, in seconds from its start."""
     ceiling = req.get("max")
-    ceiling = default_wait_max(float(req["timeout"])) if not isinstance(ceiling, (int, float)) or \
-        isinstance(ceiling, bool) else float(ceiling)
-    return max(float(req["timeout"]), ceiling)
+    if not isinstance(ceiling, (int, float)) or isinstance(ceiling, bool):
+        ceiling = None
+    return wait_ceiling(float(req["timeout"]), ceiling)
 
 
 def wait_moved_at(req: dict) -> float:
@@ -34520,7 +34651,7 @@ def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: fl
             + (f" at {sha}{'' if exact else '... (a prefix: it must match the head GitHub shows)'}"
                if sha else "")
             + (f", giving up after {timeout:g}s with no change (at {deadline_clock(timeout)} unless it changes; "
-               f"ceiling {deadline_clock(max(timeout, default_wait_max(timeout) if ceiling is None else ceiling))})"
+               f"ceiling {deadline_clock(wait_ceiling(timeout, ceiling))})"
                if leash else f", giving up after {timeout:g}s (at {deadline_clock(timeout)})"))
 
 
@@ -34624,7 +34755,7 @@ def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool,
     daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts.
     TIMEOUT is "no change for this long" and CEILING (--max) the bound from `began` (wait_deadline)."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
-            "max": max(timeout, default_wait_max(timeout) if ceiling is None else ceiling),
+            "max": wait_ceiling(timeout, ceiling),
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
             "began": time.time(), "verbose": full_output(), **({"chosen": dict(chosen)} if chosen else {})}
 
@@ -35339,7 +35470,7 @@ def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
 def poll_wait(req: dict) -> int:
     """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
     A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
-    timeout, jobs = req["timeout"], req["jobs"]
+    timeout, jobs = min(req["timeout"], wait_max(req)), req["jobs"]
     start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     said = time.monotonic()
@@ -35354,7 +35485,7 @@ def poll_wait(req: dict) -> int:
                     print_json_error("daemon-down", "the daemon is not running, so nothing is polling GitHub",
                                      down_message().rpartition("\nnext: ")[2])
                 return EXIT_DOWN
-            time.sleep(WAIT_POLL)
+            time.sleep(min(WAIT_POLL, max(0.0, start + timeout - time.monotonic())))
             continue
         down_since = None
         broken = daemon_failing()
@@ -35407,7 +35538,7 @@ def poll_wait(req: dict) -> int:
                 state = progress_update(seen, req, read_cache(req["key"]), time.time())
                 if state is not None:
                     say_waiting(progress_line(req, state))
-        time.sleep(min(WAIT_POLL, max(0.1, wait_deadline(req) - time.time())))
+        time.sleep(min(WAIT_POLL, max(0.0, wait_deadline(req) - time.time())))
 
 
 WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
@@ -35508,7 +35639,7 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
         req["timeout"] += max(0.0, req["began"] - began)
         req["began"] = began
-        req["max"] = max(req["timeout"], default_wait_max(req["timeout"]) if ceiling is None else ceiling)
+        req["max"] = wait_ceiling(req["timeout"], ceiling)
     if isinstance(moved, dict):
         req["moved"] = moved
     rid = f"{pid}-{os.urandom(4).hex()}"
@@ -35727,9 +35858,9 @@ def land_row_now(key: str) -> dict | None:
     return next((r for r in land_entries() if r.get("key") == key), None)
 
 
-def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+def land_row_wait(key: str, row: dict, leash: Leash, as_json: bool,
                   sleep: Callable[[float], None] = time.sleep) -> int | None:
-    """Wait on ROW, this host's active land row for KEY, until it ends or TIMEOUT passes with no change in it
+    """Wait on ROW, this host's active land row for KEY, until it ends or its wait deadline passes
     (LAND_ROW_WAIT's comment). None: the row went where this wait cannot follow (forwarded, gone) or no daemon
     works it, so the caller takes the ordinary wait."""
     name = key_name(key)
@@ -35737,7 +35868,6 @@ def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as
         return None
     say_waiting(f"glaeda-gh: {name} is an active row in this host's land queue ({row.get('state')}): waiting on that "
                 f"row until it merges or stops (a local read; no GitHub watcher)")
-    leash = Leash(timeout, ceiling)
     entry: dict | None = row
     marker = land_waiter_mark(key)  # LAND_MERGED_WAITER_QUIET
     while True:
@@ -35749,9 +35879,10 @@ def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as
             land_waiter_end(marker, "")
             return None
         leash.see(land_progress(entry))
-        if state in LAND_DONE or leash.left() <= 0:
+        left = leash.left()
+        if state in LAND_DONE or left <= 0:
             break
-        sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
+        sleep(min(LAND_ROW_WAIT_POLL, left))
     state = str(entry.get("state") or "")
     land_waiter_end(marker, state)
     code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
@@ -35793,7 +35924,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     The waiting line is said exactly once: by cmd_wait on the first fallback, here before BLOCKER
     otherwise -- say_waiting writes fd 2 directly, so nothing is left buffered across the exec -- and
     not again on the late fallback, which goes straight to poll_wait."""
-    if not (0 <= max(timeout, default_wait_max(timeout) if ceiling is None else ceiling) <= WAITS_MAX_TIMEOUT) \
+    if not (0 <= max(timeout, wait_ceiling(timeout, ceiling)) <= WAITS_MAX_TIMEOUT) \
             or not os.access(BASH, os.X_OK) or not serving_waits():
         return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle, ceiling, chosen)
     key = parse_key(kind, target)
@@ -35809,7 +35940,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
         register(key, jobs, waited=True, began=req["began"])
         started = time.monotonic()
-        controller_wait_run(key, timeout)
+        controller_wait_run(key, min(timeout, req["max"]))
         done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
@@ -35945,7 +36076,7 @@ class Leash:
 
     def __init__(self, timeout: float, ceiling: float | None = None) -> None:
         self.timeout = float(timeout)
-        self.ceiling = max(self.timeout, default_wait_max(self.timeout) if ceiling is None else float(ceiling))
+        self.ceiling = wait_ceiling(self.timeout, ceiling)
         self.start = self.moved = time.monotonic()
         self.mark: Any = None
         self.changes = 0
@@ -45719,12 +45850,15 @@ def main(argv: list[str] | None = None) -> int:
             # running (resume_wait, poll_wait) never comes back through here, so a row queued mid-wait never cuts one
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
+            leash = Leash(args.timeout, args.max)
             row = land_row_watched_here(pr_key, args.sha)
             if row is not None and args.until in (None, "merged"):
-                code = land_row_wait(pr_key, row, args.timeout, args.max, args.json)
+                code = land_row_wait(pr_key, row, leash, args.json)
                 if code is not None:
                     return code
-                row = None  # forwarded, gone or no daemon: the ordinary wait below
+                # Forwarding or losing the row switches the source of the verdict within the same wait.
+                args.max = max(0.0, leash.start + leash.ceiling - time.monotonic())
+                row = None
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))
