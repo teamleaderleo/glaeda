@@ -6682,6 +6682,9 @@ class Daemon:
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.consumer_sent: dict[tuple[str, str], float] = {}  # (head, consumer): last sent upstream (upstream_read)
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        # when a GraphQL query of each key alone last failed (batched): its own failure, so it moves back like a failed
+        # REST read (tried_at); a key in a failed batch keeps its place, the batch's failure may be another key's
+        self.gql_failed_alone: dict[str, float] = {}
         # when a confirming read (wait_confirms) of each run was last made ahead of the rest, and the finish it was
         # for (rest_run): one such read per finish
         self.confirm_tried: dict[str, tuple[float, dict]] = {}
@@ -9662,8 +9665,19 @@ class Daemon:
         last fetch. Never read nor tried (no cache) sorts first, so a new watch is filled at once."""
         c = e.get("cache") or {}
         at = c.get("restAt") if c.get("source") == "controller" else c.get("fetchedAt")
-        return max(float(at) if isinstance(at, (int, float)) else float("-inf"),
-                   self.rest_tried.get(e["key"], float("-inf")))
+        return max(float(at) if isinstance(at, (int, float)) else float("-inf"), self.tried_at(e["key"]))
+
+    def tried_at(self, key: str) -> float:
+        """When a read of KEY alone last ended without its data, or a REST read of it ended at all: a REST read
+        (rest_tried) or a GraphQL query of it alone that failed (gql_failed_alone). Every order that puts the oldest data
+        first counts from here too, so a key GitHub keeps failing takes one turn, then waits behind the others."""
+        return max((getattr(self, "rest_tried", None) or {}).get(key, float("-inf")),
+                   (getattr(self, "gql_failed_alone", None) or {}).get(key, float("-inf")))
+
+    def read_turn(self, e: dict) -> float:
+        """The age batched() orders GraphQL reads by: the entry's data (never read sorts first), or its last failed
+        try alone (tried_at) when that is later."""
+        return max(float((e.get("cache") or {}).get("dataAt") or 0), self.tried_at(e["key"]))
 
     def rest_order(self, entries: list[dict]) -> list[dict]:
         """The order a tick reads REST keys in. A finished run a wait only needs confirmed (wait_confirms) goes first:
@@ -9716,7 +9730,7 @@ class Daemon:
     def never_read(self, e: dict) -> bool:
         """A PR or run watch with no copy at all, never read nor tried over REST: its readers get null until its first
         read (unread_lead)."""
-        if not e["key"].startswith(("pr:", "run:")) or e["key"] in self.rest_tried:
+        if not e["key"].startswith(("pr:", "run:")) or self.tried_at(e["key"]) > float("-inf"):
             return False
         c = e.get("cache") or {}
         return not c.get("data") and not isinstance(c.get("fetchedAt"), (int, float))
@@ -9747,7 +9761,7 @@ class Daemon:
                 continue
             seen = c.get("dataAt") if isinstance(c.get("dataAt"), (int, float)) else since.get(e["key"], self.now)
             # a failed try moves it back too, so a key GitHub keeps failing cannot hold the floor from the others
-            seen = max(seen, (getattr(self, "rest_tried", None) or {}).get(e["key"], float("-inf")))
+            seen = max(seen, self.tried_at(e["key"]))
             age = self.now - seen
             if age > best_age:
                 best, best_age = e, age
@@ -10718,6 +10732,8 @@ class Daemon:
         self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.gql_failed_alone = {k: t for k, t in getattr(self, "gql_failed_alone", {}).items()
+                                 if self.now - t < 2 * IDLE_EXPIRY}
         self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         # Evaluate the watches selected at tick start, but include the time spent waiting for their reads.
@@ -11622,7 +11638,7 @@ class Daemon:
             # its chunk failed it tick after tick: alone, first, the oldest data of them first (UNREAD_ALONE_AFTER)
             failing = [e for e in group if e["key"] not in self.heavy
                        and (unread.get(e["key"]) or {}).get("tries", 0) >= UNREAD_ALONE_AFTER]
-            failing.sort(key=lambda e: float((e.get("cache") or {}).get("dataAt") or 0))
+            failing.sort(key=self.read_turn)
             lone = {e["key"] for e in failing[:max(0, UNREAD_ALONE_MAX - len(lone_unread))]}
             lone_unread.update(lone)
             for e in group:
@@ -11650,18 +11666,25 @@ class Daemon:
             # the App.
             groups: dict[str, list[dict]] = {}
             pool = self.app_pool
-            for e in rest:
+            # Each query the oldest turns of its group (read_turn), not the order the entries came in: a chunk cut in
+            # that order mixed old and new, so every chunk's oldest looked alike and the entries of the chunks that came
+            # last were never sent while a failing chunk went first every tick.
+            for e in sorted(rest, key=self.read_turn):
                 benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
                 groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""),
                                   []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
 
         def oldest_first(queue: list[list[dict]]) -> list[list[dict]]:
-            """Chunks by the oldest data in each (never read first). The chunks above run one repository at a time, then
-            heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only inside a chunk:
-            a tick that ran out of time read the first repository's newest data before another's oldest."""
-            return sorted(queue, key=lambda c: (not (len(c) == 1 and c[0]["key"] in lone_unread),
-                                                min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c)))
+            """Chunks by the oldest turn in each (read_turn: never read first). The chunks above run one repository at a
+            time, then heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only
+            inside a chunk: a tick that ran out of time read the first repository's newest data before another's oldest.
+            An entry read alone because its chunks kept failing (lone_unread) takes its turn by age too, not ahead of
+            all: it went first every tick, and with it failing alone its data never got newer, so cmux-cp-1 and
+            cmux-cp-2 (2026-11-27 02:20Z) spent each tick's PR share on the same 502ing PRs, lone and in their batch's
+            halves, while ~40 waited PRs were "not read for 1298s (14 due ticks, its query sent on 0)". Once it failed
+            alone (gql_failed_alone) it goes behind the others, and every waited entry is sent within one pass."""
+            return sorted(queue, key=lambda c: min(self.read_turn(e) for e in c))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = deque(oldest_first(chunks([e for e in entries if self.waited(e)]))
                       + oldest_first(chunks([e for e in entries if not self.waited(e)])))
@@ -11746,10 +11769,14 @@ class Daemon:
                 with contextlib.suppress(Exception):  # noqa: BLE001  storing the error must not stop the rest
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
+                if len(chunk) == 1:
+                    self.__dict__.setdefault("gql_failed_alone", {})[chunk[0]["key"]] = self.now
                 continue
             if error is not None:
                 for e in chunk:
                     miss[e["key"]] = f"{' '.join(error.split())[:200]} (in a {kind} batch of {len(chunk)})"
+                if len(chunk) == 1:  # its own failure: it takes its next turn behind the others (read_turn)
+                    self.__dict__.setdefault("gql_failed_alone", {})[chunk[0]["key"]] = self.now
             timed_out = error and GQL_GATEWAY_TIMEOUT.search(error)
             if timed_out and pr_timeout_rest and repo in pr_timeout_rest and self.rest_admits(kind, chunk[0]):
                 pr_timeout_rest[repo] = True
