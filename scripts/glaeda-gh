@@ -15678,6 +15678,33 @@ def land_overflow(config: dict | None = None) -> list[list[str]]:
     return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)]
 
 
+# Land failover: a forwarding host's executor unreachable never stops its lands. cosmic-gray, 2026-11-27 06:31-10:01Z:
+# tailnet tcp:22 to its executor cmux-cp-1 timed out on and off (34 failed forwards, `ssh: connect to host
+# 100.110.222.91 port 22: Operation timed out`), each failure doubling the backoff to LAND_FORWARD_RETRY_MAX, so a
+# land asked for at 09:00Z sat in requests/ until 09:20Z while cmux-cp-2, the executor's own pair, answered. land.json's
+# "fallback" names more executors, each a program as "executor" is, in the order they are tried: once the executor has
+# failed LAND_FORWARD_FAILOVER_FAILS forwards in a row, the batch goes to the first fallback that takes it. Its queue
+# judges every row as the executor's would (the same land_judge gates, the pin and any override carried as given; this
+# host adds none). The executor is tried again each time its own backoff ends, and a forward it takes ends the
+# failover. A forward that timed out may still have been applied there, so a row can sit in both queues: each lands
+# only that pinned head and only on a green judgment, and the second finds it merged.
+LAND_FALLBACK_KEY = "fallback"
+LAND_FORWARD_FAILOVER_FAILS = 2
+
+
+def land_fallback(config: dict | None = None) -> list[list[str]]:
+    """land.json's "fallback" executors (each a program, as "executor"), in the order they are tried; [] for none. One
+    naming the executor's own host is left out."""
+    cfg = land_config() if config is None else config
+    peers = cfg.get(LAND_FALLBACK_KEY)
+    if not isinstance(peers, list):
+        return []
+    primary = land_executor(cfg)
+    skip = land_forward_name(primary) if primary is not None else None
+    return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)
+            and land_forward_name(p) != skip]
+
+
 def land_room(pool: Any, now: float) -> int:
     """How many more lands this host's queue takes from a peer now, from its last land-pool line POOL: its idle
     workers less the rows already due here (the host's load is no part of it: LAND_LOAD_LINE is gone); 0 when the line
@@ -19180,6 +19207,8 @@ class LandQueue:
         self.unlabel_thread: threading.Thread | None = None  # LAND_UNLABEL's sends, one batch at a time
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.primary_after = float("-inf")  # the executor's own backoff while fallbacks take its forwards (land_fallback)
+        self.failed_over: str | None = None  # the fallback taking this host's forwards now, said once (land_fallback)
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
         self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_requests_stamp: tuple[int, int, int] | None = None
@@ -20057,31 +20086,72 @@ class LandQueue:
             with self.lock:
                 self.overflowing = set()
 
+    def forward_once(self, command: list[str], batch: list[dict]) -> tuple[str, dict]:
+        """BATCH sent to COMMAND's `land serve`: (the host that took it, its answer), or WatchError."""
+        name = land_forward_name(command)
+        answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
+                              LAND_FORWARD_DEADLINE)
+        if not answer.get("ok"):
+            raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+        if isinstance(answer.get("redirectedTo"), str):
+            self.forward_redirected(name, answer["redirectedTo"])
+            name = answer["redirectedTo"]
+        return name, answer
+
     def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
-        name = land_forward_name(command)
-        try:
-            answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
-                                  LAND_FORWARD_DEADLINE)
-            if not answer.get("ok"):
-                raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
-            if isinstance(answer.get("redirectedTo"), str):
-                self.forward_redirected(name, answer["redirectedTo"])
-                name = answer["redirectedTo"]
+        primary = name = land_forward_name(command)
+        fallbacks = land_fallback(self.config())
+        took: list[str] | None = None
+        answer: dict = {}
+        error: BaseException | None = None
+        why = ""
+        # the executor first, unless it has failed LAND_FORWARD_FAILOVER_FAILS in a row and its backoff still runs
+        skip_primary = bool(fallbacks) and self.forward_fails >= LAND_FORWARD_FAILOVER_FAILS \
+            and self.now < self.primary_after
+        if not skip_primary:
+            try:
+                name, answer = self.forward_once(command, batch)
+                took = command
+            except Exception as failed:  # noqa: BLE001  an unreachable executor is retried, never fatal
+                error, why = failed, str(failed) if isinstance(failed, WatchError) else describe(failed)
+                with self.lock:
+                    self.forward_fails += 1
+                    self.primary_after = self.now + min(LAND_FORWARD_RETRY_MAX,
+                                                        LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
+                log({"event": "land-forward-failed", "executor": primary, "error": why, "pending": len(batch)})
+        if took is None and fallbacks and self.forward_fails >= LAND_FORWARD_FAILOVER_FAILS:
+            for other in fallbacks:
+                try:
+                    name, answer = self.forward_once(other, batch)
+                    took = other
+                    break
+                except Exception as failed:  # noqa: BLE001  the next fallback may take it
+                    log({"event": "land-forward-fallback-failed", "executor": land_forward_name(other),
+                         "error": land_trim(str(failed) if isinstance(failed, WatchError) else describe(failed), 300),
+                         "pending": len(batch)})
+            if took is not None and self.failed_over != name:
+                self.failed_over = name
+                log({"event": "land-forward-failover", "executor": primary, "to": name,
+                     "fails": self.forward_fails, "error": why, "pending": len(batch)})
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-failover", "warn", f"glaeda land on {policy_host()}: its executor "
+                                f"{primary} failed {self.forward_fails} forwards in a row ({why or 'in its backoff'}); "
+                                f"its lands go to {name} (land.json fallback) until {primary} takes one again",
+                                {"executor": primary, "to": name, "error": why})
+        if took is not None:
             accepted = {str(a) for a in answer.get("accepted") or []}
             refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
                        if isinstance(r, dict) and r.get("id")}
-        except Exception as error:  # noqa: BLE001  an unreachable executor is retried, never fatal
-            why = str(error) if isinstance(error, WatchError) else describe(error)
+        else:
+            why = why or "every land.json fallback failed while the executor's backoff runs"
             with self.lock:
                 self.sending = set()
-                self.forward_fails += 1
-                wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
+                wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (max(1, self.forward_fails) - 1))
                 self.forward_after = self.now + wait
-                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "failing", "error": why,
+                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": primary, "state": "failing", "error": why,
                                                             "at": self.now, "pending": len(batch),
                                                             "retryAt": self.forward_after})
-            log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
             if isinstance(error, LandNotExecutor) and not self.forward_misrouted:
                 # never heals by retrying: land.json names a host that executes nothing (LAND_REDIRECT_HOPS)
                 self.forward_misrouted = True
@@ -20098,8 +20168,13 @@ class LandQueue:
             return
         with self.lock:
             self.sending = set()
-            self.forward_fails = 0
-            self.forward_misrouted = False
+            if took is command:  # the executor itself took it: the failover, if any, ends
+                if self.failed_over is not None:
+                    log({"event": "land-forward-failback", "executor": primary, "from": self.failed_over})
+                self.forward_fails = 0
+                self.primary_after = float("-inf")
+                self.failed_over = None
+                self.forward_misrouted = False
             self.forward_after = float("-inf")
             for rid, path in files:
                 if rid in accepted:
@@ -20126,7 +20201,8 @@ class LandQueue:
                     self.stop(e, "forward_refused", f"the land executor {name} refused this PR's handoff: "
                               f"{refused[req['id']]}", f"glaeda-gh land {key_name(key)} again with a valid --notify")
             write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "ok", "at": self.now,
-                                                        "sent": len(accepted)})
+                                                        "sent": len(accepted)}
+                       | ({"failoverFrom": primary} if took is not command else {}))
         log({"event": "land-forwarded", "executor": name, "sent": len(accepted), "handedOff": len(handed)})
 
     def latch_held(self) -> tuple[str, float] | None:
@@ -20739,7 +20815,7 @@ class LandQueue:
             return None
         cfg = self.config()
         executor = land_executor(cfg)
-        programs = ([executor] if executor is not None else []) + land_overflow(cfg)
+        programs = ([executor] if executor is not None else []) + land_fallback(cfg) + land_overflow(cfg)
         for command in programs:
             if land_forward_name(command) == host:
                 return command
