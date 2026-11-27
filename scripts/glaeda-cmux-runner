@@ -3412,6 +3412,9 @@ def main(argv: list[str] | None = None) -> int:
                if dev or nightly or gateway or ctx.gui_runner or ctx.session_runner or ctx.fast_runner
                else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
+        unify = getattr(fleet_labels(), "with_unified", None)  # RFD 0185 phase 1: the version-free labels, beside these
+        if unify is not None:
+            ctx.labels = unify(ctx.labels)
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"

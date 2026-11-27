@@ -31303,7 +31303,7 @@ def stale_message(lag: float) -> str:
 
 
 def failing(checks: list[dict]) -> list[dict]:
-    return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED]
+    return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED and not merge_train_turned_away(c)]
 
 
 def cancelled_unstarted(c: dict) -> bool:
@@ -31326,11 +31326,27 @@ def refused_job(job: dict) -> bool:
             and quick(job.get("started_at"), job.get("completed_at")))
 
 
+# The HQ merge train's commit status (cmuxterm-hq tools/fleet-reconcilers/merge_train.py) at a boarded PR's head. Its
+# `error` is the train turning the head away ("not seated: train T11270439-f0a5ca4 took 2 seats, the next no sooner
+# than 05:39Z; its base merge runs now (update_branch)"), by design: land-judge reads it as FALLBACK, the base merge
+# and then the land (cmuxterm-hq docs/handbook/merge-train-turn-away.md). It is no red. `status` printed
+# "failed: merge-train" for cmux#59074 at a3d4b1e0 (2026-11-27) with 173 checks green, and a wait exited 1 on it.
+# Its `failure` (the train's own red at the head) stays failed. Detector: test-glaeda-gh.py MergeTrainTurnAway.
+MERGE_TRAIN_CONTEXT = "merge-train"
+
+
+def merge_train_turned_away(c: dict) -> bool:
+    """Whether check C is the merge train's turn-away: the `merge-train` commit status (no workflow) in ERROR."""
+    return (c.get("name") == MERGE_TRAIN_CONTEXT and not c.get("workflow") and c.get("status") == "COMPLETED"
+            and str(c.get("conclusion") or "").upper() == "ERROR")
+
+
 def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) -> dict[str, list[dict]]:
-    """Split a PR's checks into passed, failed, pending and held. A failed check is held while a job
+    """Split a PR's checks into passed, failed, pending, held and fallback. A failed check is held while a job
     of its workflow run was refused at runner setup less than `grace` seconds ago: the rescue re-runs
     that run's failed jobs, dependents such as an aggregate status check included. A check cancelled
-    before any step ran is held as long: the rescue cancelled it in the queue and re-runs it."""
+    before any step ran is held as long: the rescue cancelled it in the queue and re-runs it. The merge train's
+    turn-away (merge_train_turned_away) is fallback: neither a red nor a check still to finish."""
     now = time.time() if now is None else now
     checks = data.get("checks") or []
     def recent(c: dict) -> bool:
@@ -31338,10 +31354,12 @@ def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) 
     held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c) and recent(c)}
     # the rescue cancels the whole run: its jobs that were running come back cancelled with steps
     queued_runs = {c.get("runId") for c in checks if c.get("runId") and cancelled_unstarted(c) and recent(c)}
-    out: dict[str, list[dict]] = {"passed": [], "failed": [], "pending": [], "held": []}
+    out: dict[str, list[dict]] = {"passed": [], "failed": [], "pending": [], "held": [], "fallback": []}
     for c in checks:
         cancelled = (c.get("conclusion") or "").upper() == "CANCELLED"
-        if c.get("status") != "COMPLETED":
+        if merge_train_turned_away(c):
+            out["fallback"].append(c)
+        elif c.get("status") != "COMPLETED":
             out["pending"].append(c)
         elif (c.get("conclusion") or "").upper() in FAILED:
             held = (c.get("runId") in held_runs or (cancelled_unstarted(c) and recent(c))
@@ -32647,6 +32665,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append(f"  inherited from {data.get('baseRefName')}: {names}{more}: {INHERITED_ADVICE}")
             if not own_failed:
                 lines.append("  every red here is inherited: nothing to do on this PR for them")
+        for c in groups["fallback"]:
+            said = str(c.get("description") or "").strip()
+            lines.append(f"  awaiting train / fallback: {label(c)}: the merge train turned this head away"
+                         f"{f' ({said})' if said else ''}; no red: land-judge runs the base merge, then the land")
         for c in groups["held"][:shown_failed]:
             refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
@@ -36296,10 +36318,21 @@ def free_account_reading(now: float, make: Callable[[], Any] | None = None) -> d
     if daemon.rate_limit_at < now:  # read_rate_limit stamps this only when /rate_limit answered
         why = next((e for e in reversed(daemon.errors) if e.startswith("rate_limit: ")), None)
         return {"error": why[len("rate_limit: "):] if why else "/rate_limit gave no reading"}
-    # budget.json was loaded at construction, so only a bucket this answer refreshed is reported: its seenAt is NOW.
-    out = {b: {**r, "seenAt": now} for b in ("rest", "graphql")
-           if isinstance(r := daemon.budget.get(b), dict) and isinstance(r.get("remaining"), int)
-           and float(r.get("seenAt") or 0) >= now}
+    # budget.json was loaded at construction, so only a counter this answer refreshed is reported: its seenAt is NOW.
+    # The settled reading is not enough: for GraphQL it is the counter the daemon's own queries last drew from
+    # (settle_counters), whose seenAt is that query's, so a /rate_limit that answered fine left budget["graphql"] older
+    # than NOW and this said "named no core or graphql resource" (cmux-cp-2, 2026-11-27 02:58Z, while
+    # `glaeda-gh gh api /rate_limit` read GraphQL 2653/5000). The settled reading when this read refreshed it, else the
+    # poorest counter this read refreshed.
+    out = {}
+    for bucket, key in (("rest", "restCounters"), ("graphql", "graphqlCounters")):
+        r = daemon.budget.get(bucket)
+        if isinstance(r, dict) and isinstance(r.get("remaining"), int) and float(r.get("seenAt") or 0) >= now:
+            out[bucket] = {**r, "seenAt": now}
+            continue
+        fresh = [c for c in rest_counters(daemon.budget, key) if float(c.get("seenAt") or 0) >= now]
+        if fresh:
+            out[bucket] = {**min(fresh, key=lambda c: c["remaining"]), "seenAt": now}
     return {"readings": out} if out else {"error": "/rate_limit named no core or graphql resource"}
 
 
