@@ -7265,7 +7265,7 @@ class ClientTest(Base):
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1)))
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", "o/r#1", False, False, fields=["hed"])
-        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, inherited, own, passed"):
+        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, fallback, held, inherited, own, passed"):
             self.status("pr", "o/r#1", False, False, fields=["checks.red"])
         # a PR with no data yet refuses the typo too, rather than printing an empty column
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
@@ -50448,6 +50448,42 @@ class LandCarryTest(unittest.TestCase):
             gg.land_carry("manaflow-ai/glaeda", 43, "")
         self.assertIn("no approving review", str(said.exception))
         self.assertEqual(len(calls), 1)
+
+
+class MergeTrainTurnAway(unittest.TestCase):
+    """cmux#59074 at a3d4b1e0, 2026-11-27: 173 checks passed and the merge train posted `merge-train` error "not
+    seated: ...", its turn-away, whose fallback is the base merge and then the land. cmux-gh status said "failed:
+    merge-train" and land refused it as a red. The turn-away is "awaiting train / fallback", never failed
+    (cmuxterm-hq docs/handbook/merge-train-turn-away.md)."""
+
+    SAID = ("not seated: train T11270439-f0a5ca4 took 2 seats, the next no sooner than 05:39Z; "
+            "its base merge runs now (update_branch)")
+
+    def data(self, conclusion: str = "ERROR") -> dict:
+        train = {"name": "merge-train", "workflow": None, "status": "COMPLETED", "conclusion": conclusion,
+                 "url": "https://ci/merge-train", "description": self.SAID}
+        green = {"name": "tests", "workflow": "CI", "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "url": "https://ci/tests"}
+        return {"checks": [green, train]}
+
+    def test_the_turn_away_is_fallback_not_failed(self) -> None:
+        groups = gg.classify(self.data(), NOW, gg.RESCUE_GRACE)
+        self.assertEqual(groups["failed"], [])
+        self.assertEqual([c["name"] for c in groups["fallback"]], ["merge-train"])
+        self.assertTrue(gg.merge_train_turned_away(self.data()["checks"][1]))
+        self.assertNotEqual(gg.check_verdict(self.data(), "green", NOW), gg.EXIT_FAIL)
+
+    def test_a_train_failure_stays_failed(self) -> None:
+        groups = gg.classify(self.data("FAILURE"), NOW, gg.RESCUE_GRACE)
+        self.assertEqual([c["name"] for c in groups["failed"]], ["merge-train"])
+        self.assertEqual(groups["fallback"], [])
+        self.assertEqual(gg.check_verdict(self.data("FAILURE"), "green", NOW), gg.EXIT_FAIL)
+
+    def test_a_workflow_job_named_merge_train_in_error_stays_failed(self) -> None:
+        data = self.data()
+        data["checks"][1]["workflow"] = "CI"
+        self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["merge-train"])
+
 
 if __name__ == "__main__":
     unittest.main()
