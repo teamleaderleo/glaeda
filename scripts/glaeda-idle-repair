@@ -99,13 +99,13 @@ def load_disk_module() -> Any:
     return module
 
 
-# Someone at the keyboard. On cosmic-gray (Leo's own Mac, the one he works at) this job ran the full disk pass,
-# `cmux-disk --refresh --pressure --idle --apply`, every 15-26 min while he used it: 2026-11-27 13:5xZ-15:1xZ the
-# last three passes each hit their 660 s bound (exit 124) at load 60-250, with git cat-file over the hq mirror on
-# top of an acpmux delivery wedge, while host-presence read him active (HID idle 0 s). host_busy asks only about CI
+# Someone at the keyboard. On a personal desktop Mac this job ran the full disk pass,
+# `cmux-disk --refresh --pressure --idle --apply`, every 15-26 min while it was in use: 2026-11-27 13:5xZ-15:1xZ the
+# last three passes each hit their 660 s bound (exit 124) at load 60-250, with git cat-file over a mirror on top of
+# an agent-daemon delivery wedge, while the keyboard read active (HID idle 0 s). host_busy asks only about CI
 # jobs and builds, so an attended desktop always read idle. The idle sweep and the --refresh survey are named for an
 # idle host; under a person they wait. Disk pressure does not: an attended Mac still gets `--pressure --apply`,
-# which acts only below its free target. The same reading and threshold as leo-workspace tools/host_presence.py
+# which acts only below its free target. The same reading and threshold as the desktop presence check
 # (HID idle under 600 s is a person there; a locked screen or no reading changes nothing here). A fleet mini nobody
 # touches reads days of HID idle and keeps the whole pass.
 ATTENDED_IDLE_S = 600

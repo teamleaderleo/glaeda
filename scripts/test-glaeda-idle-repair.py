@@ -68,7 +68,7 @@ class IdleRepairTest(unittest.TestCase):
         self.assertEqual([call.args[1] for call in run.call_args_list], [660, 180])
 
     def test_attended_mac_runs_the_pressure_pass_alone(self) -> None:
-        # cosmic-gray 2026-11-27: the --refresh --idle pass ran every 15-26 min while Leo used the Mac, at load 60-250.
+        # 2026-11-27: the --refresh --idle pass ran every 15-26 min on a desktop Mac in use, at load 60-250.
         disk = mock.Mock()
         disk.host_busy.return_value = ""
         with mock.patch.object(idle, "attended", return_value=True), \
