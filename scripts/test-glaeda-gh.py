@@ -43683,10 +43683,10 @@ class LandForwardTest(Base):
                             config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
                             behind=lambda *a: None, forward=forward)
 
-    def test_land_fallback_reads_the_config_and_drops_the_executor_itself(self):
+    def test_land_fallback_executors_reads_the_config_and_drops_the_executor_itself(self):
         cfg = {"executor": list(self.EXEC), "fallback": [list(self.EXEC), list(self.PAIR), "bad", []]}
-        self.assertEqual(gg.land_fallback(cfg), [self.PAIR])
-        self.assertEqual(gg.land_fallback({"executor": list(self.EXEC)}), [])
+        self.assertEqual(gg.land_fallback_executors(cfg), [self.PAIR])
+        self.assertEqual(gg.land_fallback_executors({"executor": list(self.EXEC)}), [])
 
     def test_an_unreachable_executor_fails_over_to_the_fallback_and_back(self):
         # cosmic-gray 2026-11-27: cmux-cp-1 unreachable on tailnet :22 on and off for 3.5 h, every land backing off

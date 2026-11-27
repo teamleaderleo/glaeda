@@ -15692,7 +15692,7 @@ LAND_FALLBACK_KEY = "fallback"
 LAND_FORWARD_FAILOVER_FAILS = 2
 
 
-def land_fallback(config: dict | None = None) -> list[list[str]]:
+def land_fallback_executors(config: dict | None = None) -> list[list[str]]:
     """land.json's "fallback" executors (each a program, as "executor"), in the order they are tried; [] for none. One
     naming the executor's own host is left out."""
     cfg = land_config() if config is None else config
@@ -19207,8 +19207,8 @@ class LandQueue:
         self.unlabel_thread: threading.Thread | None = None  # LAND_UNLABEL's sends, one batch at a time
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
-        self.primary_after = float("-inf")  # the executor's own backoff while fallbacks take its forwards (land_fallback)
-        self.failed_over: str | None = None  # the fallback taking this host's forwards now, said once (land_fallback)
+        self.primary_after = float("-inf")  # the executor's own backoff while fallbacks take its forwards (land_fallback_executors)
+        self.failed_over: str | None = None  # the fallback taking this host's forwards now, said once (land_fallback_executors)
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
         self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_requests_stamp: tuple[int, int, int] | None = None
@@ -20101,7 +20101,7 @@ class LandQueue:
     def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
         primary = name = land_forward_name(command)
-        fallbacks = land_fallback(self.config())
+        fallbacks = land_fallback_executors(self.config())
         took: list[str] | None = None
         answer: dict = {}
         error: BaseException | None = None
@@ -20815,7 +20815,7 @@ class LandQueue:
             return None
         cfg = self.config()
         executor = land_executor(cfg)
-        programs = ([executor] if executor is not None else []) + land_fallback(cfg) + land_overflow(cfg)
+        programs = ([executor] if executor is not None else []) + land_fallback_executors(cfg) + land_overflow(cfg)
         for command in programs:
             if land_forward_name(command) == host:
                 return command
