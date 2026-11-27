@@ -19353,6 +19353,29 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(stale)["register"]["state"], "relabel")
         self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
 
+    def test_refresh_hooks_heals_a_runner_already_listening_with_no_gate(self) -> None:
+        """GATE_RETRY for runners ungated before it shipped: an old listen.sh exec'd run.sh when its gate died, so
+        cmux22-glaeda-13 listened 14 h with no gate and refused every job under a later fleet lease. A wrapper is not
+        rewritten by --refresh-hooks, so the refresh stops such a runner while idle and launchd starts a gate."""
+        runner = Path("/Users/cmux/actions-runner-glaeda-13")
+        listener = f"{runner}/bin.2.338.2/Runner.Listener run --startuptype service"
+        gate = f"/usr/bin/python3 {runner}/glaeda-hooks/glaeda-cmux-runner-hook listen --runner-dir {runner}"
+        ungated = f" 101 /bin/bash {runner}/run.sh\n 102 {listener}\n"
+        self.assertEqual(cr.ungated_listeners(runner, ungated), [102])
+        self.assertEqual(cr.ungated_listeners(runner, ungated + f" 100 {gate}\n"), [], "a gated runner is left alone")
+        self.assertEqual(cr.ungated_listeners(Path(f"{runner}0"), ungated), [], "another runner's listener")
+        done = subprocess.CompletedProcess([], 0, stdout=ungated, stderr="")
+        for busy, want in ((True, None), (False, cr.UNGATED_STOPPED)):
+            with mock.patch.object(cr.subprocess, "run", return_value=done), \
+                    mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(2)), \
+                    mock.patch.object(cr, "worker_running", return_value=busy), \
+                    mock.patch.object(cr.os, "kill") as kill:
+                self.assertEqual(cr.heal_ungated(runner), want)
+            if busy:
+                kill.assert_not_called()  # a job runs: never stopped under it; the next refresh looks again
+            else:
+                kill.assert_called_once_with(102, signal.SIGINT)
+
     def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
         runner_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, runner_dir, ignore_errors=True)
