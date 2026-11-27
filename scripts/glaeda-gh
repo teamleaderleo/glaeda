@@ -8439,8 +8439,8 @@ class Daemon:
             return None
         role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
-        if saved is None and (item.get("uncertain") or item.get("attempts")):
-            return None  # the first send was already attempted by the login
+        if saved is None and (item.get("uncertain") or item.get("attempts")) and not item.get("handoffChecked"):
+            return None  # the first send was already attempted by the login (handoff_check clears a create for its App)
         if saved not in (None, role):
             return None
         if saved is None and op in APP_CREATE_ROLE and item.get("appRefused"):
@@ -8531,6 +8531,8 @@ class Daemon:
                 paused = True
                 # The login's create pause holds the login's writes and the review App's comments. A create goes on the
                 # App of its purpose meanwhile (app_create_due), so it never waits on the login's pause.
+                if self.app_create_due(item) and self.handoff_check(path, item) == "done":
+                    continue  # it had already landed: finished, never made twice
                 actor = self.outbox_actor(item) if self.app_create_due(item) else None
                 if not actor:
                     continue  # the login's write waits out its pause; a create behind it may still go on its App
@@ -8556,6 +8558,26 @@ class Daemon:
                 if actor and actor.get("role") not in APP_NON_POSTER_ROLES:
                     self.post_at = logged_at  # a poster's write spaces nothing of the login's
             return
+
+    def handoff_check(self, path: Path, item: dict) -> str:
+        """A create the login already tried (attempts, uncertain: a throttle, a 5xx) and that its pause now holds may
+        move to the App of its purpose, but never blind: look first for the PR (open, for its head) or the issue (same
+        title and body since queued) it would make. Found: finish it with that URL ("done"). The look got no answer:
+        keep the login ("wait"). Not there: mark handoffChecked so outbox_actor lets the App make it ("ok")."""
+        if item.get("kind") not in ("pr", "issue") or item.get("appWriter") or item.get("handoffChecked") \
+                or not (item.get("uncertain") or item.get("attempts")):
+            return "ok"
+        found, answered = self.post_find(item, None)
+        if found:
+            self.post_finish(path, item, url=found.get("html_url"), number=found.get("number"),
+                             note="already made by the login's earlier send; found before moving it to its App")
+            return "done"
+        if not answered:
+            return "wait"
+        item["handoffChecked"] = True
+        write_json(path, item)
+        log({"event": "post-handoff-checked", "id": item["id"], "kind": item["kind"], "attempts": item.get("attempts")})
+        return "ok"
 
     def post_blocker_why(self, head: dict) -> str:
         """What holds the outbox's head write, in words: the daemon's holds on the login, then the head's own."""

@@ -18615,6 +18615,53 @@ class PostTest(unittest.TestCase):
         self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
         self.assertEqual(gg.post_state(comment["id"])["state"], "queued")  # the login's comment waits the pause out
 
+    def stuck_pr(self, **extra) -> dict:
+        """A PR the login already tried once (attempts=1) and that its create pause now holds."""
+        pr = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "b")
+        path = gg.outbox_dir() / (pr["id"] + ".json")
+        gg.write_json(path, {**pr, "attempts": 1, "throttled": 1, "throttleWhy": "secondary", **extra})
+        return pr
+
+    def test_a_pr_the_login_tried_once_moves_to_the_lander_app_after_a_look_finds_none(self) -> None:
+        """Before: attempts=1 pinned the create to the login for every renewed pause. After: the open-PR look finds
+        none, then the lander App makes it."""
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.stuck_pr()
+        d, t = self.daemon((200, {}, []),
+                           (201, {}, {"number": 8, "html_url": "https://github.com/teamleaderleo/glaeda/pull/8"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[:2] for c in t.calls][-1], ("POST", "/repos/teamleaderleo/glaeda/pulls"))
+        self.assertEqual(seen[-1], "Bearer " + self.APP_TOKEN)
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+
+    def test_a_pr_the_login_tried_once_is_finished_when_the_look_finds_it(self) -> None:
+        self.no_env_token()
+        self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.stuck_pr()
+        url = "https://github.com/teamleaderleo/glaeda/pull/5"
+        d, t = self.daemon((200, {}, [{"number": 5, "html_url": url}]))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])  # nothing was posted: no duplicate
+        state = gg.post_state(pr["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", url))
+
+    def test_a_pr_the_login_tried_once_stays_when_the_look_gets_no_answer(self) -> None:
+        self.no_env_token()
+        self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.stuck_pr()
+        d, t = self.daemon((500, {}, {"message": "boom"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertNotIn("POST", [c[0] for c in t.calls])
+        self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
+
     def test_a_cmux_pr_never_leaves_the_login_in_a_pause(self) -> None:
         self.no_env_token()
         asked = self.app_writer("lander")
