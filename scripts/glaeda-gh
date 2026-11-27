@@ -27779,6 +27779,12 @@ class LandQueue:
         # gcp-agent-lane-12, 2026-11-23..25: 30 of 86 "the cache shows it merged" notices woke a lane that said only
         # "nothing to do"; 8 of 90 after "merged pinned". Leo, 2026-11-24: "are there any like process level fixes?"
         own = how in LAND_OWN_MERGE_HOWS
+        to = land_notify_target(e, e.get("requester") or "")
+        waiter = land_row_waiter_for(e["key"], to) if wake and own and to else None
+        if waiter is not None:
+            # LAND_MERGED_WAITER_QUIET's comment: the requester's own `wait pr` on this row wakes it with this merge
+            log({"event": "land-merged-waiter-quiet", "key": e["key"], "to": to, "waiterPid": waiter.get("pid")})
+            wake = False
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
@@ -35264,6 +35270,81 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
 LAND_ROW_WAIT_POLL = 1.0  # a local file read, as cmd_land's own wait
 
 
+# LAND_MERGED_WAITER_QUIET: a session that queues a land and then runs `wait pr R#N` on it in the background was woken
+# twice by one merge: the land daemon's "merged at SHA" notice, and its own background command ending on the same row
+# a second later. gcp-agent-lane-5, 2026-11-26 09Z..11-27 09Z: 185 of 430 `wait pr` calls overlapped an active land
+# row for the same PR on this host, and land notices were 17.5% of every wake there (goal wakes-per-landed-pr; Leo:
+# "us not getting fucking swamped by our own fucking wake-ups, our own tool calls"). So a wait on a row
+# (land_row_wait) leaves a marker in land/waiters naming its pid and session, and `merged` sends no wake to a requester
+# whose own waiter is still running, or ended on this merge within LAND_WAITER_GRACE: the waiter's exit carries the
+# merge line. Stops, a judge's escalation, a waiter of another session, or no waiter: unchanged. Detector:
+# test-glaeda-gh-wait-land-row.py test_a_merge_the_requesters_own_waiter_reports_sends_no_second_wake.
+LAND_WAITER_GRACE = 120.0
+
+
+def land_waiters_dir() -> Path:
+    return land_dir() / "waiters"
+
+
+def land_waiter_prefix(key: str) -> str:
+    return hashlib.sha1(key.encode()).hexdigest()[:16] + "-"
+
+
+def land_waiter_path(key: str, pid: int) -> Path:
+    return land_waiters_dir() / f"{land_waiter_prefix(key)}{pid}.json"
+
+
+def land_row_waiter_for(key: str, to: str) -> dict | None:
+    """The marker of a `wait pr` on KEY's land row that is session TO's and still runs, or ended on the merge within
+    LAND_WAITER_GRACE; None when there is none (LAND_MERGED_WAITER_QUIET). A local read only."""
+    d = land_waiters_dir()
+    if not to or not d.is_dir():
+        return None
+    for path in d.glob(land_waiter_prefix(key) + "*.json"):
+        doc = read_json(path)
+        if not isinstance(doc, dict) or doc.get("key") != key or doc.get("to") != to:
+            continue
+        ended = doc.get("endedAt")
+        if ended is None and alive(doc.get("pid")):
+            return doc
+        if (isinstance(ended, (int, float)) and doc.get("state") == "merged"
+                and 0 <= time.time() - ended < LAND_WAITER_GRACE):
+            return doc
+    return None
+
+
+def land_waiter_mark(key: str) -> Path | None:
+    """Write this process's land/waiters marker for KEY (LAND_MERGED_WAITER_QUIET); None when it has no session."""
+    me = land_requester(None)
+    if not me:
+        return None
+    marker = land_waiter_path(key, os.getpid())
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        write_json(marker, {"key": key, "pid": os.getpid(), "to": me, "since": time.time()})
+    except OSError:
+        return None
+    return marker
+
+
+def land_waiter_end(marker: Path | None, state: str) -> None:
+    """Stamp MARKER merged (kept LAND_WAITER_GRACE for the daemon to read), or remove it for any other end."""
+    if marker is None:
+        return
+    with contextlib.suppress(OSError):
+        doc = read_json(marker)
+        if state == "merged" and isinstance(doc, dict):
+            write_json(marker, {**doc, "state": "merged", "endedAt": time.time()})
+        else:
+            marker.unlink()
+        for old in land_waiters_dir().glob("*.json"):  # ended markers past their grace
+            with contextlib.suppress(OSError):
+                if time.time() - old.stat().st_mtime > 6 * LAND_WAITER_GRACE and old != marker:
+                    got = read_json(old)
+                    if not isinstance(got, dict) or got.get("endedAt") is not None or not alive(got.get("pid")):
+                        old.unlink()
+
+
 def land_row_now(key: str) -> dict | None:
     """KEY's land row as last saved, from its own file, or from a scan of land/entries when that file is not it."""
     e = land_wait_entry(key)
@@ -35284,18 +35365,21 @@ def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as
                 f"row until it merges or stops (a local read; no GitHub watcher)")
     leash = Leash(timeout, ceiling)
     entry: dict | None = row
+    marker = land_waiter_mark(key)  # LAND_MERGED_WAITER_QUIET
     while True:
         entry = land_row_now(key)
         state = (entry or {}).get("state")
         if entry is None or state == LAND_FORWARDED:
             say_waiting(f"glaeda-gh: {name}'s land row is "
                         f"{'forwarded to another host' if entry else 'gone'}: waiting on the PR instead")
+            land_waiter_end(marker, "")
             return None
         leash.see(land_progress(entry))
         if state in LAND_DONE or leash.left() <= 0:
             break
         sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
     state = str(entry.get("state") or "")
+    land_waiter_end(marker, state)
     code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
     out: dict[str, Any] = {"ok": code == EXIT_OK, "key": key, "code": "land_row", "state": state,
                            "result": {"merged": "merged", "stopped": "stopped", "cancelled": "cancelled"}.get(
