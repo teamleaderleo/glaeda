@@ -670,6 +670,13 @@ TICK_BUDGET = 90  # shared wall-clock budget for the tick's GitHub reads, includ
 # each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
 # longer than what a tick had left after the reads ahead of it never stored anything, try after try.
 RESUME_MAX = 300.0
+# The tick's split while a waited PR or run is due (2026-11-27, the land host: ticks spent 85 s, 44 s of them in read head,
+# which went first in the batches; TICK_BUDGET ran out before the waited PRs were read and waited PR data was 3,677 s old):
+# the waited PRs, runs and comments are read first and may take the tick up to WAITED_TICK_SHARE s, and the heads that
+# follow have at least HEADS_MIN_SHARE s, so neither kind starves the other. A head's own read stays bounded by
+# REST_HEAD_BUDGET from the tick's start.
+HEADS_MIN_SHARE = 20
+WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
 # (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
@@ -997,6 +1004,13 @@ CONSUMER_WINDOW = 3600
 # also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
 # REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
 HEAD_DIRECT_MAX = 60
+# A waited PR or run whose data is past STALE_DATA_AFTER while GraphQL cannot read it (under its reserve, or GitHub told the
+# daemon to back off) is read over REST past the daemon's REST share (restShare 0 on a host the config does not name), the
+# oldest first, STALE_DIRECT_PER_TICK a tick and STALE_DIRECT_MAX an hour. cmux-cp-1 2026-11-27: GraphQL stopped at 723 left
+# and restShare 0, the share is "0 of 0", PR data a wait was blocked on reached 13,380 s while REST had 4,373 of 5,000 left,
+# and the stale valve restarted the daemon eight ticks in a row, which only hid it (read_stale_direct).
+STALE_DIRECT_MAX = 120
+STALE_DIRECT_PER_TICK = 3
 # A head asked after a tick's due phase (`glaeda-gh checks` on a new SHA: a merge gate's bounded wait) is read between
 # that tick's read batches, not at the next tick's due phase. cosmic-gray, 2026-11-23 23:17-23:49Z: ticks ran 1.5-5 min
 # (PR reads took 483 of 614 s), the lane-gh broker's land waits 20 s for an unread head (next_autoland
@@ -4009,6 +4023,19 @@ APP_CREATES_ENV = "GLAEDA_APP_CREATES"
 APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
 APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
 APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+# ... but only for a PR into main: cla.yml runs on `pull_request_target branches: [main]`, so a PR into feat-cmux-next has
+# no CLA check and an App opener signs nothing (app/cmux-agent's #61277 and 20+ more merged that way). A PR whose base is
+# not main asks broker-actor with --base; machines/gh-app-roles.json bot_authored_write_bases decides (Leo, 2026-11-27
+# 08:12Z: "aren't we using mosly the quota goblin pool intead of my persoal login?"; 9 cmux creates held 14+ min).
+# Detector: test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_app_in_a_pause.
+APP_CREATE_MAIN_BASES = frozenset({"", "main"})
+
+
+def app_create_never(item: dict) -> bool:
+    """Whether ITEM's create must stay on the login: a repo in APP_CREATE_NEVER, unless its base is not main."""
+    if str(item.get("repo") or "").lower() not in APP_CREATE_NEVER:
+        return False
+    return str(item.get("base") or "").strip().lower() in APP_CREATE_MAIN_BASES
 APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
 
 # Comments on a POOL of poster Apps (Leo, 2026-11-24: "but i already have github apps made. quota-goblin... etc. well,
@@ -6833,6 +6860,7 @@ class Daemon:
         self.tick_splits: dict[str, int] = {}  # queries each kind added this tick by splitting (GQL_SPLITS)
         self.tick_asked: dict[str, bool] = {}  # a kind sent a query this tick: a share's UNTIL may cut its next call
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
+        self.stale_direct_at: list[float] = []  # when each stale waited read over REST was admitted (STALE_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
@@ -8341,7 +8369,7 @@ class Daemon:
         op = APP_CREATE_OP.get(str(item.get("kind")))
         if not op or not app_creates_on() or item.get("appCreates") is False:
             return False
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+        if app_create_never(item) or item.get("appRefused"):
             return False
         return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
 
@@ -8435,7 +8463,7 @@ class Daemon:
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+        if op != "comment" and app_create_never(item):
             return None
         role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
@@ -8461,13 +8489,17 @@ class Daemon:
         tool = app_pool_tool()
         if not tool:
             return None
-        key = (op, str(item["repo"]).lower())
+        base = str(item.get("base") or "").strip() if str(item.get("repo") or "").lower() in APP_CREATE_NEVER else ""
+        key = (op, str(item["repo"]).lower(), base)
         cached = self.app_actors.get(key)
         if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
             return cached[1]
         actor = None
         try:
-            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
+            argv = [sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]]
+            if base:
+                argv += ["--base", base]
+            result = run_bounded(argv, timeout=12)
             found = json.loads(result.stdout) if not result.returncode else None
             if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
                     re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
@@ -10388,11 +10420,19 @@ class Daemon:
         # due: the plain floor batch, the blocked batches, the round robin's turn and the App share. It bounded only the
         # blocked batches, so the floor batch and the round robin's turn read heads for as long as the splits ran (the
         # land host, 2026-11-25, as at GQL_SPLITS). The first head query of the tick still goes (batched's UNTIL).
-        until_of = {"head": time.monotonic() + REST_HEAD_BUDGET if blocked["pr"] or blocked["run"] else None}
+        tick_start = time.monotonic()
+        waited_due = bool(blocked["pr"] or blocked["run"])
+        until_of = {"head": tick_start + REST_HEAD_BUDGET if waited_due else None}
+        if waited_due:  # the waited share: no new waited or plain batch starts past it, the heads keep their minimum
+            until_of.update({k: tick_start + WAITED_TICK_SHARE for k in ("pr", "run", "comment")})
         self.head_until = until_of["head"]  # and the looks between the batches (heads_between) keep it too
-        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
+        # waited PRs, runs and comments first, the heads after (they went first and took 44 of 85 s)
+        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head"):
             if over[kind] != "graphql":
                 continue
+            if kind == "head" and waited_due:  # the heads' minimum share, whatever the waited reads took
+                until_of["head"] = max(until_of["head"], time.monotonic() + HEADS_MIN_SHARE)
+                self.head_until = until_of["head"]
             if kind == "pr" and (lead := self.starved_lead(blocked[kind])) is not None:
                 read_stale_pr(lead, over[kind])
                 blocked[kind] = [e for e in blocked[kind] if e["key"] != lead["key"]]
@@ -10570,6 +10610,42 @@ class Daemon:
             self.resume_key, self.resume_from = "", float("inf")
             self.settle_prefetch()
 
+    def stale_direct_room(self) -> bool:
+        """Whether a stale waited key may be read over REST past the daemon's share now: GraphQL cannot read it (stopped, or
+        GitHub's back-off), REST is neither stopped nor under its floor, no secondary hold, and fewer than STALE_DIRECT_MAX
+        such reads this hour. While GraphQL can read, the batches and read_waited's own pass do."""
+        self.stale_direct_at = [t for t in self.stale_direct_at if self.now - t < CONSUMER_WINDOW]
+        graphql_out = self.mode("graphql") == "stop" or self.backoff["graphql"] > self.now
+        return (graphql_out and self.mode("rest") != "stop" and self.rest_above_floor()
+                and self.clock() >= self.secondary_until and self.backoff["rest"] <= self.now
+                and len(self.stale_direct_at) < STALE_DIRECT_MAX)
+
+    def read_stale_direct(self, entries: list[dict], read: set[str]) -> None:
+        """The waited PRs and runs with data past STALE_DATA_AFTER, oldest first (starved_lead), read over REST this tick
+        although the daemon's REST share is spent or zero and GraphQL is stopped: the quota rules left them no path at all,
+        so an age bound held only while GraphQL had room (cmux-cp-1 2026-11-27, 13,380 s). At most STALE_DIRECT_PER_TICK a
+        tick and STALE_DIRECT_MAX an hour, charged to the key's own waiters; a key tried within WAITED_FRESH waits."""
+        if not self.stale_direct_room():
+            return
+        pool = [e for e in entries if e["key"] not in read
+                and self.now - self.waited_tried.get(e["key"], float("-inf")) >= WAITED_FRESH]
+        for _ in range(STALE_DIRECT_PER_TICK):
+            lead = self.starved_lead(pool)
+            if lead is None or not self.stale_direct_room() or time.monotonic() >= self.tick_deadline:
+                return
+            pool = [e for e in pool if e is not lead]
+            kind = lead["key"].split(":", 1)[0]
+            self.waited_tried[lead["key"]] = self.now
+            self.stale_direct_at.append(self.now)
+            log({"event": "stale-direct", "key": lead["key"], "age": round(self.now - float((lead.get("cache") or {}).get("dataAt") or 0))})
+            try:
+                with self.calling(*caller_of(lead["key"]), waiter_of(lead)), self.phase("read rest"):
+                    self.rest_fetch[kind](lead)
+            except OutOfTime:
+                raise
+            except Exception as error:  # noqa: BLE001  one key's failure leaves the next its turn
+                self.errors.append(f"{lead['key']}: {describe(error)}")
+
     def read_waited(self, entries: list[dict], read: set[str]) -> None:
         """The PRs and runs a wait is blocked on (here, or a lane VM's through the broker: its upstream read carries
         "wait"), read over GraphQL once their data is WAITED_FRESH old while the GraphQL reserve alone stops the
@@ -10579,6 +10655,12 @@ class Daemon:
         through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
         self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
         self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
+        try:
+            self.read_stale_direct(entries, read)
+        except OutOfTime:
+            pass  # the tick's own budget ran out: the tick ends on its next read
+        except Exception as error:  # noqa: BLE001  a bounded extra read must never stop the tick
+            self.errors.append(f"stale direct: {describe(error)} at {error_site(error)}")
         if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
                 or self.waited_points() >= WAITED_PER_MINUTE):
             return
@@ -17294,6 +17376,83 @@ LAND_READY_ONCE = "readySent"
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# The push of a base merge this queue made (union_push) runs the host's pre-push hook, and leo-workspace
+# tools/git-hooks/pre-push gives pr-owner's GitHub read up to PR_OWNER_CAP (150 s) before it lets the push through: a
+# 120 s deadline (LAND_GH_DEADLINE) killed that push at 120 s whenever GitHub reads were slow. manaflow-ai/cmux#60119
+# and #60384 on air-blue, 2026-11-27: the update-branch was held by gh-quota (its content-pause authority on cmux-cp-1
+# did not answer) and answered exit 0 "queued", the queue made the clean base merge itself after LAND_HEAD_TIMEOUT, and
+# its push exited 124 at 120 s with nothing sent (union_merge_unknown); the row then waited out LAND_UPDATE_ONCE and
+# stopped "update_branch_no_new_head ... 3778 s ago" (4715 s for #60384), the base merge it had already tried counted
+# as done. A person pushed the same clean merge by hand and #60119 merged at once. Now the push has the hook's cap and
+# a margin, and a push that timed out is pushed again (the same commit: a fast-forward of the head, or nothing when it
+# did reach GitHub) once the head wait after it (LAND_HEAD_TIMEOUT) passes with no new head, LAND_UNION_PUSH_TRIES in
+# all; only then does it stop, naming the push. Detector: test-glaeda-gh.py
+# test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes.
+LAND_UNION_PUSH_DEADLINE = 240.0
+LAND_UNION_PUSH_TRIES = 2
+
+# LAND_UNION_ONE_KEY: a union merge of two sides that each rewrote one frontmatter line keeps both lines. goals/*.md
+# merge by union for their dated notes (cmuxterm-hq .gitattributes), and on 2026-11-27 goals/ci-min-per-pr-140.md
+# reached cmuxterm-hq main with three `next_step:` lines, so test_now_goals.test_repo_records_parse went red (hq#32408
+# fixed the record; hq#32592 the broker's own union merge). Union is right for a record's body, never for its keys:
+# union_plan keeps one entry per frontmatter key in each path git's plain merge conflicts on, the side's that changed
+# it from the merge base, the head's when both did (it lands after the base).
+LAND_FRONT_KEY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:\s|$)")
+
+
+def land_front_entries(text: str | None) -> tuple[list[tuple[str | None, list[str]]], int] | None:
+    """TEXT's frontmatter as (key, its lines) entries, a key's indented or list lines with it, and the index of the
+    closing --- line among TEXT's lines; None when TEXT has no frontmatter."""
+    lines = text.split("\n") if isinstance(text, str) else []
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    entries: list[tuple[str | None, list[str]]] = []
+    for i, line in enumerate(lines[1:], 1):
+        if line.rstrip() == "---":
+            return entries, i
+        if LAND_FRONT_KEY.match(line):
+            entries.append((line.split(":", 1)[0], [line]))
+        elif entries:
+            entries[-1][1].append(line)
+        else:
+            entries.append((None, [line]))
+    return None
+
+
+def land_front_entry(text: str | None, key: str) -> list[str] | None:
+    """The lines of TEXT's first frontmatter entry for KEY, or None when it has none."""
+    got = land_front_entries(text)
+    return next((lines for k, lines in (got[0] if got else []) if k == key), None)
+
+
+def land_one_line_per_key(merged: str, base: str | None, head: str | None, other: str | None) -> str:
+    """MERGED (the union merge of HEAD and OTHER, forked at BASE) with each frontmatter key it names twice or more
+    named once, where its first entry was: HEAD's entry when HEAD changed it from BASE, else OTHER's, else (neither
+    side's entry is among MERGED's) the first (LAND_UNION_ONE_KEY)."""
+    got = land_front_entries(merged)
+    if not got:
+        return merged
+    entries, close = got
+    seen: dict[str, int] = {}
+    for k, _ in entries:
+        if k:
+            seen[k] = seen.get(k, 0) + 1
+    doubled = {k for k, n in seen.items() if n > 1}
+    if not doubled:
+        return merged
+    out: list[str] = []
+    done: set[str] = set()
+    for k, lines in entries:
+        if k not in doubled:
+            out.extend(lines)
+        elif k not in done:
+            done.add(k)
+            mine, was, theirs = land_front_entry(head, k), land_front_entry(base, k), land_front_entry(other, k)
+            pick = mine if mine is not None and mine != was else theirs
+            have = [ls for kk, ls in entries if kk == k]
+            out.extend(pick if pick in have else have[0])
+    return "\n".join(["---", *out, *merged.split("\n")[close:]])
+
 # A lane VM's union mirror is filled only by the broker's fetch (lane-gh fetch), which names the mirror's own tips as
 # had. A lane VM, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
 # commits back), so every base merge's fetch asked for five weeks of history and the broker refused it in 13 s ("HTTP
@@ -19169,6 +19328,7 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
+                 held: Callable[[], bool] | None = None,
                  own_pool: Callable[[], bool] = land_own_token_pool,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
@@ -19194,6 +19354,7 @@ class LandQueue:
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
+        self.held = held or (lambda: land_host_held())  # this host is held for draining (land_host_held): its open entries go to the broker host
         self.own_pool = own_pool  # this host holds a token pool of its own (land_own_token_pool, LAND_PEER_SILENT)
         self.own_pool_seen = (float("-inf"), False)  # (until, held): own_pool's file reads once per APP_POOL_TTL
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
@@ -22968,6 +23129,8 @@ class LandQueue:
             if SHA40.fullmatch(head) and (e.get("pinSha") or not SHA40.fullmatch(cached) or cached == head):
                 self.hand_off_now(e, head, str(infra.get("why") or "GitHub could not be read here"), "handoff_infra")
                 return
+        if self.held_handoff(e, data):
+            return
         if self.after_wait(e):
             return
         head = str(data.get("headRefOid") or "").lower()
@@ -25214,6 +25377,21 @@ class LandQueue:
                 return ""  # judged here again (LAND_LOCAL_GIT_TIMEOUT's comment)
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
+    def held_handoff(self, e: dict, data: dict) -> bool:
+        """Under the lock, from consider: on a broker client this host's registry row holds for draining
+        (land_host_held, HELD_PREFIXES' comment), hand E at its pin, else the cached head, to the broker host's land
+        queue now, once per head; True when that job was started. The VM is going away, and its queue with it."""
+        if e.get("state") == LAND_FORWARDED or not self.broker_client() or self.broker_peer_silent() \
+                or not self.held():
+            return False
+        head = (str(e.get("pinSha") or "") or str(data.get("headRefOid") or "")).lower()
+        if not SHA40.fullmatch(head) or e.get("heldHandoff") == head:
+            return False
+        e["heldHandoff"] = head
+        self.hand_off_now(e, head, "this host is held for draining and deletion: its land goes to the broker host",
+                          "handoff_held")
+        return True
+
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
         """E is due a judgment: on a broker client that could not read GitHub in most of its last live judgments
         (LAND_EARLY_HANDOFF's comment), hand it at its full head to the broker host's land queue now, on a job of its
@@ -25869,12 +26047,30 @@ class LandQueue:
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
+    def merge_on_app(self, e: dict) -> bool:
+        """Whether `gh pr merge` of E goes out on the lander App (gh_app_token.py route says so): the App's token has its
+        own quota and no login's content-creation pause, so the pause never holds it. cmux#61194 and hq#32880 sat held
+        on the login's pause for over 30 min, 2026-11-27 (Leo: "aren't we using mosly the quota goblin pool intead of
+        my persoal login?"). A refusal of the App falls back to the login's shim, which parks it as before.
+        GLAEDA_APP_CREATES=0 turns it off. Detector: test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause."""
+        tool = app_pool_tool()
+        if not tool or not app_creates_on():
+            return False
+        try:
+            got = run_bounded([sys.executable, "-I", str(tool), "route", "pr", "merge", str(e["number"]), "-R",
+                               str(e["repo"])], timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return got.returncode == 0 and got.stdout.split("\t", 1)[0].strip() == "lander"
+
     def held_by_create_pause(self, e: dict, kind: str, head: str) -> bool:
         """Whether the login's create pause holds KIND at HEAD now (create_pause): then E is parked until it ends, as
         the shim's own refusal would park it (park_quota on its words), and nothing is sent. Never counted toward a
         stop, nor is the judgment after it (stepQuotaParked)."""
         until = self.create_pause(self.now)
         if until <= self.now:
+            return False
+        if kind == "merge" and self.merge_on_app(e):
             return False
         with self.lock:
             self.history(e, "step_held", kind=kind, head=head[:12], why="the login's create pause")
@@ -26406,6 +26602,9 @@ class LandQueue:
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        tree, why = self.union_one_key(gitdir, tree, paths, head, base_sha)
+        if why:
+            return "", "", "", why
         base_tree = (self.union_git(gitdir, "rev-parse", f"{base_sha}^{{tree}}").stdout or "").strip()
         if SHA40.fullmatch(base_tree) and base_tree == tree:
             # LAND_ZERO_DIFF: the merge resolves to the base's own tree, so the merge commit (and the land after it)
@@ -26437,8 +26636,53 @@ class LandQueue:
         sha = (commit.stdout or "").strip()
         if commit.returncode != 0 or not SHA40.fullmatch(sha):
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
-        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
+        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir, branch=branch)
         return sha, branch, base_sha, ""
+
+    def union_one_key(self, gitdir: str, tree: str, paths: list[str], head: str, base: str) -> tuple[str, str]:
+        """(TREE with each of PATHS naming each frontmatter key once (land_one_line_per_key), "") or ("", why not)
+        (LAND_UNION_ONE_KEY). Writes only objects into this host's union mirror, through a scratch index."""
+        fork = self.union_git(gitdir, "merge-base", head, base)
+        fork_sha = (fork.stdout or "").split()[0] if fork.returncode == 0 and (fork.stdout or "").split() else ""
+
+        def read(commit: str, path: str) -> str | None:
+            if not commit:
+                return None
+            got = self.union_git(gitdir, "cat-file", "blob", f"{commit}:{path}")
+            return got.stdout if got.returncode == 0 and isinstance(got.stdout, str) else None
+
+        fixed: dict[str, str] = {}
+        for path in paths:
+            text = read(tree, path)
+            if text is None or "\r" in text:
+                continue
+            one = land_one_line_per_key(text, read(fork_sha, path), read(head, path), read(base, path))
+            if one != text:
+                fixed[path] = one
+        if not fixed:
+            return tree, ""
+        with tempfile.TemporaryDirectory(prefix="glaeda-union-key-") as tmp:
+            index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            got = self.union_git(gitdir, "read-tree", tree, extra=index)
+            if got.returncode != 0:
+                return "", f"git read-tree {tree[:12]} failed: {land_trim(got.stderr or '', 160)}"
+            for n, (path, text) in enumerate(sorted(fixed.items())):
+                blob_file = os.path.join(tmp, f"blob-{n}")
+                with open(blob_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                blob = self.union_git(gitdir, "hash-object", "-w", blob_file)
+                listed = self.union_git(gitdir, "ls-tree", tree, "--", path)
+                oid, mode = (blob.stdout or "").strip(), ((listed.stdout or "").split() or ["100644"])[0]
+                if blob.returncode != 0 or not SHA40.fullmatch(oid):
+                    return "", f"git hash-object of {path} failed: {land_trim(blob.stderr or '', 160)}"
+                got = self.union_git(gitdir, "update-index", "--cacheinfo", f"{mode},{oid},{path}", extra=index)
+                if got.returncode != 0:
+                    return "", f"git update-index of {path} failed: {land_trim(got.stderr or '', 160)}"
+            wrote = self.union_git(gitdir, "write-tree", extra=index)
+            out = (wrote.stdout or "").strip()
+            if wrote.returncode != 0 or not SHA40.fullmatch(out):
+                return "", f"git write-tree failed: {land_trim(wrote.stderr or '', 160)}"
+        return out, ""
 
     def union_merge(self, e: dict, head: str) -> None:
         """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
@@ -26476,8 +26720,16 @@ class LandQueue:
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, kind, head, said, why, tried)
             return
+        self.union_push(e, head, sha, branch, base_sha, kind, said)
+
+    def union_push(self, e: dict, head: str, sha: str, branch: str, base_sha: str, kind: str, said: str) -> None:
+        """Push SHA, the base merge union_plan made on top of HEAD, to the PR's BRANCH and wait for the new head
+        (LAND_UNION_PUSH_DEADLINE's comment). A push that timed out is recorded in e["updateSent"]["union"], so
+        update_branch pushes it again after the head wait instead of waiting out LAND_UPDATE_ONCE."""
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
+            tries = int((e.get("unionMerge") or {}).get("pushTries") or 0) + 1
+            e["unionMerge"].update(merge=sha, branch=branch, pushTries=tries)
             self.claim(e, "update_branch", before=head, form="union_merge", merge=sha)
             e["updateSent"] = {"head": head, "at": self.now}
             self.save(e)
@@ -26485,16 +26737,17 @@ class LandQueue:
             # The broker pushes only a branch this lane pushed before: another lane's PR is refused, and stops below.
             argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--base",
                     str(e["unionMerge"].get("baseRef") or ""), "--rev", sha, "--dir", gitdir]
-            got = self.call(argv, LAND_GH_DEADLINE, e)
+            got = self.call(argv, LAND_UNION_PUSH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
-                                 timeout=LAND_GH_DEADLINE)
+                                 timeout=LAND_UNION_PUSH_DEADLINE)
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             self.nudge(e["key"])
             if got.returncode == 124:  # sent, unanswered: it may have reached GitHub (push_step keeps it sent too)
-                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12])
+                e["updateSent"].update(union=sha, branch=branch, base=base_sha, tries=tries)
+                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12], tries=tries)
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
                 return
             if got.returncode != 0:
@@ -27129,6 +27382,33 @@ class LandQueue:
             return ""
         return f"its override names {', '.join(sorted(named)[:6])}, none of the PR's {len(files)} changed files"
 
+    def union_push_again(self, e: dict, head: str, sent: dict, waited: float) -> None:
+        """LAND_UNION_PUSH_DEADLINE's comment: this queue's push of its base merge at HEAD timed out and the head wait
+        after it passed with no new head. Push the same merge again, LAND_UNION_PUSH_TRIES in all; then stop, naming
+        the push and the hand command, never waiting out LAND_UPDATE_ONCE on it."""
+        repo, number = e["repo"], str(e["number"])
+        sha, branch = str(sent.get("union") or ""), str(sent.get("branch") or "")
+        tries = int(sent.get("tries") or 1)
+        tried = e.get("unionMerge") or {}
+        gitdir = str(tried.get("gitdir") or "")
+        kind = str(tried.get("kind") or "update_branch")
+        have = bool(gitdir) and self.union_git(gitdir, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
+        if tries < LAND_UNION_PUSH_TRIES and have and branch:
+            with self.lock:
+                self.history(e, "union_push_retry", head=head[:12], merge=sha[:12], waited=round(waited),
+                             why="the push of the base merge timed out and no new head showed: pushed again")
+                self.save(e)
+            self.union_push(e, head, sha, branch, str(sent.get("base") or ""), kind, str(tried.get("out") or ""))
+            return
+        with self.lock:
+            self.stop(e, "update_branch_no_new_head",
+                      f"the base merge {sha[:12]} this queue made on {head[:12]} (git merges the base cleanly) was "
+                      f"pushed {tries} time(s) and each push timed out after {LAND_UNION_PUSH_DEADLINE:.0f} s; "
+                      f"{waited:.0f} s after the last one the head is still {head[:12]}"
+                      + ("" if have else f" (the merge commit is gone from {gitdir or 'the union mirror'})"),
+                      f"gh pr checkout {number} -R {repo}; git merge origin/{tried.get('baseRef') or '<its base>'}; "
+                      f"git push; then glaeda-gh land {repo}#{number} --sha <the new head>")
+
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
         tried = e.get("unionMerge") or {}
@@ -27184,6 +27464,9 @@ class LandQueue:
             # it makes; with none by the bound, stop and say so.
             waited = self.now - float(sent.get("at") or 0)
             if sent.get("answered") and self.update_noop(e, head, sent, waited):
+                return
+            if sent.get("union") and waited >= LAND_HEAD_TIMEOUT:
+                self.union_push_again(e, head, sent, waited)
                 return
             with self.lock:
                 if waited >= LAND_UPDATE_ONCE:
@@ -35033,15 +35316,22 @@ def direct_parts_load(now: float) -> dict[str, dict]:
 
 
 def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
-    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read)."""
+    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read).
+    The load, merge and write are one step under a lock: several waits and land workers on a host end within seconds
+    of each other, and unlocked each wrote back the file it had read before the others' answers, so a base's rulesets
+    one of them had just read was dropped and the next direct read asked GitHub for it again."""
     try:
-        kept = direct_parts_load(now)
-        for path, v in repo_parts.items():
-            if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
-                    and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
-                kept[path] = v
-        newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
-        write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(BASE / (DIRECT_PARTS + ".lock"), 2.0) as held:
+            if not held:
+                return  # a sibling is writing: its merge keeps the older answers; ours are read again at worst
+            kept = direct_parts_load(now)
+            for path, v in repo_parts.items():
+                if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
+                        and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
+                    kept[path] = v
+            newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
+            write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
     except (OSError, ValueError, TypeError):
         pass
 
@@ -36465,6 +36755,44 @@ def fleet_registries() -> list[dict]:
     docs = [read_json(path) for path in (Path(SPENDERS_CMD).resolve().parent.parent / "machines/fleet-registry.json",
                                          Path.home() / ".ssh/config.d/fleet-registry.json")]
     return [doc for doc in docs if isinstance(doc, dict)]
+
+
+
+# A GCP lane VM the fleet registry holds (a "hold", or lanes.accept_new false) is drained and then deleted by
+# cmuxterm-hq fleet_gce.held_reapable_from_machines; leo-workspace tools/lane_cap_watch.held_vms names the same set,
+# and lane_cap_rebalance moves its idle sessions off. Its land queue went nowhere: an entry still open here died with
+# the VM, so the drain kept every lane with an open land on it ("landing"), and on 2026-11-27 10:45Z that held ~38 idle
+# sessions on 10 held VMs (every-machine-in-table). A held host hands each open entry to the broker host's land queue
+# (land_handoff, as an owner refusal does) instead: LandQueue.held_handoff.
+HELD_PREFIXES = ("gcp-codex-lane-", "gcp-agent-lane-", "gcp-codex-swarm-")
+HELD_ELASTIC_PREFIX = "gcp-agent-lane-e"
+HELD_TTL = 300.0
+_host_held: tuple[float, bool] | None = None
+
+
+def registry_held(doc: dict, host: str) -> bool:
+    """Whether registry DOC holds HOST for draining: lane_cap_watch.held_vms's rule for one host."""
+    row = ((doc or {}).get("machines") or {}).get(host)
+    if not isinstance(row, dict) or row.get("retired") is True or not isinstance(row.get("lanes"), dict):
+        return False
+    if not row.get("hold") and row["lanes"].get("accept_new") is not False:
+        return False
+    if not host.startswith(HELD_PREFIXES) or host.startswith(HELD_ELASTIC_PREFIX) or row.get("elastic"):
+        return False
+    roles = row.get("roles") if isinstance(row.get("roles"), list) else []
+    return not (row.get("control_plane") or any("control" in str(r).replace("_", "-") for r in roles))
+
+
+def land_host_held() -> bool:
+    """Whether this host is held for draining (registry_held), read at most once per HELD_TTL; unreadable: not."""
+    global _host_held
+    now = time.time()
+    if _host_held is not None and now - _host_held[0] < HELD_TTL:
+        return _host_held[1]
+    docs = fleet_registries()
+    held = bool(docs) and registry_held(docs[0], policy_host())
+    _host_held = (now, held)
+    return held
 
 
 FLEET_MACHINES_TTL = 300.0
