@@ -7187,7 +7187,7 @@ DEAD_MODE = False
 
 def dead_family_ids() -> frozenset[str]:
     return frozenset({*STEP_CHECKOUT_FAMILIES, HOME_SCRATCH_FAMILY, TART_IMAGES, TART_IPSWS, TART_VMS,
-                      LIMA_VMS, *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
+                      LIMA_VMS, *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED, RUNNER_ABANDONED_WORK})
 
 
 def dead_item(fam: Family, path: Path) -> bool:
@@ -8862,6 +8862,423 @@ def apply_docker_store(receipt: Path, halt=None, below_target=None, families: fr
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(max(0, before - after))}  {fam} (docker {' '.join(command)})")
+        if why:
+            break
+    return released
+
+
+# Runner accounts' homes on a Linux lane VM (/home/ghrun, /home/ghrunner: the persistent GitHub runners of leo-workspace
+# tools/lane-runners, o1..oN, r1..rN, w1). Every family above is $HOME-relative or a fixed root, and this account cannot
+# list another account's 0750 home, so nothing measured or freed any of it: gcp-agent-lane-1 (2026-11-27) sat at 88% of
+# 774G with 126 GB in /home/ghrun while `cmux-disk` and `wt reclaim` found 0.0 GB reclaimable there. Measured there:
+# r1/_work 20G and r2/_work 14G (standard_workdir.py moved every runner to <dir>/work on 11-20 and left the old _work
+# in place, "remove it once every runner moved"), r1/work 12G (a runner the gate stopped on 11-20), and
+# /home/ghrun/.cache/go-build 21G (untouched since 11-18). Three families, one item per folder, never the runner itself
+# (its .runner, .credentials, .service, bin/ and externals/ stay: the gate starts a stopped runner again):
+# - RUNNER_ABANDONED_WORK: a runner's work or _work folder its .runner's workFolder does not name, a dead family: no
+#   runner works in it again (job-started.sh reads the workspace the runner gives it).
+# - RUNNER_STOPPED_WORK: the work folder a runner's .runner names, only while its systemd unit is not active and no
+#   process runs from the runner's folder; the runner checks the repository out again on its next job.
+# - RUNNER_GO_BUILD: Go's build cache (GOCACHE, proven by its README and trim.txt) in a runner account's home, or a
+#   runner's own .cache when it is a real folder; go build fills it again (go clean -cache is the same deletion).
+# Each goes only with a fresh proof, read as root (`sudo -n`, read only): nothing below it changed for
+# RUNNER_HOME_IDLE_HOURS (mtime and ctime, every entry, the walk complete), no process has its cwd, root, executable or
+# an open file below it (every /proc entry read; one unreadable pid holds everything), and the folder is a real
+# directory owned by the account whose home it is in. The deletion runs as that account (`sudo -n -u ACCOUNT`, never
+# root): it renames the folder aside first, so a runner that starts meanwhile makes a fresh one, then removes the aside.
+RUNNER_ABANDONED_WORK = "runner-abandoned-work"
+RUNNER_STOPPED_WORK = "runner-stopped-work"
+RUNNER_GO_BUILD = "runner-go-build"
+RUNNER_HOME_FAMILIES = frozenset({RUNNER_ABANDONED_WORK, RUNNER_STOPPED_WORK, RUNNER_GO_BUILD})
+RUNNER_HOME_IDLE_HOURS = 48.0
+RUNNER_HOME_ROOT = Path("/home")
+RUNNER_HOME_WALK_BUDGET = 4_000_000  # entries per folder; past it the folder reads as used now (kept)
+RUNNER_HOME_PROBE_TIMEOUT_S = 900
+RUNNER_HOME_DELETE_TIMEOUT_S = 1800
+RUNNER_HOME_OWNER = "the lane VM's GitHub runners (leo-workspace tools/lane-runners, lane_runner_gate.py)"
+RUNNER_HOME_REBUILD = {
+    RUNNER_ABANDONED_WORK: "nothing: its runner works in the folder its .runner names",
+    RUNNER_STOPPED_WORK: "the runner checks the repository out again on its next job",
+    RUNNER_GO_BUILD: "go build fills its cache again",
+}
+RUNNER_HOME_CACHE = HOME / ".cache/glaeda-disk/runner-homes.json"
+RUNNER_HOME_CACHE_MAX_AGE_S = 3600.0
+RUNNER_HOME_PROC = "/proc"
+_RUNNER_HOME_INPROCESS = False  # tests: probe and delete in this process, never through sudo
+_RUNNER_HOME_UNIT_ACTIVE = None  # tests: a unit's state instead of systemctl's (in process only)
+
+# Run as root (`sudo -n python3 -I -c`), read only: the candidates and their proofs. probe() is also called in this
+# process (tests, or a root pass), with UNIT_ACTIVE given.
+_RUNNER_HOME_PROBE_SRC = r"""
+import json, os, re, stat, subprocess, time
+
+ASIDE = re.compile(r"\.glaeda-disk-deleting-.+-([0-9]+)")
+
+def _unit_active(unit):
+    try:
+        r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    state = r.stdout.strip()
+    return True if state in ("active", "activating", "reloading", "deactivating") else None if not state else False
+
+def _real_dir(path):
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+def walk(path, budget, deadline):
+    # (bytes in blocks, newest of mtime and ctime, complete): never follows a link, stays on path's device
+    try:
+        top = os.lstat(path)
+    except OSError:
+        return 0, time.time(), False
+    dev, total, newest, seen, stack = top.st_dev, top.st_blocks * 512, max(top.st_mtime, top.st_ctime), 1, [path]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            return total, time.time(), False
+        with it:
+            for e in it:
+                seen += 1
+                if seen > budget or (seen % 4096 == 0 and time.time() > deadline):
+                    return total, time.time(), False
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return total, time.time(), False
+                total += st.st_blocks * 512
+                newest = max(newest, st.st_mtime, st.st_ctime)
+                if stat.S_ISDIR(st.st_mode):
+                    if st.st_dev != dev:
+                        return total, time.time(), False
+                    stack.append(e.path)
+    return total, newest, True
+
+def proc_state(proc):
+    # every /proc entry's cwd, root, exe and open files, and how many pids could not be read
+    links, denied = [], 0
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        base = proc + "/" + pid
+        try:
+            fds = [base + "/fd/" + fd for fd in os.listdir(base + "/fd")]
+        except FileNotFoundError:
+            continue
+        except OSError:
+            denied += 1
+            continue
+        for link in (base + "/cwd", base + "/root", base + "/exe", *fds):
+            try:
+                links.append(os.readlink(link))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                denied += 1
+                break
+            except OSError:
+                continue
+    return links, denied
+
+def _below(links, path):
+    pre = path.rstrip("/") + "/"
+    return sum(1 for l in links if l == path or l.startswith(pre))
+
+def _go_cache(path):
+    try:
+        with open(path + "/README", "rb") as f:
+            head = f.read(200)
+    except OSError:
+        return False
+    return head.startswith(b"This directory holds cached build artifacts from the Go build system.") \
+        and os.path.isfile(path + "/trim.txt")
+
+def _asides(parent, family, out, owner):
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return
+    for name in names:
+        m = ASIDE.fullmatch(name)
+        if m and _real_dir(parent + "/" + name):
+            try:
+                os.kill(int(m.group(1)), 0)
+                continue  # its deleter still runs
+            except ProcessLookupError:
+                pass
+            except OSError:
+                continue
+            out.append({"family": family, "path": parent + "/" + name, "owner_uid": owner, "aside": True})
+
+def candidates(root):
+    out = []
+    try:
+        homes = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for h in homes:
+        home = root.rstrip("/") + "/" + h
+        if not _real_dir(home):
+            continue
+        uid = os.lstat(home).st_uid
+        runners = []
+        try:
+            names = sorted(os.listdir(home))
+        except OSError:
+            continue
+        for n in names:
+            d = home + "/" + n
+            if _real_dir(d) and os.lstat(d).st_uid == uid:
+                try:
+                    if stat.S_ISREG(os.lstat(d + "/.runner").st_mode):
+                        runners.append(d)
+                except OSError:
+                    pass
+        if not runners:
+            continue
+        caches = [home + "/.cache"] + [r + "/.cache" for r in runners]
+        for c in caches:
+            if not _real_dir(c):
+                continue
+            go = c + "/go-build"
+            if _real_dir(go) and _go_cache(go):
+                out.append({"family": "runner-go-build", "path": go, "owner_uid": uid})
+            _asides(c, "runner-go-build", out, uid)
+        for r in runners:
+            try:
+                with open(r + "/.runner", encoding="utf-8-sig") as f:
+                    named = json.load(f).get("workFolder")
+            except (OSError, ValueError, AttributeError):
+                named = None
+            named = os.path.normpath(os.path.join(r, named)) if isinstance(named, str) and named else None
+            try:
+                with open(r + "/.service", encoding="utf-8") as f:
+                    unit = f.read().strip() or None
+            except OSError:
+                unit = None
+            for w in ("work", "_work"):
+                p = r + "/" + w
+                if not _real_dir(p):
+                    continue
+                fam = "runner-stopped-work" if named in (None, p) else "runner-abandoned-work"
+                out.append({"family": fam, "path": p, "owner_uid": uid, "runner": r, "unit": unit,
+                            "named": named})
+            _asides(r, "runner-abandoned-work", out, uid)
+    return out
+
+def probe(root="/home", proc="/proc", budget=4000000, timeout=900.0, only=None, unit_active=None):
+    unit_active = unit_active or _unit_active
+    deadline = time.time() + timeout
+    rows = [c for c in candidates(root) if only is None or c["path"] == only]
+    if not rows:
+        return {"rows": [], "denied": 0}
+    links, denied = proc_state(proc)
+    for row in rows:
+        p = row["path"]
+        try:
+            st = os.lstat(p)
+            row["owned"] = stat.S_ISDIR(st.st_mode) and st.st_uid == row["owner_uid"]
+        except OSError:
+            row["owned"] = False
+        row["holders"] = _below(links, p)
+        if row.get("runner"):
+            row["runner_procs"] = _below(links, row["runner"])
+            row["unit_active"] = unit_active(row["unit"]) if row.get("unit") else False
+        row["bytes"], row["newest"], row["complete"] = walk(p, budget, deadline)
+    return {"rows": rows, "denied": denied}
+"""
+_runner_home_ns: dict[str, Any] = {}
+exec(_RUNNER_HOME_PROBE_SRC, _runner_home_ns)
+
+# Run as the folder's account (`sudo -n -u ACCOUNT -H python3 -I -c`): the folder, a real directory this account owns,
+# renamed aside in its own parent, then removed. Prints {"ok", "errors"}.
+_RUNNER_HOME_DELETE_SRC = r"""
+import json, os, shutil, stat, sys
+path = sys.argv[1]
+errors = []
+try:
+    st = os.lstat(path)
+    parent = os.path.dirname(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_ISLNK(os.lstat(parent).st_mode):
+        print(json.dumps({"ok": False, "errors": ["not a real directory this account owns"]}))
+        sys.exit(0)
+    name = os.path.basename(path)
+    if name.startswith(".glaeda-disk-deleting-"):
+        aside = path
+    else:
+        aside = os.path.join(parent, ".glaeda-disk-deleting-" + name + "-" + str(os.getpid()))
+        os.rename(path, aside)
+    shutil.rmtree(aside, onerror=lambda f, p, e: errors.append(p[-120:] + ": " + type(e[1]).__name__))
+except OSError as e:
+    errors.append(type(e).__name__ + ": " + str(e)[:120])
+print(json.dumps({"ok": not errors, "errors": errors[:5]}))
+"""
+
+
+def runner_home_probe(only: str | None = None) -> dict[str, Any] | None:
+    """The runner homes' candidates with their proofs (_RUNNER_HOME_PROBE_SRC); None when this pass cannot read them as
+    root (no passwordless sudo), off Linux nothing."""
+    if DARWIN:
+        return {"rows": [], "denied": 0}
+    kwargs = {"root": os.fspath(RUNNER_HOME_ROOT), "proc": RUNNER_HOME_PROC, "budget": RUNNER_HOME_WALK_BUDGET,
+              "timeout": float(RUNNER_HOME_PROBE_TIMEOUT_S), "only": only}
+    if _RUNNER_HOME_INPROCESS or os.geteuid() == 0:
+        return _runner_home_ns["probe"](**kwargs, unit_active=_RUNNER_HOME_UNIT_ACTIVE)
+    if not sudo_reads():
+        return None
+    code = (_RUNNER_HOME_PROBE_SRC + "\nimport sys\nprint(json.dumps(probe(**json.loads(sys.argv[1]))))\n")
+    python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else (sys.executable or "python3")
+    argv = ["sudo", "-n", *([ionice, "-c", "3"] if (ionice := shutil.which("ionice")) else []),
+            "timeout", "-k", "5", str(RUNNER_HOME_PROBE_TIMEOUT_S + 60), python, "-I", "-c", code, json.dumps(kwargs)]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=RUNNER_HOME_PROBE_TIMEOUT_S + 90)
+        doc = json.loads(out.stdout.strip().splitlines()[-1]) if out.returncode == 0 and out.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    return doc if isinstance(doc, dict) and isinstance(doc.get("rows"), list) else None
+
+
+def runner_home_item(row: dict[str, Any], denied: int, now: float | None = None,
+                     idle_hours: float = RUNNER_HOME_IDLE_HOURS) -> Item:
+    """One probe row judged (RUNNER_ABANDONED_WORK's comment names the rules)."""
+    now = time.time() if now is None else now
+    fam = str(row.get("family"))
+    newest = row.get("newest") if isinstance(row.get("newest"), (int, float)) else now
+    idle = max(0.0, (now - newest) / 3600)
+    size = int(row.get("bytes") or 0)
+    aside = bool(row.get("aside"))
+    why: list[str] = []
+    if fam not in RUNNER_HOME_FAMILIES:
+        verdict, why = "kept", [f"unknown family {fam}"]
+    elif not row.get("owned"):
+        verdict, why = "kept", ["not a real directory owned by its home's account"]
+    elif denied:
+        verdict, why = "in-use", [f"{denied} processes could not be read, so any of them may hold it"]
+    elif row.get("holders"):
+        verdict, why = "in-use", [f"{row['holders']} open files, cwds or executables of running processes are in it"]
+    elif fam == RUNNER_STOPPED_WORK and not aside and (row.get("unit_active") is not False or row.get("runner_procs")):
+        state = ("its unit's state is unreadable" if row.get("unit_active") is None
+                 else f"its unit {row.get('unit')} is active" if row.get("unit_active")
+                 else f"{row['runner_procs']} processes run from its runner")
+        verdict, why = "in-use", [f"its runner is live: {state}"]
+    elif not row.get("complete"):
+        verdict, why = "kept", ["its walk did not finish (too many entries, another filesystem or an unreadable folder)"]
+    elif not aside and idle < idle_hours:
+        verdict, why = "recent", [f"changed {idle:.1f}h ago, inside its {idle_hours:g}h window"]
+    else:
+        verdict = "reclaimable"
+        why = (["an aside its deleter left"] if aside else
+               [f"its runner works in {row.get('named')}" if fam == RUNNER_ABANDONED_WORK
+                else f"its runner is stopped ({row.get('unit') or 'no unit'})" if fam == RUNNER_STOPPED_WORK
+                else "Go's build cache in a runner account"]) + [f"unchanged {idle:.1f}h, nothing holds it"]
+    return Item(fam, str(row.get("path")), size, round(idle, 1), verdict, why, platform="linux")
+
+
+def runner_home_cached_probe(max_age_s: float = RUNNER_HOME_CACHE_MAX_AGE_S) -> dict[str, Any] | None:
+    """The last whole probe when it is younger than MAX_AGE_S, else a fresh one, kept for the next report: a report
+    must not walk tens of GiB of runner checkouts on every call. Only a listing: every deletion proves its item again."""
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        doc = json.loads(RUNNER_HOME_CACHE.read_text())
+        if (isinstance(doc, dict) and isinstance(doc.get("rows"), list)
+                and 0 <= time.time() - float(doc.get("at") or 0) < max_age_s):
+            return doc
+    doc = runner_home_probe()
+    if doc is not None:
+        with contextlib.suppress(OSError):
+            RUNNER_HOME_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = RUNNER_HOME_CACHE.with_name(f"{RUNNER_HOME_CACHE.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({**doc, "at": time.time()}))
+            os.replace(tmp, RUNNER_HOME_CACHE)
+    return doc
+
+
+def runner_home_items(only: str | None = None, now: float | None = None, cached: bool = False) -> list[Item] | None:
+    """The runner homes' items, judged; None when this pass cannot read them. CACHED: from the last whole probe when it
+    is recent (a report's, or an apply's listing), never for ONLY (a deletion's own proof)."""
+    doc = runner_home_cached_probe() if cached and only is None else runner_home_probe(only)
+    if doc is None:
+        return None
+    denied = int(doc.get("denied") or 0)
+    rows = [r for r in doc["rows"] if isinstance(r, dict)]
+    owners = {}
+    for r in rows:
+        uid = r.get("owner_uid")
+        if isinstance(uid, int) and uid not in owners:
+            try:
+                owners[uid] = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                owners[uid] = None
+    items = []
+    for r in rows:
+        item = runner_home_item(r, denied, now)
+        if owners.get(r.get("owner_uid")) is None and item.verdict == "reclaimable":
+            item.verdict, item.reasons = "kept", ["its owner's account is unknown"]
+        items.append(item)
+    _RUNNER_HOME_OWNERS.update({i.path: owners.get(r.get("owner_uid")) for i, r in zip(items, rows)})
+    return items
+
+
+_RUNNER_HOME_OWNERS: dict[str, str | None] = {}
+
+
+def runner_home_delete(path: str, account: str) -> tuple[bool, list[str]]:
+    """Remove PATH as ACCOUNT (_RUNNER_HOME_DELETE_SRC), never as root: (done, errors)."""
+    python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else (sys.executable or "python3")
+    run_as = [] if _RUNNER_HOME_INPROCESS or account == pwd.getpwuid(os.getuid()).pw_name else \
+        ["sudo", "-n", "-u", account, "-H"]
+    if _RUNNER_HOME_INPROCESS:
+        python = sys.executable or python
+    low = [*([ionice, "-c", "3"] if (ionice := shutil.which("ionice")) else []),
+           *(["nice", "-n", "15"] if shutil.which("nice") else [])]
+    try:
+        out = subprocess.run([*run_as, *low, python, "-I", "-c", _RUNNER_HOME_DELETE_SRC, path],
+                             capture_output=True, text=True, timeout=RUNNER_HOME_DELETE_TIMEOUT_S)
+        doc = json.loads(out.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as e:
+        return False, [type(e).__name__]
+    return bool(doc.get("ok")), [str(x) for x in doc.get("errors") or []]
+
+
+def apply_runner_homes(receipt: Path, halt=None, families: frozenset[str] | None = None,
+                       sweep: str = "apply", now: float | None = None) -> int:
+    """Remove every reclaimable runner-home item (RUNNER_ABANDONED_WORK), largest first, each proved again right before
+    it goes; returns the bytes the fresh proofs measured for the items removed."""
+    families = RUNNER_HOME_FAMILIES if families is None else families & RUNNER_HOME_FAMILIES
+    items = runner_home_items(now=now, cached=True)
+    if items is None:
+        print("  runner homes: not read (no passwordless sudo here)")
+        return 0
+    released = 0
+    for item in sorted((i for i in items if i.family in families and i.verdict == "reclaimable"),
+                       key=lambda i: -i.bytes):
+        why = halt() if halt is not None else ""
+        fresh = None if why else next(iter(runner_home_items(only=item.path, now=now) or []), None)
+        account = _RUNNER_HOME_OWNERS.get(item.path)
+        errors: list[str] = []
+        if why:
+            outcome = f"stopped:{why[:60]}"
+        elif fresh is None or fresh.verdict != "reclaimable" or not account:
+            outcome = f"changed:{fresh.verdict if fresh else 'gone'}"
+        else:
+            done, errors = runner_home_delete(item.path, account)
+            outcome = "reclaimed" if done else "incomplete"
+            released += fresh.bytes if done else 0
+            item = fresh
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "sweep": sweep, "account": account, "rebuild": RUNNER_HOME_REBUILD.get(item.family, ""),
+               "errors": errors, **asdict(item)}
+        with contextlib.suppress(OSError):
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            with receipt.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(item.bytes)}  {item.family} {item.path}"
+              + (f" ({'; '.join(errors)[:160]})" if errors else ""))
         if why:
             break
     return released
@@ -18759,13 +19176,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # the container image store, by image and tag (DOCKER_IMAGES): a report lists it; an apply asks docker again
     docker_items = ((docker_store_items(pressure=bool(a.pressure and under)) or [])
                     if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and docker_store_present() else [])
-    fill_holds([*items, *tooling, *docker_items])
+    # the runner accounts' homes on a Linux lane VM (RUNNER_ABANDONED_WORK): a report lists them; an apply reads again
+    runner_homes = ((runner_home_items(cached=True) or []) if not a.apply and not DARWIN and not RUNNER_CACHE_PROFILE
+                    and (not a.family or RUNNER_HOME_FAMILIES & set(a.family)) else [])
+    fill_holds([*items, *tooling, *docker_items, *runner_homes])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
                           "cmux_acts": ROLE == "devbox" and cmux_build_caches_on(),
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
                           "docker": [asdict(i) for i in docker_items],
+                          "runner_homes": [asdict(i) for i in runner_homes],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
                           "held": held_summary(items),
@@ -18790,6 +19211,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print("\nContainer image store (docker's own commands reclaim it, under pressure only)")
         for t in sorted(docker_items, key=lambda i: -i.bytes):
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
+        if runner_homes:
+            due = sum(t.bytes for t in runner_homes if t.verdict == "reclaimable")
+            print(f"\nRunner accounts' homes ({gib(due).strip()} reclaimable: idle runner work folders and Go build caches"
+                  f", proved again as root before each goes)")
+        for t in sorted(runner_homes, key=lambda i: -i.bytes):
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
         RUN["io_priority"] = lower_io_priority()
@@ -18880,6 +19307,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
             logical_released += apply_docker_store(a.receipt, halt, below_target=short_of_target,
                                                    families=frozenset(a.family) & docker_families if a.family
                                                    else None)
+        # the runner accounts' homes (RUNNER_ABANDONED_WORK), every apply mode but a pressure pass with no pressure, which
+        # returned above: a --dead pass takes only folders no runner names; a running CI job does not defer it, since
+        # nothing it may use is taken (every holder, a live runner's own work folder and the idle window keep theirs)
+        home_families = RUNNER_HOME_FAMILIES & set(a.family) if a.family else RUNNER_HOME_FAMILIES
+        if (not DARWIN and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved and home_families
+                and (not a.pressure or under or sweep)):
+            logical_released += apply_runner_homes(a.receipt, halt, frozenset(home_families), sweep=operation)
         RUN["released"] = logical_released
         blocked: dict[str, int] = {}
         for i in items:

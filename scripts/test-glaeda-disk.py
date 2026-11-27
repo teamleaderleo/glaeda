@@ -17898,5 +17898,167 @@ class DockerStoreTest(unittest.TestCase):
         self.assertEqual(gd.census_kind("/var/lib/docker/overlay2", "unreadable"), "unreadable")
 
 
+class RunnerHomeTest(unittest.TestCase):
+    """The runner accounts' homes on a Linux lane VM (RUNNER_ABANDONED_WORK): a runner's work folders and Go's build
+    cache, each proved idle, unheld and its runner stopped before it goes, and never the runner itself."""
+
+    GO_README = b"This directory holds cached build artifacts from the Go build system.\nRun \"go clean -cache\".\n"
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.root = self.base / "home"
+        self.home = self.root / "ghrun"
+        self.proc = self.base / "proc"
+        self.proc.mkdir(parents=True)
+        self.receipt = self.base / "receipt.jsonl"
+        self.units: dict[str, bool] = {}
+        # gcp-agent-lane-1, 2026-11-27: r1 stopped by the gate, its old _work beside the work folder .runner names;
+        # r2 the live reserved runner; Go's cache in the shared home, linked into each runner's HOME
+        for name, unit in (("r1", "actions.runner.x.build-1.service"), ("r2", "actions.runner.x.build-2.service")):
+            r = self.home / name
+            for sub in ("work/cmux/cmux", "_work/cmux/cmux", "bin", "externals"):
+                (r / sub).mkdir(parents=True)
+                (r / sub / "f").write_bytes(b"x" * 9000)
+            (r / ".runner").write_text("\ufeff" + json.dumps({"agentName": name, "workFolder": f"{r}/work"}),
+                                       encoding="utf-8")
+            (r / ".credentials").write_text("{}")
+            (r / ".service").write_text(unit + "\n")
+            (r / ".cache").symlink_to(self.home / ".cache")
+            self.units[unit] = name == "r2"
+        go = self.home / ".cache/go-build"
+        (go / "00").mkdir(parents=True)
+        (go / "README").write_bytes(self.GO_README)
+        (go / "trim.txt").write_text("1700000000\n")
+        (go / "00" / "abc-d").write_bytes(b"y" * 9000)
+        (self.home / ".cache/zig").mkdir()  # no family's: never listed
+        (self.home / "notes").mkdir()  # a folder with no .runner is no runner
+        (self.home / "notes/work").mkdir()
+        for name, value in (("RUNNER_HOME_ROOT", self.root), ("RUNNER_HOME_PROC", os.fspath(self.proc)),
+                            ("RUNNER_HOME_CACHE", self.base / "cache/runner-homes.json"),
+                            ("_RUNNER_HOME_INPROCESS", True), ("DARWIN", False),
+                            ("_RUNNER_HOME_UNIT_ACTIVE", lambda unit: self.units.get(unit))):
+            patcher = mock.patch.object(gd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.later = time.time() + 72 * 3600  # every fixture 72 h old (ctime cannot be set back, so the clock moves)
+
+    def hold(self, path: Path, pid: str = "4242") -> None:
+        (self.proc / pid / "fd").mkdir(parents=True)
+        (self.proc / pid / "cwd").symlink_to(path)
+
+    def items(self, now: float | None = None) -> dict[str, "gd.Item"]:
+        return {i.path: i for i in gd.runner_home_items(now=self.later if now is None else now)}
+
+    def p(self, rel: str) -> str:
+        return os.fspath(self.home / rel)
+
+    def test_selects_work_folders_and_go_cache_never_the_runner(self) -> None:
+        items = self.items()
+        self.assertEqual(set(items), {self.p("r1/work"), self.p("r1/_work"), self.p("r2/work"), self.p("r2/_work"),
+                                      self.p(".cache/go-build")})
+        self.assertEqual(items[self.p("r1/_work")].family, gd.RUNNER_ABANDONED_WORK)
+        self.assertEqual(items[self.p("r1/work")].family, gd.RUNNER_STOPPED_WORK)
+        self.assertEqual(items[self.p(".cache/go-build")].family, gd.RUNNER_GO_BUILD)
+        verdicts = {path: i.verdict for path, i in items.items()}
+        self.assertEqual(verdicts[self.p("r1/_work")], "reclaimable")
+        self.assertEqual(verdicts[self.p("r1/work")], "reclaimable")  # r1's unit is not active
+        self.assertEqual(verdicts[self.p("r2/_work")], "reclaimable")  # r2 works in work/, not here
+        self.assertEqual(verdicts[self.p("r2/work")], "in-use")  # r2's unit is active
+        self.assertIn("is active", items[self.p("r2/work")].reasons[0])
+        self.assertEqual(verdicts[self.p(".cache/go-build")], "reclaimable")
+        self.assertGreater(items[self.p("r1/_work")].bytes, 9000)
+
+    def test_inside_the_window_is_recent(self) -> None:
+        items = self.items(now=time.time() + 47 * 3600)
+        self.assertTrue(all(i.verdict in {"recent", "in-use"} for i in items.values()), items)
+
+    def test_a_newer_file_deep_inside_keeps_it(self) -> None:
+        deep = self.home / "r1/_work/cmux/cmux/f"
+        os.utime(deep, (self.later - 3600, self.later - 3600))
+        self.assertEqual(self.items()[self.p("r1/_work")].verdict, "recent")
+
+    def test_a_process_inside_holds_it(self) -> None:
+        self.hold(self.home / "r1/_work/cmux/cmux")
+        items = self.items()
+        self.assertEqual(items[self.p("r1/_work")].verdict, "in-use")
+        self.assertEqual(items[self.p(".cache/go-build")].verdict, "reclaimable")
+
+    def test_a_process_running_from_the_runner_holds_its_work_folder(self) -> None:
+        self.hold(self.home / "r1/bin")
+        items = self.items()
+        self.assertEqual(items[self.p("r1/work")].verdict, "in-use")
+        self.assertEqual(items[self.p("r1/_work")].verdict, "reclaimable")  # no runner works in it again
+
+    def test_an_unreadable_process_holds_everything(self) -> None:
+        (self.proc / "77").mkdir()  # no fd/ listing: denied, as another account's pid without root
+        os.chmod(self.proc / "77", 0)
+        self.addCleanup(os.chmod, self.proc / "77", 0o755)
+        if os.access(self.proc / "77", os.R_OK):
+            self.skipTest("running as root: the fixture cannot be unreadable")
+        self.assertTrue(all(i.verdict == "in-use" for i in self.items().values()))
+
+    def test_an_unread_unit_state_keeps_the_work_folder(self) -> None:
+        self.units.pop("actions.runner.x.build-1.service")
+        self.assertEqual(self.items()[self.p("r1/work")].verdict, "in-use")
+
+    def test_a_go_cache_needs_its_readme_and_trim(self) -> None:
+        (self.home / ".cache/go-build/trim.txt").unlink()
+        self.assertNotIn(self.p(".cache/go-build"), self.items())
+
+    def test_a_linked_work_folder_is_not_followed(self) -> None:
+        shutil.rmtree(self.home / "r1/_work")
+        (self.home / "r1/_work").symlink_to(self.home / "notes")
+        self.assertNotIn(self.p("r1/_work"), self.items())
+
+    def test_apply_removes_only_what_it_proved_and_keeps_the_runner(self) -> None:
+        freed = gd.apply_runner_homes(self.receipt, now=self.later)
+        for rel in ("r1/work", "r1/_work", "r2/_work", ".cache/go-build"):
+            self.assertFalse(os.path.lexists(self.p(rel)), rel)
+        for rel in ("r2/work", "r1/.runner", "r1/.credentials", "r1/.service", "r1/bin/f", "r1/externals/f",
+                    ".cache/zig", "notes/work"):
+            self.assertTrue(os.path.lexists(self.p(rel)), rel)
+        self.assertEqual([p.name for p in (self.home / "r1").iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+        self.assertGreater(freed, 4 * 9000)
+        recs = [json.loads(line) for line in self.receipt.read_text().splitlines()]
+        self.assertEqual({r["outcome"] for r in recs}, {"reclaimed"})
+        self.assertEqual(len(recs), 4)
+
+    def test_apply_proves_each_again_before_it_goes(self) -> None:
+        gd.runner_home_items(now=self.later, cached=True)  # the listing apply reads: nothing held then
+        self.hold(self.home / "r1/_work")
+        gd.apply_runner_homes(self.receipt, families=frozenset({gd.RUNNER_ABANDONED_WORK}), now=self.later)
+        self.assertTrue((self.home / "r1/_work/cmux/cmux/f").exists())
+        self.assertFalse((self.home / "r2/_work").exists())
+        outcomes = {r["path"]: r["outcome"] for r in map(json.loads, self.receipt.read_text().splitlines())}
+        self.assertEqual(outcomes[self.p("r1/_work")], "changed:in-use")
+
+    def test_an_interrupted_delete_is_finished(self) -> None:
+        aside = self.home / "r1" / f"{gd.DELETING_PREFIX}_work-999999999"
+        (self.home / "r1/_work").rename(aside)
+        items = self.items(now=time.time())  # an aside goes whatever its age
+        self.assertEqual(items[os.fspath(aside)].verdict, "reclaimable")
+        gd.apply_runner_homes(self.receipt, families=frozenset({gd.RUNNER_ABANDONED_WORK}))
+        self.assertFalse(aside.exists())
+
+    def test_dead_pass_takes_only_folders_no_runner_names(self) -> None:
+        dead = gd.dead_family_ids()
+        self.assertIn(gd.RUNNER_ABANDONED_WORK, dead)
+        self.assertFalse({gd.RUNNER_STOPPED_WORK, gd.RUNNER_GO_BUILD} & dead)
+
+    def test_a_report_reuses_the_last_probe(self) -> None:
+        gd.runner_home_items(now=self.later, cached=True)
+        shutil.rmtree(self.home / "r1/_work")
+        cached = {i.path for i in gd.runner_home_items(now=self.later, cached=True)}
+        self.assertIn(self.p("r1/_work"), cached)  # a listing only
+        self.assertNotIn(self.p("r1/_work"), self.items())  # a proof always reads again
+
+    def test_no_sudo_reads_nothing(self) -> None:
+        with mock.patch.object(gd, "_RUNNER_HOME_INPROCESS", False), mock.patch.object(gd, "sudo_reads", lambda: False), \
+                mock.patch.object(gd.os, "geteuid", lambda: 1000):
+            self.assertIsNone(gd.runner_home_items())
+            self.assertEqual(gd.apply_runner_homes(self.receipt), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
