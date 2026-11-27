@@ -458,10 +458,16 @@ class MiniSetupTest(unittest.TestCase):
         installed = self.home / ".local/bin"
         installed.mkdir(parents=True)
         shutil.copy2(scripts / "disk-pressure.sh", installed / "disk-pressure.sh")
+        # Identical pre-existing tools are unowned only when their mode also matches.
+        # Carrier checkouts may materialize source scripts without executable bits.
+        (installed / "disk-pressure.sh").chmod(0o755)
         (gen / ".complete").write_text(tag + "\n")
         (update / "state.json").write_text(json.dumps({"current": tag, "previous": None}))
         with mock.patch.object(ms, "SCRIPT_DIR", scripts), mock.patch.object(ms, "REPO", scripts.parent):
-            self.invoke("--gh-only", "--apply")
+            first = self.invoke("--gh-only", "--apply")
+        preexisting = next(a for a in first["actions"] if a.get("path") == str(installed / "disk-pressure.sh"))
+        self.assertEqual(preexisting["state"], "unchanged")
+        self.assertFalse(preexisting["owned"])
         (installed / "glaeda-disk").write_bytes(b"local edit")
         (scripts / "glaeda-update").write_bytes(b"different release bytes")
         with mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
