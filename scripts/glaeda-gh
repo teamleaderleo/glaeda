@@ -1683,14 +1683,29 @@ def cwd_repo(cwd: str | None = None) -> str | None:
 
     This is what a bare `N` names. A bare number was 173 of the 358 targets this host's transcripts had
     refused by 2026-11-21, more than any other form, and it is the one an agent reaches for while working in
-    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`."""
-    try:
-        done = subprocess.run(["git", "-C", cwd or ".", "remote", "get-url", "origin"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = REMOTE_RE.fullmatch(done.stdout.strip()) if done.returncode == 0 else None
-    return f"{match.group(1)}/{match.group(2)}" if match else None
+    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`.
+
+    `git remote get-url` answers the URL after `url.<base>.insteadOf`, so a host that routes fetches through a
+    local cache answers that cache's URL, not GitHub's: every lane VM's /run/cmux/git-cache/gitconfig rewrites
+    `https://github.com/` to `http://127.0.0.1:47380/github.com/`, and `origin` there read as no GitHub
+    repository at all. 2026-11-26: `glaeda-gh land manaflow-ai/cmuxterm-hq#30624 --match-head-commit e4852da0`
+    run inside a `wt` checkout of cmuxterm-hq said the directory was "no checkout of manaflow-ai/cmuxterm-hq"
+    and took the pin unchecked, as every pinned land on a lane VM did. So when the rewritten URL is not one this
+    reads, the URL as configured (`remote.origin.url`, before any rewrite) is asked once more."""
+    def ask(args: list[str]) -> str:
+        try:
+            done = subprocess.run(["git", "-C", cwd or ".", *args], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+    for args in (["remote", "get-url", "origin"], ["config", "--get", "remote.origin.url"]):
+        url = ask(args)
+        if not url:
+            return None  # no origin (or no repository): the second form has nothing more to say
+        match = REMOTE_RE.fullmatch(url)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return None
 
 
 def target_readable(kind: str, text: str) -> bool:
