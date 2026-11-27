@@ -997,6 +997,13 @@ CONSUMER_WINDOW = 3600
 # also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
 # REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
 HEAD_DIRECT_MAX = 60
+# A waited PR or run whose data is past STALE_DATA_AFTER while GraphQL cannot read it (under its reserve, or GitHub told the
+# daemon to back off) is read over REST past the daemon's REST share (restShare 0 on a host the config does not name), the
+# oldest first, STALE_DIRECT_PER_TICK a tick and STALE_DIRECT_MAX an hour. cmux-cp-1 2026-11-27: GraphQL stopped at 723 left
+# and restShare 0, the share is "0 of 0", PR data a wait was blocked on reached 13,380 s while REST had 4,373 of 5,000 left,
+# and the stale valve restarted the daemon eight ticks in a row, which only hid it (read_stale_direct).
+STALE_DIRECT_MAX = 120
+STALE_DIRECT_PER_TICK = 3
 # A head asked after a tick's due phase (`glaeda-gh checks` on a new SHA: a merge gate's bounded wait) is read between
 # that tick's read batches, not at the next tick's due phase. cosmic-gray, 2026-11-23 23:17-23:49Z: ticks ran 1.5-5 min
 # (PR reads took 483 of 614 s), the lane-gh broker's land waits 20 s for an unread head (next_autoland
@@ -6833,6 +6840,7 @@ class Daemon:
         self.tick_splits: dict[str, int] = {}  # queries each kind added this tick by splitting (GQL_SPLITS)
         self.tick_asked: dict[str, bool] = {}  # a kind sent a query this tick: a share's UNTIL may cut its next call
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
+        self.stale_direct_at: list[float] = []  # when each stale waited read over REST was admitted (STALE_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
@@ -10570,6 +10578,42 @@ class Daemon:
             self.resume_key, self.resume_from = "", float("inf")
             self.settle_prefetch()
 
+    def stale_direct_room(self) -> bool:
+        """Whether a stale waited key may be read over REST past the daemon's share now: GraphQL cannot read it (stopped, or
+        GitHub's back-off), REST is neither stopped nor under its floor, no secondary hold, and fewer than STALE_DIRECT_MAX
+        such reads this hour. While GraphQL can read, the batches and read_waited's own pass do."""
+        self.stale_direct_at = [t for t in self.stale_direct_at if self.now - t < CONSUMER_WINDOW]
+        graphql_out = self.mode("graphql") == "stop" or self.backoff["graphql"] > self.now
+        return (graphql_out and self.mode("rest") != "stop" and self.rest_above_floor()
+                and self.clock() >= self.secondary_until and self.backoff["rest"] <= self.now
+                and len(self.stale_direct_at) < STALE_DIRECT_MAX)
+
+    def read_stale_direct(self, entries: list[dict], read: set[str]) -> None:
+        """The waited PRs and runs with data past STALE_DATA_AFTER, oldest first (starved_lead), read over REST this tick
+        although the daemon's REST share is spent or zero and GraphQL is stopped: the quota rules left them no path at all,
+        so an age bound held only while GraphQL had room (cmux-cp-1 2026-11-27, 13,380 s). At most STALE_DIRECT_PER_TICK a
+        tick and STALE_DIRECT_MAX an hour, charged to the key's own waiters; a key tried within WAITED_FRESH waits."""
+        if not self.stale_direct_room():
+            return
+        pool = [e for e in entries if e["key"] not in read
+                and self.now - self.waited_tried.get(e["key"], float("-inf")) >= WAITED_FRESH]
+        for _ in range(STALE_DIRECT_PER_TICK):
+            lead = self.starved_lead(pool)
+            if lead is None or not self.stale_direct_room() or time.monotonic() >= self.tick_deadline:
+                return
+            pool = [e for e in pool if e is not lead]
+            kind = lead["key"].split(":", 1)[0]
+            self.waited_tried[lead["key"]] = self.now
+            self.stale_direct_at.append(self.now)
+            log({"event": "stale-direct", "key": lead["key"], "age": round(self.now - float((lead.get("cache") or {}).get("dataAt") or 0))})
+            try:
+                with self.calling(*caller_of(lead["key"]), waiter_of(lead)), self.phase("read rest"):
+                    self.rest_fetch[kind](lead)
+            except OutOfTime:
+                raise
+            except Exception as error:  # noqa: BLE001  one key's failure leaves the next its turn
+                self.errors.append(f"{lead['key']}: {describe(error)}")
+
     def read_waited(self, entries: list[dict], read: set[str]) -> None:
         """The PRs and runs a wait is blocked on (here, or a lane VM's through the broker: its upstream read carries
         "wait"), read over GraphQL once their data is WAITED_FRESH old while the GraphQL reserve alone stops the
@@ -10579,6 +10623,12 @@ class Daemon:
         through GitHub's own back-off or a secondary hold. READ: the keys this tick already read."""
         self.waited_log = [(t, p) for t, p in self.waited_log if self.now - t < 60]
         self.waited_tried = {k: t for k, t in self.waited_tried.items() if self.now - t < WAITED_FRESH}
+        try:
+            self.read_stale_direct(entries, read)
+        except OutOfTime:
+            pass  # the tick's own budget ran out: the tick ends on its next read
+        except Exception as error:  # noqa: BLE001  a bounded extra read must never stop the tick
+            self.errors.append(f"stale direct: {describe(error)} at {error_site(error)}")
         if (self.mode("graphql") != "stop" or self.backoff["graphql"] > self.now or self.secondary_until > self.now
                 or self.waited_points() >= WAITED_PER_MINUTE):
             return
@@ -15678,6 +15728,33 @@ def land_overflow(config: dict | None = None) -> list[list[str]]:
     return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)]
 
 
+# Land failover: a forwarding host's executor unreachable never stops its lands. cosmic-gray, 2026-11-27 06:31-10:01Z:
+# tailnet tcp:22 to its executor cmux-cp-1 timed out on and off (34 failed forwards, `ssh: connect to host
+# 100.110.222.91 port 22: Operation timed out`), each failure doubling the backoff to LAND_FORWARD_RETRY_MAX, so a
+# land asked for at 09:00Z sat in requests/ until 09:20Z while cmux-cp-2, the executor's own pair, answered. land.json's
+# "fallback" names more executors, each a program as "executor" is, in the order they are tried: once the executor has
+# failed LAND_FORWARD_FAILOVER_FAILS forwards in a row, the batch goes to the first fallback that takes it. Its queue
+# judges every row as the executor's would (the same land_judge gates, the pin and any override carried as given; this
+# host adds none). The executor is tried again each time its own backoff ends, and a forward it takes ends the
+# failover. A forward that timed out may still have been applied there, so a row can sit in both queues: each lands
+# only that pinned head and only on a green judgment, and the second finds it merged.
+LAND_FALLBACK_KEY = "fallback"
+LAND_FORWARD_FAILOVER_FAILS = 2
+
+
+def land_fallback_executors(config: dict | None = None) -> list[list[str]]:
+    """land.json's "fallback" executors (each a program, as "executor"), in the order they are tried; [] for none. One
+    naming the executor's own host is left out."""
+    cfg = land_config() if config is None else config
+    peers = cfg.get(LAND_FALLBACK_KEY)
+    if not isinstance(peers, list):
+        return []
+    primary = land_executor(cfg)
+    skip = land_forward_name(primary) if primary is not None else None
+    return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)
+            and land_forward_name(p) != skip]
+
+
 def land_room(pool: Any, now: float) -> int:
     """How many more lands this host's queue takes from a peer now, from its last land-pool line POOL: its idle
     workers less the rows already due here (the host's load is no part of it: LAND_LOAD_LINE is gone); 0 when the line
@@ -17542,8 +17619,12 @@ LAND_LATE_WHY_EVERY = 60.0
 # it ended. Now a row is told only on a read that shows its PR still open, once per PR ever (forwardQuietTold, kept on
 # the row), as an inbox fyi; a read that never lands tells nobody: forward_follow's give-up reads it live and settles it.
 LAND_FORWARD_QUIET = LAND_DUE_LATE
-LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before giving up on it, telling nobody
-LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)  # a due-late row's reason is rewritten at most this often (note_late)
+# LAND_FORWARD_READ_WAIT: how long the told-once waits on that one read before giving up on it, telling nobody, and
+# how fresh a cached read must be, or how long an asked one may take, before a no-outcome stop (outcome_read).
+# One value, set once: it was set here to 300.0 and again below to 900.0, so 900.0 ruled both uses and this line's
+# 300 was never in force.
+LAND_FORWARD_READ_WAIT = 900.0
+LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)
 # A cached read that never lands was the end of it: forward_quiet read=False told=False, and the row sat until the
 # give-up. 2026-11-27, two lands: manaflow-ai/cmux#60557 (53 min) and one in a private repo (~45 min) ended
 # their history on exactly that; on #60557 the far queue's own bot had merged the base into the branch at 06:13Z, so
@@ -17978,7 +18059,6 @@ LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
 LAND_FORWARD_STOPPED_ASK_EVERY = 1800.0
 LAND_FORWARD_ASK_EVERY = 600.0
 LAND_FORWARD_LOST_ASKS = 2
-LAND_FORWARD_READ_WAIT = 900.0
 LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "waiting", LAND_FORWARDED, "requested"})
 # A far answer holding a row open (forwardHeld) restarted its give-up clock on every ask, so a row its far queue kept
 # open never reached the give-up: whatever loop held it there held it here too, with no verdict and nobody told.
@@ -19177,6 +19257,8 @@ class LandQueue:
         self.unlabel_thread: threading.Thread | None = None  # LAND_UNLABEL's sends, one batch at a time
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.primary_after = float("-inf")  # the executor's own backoff while fallbacks take its forwards (land_fallback_executors)
+        self.failed_over: str | None = None  # the fallback taking this host's forwards now, said once (land_fallback_executors)
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
         self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_requests_stamp: tuple[int, int, int] | None = None
@@ -20054,31 +20136,72 @@ class LandQueue:
             with self.lock:
                 self.overflowing = set()
 
+    def forward_once(self, command: list[str], batch: list[dict]) -> tuple[str, dict]:
+        """BATCH sent to COMMAND's `land serve`: (the host that took it, its answer), or WatchError."""
+        name = land_forward_name(command)
+        answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
+                              LAND_FORWARD_DEADLINE)
+        if not answer.get("ok"):
+            raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+        if isinstance(answer.get("redirectedTo"), str):
+            self.forward_redirected(name, answer["redirectedTo"])
+            name = answer["redirectedTo"]
+        return name, answer
+
     def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
-        name = land_forward_name(command)
-        try:
-            answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
-                                  LAND_FORWARD_DEADLINE)
-            if not answer.get("ok"):
-                raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
-            if isinstance(answer.get("redirectedTo"), str):
-                self.forward_redirected(name, answer["redirectedTo"])
-                name = answer["redirectedTo"]
+        primary = name = land_forward_name(command)
+        fallbacks = land_fallback_executors(self.config())
+        took: list[str] | None = None
+        answer: dict = {}
+        error: BaseException | None = None
+        why = ""
+        # the executor first, unless it has failed LAND_FORWARD_FAILOVER_FAILS in a row and its backoff still runs
+        skip_primary = bool(fallbacks) and self.forward_fails >= LAND_FORWARD_FAILOVER_FAILS \
+            and self.now < self.primary_after
+        if not skip_primary:
+            try:
+                name, answer = self.forward_once(command, batch)
+                took = command
+            except Exception as failed:  # noqa: BLE001  an unreachable executor is retried, never fatal
+                error, why = failed, str(failed) if isinstance(failed, WatchError) else describe(failed)
+                with self.lock:
+                    self.forward_fails += 1
+                    self.primary_after = self.now + min(LAND_FORWARD_RETRY_MAX,
+                                                        LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
+                log({"event": "land-forward-failed", "executor": primary, "error": why, "pending": len(batch)})
+        if took is None and fallbacks and self.forward_fails >= LAND_FORWARD_FAILOVER_FAILS:
+            for other in fallbacks:
+                try:
+                    name, answer = self.forward_once(other, batch)
+                    took = other
+                    break
+                except Exception as failed:  # noqa: BLE001  the next fallback may take it
+                    log({"event": "land-forward-fallback-failed", "executor": land_forward_name(other),
+                         "error": land_trim(str(failed) if isinstance(failed, WatchError) else describe(failed), 300),
+                         "pending": len(batch)})
+            if took is not None and self.failed_over != name:
+                self.failed_over = name
+                log({"event": "land-forward-failover", "executor": primary, "to": name,
+                     "fails": self.forward_fails, "error": why, "pending": len(batch)})
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-failover", "warn", f"glaeda land on {policy_host()}: its executor "
+                                f"{primary} failed {self.forward_fails} forwards in a row ({why or 'in its backoff'}); "
+                                f"its lands go to {name} (land.json fallback) until {primary} takes one again",
+                                {"executor": primary, "to": name, "error": why})
+        if took is not None:
             accepted = {str(a) for a in answer.get("accepted") or []}
             refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
                        if isinstance(r, dict) and r.get("id")}
-        except Exception as error:  # noqa: BLE001  an unreachable executor is retried, never fatal
-            why = str(error) if isinstance(error, WatchError) else describe(error)
+        else:
+            why = why or "every land.json fallback failed while the executor's backoff runs"
             with self.lock:
                 self.sending = set()
-                self.forward_fails += 1
-                wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
+                wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (max(1, self.forward_fails) - 1))
                 self.forward_after = self.now + wait
-                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "failing", "error": why,
+                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": primary, "state": "failing", "error": why,
                                                             "at": self.now, "pending": len(batch),
                                                             "retryAt": self.forward_after})
-            log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
             if isinstance(error, LandNotExecutor) and not self.forward_misrouted:
                 # never heals by retrying: land.json names a host that executes nothing (LAND_REDIRECT_HOPS)
                 self.forward_misrouted = True
@@ -20095,8 +20218,13 @@ class LandQueue:
             return
         with self.lock:
             self.sending = set()
-            self.forward_fails = 0
-            self.forward_misrouted = False
+            if took is command:  # the executor itself took it: the failover, if any, ends
+                if self.failed_over is not None:
+                    log({"event": "land-forward-failback", "executor": primary, "from": self.failed_over})
+                self.forward_fails = 0
+                self.primary_after = float("-inf")
+                self.failed_over = None
+                self.forward_misrouted = False
             self.forward_after = float("-inf")
             for rid, path in files:
                 if rid in accepted:
@@ -20123,7 +20251,8 @@ class LandQueue:
                     self.stop(e, "forward_refused", f"the land executor {name} refused this PR's handoff: "
                               f"{refused[req['id']]}", f"glaeda-gh land {key_name(key)} again with a valid --notify")
             write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "ok", "at": self.now,
-                                                        "sent": len(accepted)})
+                                                        "sent": len(accepted)}
+                       | ({"failoverFrom": primary} if took is not command else {}))
         log({"event": "land-forwarded", "executor": name, "sent": len(accepted), "handedOff": len(handed)})
 
     def latch_held(self) -> tuple[str, float] | None:
@@ -20736,7 +20865,7 @@ class LandQueue:
             return None
         cfg = self.config()
         executor = land_executor(cfg)
-        programs = ([executor] if executor is not None else []) + land_overflow(cfg)
+        programs = ([executor] if executor is not None else []) + land_fallback_executors(cfg) + land_overflow(cfg)
         for command in programs:
             if land_forward_name(command) == host:
                 return command

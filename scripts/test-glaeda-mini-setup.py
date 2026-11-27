@@ -1032,6 +1032,28 @@ class MiniSetupTest(unittest.TestCase):
         platform_patch.start()
         self.patches.append(platform_patch)
 
+    def test_the_gh_daemon_unit_never_parks_in_failed_and_rows_each_stop(self) -> None:
+        # A crash that met a repair's own restart hit systemd's default start limit (5 in 10 s): the
+        # unit sat in failed with Restart=always never running again. Each stop leaves a row too.
+        text = (ROOT / "ops/systemd/glaeda-gh.service").read_text()
+        unit, service = text.split("[Service]", 1)
+        self.assertIn("\nStartLimitIntervalSec=0\n", unit)
+        self.assertIn("\nRestart=always\n", service)
+        post = [l for l in service.splitlines() if l.startswith("ExecStopPost=")]
+        self.assertEqual(len(post), 1, post)
+        self.assertIn("StandardOutput=append:%h/.local/state/glaeda-gh.jsonl", service)
+        # The row's command, as systemd passes it: python3 -c "<code>". Run it with a stop's env.
+        code = post[0].split(' -c "', 1)[1].rsplit('"', 1)[0]
+        self.assertNotIn("%", code)  # systemd would expand a specifier
+        self.assertNotIn("$", code)  # and a variable
+        env = {**os.environ, "SERVICE_RESULT": "exit-code", "EXIT_CODE": "exited", "EXIT_STATUS": "1"}
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True,
+                             timeout=30, stdin=subprocess.DEVNULL)
+        row = json.loads(out.stdout)
+        self.assertEqual((row["event"], row["result"], row["exitCode"], row["exitStatus"]),
+                         ("service-exit", "exit-code", "exited", "1"))
+        self.assertTrue(row["at"].endswith("+00:00"), row)
+
     def test_linux_installs_the_ops_systemd_units_then_is_idempotent(self) -> None:
         self.linux()
         receipt = self.invoke("--apply")  # Linux gets the hygiene profile without the flag
