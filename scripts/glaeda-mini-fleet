@@ -196,6 +196,7 @@ manifest path rather than replace the link with a regular file.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import concurrent.futures
 import contextlib
@@ -216,6 +217,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -272,6 +274,17 @@ HQ_CHECK_BUDGET_S = 10  # the whole comparison, gh and the checkout together
 HQ_CHECK_CACHE_S = 3600  # one verdict per copy per hour, in STATE_DIR
 HQ_CHECK_OPT_OUT = "GLAEDA_MINI_FLEET_SKIP_HQ_CHECK"
 SSH = "/usr/bin/ssh"
+# This Mac's ssh argv: SSH, plus the office-LAN fallback's config once main() has read the manifest
+# (lan_fallback). Every ssh this tool runs from here starts with it; a command run on a fleet host
+# (the share pipe's source -> peer hop) uses plain SSH, as that host has its own routes.
+SSH_LAN: list[str] = []  # ["-F", config] once lan_fallback finds a silent name
+
+
+def ssh_argv() -> list[str]:
+    return [SSH, *SSH_LAN]
+
+
+LAN_PROBE_S = 3
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 # AWS Mac minis are reached through the controller. The identity stays on that
@@ -765,6 +778,42 @@ def host_ssh_user(manifest: dict[str, Any], name: str) -> str:
     return user
 
 
+def lan_fallback(manifest: dict[str, Any], names: list[str]) -> tuple[str | None, list[str]]:
+    """An ssh config that sends each of NAMES whose tailnet name does not answer on port 22 to its manifest
+    lan_ip (an untagged tailnet node drops port 22: cmux25-34, 2026-11-27), under its own name and host
+    key alias, then the operator's own config. (path, names sent to the LAN); (None, []) when every
+    name answers. A host with a jump route (the AWS Macs) keeps its route."""
+    hosts = manifest.get("hosts") or {}
+    want = [n for n in names if isinstance(hosts.get(n), dict) and hosts[n].get("lan_ip")
+            and not hosts[n].get("ssh_jump_host")]
+
+    def down(name: str) -> bool:
+        try:
+            socket.create_connection((name, 22), LAN_PROBE_S).close()
+            return False
+        except OSError:
+            return True
+
+    if not want or os.environ.get("GLAEDA_MINI_FLEET_LAN") == "0":
+        return None, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(want))) as pool:
+        lan = [n for n, d in zip(want, pool.map(down, want)) if d]
+    if not lan:
+        return None, []
+    text = "".join(f"Host {n}\n  HostName {hosts[n]['lan_ip']}\n  HostKeyAlias {n}\n"
+                   "  StrictHostKeyChecking accept-new\n" for n in lan)
+    identity = os.path.expanduser("~/.ssh/id_ed25519_manaflow_cmux")
+    if os.path.isfile(identity):
+        text = text.replace("  StrictHostKeyChecking accept-new\n",
+                            f"  StrictHostKeyChecking accept-new\n  IdentityFile {identity}\n")
+    text += "Host *\nInclude ~/.ssh/config\nInclude /etc/ssh/ssh_config\n"
+    fd, path = tempfile.mkstemp(prefix="glaeda-mini-fleet-lan.", suffix=".conf")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+    return path, lan
+
+
 def host_ssh_options(manifest: dict[str, Any], name: str) -> tuple[str, ...]:
     """SSH options for a host's declared route, including an office jump for AWS Macs."""
     host = manifest["hosts"].get(name) or {}
@@ -831,7 +880,7 @@ def _wrap_remote(command: str) -> str:
 def ssh_command(manifest: dict[str, Any], name: str, user: str, command: str) -> list[str]:
     """Build the manifest-defined SSH argv for a probe or status command."""
     route = _ssh_route(manifest, name)
-    base = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
+    base = [*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
     if route is None:
         return [*base, "-l", user, name, command]
     nested = ("exec ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "
@@ -1178,7 +1227,7 @@ def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = Non
     if routed:
         command = ssh_command(manifest, name, user, "/bin/bash -s")
     else:
-        command = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options,
+        command = [*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options,
                    "-l", user, name, remote_command("/bin/bash -s")]
     try:
         proc = subprocess.run(
@@ -1997,7 +2046,7 @@ def remote(name: str, user: str, script: str, args: list[str], stdin: str = "",
     import shlex
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
+        proc = subprocess.run([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
                                remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=600)
     except subprocess.TimeoutExpired:
@@ -2125,7 +2174,7 @@ def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: s
     """Run one reservation script on a host: (exit code, raw stdout, stderr). Bounded and batch-mode."""
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
+        proc = subprocess.run([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
                                remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -3406,7 +3455,7 @@ def run_remote_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: fl
 def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
                timeout: float | None = None, options: tuple[str, ...] = ()) -> int:
     """One remote command, key authentication only, output to the log. stdin carries data such as a token."""
-    return run_remote_logged([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+    return run_remote_logged([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
                               *options, "-l", user, name, remote_command(command)], log, stdin, timeout)
 
 
@@ -3470,7 +3519,7 @@ def host_check(manifest: dict[str, Any], name: str) -> str | None:
 
     Read-only on the host. A host whose state cannot be read counts as held: never change a host blind."""
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+        proc = subprocess.run([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                "-l", host_ssh_user(manifest, name), name,
                                remote_command(library_command("host_check", []))], capture_output=True, text=True, timeout=120,
                               check=False)
@@ -3491,7 +3540,7 @@ def start_drain(manifest: dict[str, Any], name: str) -> Any:
 
     The entry lives while the returned ssh does: close_drains ends it. None when ssh cannot start."""
     try:
-        return subprocess.Popen([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+        return subprocess.Popen([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
                                  *host_ssh_options(manifest, name), "-l", host_ssh_user(manifest, name), name,
                                  remote_command(library_command("host_drain", []))],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3649,7 +3698,7 @@ def ship_python(name: str, user: str, action: dict[str, Any], log: Any,
     if routed_fix_call(name, user, "python_prepare", [target], log, 60, options):
         return False, f"could not create {target}"
     note(log, f"rsync {path}/ -> {name}:{target}/")
-    ssh_command = shlex.join([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options])
+    ssh_command = shlex.join([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options])
     if run_logged(["rsync", "-a", "-e", ssh_command,
                    f"{path}/", f"{user}@{name}:.local/python-{version}/"], log, timeout=FIX_TIMEOUTS["python"]):
         return False, "rsync failed; rerun fix to resume"
@@ -4117,7 +4166,7 @@ def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
         if broken:
             raise Failure("the password has a line break; sudo -S reads one line")
         for name in plans:
-            check = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+            check = subprocess.run([*ssh_argv(), "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                     "-l", host_ssh_user(manifest, name), name, sudo_stdin_command()],
                                    input=feed, capture_output=True, check=False)
             if check.returncode:
@@ -4126,7 +4175,7 @@ def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
         failed = []
         for name, script in plans.items():
             print(f"\n==== {name}: running as root with the password given once", flush=True)
-            code = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+            code = subprocess.run([*ssh_argv(), "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                    "-l", host_ssh_user(manifest, name), name, sudo_stdin_command(script)],
                                   input=feed, check=False).returncode
             if code:
@@ -4174,7 +4223,7 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     failed = run_ask_once(manifest, plans) if ask_once else []
     for name, script in ({} if ask_once else plans).items():
         print(f"\n==== {name}: running over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
-        code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+        code = subprocess.run([*ssh_argv(), "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                "-l", host_ssh_user(manifest, name), name,
                                "/bin/bash -c " + shlex.quote(script)], check=False).returncode
         if code:
@@ -4230,7 +4279,7 @@ def lan_address(manifest: dict[str, Any], name: str, log: Any) -> tuple[str | No
     address = manifest["hosts"][name].get("lan_ip")
     if not address:
         try:
-            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+            proc = subprocess.run([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                    "-l", host_ssh_user(manifest, name), name, remote_command("ipconfig getifaddr en0")],
                                   capture_output=True, text=True,
                                   timeout=30, check=False)
@@ -4881,7 +4930,7 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if sudo == "run":
             for name, script in plans.items():
                 print(f"\n==== {name}: sudo-plan over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
-                code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                code = subprocess.run([*ssh_argv(), "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                        "-l", host_ssh_user(manifest, name), name,
                                        "/bin/bash -c " + shlex.quote(script)], check=False).returncode
                 if code:
@@ -5366,7 +5415,7 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
     with open(log_path, "ab") as log:
         note(log, f"== export ({command})")
         try:
-            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+            proc = subprocess.run([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
                                    "-l", host_ssh_user(manifest, name), name, remote_command(command)],
                                   capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
         except subprocess.TimeoutExpired:
@@ -5835,6 +5884,11 @@ def main(argv: list[str] | None = None) -> int:
         GLAEDA_MAIN.clear()
         manifest = load_manifest(args.manifest)
         MANIFEST_PATH = args.manifest
+        lan_config, lan_names = lan_fallback(manifest, list(args.hosts or manifest.get("hosts", {}))
+                                             + ([args.seed] if getattr(args, "seed", None) else []))
+        SSH_LAN[:] = ["-F", lan_config] if lan_config else []
+        if lan_config:
+            print(f"office LAN for {', '.join(lan_names)} (tailnet port 22 does not answer)", file=sys.stderr)
         PINNED_CANDIDATE = manifest.get("candidate")
         if args.command == "admit":
             return cmd_admit(args.manifest, manifest, args.hosts or [],
