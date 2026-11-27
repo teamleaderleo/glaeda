@@ -4445,6 +4445,11 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
             note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
+            # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
+            # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
+            # as drifted (cmux run 45932403699, 2026-11-27 03:11Z) while its gate, probing by name, listened on.
+            env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
             note = f"would set the rustup default to {toolchain}"

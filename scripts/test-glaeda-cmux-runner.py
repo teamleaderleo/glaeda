@@ -8043,7 +8043,7 @@ time.sleep(60)
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
              python: str = "3.13", gh: bool = True, sdk_path: str | None = None,
              swiftc: str | None = None, python_runs: bool = True, unfound: tuple = (),
-             slow: str | None = None) -> None:
+             slow: str | None = None, flip_after_align: str | None = None) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain. xcrun answers
         --show-sdk-path with sdk_path and `swiftc --version` with swiftc, and fails both when they are None."""
         config = self.dir / ".config/glaeda/cmux-fleet"
@@ -8088,6 +8088,9 @@ if args[:2] == ["toolchain", "list"]:
         print(name + (" (active, default)" if name == default else ""))
 elif args == ["default"]:
     print(default + " (default)")
+    flip = {flip_after_align!r}  # another job on the mini sets the shared default just after this read
+    if flip and default != flip:
+        open(state + "/rustup-default", "w").write(flip)
 elif args == ["show"]:
     print("Default host: aarch64-apple-darwin")
 elif args[:1] == ["default"] and args[1] in installed:
@@ -8229,6 +8232,18 @@ else:
                       result.stdout)
         self.assertEqual((self.dir / "rustup-default").read_text(), "1.98.1-aarch64-apple-darwin")
         self.assertFalse(self.lock_free())
+        self.done()
+
+    def test_a_default_flipped_by_another_job_mid_admit_is_not_drift(self) -> None:
+        """ALIGNED_PROBE: job-started sets the shared rustup default, and another job on the mini sets it back before
+        the version probes run (cmux8s-mac-mini-glaeda-1, cmux run 45932403699: "rustcVersion 'rustc 1.95.0' !=
+        'rustc 1.98.1'" while its gate listened). The probes read the aligned toolchain by name, as the gate does."""
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin", flip_after_align="1.88.0-aarch64-apple-darwin")
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("toolchain drifted", result.stdout + result.stderr)
+        self.assertIn("set the rustup default to 1.98.1-aarch64-apple-darwin", result.stdout)
         self.done()
 
     def test_check_is_read_only_and_predicts_the_alignment(self) -> None:
