@@ -24221,7 +24221,14 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
-        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
+        # judged at a head the copy shows: a later stale copy counts from its own first keep. The same older copy of
+        # the same pin keeps its first keep's clock: a judgment that went ahead on it (base_merge_due: its parents
+        # unread) is no read of the pin, and its worker's base_merge_check keeps it again (stale_live). Dropped here,
+        # every keep was the first and LAND_STALE_LIVE_MAX never ran out: 2026-11-26 18:17Z to 23:34Z, one row
+        # stale_head_kept 52 times, every 300 s, staleLive.n 1 each time, never pr_head_lags_branch.
+        kept = e.get("staleLive")
+        if not (isinstance(kept, dict) and kept.get("head") == sha and kept.get("pin") == str(e.get("pinSha") or "")):
+            e.pop("staleLive", None)
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()
