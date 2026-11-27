@@ -10441,6 +10441,38 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_a_slow_waited_kind_leaves_the_waited_kinds_after_it_their_own_share(self) -> None:
+        """cmux-cp-1, 2026-11-27 12:3xZ to 16:1xZ: PR batches GitHub answered 502/504 after ~10.9 s took the whole waited
+        share (pr, run and comment shared one deadline), every waited run batch after the first was deferred as "the runs'
+        share of the tick", and a waited run's data reached 13,419 s. A kind that goes first now ends early enough to leave
+        each waited kind after it WAITED_KIND_MIN_SHARE, and one that starts late still has that minimum."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        gg.register("run:o/r/77", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "run": "graphql"}
+        self.daemon.gql_first = 0  # pr goes first, as on cmux-cp-1
+        calls: list[tuple[str, float | None, float]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                calls.append((kind, until, time.monotonic()))
+                if kind == "pr" and until is not None:  # the 502ing PR batches: they take all the time they are given
+                    time.sleep(max(0.0, until - time.monotonic()))
+            return []
+        start = time.monotonic()
+        with mock.patch.object(gg, "WAITED_TICK_SHARE", 2.0), mock.patch.object(gg, "WAITED_KIND_MIN_SHARE", 0.6), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        kinds = [k for k, _, _ in calls]
+        self.assertIn("run", kinds, calls)
+        self.assertLess(kinds.index("pr"), kinds.index("run"), calls)
+        pr_until = next(u for k, u, _ in calls if k == "pr")
+        run_until, run_at = next((u, at) for k, u, at in calls if k == "run")
+        self.assertLessEqual(pr_until - start, 2.0 - 0.6 + 0.1, "the PRs stop short of the share, leaving the runs theirs")
+        self.assertGreater(run_until - run_at, 0.4, "the waited runs have their own share left when their turn comes")
+
     def test_waited_prs_a_probe_confirms_are_read_before_the_ones_that_need_a_full_read(self) -> None:
         """The land host, 2026-11-27: waited PRs needing full reads (1.5-4 s each) went in deferral order ahead of the
         probe-eligible ones (~0.5 s), so a window stored ~30 of ~330. The cheap ones lead, order kept within a group."""
@@ -37360,6 +37392,52 @@ class LandTest(Base):
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
         self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
+    def test_a_forward_stop_told_as_fyi_is_superseded_by_its_merge_and_told_once_per_take_back(self):
+        # LAND_NOTICE_SUPERSEDE: huge-blue, cmux#45156, 2026-11-27: ~20 forward_no_outcome fyis (one per re-arm of a
+        # bound take-back) sat in the requester's inbox after cmux-cp-1 merged it, and were relayed 8 h later as a stall
+        e = self.handed_off()
+        key = f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}"
+        e["forwardBound"] = {"at": self.t - 10, "head": LA}
+        e["forwardTakenBack"] = {"at": self.t - 5, "head": LA, "from": "huge-blue", "far": "waiting_after", "held": 1}
+        sent = len(self.w.sent())
+        with self.q.lock:
+            self.q.forward_give_up(e, "OPEN", "huge-blue", False, "no outcome either")
+        stops = [c for c in self.w.sent()[sent:] if "forward_no_outcome" in c[-1]]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0][stops[0].index("--class") + 1], "fyi")
+        self.assertEqual(stops[0][stops[0].index("--supersede") + 1], key)
+        self.assertEqual(stops[0][stops[0].index("--pr") + 1], "1")
+        for _ in range(3):  # the far host's "waiting_after" re-arms it and it gives up again on the same take-back
+            e = self.q.entries[self.KEY]
+            e.update(state=gg.LAND_FORWARDED, stop=None)
+            with self.q.lock:
+                self.q.forward_give_up(e, "OPEN", "huge-blue", False, "no outcome either")
+        self.assertEqual(len([c for c in self.w.sent()[sent:] if "forward_no_outcome" in c[-1]]), 1,
+                         "told once per take-back, not once per re-arm")
+        # the far queue merges it: the requester holds the stop fyi, so the merge goes as an fyi that supersedes it
+        e = self.q.entries[self.KEY]
+        e.update(state=gg.LAND_FORWARDED, stop=None)
+        with self.q.lock:
+            self.q.merged(e, "c" * 40, "forwarded to huge-blue: its land queue merged it after its stop", wake=False)
+            self.q.merged(e, "c" * 40, "forwarded to huge-blue: its land queue merged it after its stop", wake=False)
+        merged = [c for c in self.w.sent()[sent:] if " merged at " in c[-1]]
+        self.assertEqual(len(merged), 1, "once: a second word on the same stop is no news")
+        self.assertEqual(merged[0][merged[0].index("--class") + 1], "fyi")
+        self.assertEqual(merged[0][merged[0].index("--supersede") + 1], key)
+
+    def test_a_land_fyi_to_an_acpmux_without_supersede_is_sent_again_without_it(self):
+        e = self.handed_off()
+        refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--supersede' found\n")
+        real = self.q.call
+        self.q.call = lambda argv, *a, **k: (refused if "--supersede" in argv else real(argv, *a, **k))  # type: ignore
+        sent = len(self.w.sent())
+        self.q.notify(e, e.get("requester") or "host/lane", "glaeda land: an fyi", cls=gg.LAND_FORWARD_FYI_CLASS)
+        [got] = self.w.sent()[sent:]
+        self.assertNotIn("--supersede", got)
+        self.assertNotIn("--pr", got)
+        self.assertEqual(got[got.index("--class") + 1], "fyi")
+        self.assertEqual(got[-1], "glaeda land: an fyi")
+
     def test_a_forward_told_it_had_no_verdict_gives_up_with_no_second_notice(self):
         e = self.handed_off()
         e["forwardQuietTold"] = {"at": self.t, "since": self.t, "to": "huge-blue"}
@@ -44289,7 +44367,15 @@ class LandForwardTest(Base):
         self.assertTrue(e["forwardAskRepair"])
         e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
-        self.assertEqual(len(self.w.sent()), told)
+        # quiet but for one fyi that wakes nobody and supersedes the stop fyi it was told (LAND_NOTICE_SUPERSEDE):
+        # the executor's own merge word cannot replace this host's queued stop in the requester's inbox
+        after = self.w.sent()[told:]
+        self.assertEqual(len(after), 1, after)
+        self.assertEqual(after[0][after[0].index("--class") + 1], "fyi")
+        self.assertEqual(after[0][after[0].index("--supersede") + 1], f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}")
+        self.assertIn(" merged", after[0][-1])
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual(len(self.w.sent()), told + 1, "once")
         self.assertEqual(len(self.sent_batches), 1)
 
     def test_a_row_stopped_no_outcome_before_the_ask_still_open_at_its_pin_is_landed_again_pinned(self):
