@@ -34165,10 +34165,12 @@ def note_direct_quiet(req: dict, before: str | None, after: str | None, error: s
         req.pop("directQuiet", None)
 
 
-def own_feed_quiet(key: str, entry: dict | None, since: float, now: float) -> bool:
+def own_feed_quiet(key: str | None, entry: dict | None, since: float, now: float) -> bool:
     """upstream_feed_quiet from this host's own feed view (UPSTREAM_FEED_FILE, which an upstream host's daemon keeps
     since UPSTREAM_OWN_FEED): nothing reached KEY's PR, its head or its branch since SINCE, and the feed answered
-    after it. False with no fresh view."""
+    after it. False with no fresh view or no KEY."""
+    if not key:
+        return False
     view = feed_view(key, (entry or {}).get("data"), read_json(BASE / UPSTREAM_FEED_FILE), now)
     return view is not None and upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", since, now)
 
@@ -34207,7 +34209,7 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
         # current, however old. Before, every wait on a lane VM re-read its PR directly every UPSTREAM_DIRECT_AFTER
         # (huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of 11,257 glaeda-upstream GETs a path that VM had read before).
         return None
-    if not never_read and upstream_command() is not None and own_feed_quiet(req["key"], entry, float(seen), now):
+    if not never_read and upstream_command() is not None and own_feed_quiet(req.get("key"), entry, float(seen), now):
         return None  # this host's own feed vouches for the copy (UPSTREAM_OWN_FEED)
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
     return age_s if age_s > bound else None
