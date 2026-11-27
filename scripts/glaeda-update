@@ -187,6 +187,13 @@ APPLY_EVERY_S = 600  # a full run at least this often, and the first retry's wai
 # full run only probes the channel (channel_fingerprint: two anonymous HEADs) and does the full run when it changed, so
 # a host sees a new release (or a pause) within about a minute instead of 10-13 (Leo, 2026-11-17).
 PROBE_EVERY_S = 60
+# A runner mini (FLEET_DIR exists) probes at most this often. The ~25 office minis leave through one address, and
+# GitHub limits anonymous requests to github.com per address: on 2026-11-26 it answered the whole office 403. Each
+# probe is two anonymous HEADs of github.com, so the minute probe was ~108 of a mini's ~132 github.com requests an
+# hour (6 full runs of 4 requests each, 54 probe-only runs of 2), about 3,200 an hour across the office. At 300 s a
+# mini makes ~36 (6 probes, 6 full runs); a stable mini still sees a promotion within five minutes. Leo,
+# 2026-11-27: "minis tho," / "we dont wanna like... get banned again ideally".
+SHARED_EGRESS_PROBE_EVERY_S = 300
 PROBE_TIMEOUT = 15
 PROBE = STATE_DIR / "probe.json"
 BACKOFF_MAX_S = 3600  # an unconverged host still retries at least hourly, as the agent used to run
@@ -389,13 +396,60 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # the probe reads the redirect itself
 
 
-def channel_fingerprint(ring: str, source: str = REPOSITORY) -> dict | None:
+# The build controller's release probe (cmuxterm-hq build-fleet/cmd/controller/github_release_probe.go): it reads
+# the channel release's assets from GitHub's REST API at most once a minute for the whole fleet, with an App token and
+# an ETag (an unchanged channel is a 304). Before it, every fleet Mac HEADed github.com anonymously for each probe, from
+# the office's one address GitHub refused on 2026-11-26 (Leo, 2026-11-27: "we dont wanna like... get banned again
+# ideally"). GLAEDA_UPDATE_PROBE: a controller base URL, or "off"; else $CMUX_CI_CONTROLLER, else the cmux-ci client
+# config. A host with none probes github.com as before.
+PROBE_CONTROLLER_CONFIG = ".local/share/cmux-fleet-client/client.json"
+
+
+def probe_controller(home: Path | None = None) -> str | None:
+    """The controller this host probes its channel through, or None (off, or this host has none)."""
+    base = os.environ.get("GLAEDA_UPDATE_PROBE", "").strip()
+    if base == "off":
+        return None
+    base = base or os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if not base:
+        try:
+            doc = json.loads(((home or Path.home()) / PROBE_CONTROLLER_CONFIG).read_text())
+            base = doc.get("controller") if isinstance(doc, dict) else None
+        except (OSError, ValueError):
+            base = None
+    return base.rstrip("/") if isinstance(base, str) and base.startswith(("http://", "https://")) else None
+
+
+def controller_fingerprint(base: str, ring: str, repo: str) -> dict | None:
+    """channel_fingerprint through the controller: each channel file's asset id, update time and size. None when the
+    controller cannot tell (starting, unreachable, GitHub refused it): the caller waits for its next full run, and
+    github.com is not asked."""
+    request = urllib.request.Request(f"{base}/v1/github-release-probe/{repo}/ota-channels",
+                                     headers={"User-Agent": "glaeda-update"})
+    try:
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            doc = json.loads(response.read(1 << 20))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("status") not in (200, 404) or not isinstance(doc.get("assets"), dict):
+        return None
+    out: dict = {"repo": repo, "via": "controller"}
+    for name in ("control.json", f"{ring}.json"):
+        value = doc["assets"].get(name)
+        out[name] = value if isinstance(value, str) else "absent"
+    return out
+
+
+def channel_fingerprint(ring: str, source: str = REPOSITORY, home: Path | None = None) -> dict | None:
     """What control.json and <ring>.json are now, without downloading them: one anonymous HEAD each at the first
     channel source, never the GitHub API. github.com answers a release download with a redirect to the asset's
     storage path, and every upload (`gh release upload --clobber`) is a new asset with a new path; an ETag stands
     in where there is no redirect. None when it cannot tell (offline, an unexpected answer): the caller then waits
     for its next full run."""
     repo = channel_sources(source)[0]
+    base = probe_controller(home)
+    if base:
+        return controller_fingerprint(base, ring, repo)
     opener = urllib.request.build_opener(_NoRedirect)
     out: dict = {"repo": repo}
     for name in ("control.json", f"{ring}.json"):
@@ -435,21 +489,44 @@ def save_probe(doc: dict, state_dir: Path = STATE_DIR) -> None:
     os.replace(tmp, state_dir / PROBE.name)
 
 
+def shared_egress() -> bool:
+    """This host is a runner mini, one of many behind the office's single address (SHARED_EGRESS_PROBE_EVERY_S)."""
+    return FLEET_DIR.is_dir()
+
+
+def probe_every() -> int:
+    return SHARED_EGRESS_PROBE_EVERY_S if shared_egress() else PROBE_EVERY_S
+
+
+def _when(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def probe_gate(config: dict, now: float, state_dir: Path = STATE_DIR) -> tuple[bool, dict | None, str]:
     """(do a full run now, the fingerprint seen, why). A full run is due APPLY_EVERY_S after the last one, as the
     agent used to run; between them, only when the channel files changed since the last full run. A probe that
     cannot tell starts nothing, so an outage never turns the minute probe into a full run every minute, and the
-    backoff and quarantine of a full run apply as before."""
+    backoff and quarantine of a full run apply as before. On a runner mini a probe within probe_every() of the last
+    probe or full run is skipped, with no request at all ("probed recently"); a due full run or soak end is not."""
     doc = load_probe(state_dir)
-    seen = channel_fingerprint(config["ring"], config.get("source", REPOSITORY))
     last = doc.get("fullRunAt")
-    if not isinstance(last, (int, float)) or not 0 <= now - last < APPLY_EVERY_S:
+    due = not isinstance(last, (int, float)) or not 0 <= now - last < APPLY_EVERY_S
+    soak = _when(doc.get("soakEndsAt"))
+    soak_due = soak is not None and now >= soak
+    every = probe_every()
+    if not due and not soak_due and every > PROBE_EVERY_S:
+        probed = max((t for t in (_when(doc.get("probedAt")), _when(last)) if t is not None), default=None)
+        if probed is not None and 0 <= now - probed < every:
+            return False, doc.get("channel"), "probed recently"
+    seen = channel_fingerprint(config["ring"], config.get("source", REPOSITORY))
+    if due:
         return True, seen, "due"
     if seen is not None and seen != doc.get("channel"):
         return True, seen, "channel changed"
-    soak = doc.get("soakEndsAt")
-    if isinstance(soak, (int, float)) and not isinstance(soak, bool) and now >= soak:
+    if soak_due:
         return True, seen, "soak ended"  # this canary's post-soak promote nudge (nudge_pending_at)
+    if every > PROBE_EVERY_S:
+        save_probe({**doc, "probedAt": now}, state_dir)
     return False, seen, "unchanged"
 
 

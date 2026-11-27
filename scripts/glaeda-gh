@@ -4951,12 +4951,12 @@ def load_feed_view() -> dict | None:
 
 
 def feed_view(key: str, data: dict | None, doc: dict | None, now: float) -> dict | None:
-    """What this host's feed says about PR KEY, for a downstream's land_feed_quiet (upstream_feed_quiet): since when
+    """What this host's feed says about PR or head KEY, for a downstream's land_feed_quiet (upstream_feed_quiet): since when
     the feed has answered without a gap (liveSince), when it last answered (at), and the newest event it delivered for
     the PR, the head this host's copy names, or its branch (eventAt, None for none). None, so the downstream holds
     nothing quiet, unless the feed answers now (CONTROLLER_FRESH) and covers the repository (FED_REPO_KEEP), as
     Daemon.fed asks."""
-    if not key.startswith("pr:") or not isinstance(doc, dict):
+    if not key.startswith(("pr:", "head:")) or not isinstance(doc, dict):
         return None
     live, ok = doc.get("liveSince"), doc.get("okAt")
     if not _finite(live) or not _finite(ok) or not 0 <= now - ok <= CONTROLLER_FRESH:
@@ -4971,9 +4971,17 @@ def feed_view(key: str, data: dict | None, doc: dict | None, now: float) -> dict
         return None
     marks = doc.get("marks") if isinstance(doc.get("marks"), dict) else {}
     data = data if isinstance(data, dict) else {}
-    head = str(data.get("headRefOid") or "").lower()
-    names = [f"pr:{repo}#{number}"] + ([f"sha:{repo}@{head}"] if head else []) \
-        + ([f"branch:{repo}@{data['headRefName']}"] if data.get("headRefName") else [])
+    if key.startswith("head:"):
+        # A commit's checks (head key): the feed marks its runs, suites and statuses as sha:REPO@SHA, the mark
+        # head_feed_quiet trusts on the broker host. Before, a lane VM's wait on a head had no view and re-read the
+        # commit's check-runs, status and check-suites every UPSTREAM_DIRECT_AFTER (2026-11-27 01:10-03:10Z: 1,861 of
+        # glaeda-upstream's 4,460 App requests an hour were those three per-commit reads).
+        head = str(number).lower()
+        names = [f"sha:{repo}@{head}"]
+    else:
+        head = str(data.get("headRefOid") or "").lower()
+        names = [f"pr:{repo}#{number}"] + ([f"sha:{repo}@{head}"] if head else []) \
+            + ([f"branch:{repo}@{data['headRefName']}"] if data.get("headRefName") else [])
     events = [marks[m] for m in names if _finite(marks.get(m))]
     return {"liveSince": live, "at": ok, "eventAt": max(events) if events else None, "head": head or None}
 
@@ -6674,6 +6682,9 @@ class Daemon:
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.consumer_sent: dict[tuple[str, str], float] = {}  # (head, consumer): last sent upstream (upstream_read)
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        # when a GraphQL query of each key alone last failed (batched): its own failure, so it moves back like a failed
+        # REST read (tried_at); a key in a failed batch keeps its place, the batch's failure may be another key's
+        self.gql_failed_alone: dict[str, float] = {}
         # when a confirming read (wait_confirms) of each run was last made ahead of the rest, and the finish it was
         # for (rest_run): one such read per finish
         self.confirm_tried: dict[str, tuple[float, dict]] = {}
@@ -9654,8 +9665,19 @@ class Daemon:
         last fetch. Never read nor tried (no cache) sorts first, so a new watch is filled at once."""
         c = e.get("cache") or {}
         at = c.get("restAt") if c.get("source") == "controller" else c.get("fetchedAt")
-        return max(float(at) if isinstance(at, (int, float)) else float("-inf"),
-                   self.rest_tried.get(e["key"], float("-inf")))
+        return max(float(at) if isinstance(at, (int, float)) else float("-inf"), self.tried_at(e["key"]))
+
+    def tried_at(self, key: str) -> float:
+        """When a read of KEY alone last ended without its data, or a REST read of it ended at all: a REST read
+        (rest_tried) or a GraphQL query of it alone that failed (gql_failed_alone). Every order that puts the oldest data
+        first counts from here too, so a key GitHub keeps failing takes one turn, then waits behind the others."""
+        return max((getattr(self, "rest_tried", None) or {}).get(key, float("-inf")),
+                   (getattr(self, "gql_failed_alone", None) or {}).get(key, float("-inf")))
+
+    def read_turn(self, e: dict) -> float:
+        """The age batched() orders GraphQL reads by: the entry's data (never read sorts first), or its last failed
+        try alone (tried_at) when that is later."""
+        return max(float((e.get("cache") or {}).get("dataAt") or 0), self.tried_at(e["key"]))
 
     def rest_order(self, entries: list[dict]) -> list[dict]:
         """The order a tick reads REST keys in. A finished run a wait only needs confirmed (wait_confirms) goes first:
@@ -9708,7 +9730,7 @@ class Daemon:
     def never_read(self, e: dict) -> bool:
         """A PR or run watch with no copy at all, never read nor tried over REST: its readers get null until its first
         read (unread_lead)."""
-        if not e["key"].startswith(("pr:", "run:")) or e["key"] in self.rest_tried:
+        if not e["key"].startswith(("pr:", "run:")) or self.tried_at(e["key"]) > float("-inf"):
             return False
         c = e.get("cache") or {}
         return not c.get("data") and not isinstance(c.get("fetchedAt"), (int, float))
@@ -9739,7 +9761,7 @@ class Daemon:
                 continue
             seen = c.get("dataAt") if isinstance(c.get("dataAt"), (int, float)) else since.get(e["key"], self.now)
             # a failed try moves it back too, so a key GitHub keeps failing cannot hold the floor from the others
-            seen = max(seen, (getattr(self, "rest_tried", None) or {}).get(e["key"], float("-inf")))
+            seen = max(seen, self.tried_at(e["key"]))
             age = self.now - seen
             if age > best_age:
                 best, best_age = e, age
@@ -10710,6 +10732,8 @@ class Daemon:
         self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.gql_failed_alone = {k: t for k, t in getattr(self, "gql_failed_alone", {}).items()
+                                 if self.now - t < 2 * IDLE_EXPIRY}
         self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         # Evaluate the watches selected at tick start, but include the time spent waiting for their reads.
@@ -11061,6 +11085,30 @@ class Daemon:
             else:
                 write_json(path, before)
 
+    def upstream_follow_feed(self) -> None:
+        """On an upstream host, follow the controller's change feed for its own view (feed_live_since, feed_marks,
+        saved in UPSTREAM_FEED_FILE), every CONTROLLER_FEED_EVERY: the feed needs no controller token, and nothing
+        else of the controller is used here (no hooks, no run baselines). land_feed_quiet and wait_starved rule with
+        it when the upstream's view of a PR does not vouch for its copy (UPSTREAM_OWN_FEED). Out (an error), the view
+        is dropped and asked again after CONTROLLER_RETRY."""
+        if self.controller is None or self.now < self.controller_down_until \
+                or self.now - self.controller_feed_at < CONTROLLER_FEED_EVERY:
+            return
+        self.controller_feed_at = self.now
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        if not self.controller_room():
+            return
+        try:
+            pages = self.read_feed()
+        except WatchError:
+            self.feed_live_since = None  # what the feed misses while out is not known
+            self.controller_down_until = self.now + CONTROLLER_RETRY
+            self.save_feed_view()
+            return
+        self.controller_feed_error = None  # a later page that failed: the cursor stays at the pages taken
+        self.took_feed(pages)
+        self.save_feed_view()
+
     def upstream_left(self) -> float:
         """Seconds left of this tick's UPSTREAM_TICK_BUDGET for one upstream run, at most UPSTREAM_DEADLINE."""
         return min(float(UPSTREAM_DEADLINE), self.upstream_end - time.monotonic())
@@ -11069,6 +11117,12 @@ class Daemon:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
+        try:
+            with self.phase("feed"):
+                self.upstream_follow_feed()
+        except Exception as error:  # noqa: BLE001  the feed only spares reads: a fault must not stop them
+            self.feed_live_since = None
+            self.errors.append(f"feed: {describe(error)} at {error_site(error)}"[:UPSTREAM_ERROR_MAX])
         if lane_vm_poster():
             try:
                 with self.phase("outbox"):
@@ -11584,7 +11638,7 @@ class Daemon:
             # its chunk failed it tick after tick: alone, first, the oldest data of them first (UNREAD_ALONE_AFTER)
             failing = [e for e in group if e["key"] not in self.heavy
                        and (unread.get(e["key"]) or {}).get("tries", 0) >= UNREAD_ALONE_AFTER]
-            failing.sort(key=lambda e: float((e.get("cache") or {}).get("dataAt") or 0))
+            failing.sort(key=self.read_turn)
             lone = {e["key"] for e in failing[:max(0, UNREAD_ALONE_MAX - len(lone_unread))]}
             lone_unread.update(lone)
             for e in group:
@@ -11612,18 +11666,25 @@ class Daemon:
             # the App.
             groups: dict[str, list[dict]] = {}
             pool = self.app_pool
-            for e in rest:
+            # Each query the oldest turns of its group (read_turn), not the order the entries came in: a chunk cut in
+            # that order mixed old and new, so every chunk's oldest looked alike and the entries of the chunks that came
+            # last were never sent while a failing chunk went first every tick.
+            for e in sorted(rest, key=self.read_turn):
                 benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
                 groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""),
                                   []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
 
         def oldest_first(queue: list[list[dict]]) -> list[list[dict]]:
-            """Chunks by the oldest data in each (never read first). The chunks above run one repository at a time, then
-            heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only inside a chunk:
-            a tick that ran out of time read the first repository's newest data before another's oldest."""
-            return sorted(queue, key=lambda c: (not (len(c) == 1 and c[0]["key"] in lone_unread),
-                                                min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c)))
+            """Chunks by the oldest turn in each (read_turn: never read first). The chunks above run one repository at a
+            time, then heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only
+            inside a chunk: a tick that ran out of time read the first repository's newest data before another's oldest.
+            An entry read alone because its chunks kept failing (lone_unread) takes its turn by age too, not ahead of
+            all: it went first every tick, and with it failing alone its data never got newer, so cmux-cp-1 and
+            cmux-cp-2 (2026-11-27 02:20Z) spent each tick's PR share on the same 502ing PRs, lone and in their batch's
+            halves, while ~40 waited PRs were "not read for 1298s (14 due ticks, its query sent on 0)". Once it failed
+            alone (gql_failed_alone) it goes behind the others, and every waited entry is sent within one pass."""
+            return sorted(queue, key=lambda c: min(self.read_turn(e) for e in c))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = deque(oldest_first(chunks([e for e in entries if self.waited(e)]))
                       + oldest_first(chunks([e for e in entries if not self.waited(e)])))
@@ -11708,10 +11769,14 @@ class Daemon:
                 with contextlib.suppress(Exception):  # noqa: BLE001  storing the error must not stop the rest
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
+                if len(chunk) == 1:
+                    self.__dict__.setdefault("gql_failed_alone", {})[chunk[0]["key"]] = self.now
                 continue
             if error is not None:
                 for e in chunk:
                     miss[e["key"]] = f"{' '.join(error.split())[:200]} (in a {kind} batch of {len(chunk)})"
+                if len(chunk) == 1:  # its own failure: it takes its next turn behind the others (read_turn)
+                    self.__dict__.setdefault("gql_failed_alone", {})[chunk[0]["key"]] = self.now
             timed_out = error and GQL_GATEWAY_TIMEOUT.search(error)
             if timed_out and pr_timeout_rest and repo in pr_timeout_rest and self.rest_admits(kind, chunk[0]):
                 pr_timeout_rest[repo] = True
@@ -14633,8 +14698,8 @@ class Daemon:
         if land_pending_status((read_cache(key) or {}).get("data") or {}):
             return False  # a commit status ending its wait reaches the feed as no event (land_pending_status)
         view = self.upstream_feed.get(key)
-        if view is not None:
-            return upstream_feed_quiet(view, sha, since, self.now)
+        if view is not None and upstream_feed_quiet(view, sha, since, self.now):
+            return True  # else this host's own feed, when it follows one (UPSTREAM_OWN_FEED), may still vouch
         if not key.startswith("pr:") or self.feed_live_since is None or self.feed_live_since > since:
             return False
         if not self.fed(key):
@@ -15230,6 +15295,37 @@ def land_unlabel_args(repo: str, number: str, broker: bool) -> list[str]:
     if broker:
         return ["pr", "edit", number, "-R", repo, "--remove-label", LAND_UNLABEL]
     return ["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{LAND_UNLABEL}"]
+
+
+# LAND_UNLABEL_KEEP: a row's owed removal first reads when LAND_UNLABEL was last added (one read-only GraphQL read, the
+# form a lane VM's broker takes). An add after the row ended is another land's or a lane's re-arm, never this row's
+# leftover, so the label stays (`label_kept`). cmux#57755, 2026-11-27: ready-to-land came off six times in 5 h
+# (00:13Z..04:41Z, as yap-goblin-9000 and quota-goblin-9000, the hosts' gh pool), each 6-30 min after a live land
+# re-added it, with no add after: an older stopped row on another host owed its removal and sent it under the live
+# land, whose iOS-matrix carry needs the label (leo-workspace#12563), so the land stopped again. An unread read keeps
+# the removal as before (the label's CI cost is the reason it exists). Detector: test-glaeda-gh.py -k unlabel_keeps.
+LAND_UNLABEL_ADDS = ("query($owner: String!, $name: String!, $n: Int!) { repository(owner: $owner, name: $name) { "
+                     "issueOrPullRequest(number: $n) { ... on PullRequest { timelineItems(last: 30, itemTypes: "
+                     "[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } } } } } }")
+
+
+def land_label_adds_args(repo: str, number: str) -> list[str]:
+    """The gh argv that reads REPO#NUMBER's newest label adds (LAND_UNLABEL_KEEP)."""
+    owner, _, name = repo.partition("/")
+    return ["api", "graphql", "-f", f"query={LAND_UNLABEL_ADDS}", "-f", f"owner={owner}", "-f", f"name={name}",
+            "-F", f"n={number}"]
+
+
+def land_label_added_at(text: str, label: str = "ready-to-land") -> float | None:
+    """The newest add of LABEL in a land_label_adds_args answer, as epoch seconds; None when unread or never added."""
+    try:
+        doc = json.loads(text or "")
+        nodes = doc["data"]["repository"]["issueOrPullRequest"]["timelineItems"]["nodes"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    times = [iso_epoch(n.get("createdAt")) for n in nodes or () if isinstance(n, dict)
+             and ((n.get("label") or {}).get("name") or "") == label]
+    return max((t for t in times if t is not None), default=None)
 
 
 def land_pulse_args(repo: str, number: str, label: str, broker: bool) -> list[list[str]]:
@@ -16370,6 +16466,13 @@ LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch'
 # a path more than one VM read. The upstream host's daemon now keeps its feed view in UPSTREAM_FEED_FILE (written each
 # time it reads the feed), `read` answers each PR key with it (feed_view), and the downstream rules with that view
 # (upstream_feed_quiet) exactly as land_feed_quiet does with its own feed.
+# UPSTREAM_OWN_FEED: the upstream's view went stale all the same. cmux-cp-1's copy of a waited PR was routinely past
+# UPSTREAM_DIRECT_AFTER (a lane VM's daemon.json, 2026-11-27 02:4xZ: staleWaited pr 437 s, run 199 s), and its feed view
+# with it, so each wait re-read its PR through the broker anyway: glaeda-upstream made 3,194 of the read pool's 24,743
+# App requests in the hour to 02:40Z (check-runs 673, actions/runs 666, pulls/N 645), the largest single caller. The
+# "no controller token" above was never a reason: /v1/github/events answers without one. So an upstream host's
+# daemon now follows the feed itself (Daemon.upstream_follow_feed), and a copy its own feed vouches for is current
+# (land_feed_quiet, own_feed_quiet in wait_starved), however old the upstream's copy and view are.
 UPSTREAM_FEED_FILE = "feed-view.json"  # under BASE: {"liveSince", "okAt", "fedRepos", "marks"} (Daemon.save_feed_view)
 UPSTREAM_FEED_FRESH = 3 * UPSTREAM_EVERY  # a downstream trusts a key's feed view this long after the upstream gave it
 UPSTREAM_FEED_SKEW = 5.0  # seconds of clock difference between hosts an event time is given against a copy's dataAt
@@ -19381,7 +19484,7 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
+                     waitBudget=None, afterStopped=None, afterUnqueued=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
                      lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
@@ -21641,6 +21744,13 @@ class LandQueue:
                 return False  # it re-arms by itself, and lands with its label
         return self.now - float(st.get("at") or 0) >= LAND_UNLABEL_AFTER
 
+    def unlabel_ended_at(self, e: dict) -> float:
+        """When E's land ended: its cancel, else its stop, else its last update (LAND_UNLABEL_KEEP compares to it)."""
+        if e.get("state") == "cancelled":
+            return max((float(h.get("at") or 0) for h in e.get("history") or [] if h.get("event") == "cancelled"),
+                       default=float(e.get("updated") or 0))
+        return float((e.get("stop") or {}).get("at") or e.get("updated") or 0)
+
     def unlabel_start(self, keys: list[str]) -> None:
         """Send the owed label removals (unlabel_owed), LAND_UNLABEL_BATCH at most, off the pass thread."""
         if not keys or (self.unlabel_thread is not None and self.unlabel_thread.is_alive()):
@@ -21663,6 +21773,22 @@ class LandQueue:
             try:
                 e = self.entries.get(key)
                 if e is None:
+                    continue
+                read = self.call([gh, *land_label_adds_args(str(e["repo"]), str(e["number"]))], LAND_GH_DEADLINE, None)
+                added = land_label_added_at(read.stdout or "") if read.returncode == 0 else None
+                ended = self.unlabel_ended_at(e)
+                if added is not None and added > ended:
+                    with self.lock:
+                        if self.entries.get(key) is not e or int(e.get("gen") or 0) != gen \
+                                or e.get("state") not in ("stopped", "cancelled"):
+                            continue
+                        at = dt.datetime.fromtimestamp(added, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        e["unlabeled"] = {"head": str(e.get("head") or ""), "at": self.now, "kept": at}
+                        e.pop("unlabelFail", None)
+                        self.history(e, "label_kept", label=LAND_UNLABEL,
+                                     note=f"re-added at {at}, after this land ended: another land's, not this row's")
+                        self.save(e)
+                    log({"event": "land-unlabel-kept", "key": key, "added": added, "ended": ended})
                     continue
                 argv = land_unlabel_args(str(e["repo"]), str(e["number"]), self.broker_client())
                 got = self.call([gh, *argv], LAND_GH_DEADLINE, None)
@@ -22861,6 +22987,10 @@ class LandQueue:
                           "(its land entry aged out)",
                           f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
                 return True
+            if ae is None and self.after_unqueued(e, a):
+                return True
+            if ae is not None and (e.get("afterUnqueued") or {}).get("key") == a:
+                e.pop("afterUnqueued", None)  # queued now: its own land bounds this wait
             pending.append(a)
         if stopped and self.after_stopped(e, *stopped):
             return True
@@ -22878,6 +23008,26 @@ class LandQueue:
             self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
             self.save(e)
         return False
+
+    def after_unqueued(self, e: dict, a: str) -> bool:
+        """E lands after A, which is open with no land row here: nothing would ever merge it, end it or stop it, so E
+        waited with no bound (cmux#45065 after #45002, open and idle since 11-22: 24 h waiting_after on cmux-cp-1 until
+        the forward give-up stopped it forward_no_outcome, naming neither). E waits LAND_AFTER_STOPPED_WAIT from the
+        first pass that sees A unqueued, then stops after_unqueued naming A and both ways on. True when E stopped."""
+        mark = e.get("afterUnqueued") or {}
+        if mark.get("key") != a:
+            e["afterUnqueued"] = {"key": a, "since": self.now}
+            self.history(e, "after_unqueued_waiting", after=a)
+            self.save(e)
+            return False
+        if self.now - float(mark.get("since") or self.now) < LAND_AFTER_STOPPED_WAIT:
+            return False
+        self.stop(e, "after_unqueued",
+                  f"{key_name(a)}, which it lands after, stayed open with no land queued for "
+                  f"{LAND_AFTER_STOPPED_WAIT:.0f} s",
+                  f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}, "
+                  f"or glaeda-gh land {key_name(e['key'])} without --after")
+        return True
 
     def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
         """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester
@@ -24221,7 +24371,14 @@ class LandQueue:
                           "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
                                                                str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
-        e.pop("staleLive", None)  # judged at a head the copy shows: a later stale copy counts from its own first keep
+        # judged at a head the copy shows: a later stale copy counts from its own first keep. The same older copy of
+        # the same pin keeps its first keep's clock: a judgment that went ahead on it (base_merge_due: its parents
+        # unread) is no read of the pin, and its worker's base_merge_check keeps it again (stale_live). Dropped here,
+        # every keep was the first and LAND_STALE_LIVE_MAX never ran out: 2026-11-26 18:17Z to 23:34Z, one row
+        # stale_head_kept 52 times, every 300 s, staleLive.n 1 each time, never pr_head_lags_branch.
+        kept = e.get("staleLive")
+        if not (isinstance(kept, dict) and kept.get("head") == sha and kept.get("pin") == str(e.get("pinSha") or "")):
+            e.pop("staleLive", None)
         e.pop("dueAt", None)
         self.save(e)
         self.headroom_take()
@@ -24624,7 +24781,7 @@ class LandQueue:
                 # incomplete base-red search; take() checks the target and uses the ordinary pinned merge.
                 self.history(e, "override_merge", code=answer["code"], head=head[:12], **land_override_history(e))
                 act = {**act, "kind": "merge", "sha": head}
-                answer = {**answer, "ok": True, "code": "ok", "action": act}
+                answer = {**answer, "ok": True, "code": "ok", "via": "override_receipted_base_red", "action": act}
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
                 bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
                     and bool(LAND_UNREAD_TRANSIENT.search(reason))
@@ -24995,7 +25152,8 @@ class LandQueue:
                              **land_override_history(e))
             log({"event": "land-override-carried", "key": e["key"], "head": head[:12],
                  "code": str(answer.get("code") or kind), "override": (e.get("override") or {}).get("reason")})
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_carried",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if land_override_waited(e, act, answer, head, self.now):
             # LAND_OVERRIDE_WAIT_CODES' comment: the check never posted within its wait, and the override answers it
@@ -25003,7 +25161,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              waited=round(self.now - float(e["overrideWait"]["since"])), **land_override_history(e))
                 e.pop("overrideWait", None)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_waited",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if (kind in LAND_OVERRIDE_PIN_KINDS or land_train_retry(act)) and land_override_pinned(e, head):
             # LAND_OVERRIDE_PIN_KINDS' and land_train_retry's comments: the pinned merge carrying the override, once per
@@ -25022,7 +25181,8 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              carried="pinned", **land_override_history(e))
                 self.save(e)
-            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            self.do_merge(e, head, {**answer, "ok": True, "via": "override_pinned",
+                                    "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
@@ -25035,7 +25195,8 @@ class LandQueue:
                 # the queue's own update-branch's head included, as a pinned merge carrying it
                 with self.lock:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
-                self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                self.do_merge(e, head, {**answer, "ok": True, "via": "override_takes",
+                                        "action": {"v": 1, "kind": "merge", "sha": head}})
                 return
             if (str(answer.get("code") or "") == "conflicts_base" or cls == "conflict") and self.base_merge_first(
                     e, head, "base", land_reason(why), land_trim(nxt or answer.get("next"))):
@@ -26031,6 +26192,10 @@ class LandQueue:
             self.save(e)
         removed = self.call([gh, *off], LAND_GH_DEADLINE, e)
         got = self.call([gh, *on], LAND_GH_DEADLINE, e)
+        if removed.returncode == 0 and got.returncode not in (0, 124):
+            # the label is off and the add was refused: one more add now, so a refused add (quota, a pool app's 502)
+            # never leaves the PR without the label its land and its iOS-matrix carry read (cmux#57755, 2026-11-27)
+            got = self.call([gh, *on], LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
             if got.returncode not in (0, 124):
@@ -26559,7 +26724,7 @@ class LandQueue:
                     self.history(e, "override_pin_merge", head=head[:12],
                                  why="a pinned override row is merged at its pin, never base-updated")
                     self.save(e)
-                self.do_merge(e, head, {"pinned": True})
+                self.do_merge(e, head, {"pinned": True, "via": "override_pin"})
                 return
         sent = e.get("updateSent") or {}
         if head and sent.get("head") == head:
@@ -27050,8 +27215,10 @@ class LandQueue:
         lease = self.merge_lease(e, sha)
         if lease is False:
             return
+        snapshot = (self.cache_of(e["key"]) or {}).get("data")  # a file read, off the lock
         with self.lock:
             self.claim(e, "merge", sha=sha)
+            judged = land_merge_record(e, sha, answer, snapshot, self.now)
         if self.broker_client():
             got = self.broker_land(e, sha)
         else:
@@ -27077,7 +27244,7 @@ class LandQueue:
         with self.lock:
             self.finish(e, got, verified=state)
             if state == "MERGED":
-                self.merged(e, merge_sha, "merged pinned")
+                self.merged(e, merge_sha, "merged pinned", judged=judged)
                 return
             if self.ended(e, state, merge_sha, "the read after its merge shows it"):
                 return  # CLOSED: closed unmerged, no refusal counted
@@ -27226,10 +27393,13 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True) -> None:
-        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here."""
+    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True, judged: dict | None = None) -> None:
+        """WAKE False: the requester was told by the host that merged it (forward_answered), a log line here. JUDGED:
+        this queue's own merge's record (LAND_MERGE_RECORD), on the entry and its "merged" row."""
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
-        self.history(e, "merged", sha=merge_sha, how=how)
+        if judged is not None:
+            e["landJudge"] = judged
+        self.history(e, "merged", sha=merge_sha, how=how, **({"landJudge": judged} if judged is not None else {}))
         self.save(e)
         # LAND_MERGED_ELSEWHERE_FYI: only this queue's own merge is news that wakes its requester. A merge read from a
         # copy (a hand merge, another host's queue that told it already) reaches it as an inbox fyi with its next news.
@@ -28352,6 +28522,44 @@ def land_override_history(e: dict) -> dict:
     of at most 240 characters)."""
     o = e.get("override")
     return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
+
+
+# LAND_MERGE_RECORD: the daemon's own merge history names what let each merge through. Before, its "merged" row said
+# only the SHA and "merged pinned": a merge past a red or pending check left no trace of which check, under which
+# verdict, or the override's reason (the queue's entries on one land host, 2026-11-26/27: four such merges, two past a
+# red ws-check and two past a pending one, each read back as a plain merge). leo-workspace#12618 closed the same hole
+# in the gh shim's landing record (land_judge.{verdict, excused[], override_reason}); this mirrors that record on the
+# entry ("landJudge") and its "merged" history row. It is written from what the queue already held at the merge (the
+# judgment it acted on and the check snapshot at the merged head): it reads nothing new and changes no decision.
+# Detector: test-glaeda-gh.py test_a_merge_past_a_red_or_pending_check_records_its_verdict_and_each_excused_check.
+LAND_RECORD_EXCUSED_MAX = 40
+
+
+def land_merge_record(e: dict, sha: str, answer: dict, data: dict | None, now: float) -> dict:
+    """What let E's merge at SHA through, as the shim's landing record words it: {verdict, excused[{name, state, why}],
+    override_reason?}. VERDICT is how the queue reached the merge (land_judge's ok code, or the override path, "via");
+    EXCUSED each check the snapshot DATA shows red or unfinished at SHA; an override's reason when one rode the merge."""
+    via = str(answer.get("via") or "")
+    code = str(answer.get("code") or ("ok" if answer.get("ok") else ""))
+    verdict = f"{via} ({code})" if via and code and code != "ok" else via or code or "unjudged"
+    o = e.get("override")
+    reason = str(o.get("reason") or "") if isinstance(o, dict) else ""
+    why = (f"override: {reason}" if via.startswith("override") and reason
+           else f"land_judge {verdict}: {land_reason(answer.get('reason'))}" if answer.get("reason")
+           else f"land_judge {verdict} at this head")
+    excused: list[dict] = []
+    data = data or {}
+    if str(data.get("headRefOid") or "").lower() == sha.lower():
+        groups = classify(data, now)
+        for state, cs in (("red", groups["failed"]), ("held", groups["held"]), ("pending", groups["pending"])):
+            for c in cs:
+                excused.append({"name": land_trim(c.get("name"), 200), "state": state, "why": land_trim(why, 400)})
+    out: dict = {"verdict": land_trim(verdict, 80), "excused": excused[:LAND_RECORD_EXCUSED_MAX]}
+    if data and str(data.get("headRefOid") or "").lower() != sha.lower():
+        out["checksUnread"] = True  # the snapshot was of another head: no check list, said so rather than "none"
+    if reason:
+        out["override_reason"] = land_trim(reason, 500)
+    return out
 
 
 # A request `land` or `land cancel` wrote is a file in requests/ until the daemon's next land pass applies it, and only
@@ -34097,6 +34305,16 @@ def note_direct_quiet(req: dict, before: str | None, after: str | None, error: s
         req.pop("directQuiet", None)
 
 
+def own_feed_quiet(key: str | None, entry: dict | None, since: float, now: float) -> bool:
+    """upstream_feed_quiet from this host's own feed view (UPSTREAM_FEED_FILE, which an upstream host's daemon keeps
+    since UPSTREAM_OWN_FEED): nothing reached KEY's PR, its head or its branch since SINCE, and the feed answered
+    after it. False with no fresh view or no KEY."""
+    if not key:
+        return False
+    view = feed_view(key, (entry or {}).get("data"), read_json(BASE / UPSTREAM_FEED_FILE), now)
+    return view is not None and upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", since, now)
+
+
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     """How old the data a wait is blocked on is, when it is starved: the wait has run STALE_DATA_AFTER and nothing was
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
@@ -34131,6 +34349,8 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
         # current, however old. Before, every wait on a lane VM re-read its PR directly every UPSTREAM_DIRECT_AFTER
         # (huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of 11,257 glaeda-upstream GETs a path that VM had read before).
         return None
+    if not never_read and upstream_command() is not None and own_feed_quiet(req.get("key"), entry, float(seen), now):
+        return None  # this host's own feed vouches for the copy (UPSTREAM_OWN_FEED)
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
     return age_s if age_s > bound else None
 
@@ -34622,12 +34842,75 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
               f"the land daemon reads that PR, judges it on its own schedule and ends the row itself, and it tells "
               f"the row's requester when it does. A second watcher here reads nothing the daemon does not already "
               f"read and spends the shared GraphQL pool the land's own reserve keeps back for lands")
-    nxt = f"glaeda-gh land {name} --wait {max(1, int(timeout)):d}"
+    nxt = f"glaeda-gh wait pr {name} --until merged --timeout {max(1, int(timeout)):d}"
     out = json.dumps({"ok": False, "code": "land_row_watching", "reason": reason, "next": nxt,
                       "landRow": {"key": key, "state": row.get("state"), "head": row.get("head"),
                                   "wakeAt": row.get("wakeAt"), "requester": row.get("requester")}}) + "\n" \
         if as_json else ""
     return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
+
+
+# LAND_ROW_WAIT: the two wait commands pointed at each other. `wait pr R#N` on a PR this host's land queue holds refused
+# (land_row_watching, exit 64) and named `land R#N --wait T`; an agent's `land --wait` is held to LAND_AGENT_WAIT_CAP
+# (150 s) and then named `cmux-gh wait pr R#N --until merged --timeout 1800`, which refused again. So an agent could
+# follow neither hint to wait on a queued land. Now `wait pr` with --until merged (or no --until) on an active row
+# waits on that row itself: it reads only the local land/entries file, as `land --wait` does, so it is still never a
+# second GitHub watcher (the refusal's reason, glaeda#2612), and it re-requests nothing. It ends with the row: exit 0
+# merged, 1 stopped or cancelled, 2 when --timeout passes with no change in the row. A row forwarded away, gone, or a
+# daemon that is down hands it back to the ordinary wait. --until green|done|required still refuses, naming this wait.
+# Detector: test-glaeda-gh-wait-land-row.py test_the_refusals_next_and_the_land_caps_next_end_in_a_wait_that_waits.
+LAND_ROW_WAIT_POLL = 1.0  # a local file read, as cmd_land's own wait
+
+
+def land_row_now(key: str) -> dict | None:
+    """KEY's land row as last saved, from its own file, or from a scan of land/entries when that file is not it."""
+    e = land_wait_entry(key)
+    if e is not None:
+        return e
+    return next((r for r in land_entries() if r.get("key") == key), None)
+
+
+def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+                  sleep: Callable[[float], None] = time.sleep) -> int | None:
+    """Wait on ROW, this host's active land row for KEY, until it ends or TIMEOUT passes with no change in it
+    (LAND_ROW_WAIT's comment). None: the row went where this wait cannot follow (forwarded, gone) or no daemon
+    works it, so the caller takes the ordinary wait."""
+    name = key_name(key)
+    if not daemon_running():
+        return None
+    say_waiting(f"glaeda-gh: {name} is an active row in this host's land queue ({row.get('state')}): waiting on that "
+                f"row until it merges or stops (a local read; no GitHub watcher)")
+    leash = Leash(timeout, ceiling)
+    entry: dict | None = row
+    while True:
+        entry = land_row_now(key)
+        state = (entry or {}).get("state")
+        if entry is None or state == LAND_FORWARDED:
+            say_waiting(f"glaeda-gh: {name}'s land row is "
+                        f"{'forwarded to another host' if entry else 'gone'}: waiting on the PR instead")
+            return None
+        leash.see(land_progress(entry))
+        if state in LAND_DONE or leash.left() <= 0:
+            break
+        sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
+    state = str(entry.get("state") or "")
+    code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
+    out: dict[str, Any] = {"ok": code == EXIT_OK, "key": key, "code": "land_row", "state": state,
+                           "result": {"merged": "merged", "stopped": "stopped", "cancelled": "cancelled"}.get(
+                               state, "timeout"), "mergeSha": entry.get("mergeSha"),
+                           "line": land_line(entry, time.time())}
+    stop = entry.get("stop") if isinstance(entry.get("stop"), dict) else {}
+    if state == "stopped":
+        out.update(reason=stop.get("reason"), next=stop.get("next"), stop=stop.get("code"))
+    if code == EXIT_TIMEOUT:
+        out.update(leash.fields(), next=f"glaeda-gh land status {name}")
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(out["line"])
+        if out.get("next"):
+            say_waiting(f"next: {out['next']}")
+    return code
 
 
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
@@ -44490,6 +44773,11 @@ def main(argv: list[str] | None = None) -> int:
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
             row = land_row_watched_here(pr_key, args.sha)
+            if row is not None and args.until in (None, "merged"):
+                code = land_row_wait(pr_key, row, args.timeout, args.max, args.json)
+                if code is not None:
+                    return code
+                row = None  # forwarded, gone or no daemon: the ordinary wait below
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))

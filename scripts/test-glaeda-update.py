@@ -149,6 +149,11 @@ class UpdateTest(unittest.TestCase):
         gu.local_target = lambda: TARGET
         os.environ["GLAEDA_TEST_BIN"] = str(self.bin)
         self.config = {"ring": "canary", "setupArgs": ["--hygiene-only"], "host": "test", "reportStatus": False}
+        # The minute probe as on a host of its own, whatever host runs this suite (a runner mini has FLEET_DIR).
+        self.real_shared_egress = gu.shared_egress
+        egress = mock.patch.object(gu, "shared_egress", return_value=False)
+        egress.start()
+        self.addCleanup(egress.stop)
 
     def tearDown(self) -> None:
         gu.fetch, gu.attestation, gu.local_target, test_bin = self.saved
@@ -1064,6 +1069,51 @@ class UpdateTest(unittest.TestCase):
         response.__enter__.return_value = response
         return response
 
+    def test_a_host_with_a_controller_probes_through_it_and_never_asks_github(self) -> None:
+        answer = {"repo": "teamleaderleo/glaeda", "tag": "ota-channels", "status": 200,
+                  "assets": {"control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"}}
+        asked = []
+
+        def urlopen(request, timeout):
+            asked.append(request.full_url)
+            if isinstance(answer, Exception):
+                raise answer
+            response = mock.MagicMock()
+            response.read.return_value = json.dumps(answer).encode()
+            response.__enter__.return_value = response
+            return response
+        github = mock.Mock(side_effect=AssertionError("github.com asked"))
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "", "CMUX_CI_CONTROLLER": ""}), \
+                mock.patch.object(gu.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(gu.urllib.request, "build_opener", github):
+            config = Path(home) / gu.PROBE_CONTROLLER_CONFIG
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"controller": "http://100.89.225.106:18765/"}))
+            seen = gu.channel_fingerprint("stable", home=Path(home))
+            self.assertEqual(asked, ["http://100.89.225.106:18765/v1/github-release-probe/teamleaderleo/glaeda/ota-channels"])
+            self.assertEqual(seen, {"repo": gu.REPOSITORY, "via": "controller",
+                                    "control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"})
+            self.assertEqual(gu.channel_fingerprint("canary", home=Path(home))["canary.json"], "absent")
+            answer["assets"]["stable.json"] = "3:2026-11-27T00:05:00Z:21"
+            self.assertNotEqual(gu.channel_fingerprint("stable", home=Path(home)), seen)
+            answer["status"], answer["assets"] = 404, {}  # no channel release yet: both files absent
+            self.assertEqual(gu.channel_fingerprint("stable", home=Path(home))["control.json"], "absent")
+            answer["status"] = 500  # GitHub refused the controller: no answer, and no github.com fallback
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.HTTPError("u", 503, "the controller is starting", {}, None)
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.URLError("offline")
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            with mock.patch.dict(os.environ, {"CMUX_CI_CONTROLLER": "http://10.0.0.1:18765"}):
+                self.assertEqual(gu.probe_controller(Path(home)), "http://10.0.0.1:18765")
+            with mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"}):
+                self.assertIsNone(gu.probe_controller(Path(home)))
+            config.write_text("not json")
+            self.assertIsNone(gu.probe_controller(Path(home)))
+        github.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"})  # this host's controller, if any, is not the test's
     def test_the_channel_fingerprint_is_the_asset_each_file_redirects_to(self) -> None:
         location = "https://release-assets.githubusercontent.com/github-production-release-asset/1/{}?sig=x&se=1"
         answers = {"control.json": urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("c1")}, None),
@@ -1112,6 +1162,45 @@ class UpdateTest(unittest.TestCase):
         (self.state / gu.PROBE.name).write_text("not json")
         with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
             self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
+
+    def test_a_runner_mini_probes_every_five_minutes_not_every_minute(self) -> None:
+        # Leo, 2026-11-27: "we dont wanna like... get banned again ideally": ~25 minis share one office address.
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "stable.json": "s1"}
+        changed = {**seen, "stable.json": "s2"}
+        every = gu.SHARED_EGRESS_PROBE_EVERY_S
+        self.assertEqual(every, 300)
+        with mock.patch.object(gu, "shared_egress", return_value=True):
+            self.assertEqual(gu.probe_every(), every)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=changed) as probe:
+                gu.save_probe({"channel": seen, "fullRunAt": now}, self.state)
+                # within five minutes of the full run: no request, even though the channel moved
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state), (False, seen, "probed recently"))
+                self.assertEqual(gu.probe_gate(self.config, now + every - 1, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 0)
+                # five minutes on, it probes and sees the change
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state), (True, changed, "channel changed"))
+                self.assertEqual(probe.call_count, 1)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=seen) as probe:
+                # an unchanged probe is recorded, so the next one waits five minutes from it
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state)[0::2], (False, "unchanged"))
+                self.assertEqual(gu.load_probe(self.state)["probedAt"], now + every)
+                self.assertEqual(gu.load_probe(self.state)["fullRunAt"], now)
+                self.assertEqual(gu.probe_gate(self.config, now + every + 60, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 1)
+                # a due full run and a soak's end never wait for the probe interval
+                self.assertEqual(gu.probe_gate(self.config, now + gu.APPLY_EVERY_S, self.state)[0::2], (True, "due"))
+                gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": now + 60}, self.state)
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state)[0::2], (True, "soak ended"))
+                # a clock step back probes (and runs: the full run is due)
+                self.assertEqual(gu.probe_gate(self.config, now - 1, self.state)[0::2], (True, "due"))
+        with mock.patch.object(gu, "FLEET_DIR", self.root / "fleet"), \
+                mock.patch.object(gu, "shared_egress", self.real_shared_egress):
+            self.assertFalse(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), gu.PROBE_EVERY_S)
+            (self.root / "fleet").mkdir()
+            self.assertTrue(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), every)
 
     def test_the_minute_probe_starts_a_full_run_when_a_canary_soak_ends(self) -> None:
         now = 1_800_000_000.0
