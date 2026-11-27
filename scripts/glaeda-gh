@@ -985,6 +985,10 @@ STALE_DUMP_ADVICE = ("Where each thread is: kill -USR1 <daemon pid> (daemon.json
                      "journal), on a Mac ~/Library/Logs/glaeda-gh.err")
 DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
 DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
+# A read outside the serving daemon (a wait's direct read, a land refresh, a straggler read) is a fallback: it goes on an
+# App or it waits for the daemon, never on the login (fallback_no_login). cosmic-gray, 2026-11-27 (interim-coord-2):
+# about 60 an hour of these went on Leo's login, and none reached the spend log (SPEND_SIDE_FILE says how they do now).
+DIRECT_NO_LOGIN = "a fallback read never goes on this host's login and no App answers it now: the daemon reads it"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
 RECENT_ERRORS_KEEP = 3600  # daemon.json's recentErrors: the distinct errors of this long, newest first
 COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
@@ -1971,6 +1975,70 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
                     and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in row)):
                 out.setdefault(int(minute), {})[key] = list(row)
     return out
+
+
+# The spend log of the reads made outside the serving daemon (direct reads, land refreshes, the gh shim's job-log
+# reads): each process merges its rows here (spend_side_add), and the serving daemon folds them into its own spend log
+# (Daemon.save_spend), so spend.json and spendBy count every request this host sent. A second writer of SPEND_FILE
+# itself would overwrite the minutes the daemon counted since it was read.
+SPEND_SIDE_FILE = "spend-side.json"
+
+
+def fallback_no_login() -> str:
+    """The token source of every Daemon built outside the serving daemon on a host with a login: a request the App
+    chain does not take fails here instead of going on the login (DIRECT_NO_LOGIN)."""
+    raise WatchError(DIRECT_NO_LOGIN)
+
+
+def no_login_reader(daemon: "Daemon") -> bool:
+    """Whether DAEMON is a fallback reader with no login (fallback_no_login), so a read its App chain does not take
+    returns DIRECT_NO_LOGIN before it is tried rather than failing inside the transport."""
+    return getattr(daemon, "token_source", None) is fallback_no_login
+
+
+def spend_side_add(spend: dict[int, dict[str, list[int]]] | None) -> None:
+    """Merge SPEND (Daemon.spend's shape) into SPEND_SIDE_FILE, under its lock. Best effort: never raises."""
+    if not spend:
+        return
+    try:
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(BASE / (SPEND_SIDE_FILE + ".lock"), 2.0) as held:
+            if not held:
+                log({"event": "spend-side-lost", "rows": sum(len(r) for r in spend.values())})
+                return
+            kept = load_spend(read_json(BASE / SPEND_SIDE_FILE))
+            for minute, rows in spend.items():
+                for key, row in rows.items():
+                    mine = kept.setdefault(int(minute), {}).setdefault(key, [0, 0, 0])
+                    for i in range(3):
+                        mine[i] += int(row[i])
+            write_json(BASE / SPEND_SIDE_FILE, {"schema": "glaeda-gh-spend/v1", "at": time.time(),
+                                                "fields": ["requests", "counted", "points"],
+                                                "minutes": {str(m): r for m, r in sorted(kept.items())}})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def spend_side_note(bucket: str, name: str, kind: str, repo: str, counted: int, why: str) -> None:
+    """One request a process outside the daemon sent, in Daemon.note_spend's key ("bucket\tname\tkind\trepo\twaiter
+    \twhy"), so spendBy names it with the daemon's own rows."""
+    key = "\t".join((bucket, name, kind, repo, "", why))
+    spend_side_add({int(time.time() // 60): {key: [1, counted, 0]}})
+
+
+def spend_side_take() -> dict[int, dict[str, list[int]]]:
+    """SPEND_SIDE_FILE's rows, and the file emptied, under its lock; {} when it is held or absent."""
+    try:
+        with bounded_lock(BASE / (SPEND_SIDE_FILE + ".lock"), 0.5) as held:
+            if not held:
+                return {}
+            path = BASE / SPEND_SIDE_FILE
+            rows = load_spend(read_json(path))
+            if rows:
+                path.unlink(missing_ok=True)
+            return rows
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 SPEND_WAITERS_SHOWN = 3  # waiters named inside one restByCaller or graphqlByQuery row
@@ -7331,6 +7399,13 @@ class Daemon:
         return spend_summary(self.spend_rows(seconds), seconds)
 
     def save_spend(self, force: bool = False) -> None:
+        # the rows the processes outside the daemon sent (SPEND_SIDE_FILE): one spend log for every path
+        for minute, rows in spend_side_take().items():
+            for key, row in rows.items():
+                mine = self.spend.setdefault(minute, {}).setdefault(key, [0, 0, 0])
+                for i in range(3):
+                    mine[i] += row[i]
+                self.spend_dirty = True
         first = int(self.clock() // 60) - 60
         self.spend = {m: rows for m, rows in self.spend.items() if m >= first}
         if not self.spend_dirty or (not force and self.now - self.spend_saved_at < SPEND_SAVE_EVERY):
@@ -15961,7 +16036,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
     if len(keys) <= 1 or upstream_command() is not None:
         return {k: land_direct_read(k) for k in keys}
     try:
-        daemon = Daemon(controller=None, upstream=None)
+        daemon = Daemon(controller=None, upstream=None, token=fallback_no_login)
     except Exception as failure:  # noqa: BLE001  a refresh never stops the queue
         why = f"{describe(failure)} at {error_site(failure)}"
         return {k: why for k in keys}
@@ -16029,6 +16104,8 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
         except Exception as failure:  # noqa: BLE001
             why = f"{describe(failure)} at {error_site(failure)}"
             errors.update({k: why for k in todo if k not in errors})
+        finally:
+            spend_side_add(getattr(daemon, "spend", None))
     for k in todo:
         cached = read_cache(k) or {}
         if (cached.get("dataAt") or 0) >= daemon.now:
@@ -16810,6 +16887,16 @@ def land_last_turn_began(out: str) -> float | None:
 # Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our own tool calls". A requester that
 # has run no turn since (the fyi may still be queued) still gets the superseding fyi. Detector:
 # test-glaeda-gh.py test_a_forward_merge_after_a_read_no_verdict_fyi_sends_no_second_merged_word.
+# LAND_MERGED_ELSEWHERE_SEEN: a merge this queue did not make (a hand merge, or another host's queue that held a row
+# for the same PR) goes to its requester as an inbox fyi (LAND_MERGED_ELSEWHERE_FYI), and an idle inbox's fyi wakes
+# its session within 60 min. When the PR was queued on several hosts, the merging queue's "merged at SHA" woke the
+# requester within a minute and every other host's bare "merged" woke it again up to an hour later; a hand merge is
+# the requester's own act. gcp-agent-lane-19, 11-26 20:50Z..11-27 20:50Z: 18 wakes carried a bare "merged", 9 of them
+# turns that made no call ("already merged", "repeat notices"): cmux#60681 told by three hosts, cmux#60691 and
+# hq#31849 by two, cmux#59062 an hour after its session merged it. So a not-own merge's fyi is sent only to a
+# requester that has started no turn since the PR's mergedAt (LAND_MERGED_FYI_READ's session read); one idle since
+# before the merge still hears of it. Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our
+# own tool calls". Detector: test-glaeda-gh.py test_a_merge_made_elsewhere_is_not_told_to_a_requester_awake_since.
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -18136,6 +18223,15 @@ LAND_LATE_WHY_EVERY = 60.0
 # it ended. Now a row is told only on a read that shows its PR still open, once per PR ever (forwardQuietTold, kept on
 # the row), as an inbox fyi; a read that never lands tells nobody: forward_follow's give-up reads it live and settles it.
 LAND_FORWARD_QUIET = LAND_DUE_LATE
+# LAND_FORWARD_QUIET_HELD: the told-once "no verdict has come back" fyi is not sent while the far host's last answer
+# (forward_ask, every LAND_FORWARD_ASK_EVERY) holds the row open in its queue (forwardHeld): that queue judges it on its
+# own bounds and tells the requester its outcome, and forward_follow already trusts the same hold. A pin the PR has
+# moved off still tells at once (the land pinned there cannot merge: the requester re-pins), and a hold that lapses (no
+# fresh answer, or past LAND_FORWARD_HELD_BOUND) tells as before. gcp-agent-lane-19, 30 h to 2026-11-27 20:15Z: 42
+# no-verdict tells, every one to a row cmux-cp-1 held (1,029 of 1,029 far rows asked answered held); 37 named an
+# unmoved pin, and each woke its idle requester within the fyi's 60 min bound, mostly alone, to re-queue a row the far
+# queue then merged and told again. Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our own
+# tool calls". Detector: test-glaeda-gh.py test_a_forward_the_far_queue_holds_open_tells_no_verdict_only_once_the_hold_lapses.
 # LAND_FORWARD_READ_WAIT: how long the told-once waits on that one read before giving up on it, telling nobody, and
 # how fresh a cached read must be, or how long an asked one may take, before a no-outcome stop (outcome_read).
 # One value, set once: it was set here to 300.0 and again below to 900.0, so 900.0 ruled both uses and this line's
@@ -21083,6 +21179,14 @@ class LandQueue:
             return
         self.forward_quiet_tell(e, since, data, True)
 
+    def forward_held_now(self, e: dict) -> bool:
+        """Under the lock. Whether the far host's last answer holds forwarded E open (forwardHeld, one of
+        LAND_FORWARD_OPEN) since its newest hand-off, fresh within the ask bound forward_follow trusts, and E is not
+        past its own bound (forward_over): that queue's bounds end it and it tells the requester (LAND_FORWARD_QUIET_HELD)."""
+        held = float((e.get("forwardHeld") or {}).get("at") or 0)
+        return held > 0 and held >= self.forwarded_since(e) and not self.forward_over(e) \
+            and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY
+
     def forward_pin(self, e: dict) -> str:
         """The head E was handed off at (its pin), lowercased."""
         return str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "").lower()
@@ -21227,6 +21331,15 @@ class LandQueue:
         live = str(data.get("headRefOid") or "").lower()
         mins = round((self.now - since) / 60)
         moved = bool(SHA40.fullmatch(live) and SHA40.fullmatch(head) and land_head_moved(head, live))
+        if not moved and self.forward_held_now(e):
+            # LAND_FORWARD_QUIET_HELD's comment: the far queue holds it open and tells its outcome itself
+            if not e.get("forwardQuietHeld"):
+                e["forwardQuietHeld"] = {"at": self.now, "since": since, "to": to}
+                self.history(e, "forward_quiet_held", to=to, waited=round(self.now - since))
+                self.save(e)
+                log({"event": "land-forward-quiet-held", "key": key, "to": to, "waited": round(self.now - since),
+                     "held": (e.get("forwardHeld") or {}).get("state")})
+            return
         seen = f"the PR still reads open at {live[:12]}" if live else "the PR still reads open"
         nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
         e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read),
@@ -26880,7 +26993,8 @@ class LandQueue:
         with self.lock:
             self.claim(e, "retarget", before=head, base=base, form="stacked_rebase", rebased=tip)
         got = self.union_git(gitdir, "push", "--quiet", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{head}",
-                             "origin", f"{tip}:refs/heads/{branch}", timeout=LAND_GH_DEADLINE)
+                             "origin", f"{tip}:refs/heads/{branch}", timeout=LAND_GH_DEADLINE,
+                             e=e)  # a claimed step: handed (call), so a re-exec goes on without waiting for it
         with self.lock:
             self.finish(e, got)
             if got.returncode != 0:
@@ -27289,7 +27403,7 @@ class LandQueue:
             got = self.call(argv, LAND_UNION_PUSH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
-                                 timeout=LAND_UNION_PUSH_DEADLINE)
+                                 timeout=LAND_UNION_PUSH_DEADLINE, e=e)  # handed, as the broker push above
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
@@ -28710,6 +28824,10 @@ class LandQueue:
             wake = True  # LAND_NOTICE_SUPERSEDE's comment: an fyi, it wakes nobody and replaces the queued stop
             if e.get("forwardedTo") and told_at > 0:
                 read_since = told_at  # LAND_MERGED_FYI_READ's comment: the far queue tells this merge itself
+        if wake and not own and read_since is None:
+            # LAND_MERGED_ELSEWHERE_SEEN's comment: a requester that ran a turn after the merge has heard of it
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            read_since = iso_epoch(str(data.get("mergedAt") or "")) or None
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
@@ -32908,20 +33026,25 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
         daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
         daemon.rollup_controller = direct_rollup_controller()
     else:
-        daemon = Daemon(controller=None, upstream=None)
+        daemon = Daemon(controller=None, upstream=None, token=fallback_no_login)
+    if no_login_reader(daemon) and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
+        return {p: DIRECT_NO_LOGIN for p in paths}
     if login_stopped(daemon, "rest") and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
         return {p: DIRECT_QUOTA for p in paths}
     daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as direct_read: a session's read)
     daemon.now = time.time()
     daemon.tick_deadline = time.monotonic() + budget
     out: dict[str, Any] = {}
-    with daemon.calling(*caller_of(f"pr:{repo}#0"), "tool:glaeda-gh wait (queued jobs)"):
-        for path in paths:
-            try:
-                state, doc, _ = daemon.get(f"/repos/{repo}/{path}", None)
-            except OutOfTime:
-                state, doc = "error", "out of time"
-            out[path] = doc if state == "fresh" else str(doc)
+    try:
+        with daemon.calling(*caller_of(f"pr:{repo}#0"), "tool:glaeda-gh wait (queued jobs)"):
+            for path in paths:
+                try:
+                    state, doc, _ = daemon.get(f"/repos/{repo}/{path}", None)
+                except OutOfTime:
+                    state, doc = "error", "out of time"
+                out[path] = doc if state == "fresh" else str(doc)
+    finally:
+        spend_side_add(getattr(daemon, "spend", None))
     return out
 
 
@@ -35844,9 +35967,11 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
             daemon.rollup_controller = direct_rollup_controller()
         else:
-            daemon = Daemon(controller=None, upstream=None)
+            daemon = Daemon(controller=None, upstream=None, token=fallback_no_login)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
+    if no_login_reader(daemon) and not app_reads_key(daemon, key, bucket):
+        return DIRECT_NO_LOGIN  # the wait goes on waiting for the daemon, which reads (and logs) it
     # The login's stop holds only a read that would go on the login (app_reads_key): one an App pool answers is sent.
     if login_stopped(daemon, bucket) and not app_reads_key(daemon, key, bucket):
         return DIRECT_QUOTA
@@ -35884,6 +36009,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     finally:
         if broker is not None:
             direct_parts_save(daemon.repo_parts, daemon.now)
+        spend_side_add(getattr(daemon, "spend", None))
     if error:
         return error
     cached = read_cache(key) or {}
@@ -41322,7 +41448,7 @@ def gh_job_log_kept(repo: str, job: int, controller: Any = "env") -> tuple[bytes
         ctl = Controller.from_env() if controller == "env" else controller
         if ctl is None:
             return None, "no controller"
-        status, body = controller_job_log(ctl, repo, job)
+        status, body = controller_job_log_patient(ctl, repo, job, time.monotonic() + JOB_LOG_429_WAIT_MAX)
         if status == 0:
             with contextlib.suppress(OSError):
                 BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -41341,6 +41467,10 @@ def gh_job_log_answer(real: str, args: list[str], repo: str, job: int, said: dic
     """Answer one plain job-log read: kept, else the controller, else gh once (identical reads wait on its lock), whose
     answer is kept when the job had finished. The decision log says which (`joblog`)."""
     text, source = gh_job_log_kept(repo, job, controller)
+    if text is None and source == "controller HTTP 429" and job_log_login_host():
+        broker_note({"route": "refuse", "joblog": "429", **said})
+        print(f"glaeda-gh: {repo} job {job}: {JOB_LOG_429_WHY}; ask again after a minute", file=sys.stderr)
+        return BROKER_EXIT_REFUSED
     if text is None:
         gh_cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = gh_cache_dir() / f".joblog-{hashlib.sha256(f'{repo}/{job}'.encode()).hexdigest()[:24]}.lock"
@@ -41349,6 +41479,9 @@ def gh_job_log_answer(real: str, args: list[str], repo: str, job: int, said: dic
             if text is None:
                 broker_note({"route": "pass", "joblog": "gh", **said})
                 rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
+                # in the daemon's spend log too (SPEND_SIDE_FILE): the login's request when this host has one
+                spend_side_note("rest", route_of("GET", f"/repos/{repo}/actions/jobs/{job}/logs"), "joblog", repo,
+                                1 if job_log_login_host() else 0, "gh-shim")
                 if rc == 0 and job_log_finished(out):
                     with contextlib.suppress(OSError):
                         job_log_put(repo, job, out)
@@ -43844,7 +43977,8 @@ def log_read_seconds(deadline: float | None, cap: float) -> float:
     return max(0.0, min(cap, deadline - time.monotonic()))
 
 
-def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
+def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float | None = None,
+                       said: dict | None = None) -> tuple[int, bytes]:
     """(HTTP status, body) of the controller's GET /v1/github/job-log: 200 is a finished job's log; 0 when it did not
     answer. 404 (unknown job, or an older controller), 409 (still running), 410 (GitHub expired it) and 429 (its log
     reads are spent) carry no log."""
@@ -43858,9 +43992,42 @@ def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float |
                 OPENER.open(urllib.request.Request(url, headers=headers), timeout=left) as response:
             return response.status, response.read(JOB_LOG_RAW_MAX + 1)
     except urllib.error.HTTPError as error:
+        if said is not None:
+            with contextlib.suppress(AttributeError, TypeError, ValueError):
+                said["retryAfter"] = max(0.0, float(error.headers.get("Retry-After")))
         return error.code, b""
     except (OSError, HTTPException, ValueError):  # DeadlineTimeout is an OSError
         return 0, b""
+
+
+# The controller answers 429 when its job-log reads are spent. That is never a reason to read the log on this host's
+# login (cosmic-gray, 2026-11-27, interim-coord-2: about 60 an hour went on Leo's login, through the gh shim's pass
+# that wrote nothing to the spend log): the read waits for the controller's Retry-After (JOB_LOG_429_WAIT without one),
+# at most JOB_LOG_429_WAIT_MAX and never past the caller's deadline, and asks once more; still 429, it says so.
+JOB_LOG_429_WAIT = 5.0
+JOB_LOG_429_WAIT_MAX = 30.0
+JOB_LOG_429_WHY = "controller log reads spent (HTTP 429); not read on this host's login"
+
+
+def controller_job_log_patient(ctl: "Controller", repo: str, job: int, deadline: float | None = None,
+                               sleep: Callable[[float], None] | None = None) -> tuple[int, bytes]:
+    """controller_job_log, and on a 429 one more ask after its Retry-After when that fits DEADLINE (and
+    JOB_LOG_429_WAIT_MAX)."""
+    said: dict = {}
+    status, body = controller_job_log(ctl, repo, job, deadline, said=said)
+    if status != 429:
+        return status, body
+    wait = float(said.get("retryAfter", JOB_LOG_429_WAIT))
+    if wait > JOB_LOG_429_WAIT_MAX or (deadline is not None and time.monotonic() + wait + 1.0 >= deadline):
+        return status, body
+    (sleep or time.sleep)(wait)
+    return controller_job_log(ctl, repo, job, deadline)
+
+
+def job_log_login_host() -> bool:
+    """Whether a `gh` this host runs reads GitHub with its own login: a lane VM's (an upstream host's) PATH gh is the
+    broker, which reads with an App."""
+    return upstream_command() is None
 
 
 def rest_job_log(repo: str, job: int, deadline: float | None = None) -> tuple[bool, bytes, str]:
@@ -43904,7 +44071,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     ctl = Controller.from_env() if controller == "env" else controller
     status = 0
     if ctl is not None:
-        status, body = controller_job_log(ctl, repo, job, deadline)
+        status, body = controller_job_log_patient(ctl, repo, job, deadline)
         if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
             with contextlib.suppress(OSError):
                 job_log_put(repo, job, body)  # the controller serves only a finished job's log
@@ -43916,6 +44083,8 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     if rest is None:
         return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
             status, "not kept by the controller")
+    if status == 429 and job_log_login_host():
+        return None, "", JOB_LOG_429_WHY
     ok, body, why = rest(repo, job, deadline)
     if not ok:
         return None, "", why
