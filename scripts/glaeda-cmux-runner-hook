@@ -3118,6 +3118,17 @@ GATE_WAITER_EVERY_S = 30.0
 # slow still gets a drained host once per cycle and no listener stays held without anyone stepping in.
 GATE_WAITER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_MAX_HOLD_S") or 10 * 60)
 GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") or 20 * 60)
+# YIELDER_KEEPS_ITS_TURN: a yieldToWaiters dedicated runner (YIELD_TO_WAITERS) also holds its listener off while the
+# yielding build (the catch-up fill, <host lock>.yield) holds host.lock, not only while it waits for it. cmux15,
+# 2026-11-26 23:08Z: the gate held trusted-main off for the waiting fill, the fill took host.lock, host_held read the
+# yielding holder as "the host is free" (gate_yields), the listener took the next Seed DerivedData job at 23:10:11Z
+# and its job-started preempted the fill (receipt 23:08:39Z). Seed jobs come back to back, so the fill never got a
+# gap and the fleet CAS on cmux-lawrence got no put for hours. The hold is bounded like a waiter's: past
+# GATE_YIELDER_MAX_HOLD_S of one holder (pid and start) the gate listens again for GATE_WAITER_WAIVE_S, logged once,
+# so a fill that never finishes cannot keep the seeds out. 0 turns the hold off. Pool runners keep listening through
+# a yielding holder (their jobs preempt it on purpose); the nightly slot keeps listening too (NIGHTLY_WAITER).
+GATE_YIELDER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_YIELDER_MAX_HOLD_S") or 20 * 60)
+YIELDER_HOLDS = "a yielding fleet build holds the host"
 # A waiter not seen this long starts a new wait. A worker that took the lock and handed the job back re-queues within
 # seconds to minutes (its eviction runs under the lock, and the gate takes no reading while the lock is held); a build
 # that ran holds it far longer.
@@ -12066,6 +12077,7 @@ class Gate:
         self.backfill_noted: set[int] = set()  # the drain waiters DRAIN_BACKFILL last passed (logged once)
         self.job_waited = False  # a fleet build was waiting, or the host was reserved, at the last poll of a job
         self.waiting_at = -GATE_WAITER_EVERY_S
+        self.yielder_span: tuple[tuple[int, str | None], float, int] | None = None  # YIELDER_KEEPS_ITS_TURN
         self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
@@ -12357,7 +12369,31 @@ class Gate:
             return None
         if self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
-        return waiter_why(self.host_lock, min(self.waiting)) if self.waiting else None
+        return waiter_why(self.host_lock, min(self.waiting)) if self.waiting else self.yielder_hold()
+
+    def yielder_hold(self) -> str | None:
+        """YIELDER_KEEPS_ITS_TURN: why a yieldToWaiters dedicated listener stays off while the yielding build holds
+        host.lock (gate_yields: it and its processes alone have the lock open), bounded per holder by
+        GATE_YIELDER_MAX_HOLD_S then GATE_WAITER_WAIVE_S, or None."""
+        if GATE_YIELDER_MAX_HOLD_S <= 0 or self.nightly_slot:
+            self.yielder_span = None
+            return None
+        pid = yielding_pid(self.host_lock)
+        if pid is None or not gate_yields(self.host_lock, holder_pids(self.state_dir)):
+            self.yielder_span = None
+            return None
+        key, now = (pid, process_identity(pid)), time.monotonic()
+        if self.yielder_span is None or self.yielder_span[0] != key:
+            self.yielder_span = (key, now, -1)
+        _, since, noted = self.yielder_span
+        held, cycle = now - since, GATE_YIELDER_MAX_HOLD_S + GATE_WAITER_WAIVE_S
+        if held % cycle < GATE_YIELDER_MAX_HOLD_S:
+            return f"{YIELDER_HOLDS} (pid {pid})"
+        if noted != (turn := int(held // cycle)):
+            self.yielder_span = (key, since, turn)
+            gate_log(f"a yielding fleet build (pid {pid}) has held the host for {held / 60:.0f} min: listening anyway "
+                     f"for up to {GATE_WAITER_WAIVE_S / 60:g} min")
+        return None
 
     def signer_yield(self) -> str | None:
         """SIGNER_SIBLING_YIELD: why an idle trusted signing listener takes no job now, or None. While a signing job

@@ -848,6 +848,35 @@ class Proxy(unittest.TestCase):
                                     "https://github.com/manaflow-ai/cmux.git"])
             self.assertIn("Failed to connect", result["proxy_errors"][0])
 
+    def test_a_fresh_mirror_holds_the_github_fallback(self) -> None:
+        """A failed proxy fetch on a mirror fetched under PROXY_HOLD_S ago asks GitHub nothing: the next pass asks the
+        proxy again. A mirror past it, or one whose age is unknown, still falls back."""
+        with tempfile.TemporaryDirectory() as temp:
+            mirror = Path(temp)
+            (mirror / "objects/pack").mkdir(parents=True)
+            urls = []
+
+            def starting(command, timeout):
+                urls.append(command[command.index("--prune") + 1])
+                return (128, "remote: the controller is starting; retry") if "c:1" in urls[-1] else (0, "")
+            kw = {"proxy": "http://c:1/v1/git/manaflow-ai/cmux.git", "runner": starting, "sleep": lambda _: None}
+            result = gm.fetch_via_proxy(mirror, "https://github.com/manaflow-ai/cmux.git", fetched_age=60, **kw)
+            self.assertEqual((result["ok"], result["via"]), (False, "proxy"))
+            self.assertIn("GitHub not asked", result["held"])
+            self.assertEqual(urls, ["http://c:1/v1/git/manaflow-ai/cmux.git"])
+            for age in (gm.PROXY_HOLD_S + 1, None, -5):
+                urls.clear()
+                result = gm.fetch_via_proxy(mirror, "https://github.com/manaflow-ai/cmux.git", fetched_age=age, **kw)
+                self.assertEqual((result["ok"], result["via"]), (True, "github"), age)
+                self.assertEqual(len(urls), 2, age)
+
+    def test_fetched_age_reads_the_last_record(self) -> None:
+        now = gm.dt.datetime(2026, 11, 27, 1, 0, 0, tzinfo=gm.dt.timezone.utc).timestamp()
+        self.assertEqual(gm.fetched_age({"fetched_at": "2026-11-27T00:58:20Z"}, now), 100)
+        self.assertIsNone(gm.fetched_age({}, now))
+        self.assertIsNone(gm.fetched_age({"fetched_at": None}, now))
+        self.assertIsNone(gm.fetched_age({"fetched_at": "yesterday"}, now))
+
 
 if __name__ == "__main__":
     unittest.main()

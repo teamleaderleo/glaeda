@@ -109,6 +109,13 @@ LOW_SPEED = ("-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=60")
 FETCH_TIMEOUT = 600
 FETCH_TRIES = 3
 BACKOFF = (10, 30)
+# How long a fresh mirror waits out a failed proxy fetch before it asks GitHub. On 2026-11-26 the proxy failed about
+# 4 passes an hour on each mini (cmux11s, 08Z-01Z: 80 of 141 "the controller is starting; retry", the controller's
+# 1m24s start after each deploy; then HTTP 500s, stalls and connect failures), and each sent that pass to github.com
+# anonymously from the office's one address (Leo, 2026-11-27: "we dont wanna like... get banned again ideally").
+# Passes run every minute and a job tolerates a mirror minutes old, so the next pass asks the proxy again; GitHub only
+# once the mirror is PROXY_HOLD_S stale, well inside glaeda-mini-health's 30-minute git_mirror_stale.
+PROXY_HOLD_S = 600
 # A first seed runs at the uplink's speed: 2.2 GB at 0.4-0.9 MB/s (2026-10-27) is 40-90 minutes.
 DOWNLOAD_TIMEOUT = 10800
 DOWNLOAD_TRIES = 4
@@ -388,12 +395,18 @@ def proxied(url: str, home: Path | None = None) -> str | None:
     return f"{base}/v1/git/{match.group(1)}.git" if base else None
 
 
-def fetch_via_proxy(mirror: Path, url: str, *, proxy: str | None, **kwargs) -> dict:
-    """fetch() from the controller proxy (one try), then, only if that fails, from `url` itself."""
+def fetch_via_proxy(mirror: Path, url: str, *, proxy: str | None, fetched_age: float | None = None,
+                    **kwargs) -> dict:
+    """fetch() from the controller proxy (one try), then, only if that fails, from `url` itself. `fetched_age` (seconds
+    since this mirror's last good fetch, None when unknown) under PROXY_HOLD_S holds the GitHub fallback: the pass
+    fails and the next one asks the proxy again."""
     if proxy:
         through = fetch(mirror, proxy, **{**kwargs, "tries": 1})
         if through["ok"]:
             return {**through, "via": "proxy"}
+        if fetched_age is not None and 0 <= fetched_age < PROXY_HOLD_S:
+            return {**through, "via": "proxy", "held": f"GitHub not asked: the mirror fetched {fetched_age:.0f} s ago "
+                                                      f"(under {PROXY_HOLD_S} s)"}
         direct = fetch(mirror, url, **kwargs)
         return {**direct, "via": "github", "proxy_errors": through["errors"]}
     return {**fetch(mirror, url, **kwargs), "via": "github"}
@@ -793,6 +806,18 @@ def last_record() -> dict:
         return {}
 
 
+def fetched_age(previous: dict, now: float | None = None) -> float | None:
+    """Seconds since the last good fetch `previous` (the last record) names, or None when it names none."""
+    at = previous.get("fetched_at")
+    if not isinstance(at, str):
+        return None
+    try:
+        when = dt.datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+    return (time.time() if now is None else now) - when
+
+
 def write_record(record: dict, previous: dict) -> dict:
     """Write RECORD whole. fetched_at is when a fetch last succeeded, carried over a failed one, so a stalled
     mirror reads as stale (glaeda-mini-health git_mirror_stale) however its passes end."""
@@ -925,7 +950,8 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             if problem:
                 record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
             configure(MIRROR)
-            result = fetch_via_proxy(MIRROR, REPO_URL, proxy=proxied(REPO_URL, home))
+            result = fetch_via_proxy(MIRROR, REPO_URL, proxy=proxied(REPO_URL, home),
+                                     fetched_age=None if problem else fetched_age(previous))
         finally:
             if not result["ok"]:
                 # The bundle set the branches to its own (older) tips, and nothing fetched since: put back what the
