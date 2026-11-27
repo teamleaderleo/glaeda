@@ -16795,6 +16795,15 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("without it", log.read_text())
 
 
+_real_fleet_labels = cr.fleet_labels
+
+
+def legacy_labels_only():
+    module = _real_fleet_labels()
+    module.with_unified = None  # the runner skips the version-free labels when the rule is absent
+    return module
+
+
 class RunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -16815,6 +16824,8 @@ class RunnerTest(unittest.TestCase):
             mock.patch.object(cr, "CURL", os.fspath(self.curl)),
             mock.patch.object(cr, "LAUNCHCTL", os.fspath(self.launchctl)),
             mock.patch.object(cr, "default_name", lambda: "mini-test-glaeda"),
+            # these tests pin the exact legacy label list; the version-free labels (RFD 0185) have their own test
+            mock.patch.object(cr, "fleet_labels", legacy_labels_only),
         ]
         for p in self.patches:
             p.start()
