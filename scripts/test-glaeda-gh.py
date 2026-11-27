@@ -10558,6 +10558,49 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_waited_comments_alone_bound_the_heads_like_a_waited_pr(self) -> None:
+        """cmux-cp-2, 2026-11-27 11:13Z: "no comment read stored in the last 600s; ticks spent 509.7s, most in read head
+        (217.1s)". The heads' share held only while a waited PR or run was due, so with only `wait comment`s blocked the
+        heads read unbounded. A waited comment now sets the share as they do, on GraphQL and on REST."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        gg.register("comment:o/r#900", waited=True)
+        for n in range(4):
+            gg.register(f"head:o/r@{n:040x}", consumer="merge-hold")
+        self.daemon.paths = {**self.daemon.paths, "comment": "graphql", "head": "graphql"}
+        calls: list[tuple[str, float | None]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                calls.append((kind, until))
+            return []
+        with mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        kinds = [k for k, _ in calls]
+        self.assertLess(kinds.index("comment"), kinds.index("head"), calls)
+        self.assertIsNotNone(next(u for k, u in calls if k == "head"), "the heads have a share while a comment waits")
+        self.assertIsNotNone(next(u for k, u in calls if k == "comment"), "the waited comment keeps the waited share")
+
+    def test_waited_comment_over_rest_defers_waited_heads_past_their_share(self) -> None:
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        shas = [f"{n:040x}" for n in range(1, 5)]
+        for sha in shas:  # answered once, long ago: due again and waited, ranked ahead of the comment
+            key = f"head:o/r@{sha}"
+            gg.register(key, consumer="merge-hold", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 9500, "dataAt": NOW - 9500,
+                                                               "error": None, "data": {"checks": []}})
+        gg.register("comment:o/r#900", waited=True)  # read more lately than the heads: ranked behind them
+        gg.write_json(gg.cache_dir() / gg.file_name("comment:o/r#900"), {
+            "key": "comment:o/r#900", "fetchedAt": NOW - 5000, "dataAt": NOW - 5000, "error": None, "data": {"comments": []}})
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), mock.patch.object(gg, "HEADS_MIN_SHARE", 0), \
+                mock.patch.object(self.daemon, "fetch_comment_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertIn("comment:o/r#900", read)
+        self.assertLess(len([k for k in read if k.startswith("head:")]), len(shas), read)
+
     def test_a_slow_waited_kind_leaves_the_waited_kinds_after_it_their_own_share(self) -> None:
         """cmux-cp-1, 2026-11-27 12:3xZ to 16:1xZ: PR batches GitHub answered 502/504 after ~10.9 s took the whole waited
         share (pr, run and comment shared one deadline), every waited run batch after the first was deferred as "the runs'
@@ -28864,12 +28907,14 @@ class LandTest(Base):
 
     upstream = False  # this host reads PRs through an upstream (a lane VM)
     fresh_head: str | None = None  # what a direct read (refresh) stores, or None for a read that fails
+    fresh_review: str = ""  # the reviewDecision that read stores ("" leaves it out)
 
     def refresh(self, key: str) -> str | None:
         self.w.refreshed.append(key)
         if self.fresh_head is None:
             return "lane-gh call get: quota"
-        self.w.set_pr(key, land_pr(self.fresh_head), self.t)
+        self.w.set_pr(key, {**land_pr(self.fresh_head),
+                            **({"reviewDecision": self.fresh_review} if self.fresh_review else {})}, self.t)
         return None
 
     def land(self, target: str = "o/r#1", after: list[str] | None = None, requester: str = "host/lane") -> None:
@@ -33792,6 +33837,89 @@ class LandTest(Base):
             [h for h in e["history"] if h["event"] == "judged"][1:])]
         self.assertEqual(waits, [60, 120, 240, 480, 960])
         self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
+
+    REVIEW_REFUSED = ("land-judge (pass): ok: may merge at " + LA + "\nGitHub refused o/r#1 for its base-branch "
+                      "policy (not land-judge): every required check at " + LA[:12] + " has passed, so another rule "
+                      "holds it (a required review, a ruleset's other rule, a stale branch): see the PR's merge box")
+
+    def review_stop(self) -> dict:
+        """A row whose pinned merge GitHub refused for a missing approving review (LAND_REVIEW_REQUIRED)."""
+        self.w.set_pr(self.KEY, {**land_pr(LA), "reviewDecision": "REVIEW_REQUIRED"}, self.t)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        self.w.answers.append(ok_answer(LA))
+        return self.tick()
+
+    def test_a_review_required_stop_spends_no_refusals_and_lands_once_approved(self):
+        # 2026-11-27, the release-candidate freeze: feat-cmux-next wants one approving review, Leo stamps each PR
+        # himself ("am personally stamping thru the approval"). Each such PR took six merge calls and ~31 min of
+        # backoff, then stopped merge_refused, and his approval re-queued none of them.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        e = self.review_stop()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", gg.LAND_REVIEW_REQUIRED), e.get("stop"))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)  # one merge call, no backoff spent
+        self.assertNotIn("stepFail", e)
+        self.assertIn("approves it at " + LA[:12], e["stop"]["next"])
+        judged = len(self.w.explains())
+        # still unapproved: read on its cadence, never judged, never re-armed
+        self.fresh_head, self.fresh_review = LA, "REVIEW_REQUIRED"
+        e = self.tick(gg.LAND_REVIEW_READ_EVERY + 5)
+        self.tick(5)
+        e = self.tick(5)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged))
+        self.assertIn(self.KEY, self.w.refreshed)
+        # Leo approves the head: the next stopped-row read sees it and the same head lands, nobody requeueing it
+        self.fresh_review = "APPROVED"
+        self.w.gh_rc["merge"] = 0
+        self.w.gh_err["merge"] = ""
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(8):  # a read due within LAND_REVIEW_READ_EVERY, the re-arm on the pass after it lands
+            e = self.tick(gg.LAND_REVIEW_READ_EVERY / 4)
+            if e.get("state") in gg.LAND_DONE - {"stopped"}:
+                break
+        self.assertEqual(e.get("state"), "merged", e.get("history", [])[-6:])
+        self.assertTrue(any(h["event"] == "rearmed" and h.get("code") == gg.LAND_REVIEW_REQUIRED
+                            for h in e["history"]))
+
+    def test_a_review_required_stop_is_not_rearmed_by_an_approval_of_another_head(self):
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        e = self.review_stop()
+        self.assertEqual(e["stop"]["code"], gg.LAND_REVIEW_REQUIRED)
+        self.fresh_head, self.fresh_review = LB, "APPROVED"  # a new head: its own approval, its owner's new land
+        for _ in range(4):
+            e = self.tick(gg.LAND_REVIEW_READ_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", gg.LAND_REVIEW_REQUIRED))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+
+    def test_a_policy_refusal_with_no_review_wanted_still_counts_as_before(self):
+        # a base that requires no review (no reviewDecision in the copy): the refusal is another rule's
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        e = self.run_hour(lambda: ok_answer(LA))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), gg.LAND_STEP_STOP)
+
+    def test_an_old_merge_refused_stop_for_a_review_becomes_review_required_and_lands_once_approved(self):
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        e = self.run_hour(lambda: ok_answer(LA))  # no reviewDecision in the copy yet: the old merge_refused stop
+        self.assertEqual(e["stop"]["code"], "merge_refused")
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.w.answers.clear()
+        self.w.set_pr(self.KEY, {**land_pr(LA), "reviewDecision": "APPROVED"}, self.t + 1)
+        self.w.gh_rc["merge"] = 0
+        self.w.gh_err["merge"] = ""
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(5)
+        e = self.tick(5)
+        self.assertEqual(e.get("state"), "merged", e.get("history", [])[-6:])
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), merges + 1)
 
     def test_alternating_merge_refusals_at_one_head_do_not_reset_each_others_count(self):
         """A non-transient refusal at a head that has not moved is no progress whatever its words, so the count is
