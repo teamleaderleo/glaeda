@@ -676,6 +676,11 @@ RESUME_MAX = 300.0
 # follow have at least HEADS_MIN_SHARE s, so neither kind starves the other. A head's own read stays bounded by
 # REST_HEAD_BUDGET from the tick's start.
 HEADS_MIN_SHARE = 20
+# And the waited PRs a probe can confirm (probe_ok: whole cached answer, its fingerprint) are probed first, WAITED_PROBE_BATCH
+# a query and about a point (probe_waited_prs), for at most PROBE_SHARE s of the tick: 376 waited keys (a land queue's) at
+# ~2.6 s a full read could not all be read inside 600 s (the land host, 2026-11-27, waited PR data 4,450 s old), and an
+# unchanged PR needs no full read. Only the PRs whose fingerprint moved go to the full reads that follow.
+PROBE_SHARE = 25
 WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
@@ -10426,6 +10431,11 @@ class Daemon:
         if waited_due:  # the waited share: no new waited or plain batch starts past it, the heads keep their minimum
             until_of.update({k: tick_start + WAITED_TICK_SHARE for k in ("pr", "run", "comment")})
         self.head_until = until_of["head"]  # and the looks between the batches (heads_between) keep it too
+        if over["pr"] == "graphql" and blocked["pr"]:
+            done = self.probe_waited_prs(blocked["pr"], tick_start + PROBE_SHARE)
+            if done:
+                blocked["pr"] = [e for e in blocked["pr"] if e["key"] not in done]
+                due["pr"] = [e for e in due["pr"] if e["key"] not in done]
         # waited PRs, runs and comments first, the heads after (they went first and took 44 of 85 s)
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head"):
             if over[kind] != "graphql":
@@ -10729,6 +10739,39 @@ class Daemon:
             return  # the tick's budget is spent: the next tick goes on
         finally:
             self.waived = False
+
+    def probe_waited_prs(self, prs: list[dict], until: float) -> set[str]:
+        """The keys of PRS a probe confirmed unchanged (probe_prs stored them: dataAt and fetchedAt moved), oldest data
+        first, one repository a query (an App answers one owner), until UNTIL (time.monotonic()) or the first error: what
+        it leaves, and every PR whose fingerprint moved, is read in full by the batches."""
+        done: set[str] = set()
+        if self.mode("graphql") == "stop" or self.gql_down() or self.secondary_until > self.now \
+                or self.backoff["graphql"] > self.now:
+            return done
+        data_at = lambda e: float((e["cache"] or {}).get("dataAt") or 0)  # noqa: E731
+        groups: dict[str, list[dict]] = {}
+        for e in sorted((e for e in prs if self.probe_ok(e)), key=data_at):
+            groups.setdefault(caller_of(e["key"])[1].lower(), []).append(e)
+        chunks = sorted((g[i:i + WAITED_PROBE_BATCH] for g in groups.values() for i in range(0, len(g), WAITED_PROBE_BATCH)),
+                        key=lambda c: min(data_at(e) for e in c))
+        try:
+            for chunk in chunks:
+                if time.monotonic() >= min(until, self.tick_deadline):
+                    break
+                repos = sorted({caller_of(e["key"])[1] for e in chunk})
+                with self.phase("read pr"), self.calling("pr", repos[0] if len(repos) == 1 else f"{len(repos)} repos",
+                                                         waiters_of(chunk)):
+                    changed, error = self.probe_prs(chunk)
+                if error is not None:
+                    self.errors.append(f"probe: {error}")
+                    break
+                moved = {e["key"] for e in changed}
+                done |= {e["key"] for e in chunk if e["key"] not in moved}
+        except OutOfTime:
+            pass
+        except Exception as error:  # noqa: BLE001  the full reads that follow still read them
+            self.errors.append(f"probe: {describe(error)} at {error_site(error)}")
+        return done
 
     def waited_points(self) -> int:
         return sum(p for t, p in self.waited_log if self.now - t < 60)

@@ -24695,6 +24695,27 @@ class WaitedUnderReserveTest(Base):
         self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (0, 1), "ten unchanged PRs cost one probe")
         self.assertEqual(self.ages(later, (11, 12)), [gg.CYCLE] * 2, "an unwaited PR is read under the reserve")
 
+    def test_unchanged_waited_prs_are_probed_not_read_in_full_while_graphql_is_normal(self) -> None:
+        """The land host, 2026-11-27: 376 waited keys at ~2.6 s a full read could not all be read in 600 s, waited PR data
+        was 4,450 s old. The ticks' waited PRs a probe can confirm are probed first (one point per WAITED_PROBE_BATCH);
+        only a PR whose fingerprint moved is read in full."""
+        self.gh.graphql_remaining = 5000
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 5000, "reset": NOW + 1800, "seenAt": NOW}
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 5000, "reset": NOW + 1800, "seenAt": NOW}
+        node = self.gh.prs[("o", "r", 4)]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
+            status="COMPLETED", conclusion="FAILURE")
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        later = NOW + gg.CYCLE
+        status = self.at(later)
+        self.assertEqual(status["modes"]["graphql"], "normal")
+        self.assertGreaterEqual(self.gh.probes, 1)
+        self.assertLessEqual(self.gh.full_reads - self.full0, 1 + 2, "only the changed PR (and the unwaited ones) in full")
+        self.assertEqual(gg.read_cache("pr:o/r#3")["via"], "graphql-probe")
+        self.assertEqual(gg.read_cache("pr:o/r#3")["dataAt"], later)
+        cached = gg.read_cache("pr:o/r#4")
+        self.assertEqual((cached["via"], cached["data"]["checkState"]), ("graphql", "FAILURE"), "the changed one in full")
+
     def test_a_stale_waited_pr_gets_the_last_point_under_the_reserve(self) -> None:
         later = NOW + gg.CYCLE
         key = "pr:o/r#7"
