@@ -7898,7 +7898,7 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
     clones = []
     for gitdir in shared_mirrors(home):
         release_abandoned_compact_lock(gitdir / "objects/maintenance.lock")
-        packs = git_pack_count(gitdir)
+        packs = len(mirror_fold_packs(gitdir))  # kept packs are not folded: they never count toward the trigger
         if packs >= SHARED_MIRROR_COMPACT_PACKS and not one_pack_dominates(gitdir):
             clones.append((git_object_bytes(gitdir), packs, gitdir))
     clones.sort(key=lambda c: (-c[0], -c[1]))
@@ -7912,14 +7912,16 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
 
 
 def one_pack_dominates(gitdir: Path) -> bool:
-    """True when the largest pack holds more than SHARED_MIRROR_DOMINANT_SHARE of the mirror's pack bytes: a fold
-    would rewrite it to free at most the small rest."""
+    """True when the largest pack a fold would rewrite (mirror_fold_packs) holds more than
+    SHARED_MIRROR_DOMINANT_SHARE of those packs' bytes: a fold would rewrite it to free at most the small rest.
+    A pack with a .keep beside it counts for neither side: `repack -a` leaves it, so it can never be merged in.
+    fs-agent-lane-22, 2026-11-27: a dead fetch's 1.1 GiB kept pack beside the 1.8 GiB fold pack read as 61%, so
+    the cmux mirror was folded 59 times in 24 h (every 15 min, 180-600 CPU-s and up to 2.9 GB resident each on a
+    4-core, 8 GB VM) to free 26 MiB a fold; the pressure pass drove the load to 60-104."""
     sizes = []
-    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
-        for e in it:
-            if e.name.endswith(".pack") and not e.name.startswith((".tmp-", "tmp_")):
-                with contextlib.suppress(OSError):
-                    sizes.append(e.stat(follow_symlinks=False).st_size)
+    for stem in mirror_fold_packs(gitdir):
+        with contextlib.suppress(OSError):
+            sizes.append((gitdir / "objects/pack" / f"{stem}.pack").stat(follow_symlinks=False).st_size)
     total = sum(sizes)
     return total > 0 and max(sizes) > SHARED_MIRROR_DOMINANT_SHARE * total
 

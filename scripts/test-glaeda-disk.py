@@ -8440,6 +8440,44 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.compact_shared_mirrors(receipt, home)
         self.assertEqual(gd.git_pack_count(mirror), 1)
 
+    def test_shared_mirror_compact_judges_dominance_without_kept_packs(self) -> None:
+        # fs-agent-lane-22, 2026-11-27: a dead fetch's .keep pinned a 1.1 GiB pack that `repack -a` never folds; counted
+        # in the share, the 1.8 GiB fold pack read as 61% and the mirror was refolded every 15 min for 26 MiB a fold
+        home, mirror, _ = self._shared_mirror(4)
+        packdir = mirror / "objects/pack"
+
+        def add_pack(name: str, size: int) -> str:
+            blob = self.root / name
+            blob.write_bytes(os.urandom(size))  # incompressible: the pack stays this big
+            oid = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(blob)).strip()
+            out = subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                                  os.fspath(packdir / "pack")], input=oid + "\n", text=True, check=True,
+                                 capture_output=True).stdout.strip()
+            (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+            return f"pack-{out}"
+
+        add_pack("big", 256 * 1024)
+        kept = add_pack("kept", 192 * 1024)
+        (packdir / f"{kept}.keep").write_text("fetch-pack 2254513 on fs-agent-lane-22\n")
+        self.assertNotIn(kept, gd.mirror_fold_packs(mirror))
+        # big is 256 of ~450 KiB on disk (57%), but 256 of ~258 KiB of what a fold rewrites
+        self.assertTrue(gd.one_pack_dominates(mirror))
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log():
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        self.assertFalse(receipt.exists())
+        self.assertTrue((packdir / f"{kept}.pack").exists())
+        # once the fold packs' small rest passes a fifth, the fold runs and the kept pack stays as it was
+        for n in range(3):
+            add_pack(f"extra{n}", 64 * 1024)
+        self.assertFalse(gd.one_pack_dominates(mirror))
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(sorted(p.stem for p in packdir.glob("*.pack")), sorted([kept, *gd.mirror_fold_packs(mirror)]))
+        self.assertEqual(len(gd.mirror_fold_packs(mirror)), 1)
+        self.assertTrue((packdir / f"{kept}.pack").exists())
+
     def _seed_fold(self, post, put=None) -> tuple[Path, list[str], dict]:
         """Fold a 4-pack wt mirror with seed_release_url set and post/put standing in for the controller; returns
         the mirror, the packs it held before and the receipt row."""
