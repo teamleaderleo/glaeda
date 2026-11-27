@@ -717,6 +717,11 @@ class Base(unittest.TestCase):
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
+        # The waited-PR pool reads through its own Daemon (land_direct_read_many), past these tests' fakes of
+        # batched and fetch: off here, and the pool's own tests turn it back on.
+        pool_off = mock.patch.object(gg, "WAITED_POOL_WORKERS", 0)
+        pool_off.start()
+        self.addCleanup(pool_off.stop)
         for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
                             ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
@@ -10440,6 +10445,68 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW)
         order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
         self.assertEqual(set(order[:2]), cheap, order)
+
+    def test_many_waited_prs_are_read_by_a_bounded_pool_beside_the_serial_reads(self) -> None:
+        """The land host, 2026-11-27: ~330 waited PRs read one query at a time stored 22-50 a window. From WAITED_POOL_MIN
+        due, workers read up to WAITED_POOL_WORKERS chunks of WAITED_POOL_CHUNK beside the tick; the serial read gets the
+        rest and a key a worker could not read is deferred, not lost."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: (None if k.endswith("#1") else "no data stored") for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "oldest_waited_age", return_value=gg.WAITED_POOL_STALE_S + 1), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(len(pooled), 1, pooled)
+        self.assertLessEqual(len(pooled[0]), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(len(pooled[0]), total, "all of them fit one worker's chunk")
+        self.assertEqual(serial, [], "what a worker took is not read twice")
+        self.assertNotIn("pr:o/r#1", self.daemon.deferred)
+        self.assertIn("pr:o/r#2", self.daemon.deferred)
+
+    def test_the_waited_pool_waits_until_the_serial_reads_fall_behind(self) -> None:
+        """cmux-cp-2, 2026-11-27: the pool is the heal for stale waited PR data, so it starts only once the oldest waited
+        PR's data is WAITED_POOL_STALE_S old; while the serial reads keep up (fresh watches here) they read them all."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: None for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(pooled, [], "fresh data: no pool")
+        self.assertEqual(len([k for k in serial if k.startswith("pr:")]), total, serial)
+        old = {"key": "pr:o/r#1", "cache": {"dataAt": NOW - 900}}
+        with mock.patch.object(self.daemon, "waited", return_value=True):
+            self.daemon.now = NOW
+            self.assertGreaterEqual(self.daemon.oldest_waited_age([old]), 900)
 
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
@@ -26309,6 +26376,13 @@ class StaleDataTest(Base):
         ctl.bodies = {}
         self.assertTrue(served_by(row(30, mergeable=None)))  # mergeability not computed yet: GitHub
         self.assertTrue(served_by(None))  # no row: GitHub
+        # no PR row at all, but the hub's kept pull body proven current (a separate store the broker serves from):
+        # it answers, with no pulls/N; proven not current, or on no head, GitHub does
+        ctl.bodies = {("o/r", 9): {"current": True, "pull": body}}
+        self.assertEqual(served_by(None), [])
+        ctl.bodies = {("o/r", 9): {"current": False, "pull": body}}
+        self.assertTrue(served_by(None))
+        ctl.bodies = {}
         merged = row(90000, state="closed", merged=True, merged_at="2026-11-25T01:00:00Z", mergeable=None)
         self.assertEqual(served_by(merged), [])
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["state"], "MERGED")
@@ -33101,6 +33175,30 @@ class LandTest(Base):
         self.assertEqual(self.w.answers, [])
         self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
         self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
+
+    def test_a_wait_on_a_head_with_a_pending_status_wakes_within_the_status_bound(self):
+        # cmux#61127, 2026-11-27: waiting from 12:05:16Z on `risk evidence` and the cheap-tier cmux/land-tier status;
+        # the run finished 12:11:43Z and the feed carries no event for it, so the row slept to the 1 h wake and was
+        # judged only when a person relabelled at 12:19Z. With a status pending it wakes within LAND_WAIT_STATUS.
+        said = "Cheap tier: the full tier runs when ready-to-land or full-ci is added"
+        self.assertLessEqual(gg.LAND_WAIT_STATUS, 600.0)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        e = self.tick()
+        self.assertEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertLessEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_STATUS)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "COMPLETED", "SUCCESS"),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_WAIT_STATUS + 1)
+        self.assertEqual(self.w.answers, [], "judged at the wake, not left to the 1 h one")
+
+    def test_a_wait_with_no_pending_status_keeps_the_default_wake(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None)])
+        self.land()
+        e = self.tick()
+        self.assertGreaterEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_DEFAULT - 5)
 
     def test_a_waiting_row_whose_checks_finish_but_the_label_gated_one_is_judged_at_the_next_read(self):
         # cmux#61127, 2026-11-27: waiting on `risk evidence` (12:05Z); it finished 12:11Z, leaving only
@@ -42091,6 +42189,39 @@ class LandTest(Base):
         self.assertEqual([r["n"] for r in rows if r["event"] == "land-refresh-batch"], [50, 10, 3])
         for key in keys:
             self.assertFalse(self.due(key), "read: fresh")
+
+    def test_a_deferred_refresh_is_owed_and_read_first_oldest_copy_first(self):
+        """cmux-cp-1, 2026-11-27 12:57-13:23Z: 147 of 524 land refreshes (28 %) came back "not read: deferred, the tick's
+        time ran out", their copies' median age 3,497 s (the read ones' 1,711 s), the oldest 33,869 s: the pass handed
+        the rows out in its own order, a deferred row then waited as long as one that was read, and went again at the
+        tail. A deferred row is owed (refreshDeferred): read again after LAND_REFRESH_DEFERRED_RETRY, and the pass hands
+        the owed rows first, then the oldest copies."""
+        deferred = gg.LAND_REFRESH_DEFERRED_PREFIX + "the tick's time (TICK_BUDGET) ran out before it was read"
+        batches, rows = self.batched_refresh_queue(answer=deferred)
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 61))
+        for n, key in enumerate(keys):  # the pass meets them newest copy last, oldest copy first on the highest number
+            self.w.cache[key]["dataAt"] = self.t - 3600 - n
+        for key in keys:
+            self.assertTrue(self.due(key))
+        self.q.flush_refreshes()
+        oldest = sorted(keys, key=lambda k: self.w.cache[k]["dataAt"])
+        self.assertEqual(batches[0], oldest[:gg.LAND_REFRESH_BATCH], "the oldest copies take the first batch")
+        for key in keys:
+            self.assertIsInstance(self.q.entries[key].get("refreshDeferred"), float, key)
+            self.assertFalse(self.due(key), "not at once")
+        self.q.now = self.t + gg.LAND_REFRESH_DEFERRED_RETRY + 1  # sooner than LAND_REFRESH_AFTER's 120 s
+        self.assertLess(gg.LAND_REFRESH_DEFERRED_RETRY, gg.LAND_REFRESH_AFTER)
+        for key in keys:
+            self.assertTrue(self.due(key), key)
+        # the rows the pass queues now: the longest owed first, whatever the age of the copy
+        self.q.refresh_queued.clear()
+        self.q.entries["pr:o/r#3"]["refreshDeferred"] = self.t - 500
+        self.q.refresh_queued["o/r"] = [k for k in keys]
+        batches.clear()
+        self.q.refresh_many = lambda ks: (batches.append(list(ks)), {k: None for k in ks})[1]
+        self.q.flush_refreshes()
+        self.assertEqual(batches[0][0], "pr:o/r#3")
+        self.assertNotIn("refreshDeferred", self.q.entries["pr:o/r#3"], "read: no longer owed")
 
     def test_a_batch_refused_for_quota_holds_refreshes_once(self):
         """A batch whose every read comes back DIRECT_QUOTA sets one hold (as one refused read does), not one a row."""
