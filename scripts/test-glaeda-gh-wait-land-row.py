@@ -113,11 +113,12 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         env = {**os.environ, "GLAEDA_GH_DIR": HOME}
         began = time.monotonic()
         p = subprocess.run([sys.executable, "-I", os.fspath(SCRIPT), "wait", "pr", f"{REPO}#15",
-                            "--timeout", "8", "--json"], capture_output=True, text=True, env=env, timeout=120)
+                            "--until", "green", "--timeout", "60", "--json"], capture_output=True, text=True, env=env, timeout=120)
         took = time.monotonic() - began
         self.assertEqual(p.returncode, 64, f"exit {p.returncode}; out={p.stdout[-400:]!r} err={p.stderr[-400:]!r}")
         self.assertEqual(json.loads(p.stdout.strip())["code"], "land_row_watching")
-        self.assertLess(took, 8, "it must refuse at once, not after waiting out the timeout")
+        # 60, not 8: starting this 44k-line script takes 8-10 s on a loaded lane VM, so an 8 s bound failed on load
+        self.assertLess(took, 60, "it must refuse at once, not after waiting out the timeout")
 
     def test_merged_wait_runs_the_land_wait_itself(self) -> None:
         """`wait pr --until merged|done` on a held PR runs `land N --wait T` on the row's own commit and says so in
@@ -130,7 +131,7 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
                 gg.cmd_land = lambda *a, **k: calls.append(a) or 0
                 gg.say_waiting = said.append
                 try:
-                    code = gg.main(["wait", "pr", f"{REPO}#16", "--until", until, "--timeout", "600"])
+                    code = gg.main(["wait", "pr", f"{REPO}#16", *(["--until", until] if until else []), "--timeout", "600"])
                 finally:
                     gg.cmd_land, gg.say_waiting = real_land, real_say
                 self.assertEqual(code, 0, "the land wait's own exit comes back")

@@ -34662,9 +34662,10 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
 
 
 # The `--until` values a land row's own end answers: it ends merged (exit 0) or stopped (exit 1), which is all a
-# `merged` or `done` wait asks. `green` and `required` ask about CI before any merge, which the row's end can answer
-# only late, so those keep land_row_wait_refusal and its `next:`.
-LAND_ROW_WAIT_ANSWERS = ("merged", "done")
+# `merged` or `done` wait asks. No `--until` counts too: on a PR this host is landing, the wait a caller (or a hook
+# rewriting `land status` into a wait) means is the land's. `green` and `required` ask about CI before any merge,
+# which the row's end can answer only late, so those keep land_row_wait_refusal and its `next:`.
+LAND_ROW_WAIT_ANSWERS = (None, "merged", "done")
 
 
 def land_row_wait_runs(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
