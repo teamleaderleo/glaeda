@@ -7806,6 +7806,38 @@ class ClientTest(Base):
         self.assertEqual(gg.parse_since("2026-09-25T18:00:00Z", now), (None, gg.iso_epoch("2026-09-25T18:00:00Z")))
         self.assertEqual(gg.parse_since(None, now), (None, now))
 
+    def test_a_comment_wait_the_daemon_never_reads_reads_directly_then_ends_never_read(self) -> None:
+        # fs-agent-lane-6 2026-11-27: 3600 s of "no data yet" on a key the upstream never answered, then no-progress
+        calls: list[dict] = []
+        reply = (200, "yap-goblin-9000[bot]", "nightly-readback answer (match) cluster c-1", time.time() + 1)
+
+        def answered(req: dict) -> None:
+            calls.append(req)
+            self.put("comment:t/s#454", self.comments(reply))
+            return None
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), mock.patch.object(gg, "direct_read", answered):
+            code, text = self.wait_comment(timeout=2, match="nightly-readback answer")
+        self.assertEqual(code, 0, text)
+        self.assertEqual([c["kind"] for c in calls], ["comment"])
+        calls.clear()
+        self.put("comment:t/s#454", None)  # an entry with no data: never read
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), \
+                mock.patch.object(gg, "direct_read", lambda req: calls.append(req) or "HTTP 502"):
+            began = time.monotonic()
+            code, text = self.wait_comment(timeout=30, match="nothing")
+        self.assertEqual(code, 3)
+        self.assertLess(time.monotonic() - began, 10)  # at once, not after the 30 s timeout
+        self.assertIn("ended_by: never-read", text)
+        self.assertIn("HTTP 502", text)
+        self.assertIn("next: gh api repos/t/s/issues/454/comments", text)
+        # a fresh read (by the daemon) is not starved: no direct read
+        calls.clear()
+        self.put("comment:t/s#454", self.comments())
+        with mock.patch.object(gg, "COMMENT_DIRECT_AFTER", 0), \
+                mock.patch.object(gg, "direct_read", lambda req: calls.append(req) or "HTTP 502"):
+            self.assertEqual(self.wait_comment(timeout=0.3, match="nothing")[0], 2)
+        self.assertEqual(calls, [])
+
     def test_wait_comment_on_a_missing_issue_fails(self) -> None:
         key = "comment:t/s#454"
         timer = threading.Timer(0.1, lambda: self.put(key, None, error="Could not resolve", missing=True))

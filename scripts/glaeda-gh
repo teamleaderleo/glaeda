@@ -34064,7 +34064,7 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
     # target, under the same refusals (spent bucket, daemon stop, no login): a PR nobody watches yet is
     # answered, not "no data yet" after a full cycle. Bounded: STATUS_DIRECT_MAX reads, each DIRECT_READ_BUDGET.
     began = time.time()
-    for key in [k for k in keys if unready(entries[k]) and split_key(k)[0] in ("pr", "run")][:STATUS_DIRECT_MAX]:
+    for key in [k for k in keys if unready(entries[k]) and split_key(k)[0] in ("pr", "run", "comment")][:STATUS_DIRECT_MAX]:
         kind = split_key(key)[0]
         blocked = blocked_now(kind)
         if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
@@ -34103,6 +34103,8 @@ def status_outcome(key: str, entry: dict | None) -> dict:
     return fail_fields("no-data-yet", f"{key_name(key)}: the daemon has not read it from GitHub yet"
                        + (f" (last error: {error})" if error else ""),
                        f"glaeda-gh wait {kind} {key_name(key)} --timeout 600" if kind in ("pr", "run")
+                       else f"gh api repos/{key_name(key).replace('#', '/issues/')}/comments (the daemon has not "
+                       "read it; one direct read of the thread)" if kind == "comment"
                        else f"glaeda-gh status {kind} {key_name(key)}")
 
 
@@ -34807,7 +34809,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     way the daemon stores it (so wait_step rules on it): a PR over GraphQL, a run over REST. The fallback for a wait
     whose daemon heartbeats but has not refreshed this target (wait_starved). None, or why it could not read."""
     key, kind = req["key"], req["kind"]
-    if kind not in ("pr", "run"):
+    if kind not in ("pr", "run", "comment"):
         return f"no direct read for a {kind}"
     # An upstream host (no login) reads its one target through direct_command, over REST: the broker's GET.
     broker = direct_command() if upstream_command() is not None else None
@@ -34854,6 +34856,9 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             elif kind == "pr":
                 daemon.gql_reason = "pr-direct"
                 error = daemon.fetch_prs([entry])
+            elif kind == "comment":
+                daemon.fetch_comment_rest(entry)  # REST either way: an issue's last comments, conditional reads
+                error = None
             else:
                 daemon.fetch_run(entry)
                 error = None
@@ -36021,6 +36026,25 @@ def comment_matches(c: dict, author: str | None, pattern: re.Pattern | None, sin
     return not pattern or bool(pattern.search(str(c.get("body") or "")))
 
 
+# A comment wait whose target the daemon never reads waited out its whole timeout on "no data yet" and ended
+# `ended_by: no-progress`, as if the thread had gone quiet. fs-agent-lane-6 2026-11-27 07:36-08:36Z: `wait comment
+# teamleaderleo/leo-workspace#12615 --match ...` printed "no data yet" for 3600 s on a lane VM whose upstream never
+# answered that key (no cache entry at all), while the readback it waited for had in fact never been posted. A
+# starved comment wait now reads the thread itself (direct_read, REST, the broker's GET on a lane VM) once
+# COMMENT_DIRECT_AFTER has passed with nothing fresher, then at most every COMMENT_DIRECT_EVERY; when that read
+# fails too and nothing was ever read, it ends at once with `ended_by: never-read` (exit 3), not a timeout.
+COMMENT_DIRECT_AFTER = 120
+COMMENT_DIRECT_EVERY = 300
+
+
+def comment_starved(entry: dict | None, began: float, now: float) -> bool:
+    """Whether a comment wait's target has no read newer than COMMENT_DIRECT_EVERY (or none at all)."""
+    if entry and entry.get("missing"):
+        return False
+    at = (entry or {}).get("dataAt") if (entry or {}).get("data") else None
+    return not isinstance(at, (int, float)) or now - float(at) >= COMMENT_DIRECT_EVERY
+
+
 def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | None = None,
                      match: str | None = None, since: str | None = None, ceiling: float | None = None) -> int:
     """Wait for a comment on an issue or PR by `author` whose body matches `match`, posted after
@@ -36041,6 +36065,7 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
     down, down_since = DownWait(), None
     _, owner, repo, number = split_key(key)
     name = f"{owner}/{repo}#{number}"
+    direct_at = None  # monotonic time of this wait's last direct read
     while True:
         if not daemon_running(grace=DOWN_GRACE):
             down_since = time.monotonic() if down_since is None else down_since
@@ -36063,6 +36088,24 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
             touched = now
         entry = read_cache(key)
         waited = int(now - start)
+        if now - start >= COMMENT_DIRECT_AFTER and (direct_at is None or now - direct_at >= COMMENT_DIRECT_EVERY) \
+                and comment_starved(entry, began, time.time()):
+            direct_at = now
+            say_waiting(f"glaeda-gh: the daemon has not read {name} for {waited}s; reading GitHub directly once.")
+            error = direct_read({"key": key, "kind": "comment", "jobs": False, "began": began})
+            entry = read_cache(key)
+            if error and not (entry or {}).get("data") and not (entry or {}).get("missing"):
+                note = (f"the daemon never read {name} in {waited}s and the direct read failed: {error}; "
+                        f"next: gh api repos/{owner}/{repo}/issues/{number}/comments")
+                if as_json:
+                    print(json.dumps({"key": key, "result": "never-read", "ended_by": "never-read",
+                                      "waited_s": waited, "error": error, "note": note}, sort_keys=True))
+                else:
+                    print(f"{name}: no data yet\nresult: never-read\nwaited_s: {waited}\nended_by: never-read\n"
+                          f"note: {note}")
+                return EXIT_DOWN
+            if error:
+                say_waiting(f"glaeda-gh: direct read failed: {error}.")
         if entry and (entry.get("fetchedAt") or 0) >= began and not entry.get("data") and entry.get("missing"):
             emit(key, entry, as_json, {"result": "failure", "waited_s": waited})
             return EXIT_FAIL
