@@ -452,6 +452,15 @@ class ArchiveTest(unittest.TestCase):
         finally:
             archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = saved
 
+    def test_the_archive_image_lives_on_the_t5_not_the_failing_x10(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro failed reads at more LBAs each hour (1,877 final errors in
+        # ten minutes at the worst), several under this image. The archive moved to the T5 EVO; the X10 is
+        # only the first version's old folder, which install still empties.
+        self.assertEqual(archive.HOST_VOLUME, Path("/Volumes/T5 EVO"))
+        self.assertEqual(archive.IMAGE, Path("/Volumes/T5 EVO/glaeda-seed-archive.sparsebundle"))
+        self.assertEqual(archive.MOUNT, Path("/Volumes/glaeda-seed-archive"))
+        self.assertEqual(archive.OLD_ARCHIVE, Path("/Volumes/X10 Pro/glaeda-seed-archive"))
+
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
         self.assertEqual(plist["ProgramArguments"][:len(archive.LAN_PARENT) + 2],
