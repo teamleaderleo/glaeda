@@ -1406,6 +1406,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "78c3d27524ce96a98d7ea914c56453b3ef29ed5fd481e0957a787209dd5174f9",
     "3921da1635191cfb276af97c9b26c958da208c45374345920c0cb0db7d0d5676",
     "6a47948dae3e9ed806e2d7c548dba5c96a629c667559c43decdeb98ec8104b30",
+    "8e5b471e25981713d59c03435509aa08fb4c3135ef061ad67d296d64d603de81",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5781,9 +5782,15 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def worker_cargo_target(path: Path) -> bool:
+def worker_cargo_target(path: Path, _nested: bool = False) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
-    real directory (not a symlink) that holds no version control of its own."""
+    real directory (not a symlink) that holds no version control of its own; or a directory of nothing but such
+    targets, one per source tree.
+
+    The hq worker's CARGO_TARGET_DIR is cache/cmux-tui-target/src-<hash> (one target per source tree), so the family
+    item cache/cmux-tui-target holds targets and is none itself: it read "report-only" and "unchecked" under pressure
+    while cmux21 (24 GiB free) and cmux17 (21 GiB) sat under their gui-light disk floor with 8.5 GiB there and 0.0G
+    reclaimable (2026-11-27). Every in-use veto still holds the whole item while a cargo or rustc names it."""
     try:
         if path.is_symlink() or not path.is_dir():
             return False
@@ -5791,8 +5798,16 @@ def worker_cargo_target(path: Path) -> bool:
         return False
     if any(os.path.lexists(path / m) for m in VCS_MARKERS):
         return False
-    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
-            or (path / ".rustc_info.json").is_file())
+    if (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file()):
+        return True
+    if _nested:
+        return False
+    try:
+        entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(worker_cargo_target(Path(e.path), _nested=True) for e in entries)
 
 
 def worker_build_output(fam: Family, path: Path) -> bool:
@@ -19800,6 +19815,10 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if DEAD_MOUNTS:  # paths a walk skipped on ENOTCONN/ESTALE/EIO: a dying drive or a dead mount, as a count and names
+        # (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md), not only a line on stderr
+        row["unreadable_entries"] = len(DEAD_MOUNTS)
+        row["unreadable_examples"] = sorted(DEAD_MOUNTS)[:5]
     if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
         row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass

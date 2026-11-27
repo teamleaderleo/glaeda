@@ -717,6 +717,11 @@ class Base(unittest.TestCase):
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
+        # The waited-PR pool reads through its own Daemon (land_direct_read_many), past these tests' fakes of
+        # batched and fetch: off here, and the pool's own tests turn it back on.
+        pool_off = mock.patch.object(gg, "WAITED_POOL_WORKERS", 0)
+        pool_off.start()
+        self.addCleanup(pool_off.stop)
         for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
                             ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
@@ -6858,7 +6863,9 @@ class ClientTest(Base):
         here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
         sha = "a" * 40
         by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
-        for word in ("--pin", "--pinned", "--match-head-commit"):
+        # A lane, 2026-11-27: `cmux-gh land teamleaderleo/leo-workspace#13147 --head SHA` came back
+        # "unrecognized arguments: --head" with the land unqueued; wait already takes --head for the same SHA.
+        for word in ("--pin", "--pinned", "--match-head-commit", "--head"):
             args = gg.parser().parse_args(["land", "o/r#1", word, sha])
             self.assertEqual(args.sha, sha, word)
             self.assertEqual(vars(args), vars(by_sha), word)
@@ -10440,6 +10447,68 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW)
         order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
         self.assertEqual(set(order[:2]), cheap, order)
+
+    def test_many_waited_prs_are_read_by_a_bounded_pool_beside_the_serial_reads(self) -> None:
+        """The land host, 2026-11-27: ~330 waited PRs read one query at a time stored 22-50 a window. From WAITED_POOL_MIN
+        due, workers read up to WAITED_POOL_WORKERS chunks of WAITED_POOL_CHUNK beside the tick; the serial read gets the
+        rest and a key a worker could not read is deferred, not lost."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: (None if k.endswith("#1") else "no data stored") for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "oldest_waited_age", return_value=gg.WAITED_POOL_STALE_S + 1), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(len(pooled), 1, pooled)
+        self.assertLessEqual(len(pooled[0]), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(len(pooled[0]), total, "all of them fit one worker's chunk")
+        self.assertEqual(serial, [], "what a worker took is not read twice")
+        self.assertNotIn("pr:o/r#1", self.daemon.deferred)
+        self.assertIn("pr:o/r#2", self.daemon.deferred)
+
+    def test_the_waited_pool_waits_until_the_serial_reads_fall_behind(self) -> None:
+        """cmux-cp-2, 2026-11-27: the pool is the heal for stale waited PR data, so it starts only once the oldest waited
+        PR's data is WAITED_POOL_STALE_S old; while the serial reads keep up (fresh watches here) they read them all."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: None for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(pooled, [], "fresh data: no pool")
+        self.assertEqual(len([k for k in serial if k.startswith("pr:")]), total, serial)
+        old = {"key": "pr:o/r#1", "cache": {"dataAt": NOW - 900}}
+        with mock.patch.object(self.daemon, "waited", return_value=True):
+            self.daemon.now = NOW
+            self.assertGreaterEqual(self.daemon.oldest_waited_age([old]), 900)
 
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
@@ -25640,6 +25709,29 @@ class ReexecDrainTest(Base):
         self.assertEqual(gg.reexec_due(True, False, 100.0, limit, finish_until=limit + 60), "reexec", "it ended")
         self.assertEqual(gg.reexec_due(True, True, 100.0, limit - 1, finish_until=limit + 60), "defer")
 
+    def test_with_handover_an_update_neither_holds_nor_finishes(self) -> None:
+        # a controller, 2026-11-27 13:10-14:10Z: each glaeda merge waited out hold, drain and finish behind 20-27 busy land
+        # workers (fast-patch lockWaitS 670-998 s, merge to live 675-1043 s, the swap 0.75 s). With handover on, a
+        # re-exec drops no judgment and cuts no claimed step (REEXEC_HANDED): only the drain of claimed steps not yet
+        # handed is left, REEXEC_DRAIN_MAX at most.
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0, handover=True), "defer")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0), "hold", "no handover: the hold stands")
+        self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0, handover=True), "reexec")
+        late = gg.reexec_due(True, True, 100.0, 100.0 + gg.REEXEC_DRAIN_MAX, up=120.0, handover=True)
+        self.assertNotIn(late, (None, "hold", "defer", "finish", "reexec"))
+        d = gg.Daemon.__new__(gg.Daemon)
+        q = mock.Mock(handover=True)
+        q.finishing.return_value = time.monotonic() + 200
+        d.land_queue = q
+        self.assertTrue(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0, "a handed judgment outlives the re-exec: nothing to finish")
+        q.handover = False
+        self.assertFalse(d.land_handover())
+        self.assertGreater(d.land_finishing(), 0.0, "no handover: a judgment past half its bound still finishes")
+        d.land_queue = None
+        self.assertFalse(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0)
+
     def test_same_bytes_reinstalled_do_not_reexec(self) -> None:
         """A lane VM, 2026-11-21..22: 40 of 175 release installs left glaeda-gh byte-identical, and each re-exec'd the
         daemon on its mtime. Only a change of content does now; the file is hashed only when its stat moved."""
@@ -25866,6 +25958,9 @@ class ReexecDrainTest(Base):
                 return {"modes": {}, "paths": {}, "errors": []}
 
             def land_busy(self) -> bool:
+                return False
+
+            def land_handover(self) -> bool:
                 return False
 
         execs: list = []
@@ -33083,6 +33178,30 @@ class LandTest(Base):
         self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
         self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
+    def test_a_wait_on_a_head_with_a_pending_status_wakes_within_the_status_bound(self):
+        # cmux#61127, 2026-11-27: waiting from 12:05:16Z on `risk evidence` and the cheap-tier cmux/land-tier status;
+        # the run finished 12:11:43Z and the feed carries no event for it, so the row slept to the 1 h wake and was
+        # judged only when a person relabelled at 12:19Z. With a status pending it wakes within LAND_WAIT_STATUS.
+        said = "Cheap tier: the full tier runs when ready-to-land or full-ci is added"
+        self.assertLessEqual(gg.LAND_WAIT_STATUS, 600.0)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        e = self.tick()
+        self.assertEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertLessEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_STATUS)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "COMPLETED", "SUCCESS"),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_WAIT_STATUS + 1)
+        self.assertEqual(self.w.answers, [], "judged at the wake, not left to the 1 h one")
+
+    def test_a_wait_with_no_pending_status_keeps_the_default_wake(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None)])
+        self.land()
+        e = self.tick()
+        self.assertGreaterEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_DEFAULT - 5)
+
     def test_a_waiting_row_whose_checks_finish_but_the_label_gated_one_is_judged_at_the_next_read(self):
         # cmux#61127, 2026-11-27: waiting on `risk evidence` (12:05Z); it finished 12:11Z, leaving only
         # cmux/land-tier ("Cheap tier: ... runs when ready-to-land ... is added"). No feed event follows a status or
@@ -37533,7 +37652,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("forwardedTo"), len(self.handoffs())), ("forwarded", "huge-blue", 1))
         return e
 
-    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_and_tells_its_requester(self):
+    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_with_no_second_notice(self):
         # hq#19725: 9 rows MERGED on GitHub stayed "forwarded" on the lane VM for hours.
         self.forwarded_row()
         self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
@@ -37542,12 +37661,10 @@ class LandTest(Base):
         self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
-        [said] = [c for c in self.w.sent() if "merged" in c[-1]]
-        self.assertEqual(said[3], "host/lane")
         self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
-        # LAND_MERGED_ELSEWHERE_FYI: a merge this queue did not make reaches its requester as an inbox fyi
-        self.assertEqual(said[said.index("--class") + 1], gg.LAND_FORWARD_FYI_CLASS)
+        # LAND_MERGED_FORWARDED_ONCE: huge-blue's queue merged it and told host/lane; this host sends no second notice
+        self.assertEqual([c for c in self.w.sent() if "merged" in c[-1]], [])
 
     def test_only_this_queues_own_merge_wakes_its_requester(self):
         # LAND_MERGED_ELSEWHERE_FYI: gcp-agent-lane-12, 2026-11-23..25, 30 of 86 cache-read merged notices woke a lane
@@ -37562,6 +37679,11 @@ class LandTest(Base):
 
         self.assertEqual(told("merged pinned"), gg.LAND_MERGED_CLASS)
         self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_MERGED_CLASS)
+        # LAND_MERGED_FORWARDED_ONCE: a forwarded row's merge read from the cache is the controller's, already told
+        self.w.calls.clear()
+        self.q.merged(e, "f" * 40, "the cache shows it merged")
+        self.assertEqual([c for c in self.w.sent() if "merged" in c[-1]], [])
+        e.pop("forwardedTo")  # a hand merge of a row never forwarded still reaches its requester, as an fyi
         self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
         self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
 
@@ -38976,6 +39098,24 @@ class LandTest(Base):
         # a real refusal (branch rule, review) is not a pace
         self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
                                                     "have been met, add the --auto flag"))
+
+    def test_a_lane_vm_update_branch_is_not_held_by_the_logins_create_pause(self):
+        # On a lane VM the update-branch goes to the broker's land tool, which no create pause holds (the shim admits
+        # it: gh_quota.py broker_lands). The queue's own read of the pause held it anyway: 39 of 85 base_update
+        # update-branches in a day on one lane VM were step_held. Sent now; a retarget is still held.
+        self.broker = True
+        self.q = self.queue()
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--match-head-commit", LA]])
+        self.assertNotIn("step_held", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stepQuotaParked"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
 
     def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
         # one lane VM, 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
@@ -40706,6 +40846,30 @@ class LandTest(Base):
         e = self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)
         self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_check_completed_event_judges_a_wait_whose_pr_the_cache_holds_no_copy_of(self):
+        """LAND_WAKE_NO_COPY. manaflow-ai/cmux#61813, 2026-11-27: first judged why=no_data (checks_running, 30 min
+        wait), green and CLEAN by 13:55Z, judged only at 14:09Z; leo-workspace#13493 and glaeda#3083 the same. With no
+        copy the row had no head in the queue's heads (so the feed's event matched nothing) and no_data_wait_holds
+        held it to its wake. Now the verdict's head is what the event is matched to, and the event judges it."""
+        self.feed()
+        done, _, asked = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.land()  # no self.pr(): the cache holds no copy of the PR
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        for _ in range(4):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertEqual(self.q.heads[self.KEY][1], LA)  # what Daemon.nudge_lands matches the event against
+        for _ in range(5):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)  # no event: the wait stands
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual([h.get("why") for h in e["history"] if h.get("event") == "judged"][-1], "checks_done")
+        self.assertEqual(asked, [LA])
 
     def test_a_green_rollup_judges_a_checks_wait_whose_copy_still_shows_a_check_running(self):
         """LAND_ROLLUP_READY. manaflow-ai/cmuxterm-hq#28474, 2026-11-26: judged checks_running at 09:49Z, every check
