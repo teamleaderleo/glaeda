@@ -335,9 +335,10 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(sent), 8)
         self.assertTrue(all("--github-labels-unread=" in r and "GitHub rate limit" in r and "--github-labels=" not in r
                             for r in sent), sent[0])
+        unlisted_from = len(self.calls())
         unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
         self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
-        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
+        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[unlisted_from:]
                              if c["tool"] == "ssh"), "a runner GitHub does not list: the mini decides as before")
         self.assertTrue(all(f"--latest-runner-version 2.401.0 --latest-runner-sha256 {'d' * 64}" in c["remote"]
                             for c in applies))
