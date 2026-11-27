@@ -216,5 +216,62 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         self.assertIsNone(gg.land_row_watched_here(f"run:{REPO}/26"))
 
 
+class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
+    """LAND_MERGED_WAITER_QUIET: one merge, one wake for a session whose own `wait pr` already waits on the row."""
+
+    def setUp(self) -> None:
+        for sub in ("entries", "waiters"):
+            d = Path(HOME) / "land" / sub
+            if d.is_dir():
+                for p in d.glob("*.json"):
+                    p.unlink()
+
+    def merge(self, key: str, requester: str) -> list[dict]:
+        """LandQueue.merged on a row requested by REQUESTER; the notify calls it made, with their wake."""
+        q = gg.LandQueue.__new__(gg.LandQueue)
+        calls: list[dict] = []
+        e = {"key": key, "repo": REPO, "number": 42, "state": "waiting", "requester": requester, "history": []}
+        with mock.patch.object(gg.LandQueue, "save", lambda self, e: None), \
+                mock.patch.object(gg.LandQueue, "history", lambda self, e, *a, **k: None), \
+                mock.patch.object(gg.LandQueue, "url", lambda self, e: f"https://github.com/{REPO}/pull/42"), \
+                mock.patch.object(gg.LandQueue, "notify",
+                                  lambda self, e, to, msg, wake=True, cls=None, within=None, **k:
+                                  calls.append({"to": to, "wake": wake, "msg": msg})), \
+                mock.patch.object(gg, "log", lambda *_: None):
+            q.merged(e, "f" * 40, "merged pinned")
+        return calls
+
+    def test_a_merge_the_requesters_own_waiter_reports_sends_no_second_wake(self) -> None:
+        key = f"pr:{REPO}#42"
+        row = write_row(42, "waiting")
+        seen: list[dict | None] = []
+
+        def tick(_: float) -> None:
+            seen.append(gg.land_row_waiter_for(key, "host/me"))  # while the waiter runs
+            write_row(42, "merged", mergeSha="f" * 40)
+
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "land_requester", return_value="host/me"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.land_row_wait(key, row, 60, None, True, sleep=tick), gg.EXIT_OK)
+        self.assertIsNotNone(seen[0])
+        # the daemon's merge a moment after the waiter saw it: the same session is not woken twice ...
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [False])
+        # ... another session's requester still is
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/other")], [True])
+
+    def test_no_waiter_or_a_waiter_that_did_not_end_merged_still_wakes(self) -> None:
+        key = f"pr:{REPO}#42"
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [True])
+        row = write_row(42, "waiting")
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "land_requester", return_value="host/me"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            gg.land_row_wait(key, row, 60, None, True,
+                             sleep=lambda _: write_row(42, "stopped", stop={"code": "c", "reason": "r", "next": "n"}))
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [True])
+        self.assertEqual(list((Path(HOME) / "land" / "waiters").glob("*.json")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
