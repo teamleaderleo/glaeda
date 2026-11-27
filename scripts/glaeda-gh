@@ -17717,7 +17717,8 @@ LAND_FALLBACK = {"tip_merge": "update_branch", "stale_green": "update_branch", "
                  "review_running": "wait_comment", "no_ship": "review", "same_model": "review",
                  "regen_refused": "review"}
 LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_comment", "rerun_failed", "repin",
-                        "retry", "review", "retarget", "stop", "command", "fetch", "compile_check"})
+                        "retry", "review", "retarget", "stop", "command", "fetch", "compile_check",
+                        "dispatch"})
 # A "compile_check" step: land_judge's compile_missing refusal names its one next step, `cmux-ci compile-check --ref
 # SHA --app --release` (compile_check_command), which gives the head its compile receipt in minutes. The queue stopped
 # on it as a command, and a person or agent ran it and landed again (cmux#57574 and #56907, 2026-11-26). Now the queue
@@ -17729,6 +17730,37 @@ LAND_COMMAND_COMPILE = re.compile(r"\s*cmux-ci compile-check --ref ([0-9a-f]{40}
 LAND_COMPILE_WAIT = 600.0
 LAND_COMPILE_SENDS = 2
 LAND_COMPILE_DEADLINE = 120.0  # the client's own submit, --background
+# A "dispatch" step: land_judge names a workflow_dispatch of a gate workflow as the one step that posts a status
+# nothing else will: `gh workflow run cmux-next-fast-gates.yml -R REPO --ref REF -f pr=N`, alone or followed by
+# `&& glaeda-gh wait pr REPO#N ...` (leo-workspace engine.fast_gates_dispatch for a clean base merge whose
+# cmux-next/fast-gates never posts, and base_red.fast_gates_tip_step for a fast-gates red at a base the tip moved
+# past). The queue stopped on it as a command, and a person or agent ran the dispatch by hand and landed again
+# (cmux#56020 and cmux#49678, 2026-11-27). Now the queue sends it itself, bounded:
+# - only a workflow LAND_DISPATCH_WORKFLOWS (land.json "dispatchWorkflows" adds to it) names for the PR's repository,
+#   on a ref it names or the PR's own base, with exactly one input, pr=N, this entry's own number; any other text,
+#   flag, input, workflow, repository or PR stays a command and stops as before;
+# - once per (head, workflow), kept on the entry (e["dispatchSent"], written before the send, so a restart mid-send
+#   counts it, and kept across a re-land: a second land of the same head never sends it again);
+# - a duplicate guard across rows: a dispatch of the same workflow for the same PR at the same head that any row of
+#   this queue sent is that send, not a new one;
+# - a rate limit per (repository, workflow): at most LAND_DISPATCH_PER_WINDOW sends in LAND_DISPATCH_WINDOW over all
+#   rows (land.json "dispatchPerHour"); a row past it waits for the oldest send to age out, never stops for it.
+# After a send the row waits LAND_DISPATCH_SETTLE (the run posts its pending status in about a minute) and is judged
+# again; the status the dispatch posts is judged as any other. Asked the same dispatch again at a head already sent,
+# it waits on until LAND_DISPATCH_WAIT from the send, then stops naming the dispatch it sent. A refused send is a
+# refused step (step_refused) and is not counted as sent. Detector: test-glaeda-gh.py -k dispatch.
+LAND_DISPATCH_WORKFLOWS: dict[str, dict[str, list[str]]] = {
+    "manaflow-ai/cmux": {"cmux-next-fast-gates.yml": ["feat-cmux-next"]},
+}
+LAND_COMMAND_DISPATCH = re.compile(
+    r"\s*gh workflow run (?P<wf>[\w.-]+\.ya?ml) -R (?P<repo>[\w.-]+/[\w.-]+) --ref '?(?P<ref>[A-Za-z0-9][\w./-]{0,250})'?"
+    r" -f pr=(?P<n>\d+)(?:\s*&&\s*(?P<wait>glaeda-gh wait pr (?P<wrepo>[\w.-]+/[\w.-]+)#(?P<wn>\d+)"
+    r"(?:\s+--[a-z-]+(?:[ =]\S+)?)*))?\s*")
+LAND_DISPATCH_SETTLE = 120.0
+LAND_DISPATCH_WAIT = 1800.0
+LAND_DISPATCH_WINDOW = 3600.0
+LAND_DISPATCH_PER_WINDOW = 30
+LAND_DISPATCH_KEEP = 20  # (head, workflow) sends an entry remembers
 SHA40 = re.compile(r"[0-9a-f]{40}")
 BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: land_judge could not
@@ -18580,7 +18612,31 @@ def land_action(answer: dict, head: str) -> dict:
         return act
     return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
         or land_command_label(act, answer) or land_command_compile(act, answer, head) \
-        or land_command_wait(act, answer, head)
+        or land_command_dispatch(act, answer, head) or land_command_wait(act, answer, head)
+
+
+def land_command_dispatch(act: dict, answer: dict, head: str) -> dict | None:
+    """A "command" step that is a gate workflow's dispatch for this PR (LAND_COMMAND_DISPATCH's comment) as a dispatch
+    step, else None. Only the exact shape, for the answer's own repository and PR (the wait after it too), at a judged
+    head; whether the workflow and ref are allowed is the queue's check (LandQueue.dispatch_allowed), with land.json."""
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_DISPATCH.fullmatch(text)
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
+    if not named or not repo or not number or not SHA40.fullmatch(head or ""):
+        return None
+    if named.group("repo").lower() != repo.lower() or named.group("n") != number:
+        return None
+    wait = named.group("wait") or ""
+    if wait and (named.group("wrepo").lower() != repo.lower() or named.group("wn") != number):
+        return None
+    timeout = LAND_COMMAND_TIMEOUT.search(wait)
+    return {"v": 1, "kind": "dispatch", "repo": repo, "number": number, "head": head,
+            "workflow": named.group("wf"), "ref": named.group("ref"),
+            "timeout_s": float(timeout.group(1)) if timeout else LAND_DISPATCH_WAIT, "text": text.strip(),
+            "from": "command"}
 
 
 def land_command_compile(act: dict, answer: dict, head: str) -> dict | None:
@@ -24817,6 +24873,10 @@ class LandQueue:
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
                 pass
+            elif act.get("kind") == "dispatch":
+                # A gate's dispatch (LAND_COMMAND_DISPATCH's comment): sent once per head, then bounded by
+                # LAND_DISPATCH_WAIT from that send, never by the identical-refusal stop while its status posts.
+                pass
             elif land_ci_start_left(e, act, answer, head, self.now) is not None:
                 # ci_never_ran at a head this land itself made, inside the bound: ci_never_ran_step waits on the PR
                 # for the repo's own run to appear, so this is not a refusal of the PR's to count (LAND_CI_START).
@@ -25265,6 +25325,9 @@ class LandQueue:
             return
         if kind == "compile_check":
             self.do_compile_check(e, act, answer, head)
+            return
+        if kind == "dispatch":
+            self.do_dispatch(e, act, answer, head)
             return
         if kind == "rerun_failed":
             runs = [int(r) for r in act.get("runs") or [] if str(r).isdigit()]
@@ -26278,6 +26341,113 @@ class LandQueue:
                 self.stop(e, "compile_missing", f"the compile check at {head[:12]} could not be sent (exit "
                           f"{got.returncode}: {land_trim(got.stderr or got.stdout, 200)}): "
                           f"{land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
+
+    def dispatch_allowed(self, e: dict, act: dict) -> str:
+        """Why ACT, a dispatch step for E, is not one this queue sends (LAND_COMMAND_DISPATCH's comment), or "": its
+        workflow is one LAND_DISPATCH_WORKFLOWS or land.json's "dispatchWorkflows" names for E's repository, on a ref
+        it names or the PR's own base as the daemon's copy reads it."""
+        repo, workflow, ref = str(e["repo"]), str(act.get("workflow") or ""), str(act.get("ref") or "")
+        refs: list[str] = []
+        for table in (LAND_DISPATCH_WORKFLOWS, self.config().get("dispatchWorkflows")):
+            if not isinstance(table, dict):
+                continue
+            flows = next((v for k, v in table.items() if str(k).lower() == repo.lower()), None)
+            given = flows.get(workflow) if isinstance(flows, dict) else None
+            if isinstance(given, list):
+                refs += [str(r) for r in given if isinstance(r, str)]
+        if not refs:
+            return f"{workflow or 'no workflow'} is not a gate workflow this queue dispatches for {repo}"
+        base = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("baseRefName") or "")
+        if not BRANCH_SAFE.fullmatch(ref) or ".." in ref or ref not in refs + ([base] if base else []):
+            return f"{workflow} is dispatched only on {', '.join(sorted(set(refs)))} or the PR's base, not {ref!r}"
+        return ""
+
+    def dispatch_sends(self, repo: str, workflow: str) -> list[float]:
+        """Under the lock. When every row of this queue sent WORKFLOW of REPO within LAND_DISPATCH_WINDOW (each row's
+        dispatchSent), oldest first: the rate limit's count, rebuilt from the rows so a restart keeps it."""
+        at = []
+        for x in self.entries.values():
+            if str(x.get("repo") or "").lower() != repo.lower():
+                continue
+            for d in x.get("dispatchSent") or []:
+                if isinstance(d, dict) and d.get("workflow") == workflow and isinstance(d.get("at"), (int, float)) \
+                        and self.now - d["at"] < LAND_DISPATCH_WINDOW:
+                    at.append(float(d["at"]))
+        return sorted(at)
+
+    def dispatch_sent(self, e: dict, workflow: str, head: str) -> dict | None:
+        """Under the lock. The send of WORKFLOW for E's PR at HEAD any row of this queue made (the duplicate guard),
+        else None."""
+        for x in [e] + [x for x in self.entries.values() if x is not e]:
+            if str(x.get("repo") or "").lower() != str(e["repo"]).lower() or str(x.get("number")) != str(e["number"]):
+                continue
+            for d in x.get("dispatchSent") or []:
+                if isinstance(d, dict) and d.get("workflow") == workflow and d.get("head") == head:
+                    return d
+        return None
+
+    def do_dispatch(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Send the gate workflow's dispatch land_judge named for HEAD (LAND_COMMAND_DISPATCH's comment), once per
+        (head, workflow), and judge again once its status can have posted."""
+        nxt = land_trim(act.get("text") or answer.get("next"))
+        why = self.dispatch_allowed(e, act)
+        gh = self.gh()
+        if why or gh is None:
+            with self.lock:
+                self.stop(e, str(answer.get("code") or "command"),
+                          f"{land_reason(answer.get('reason'))} ({why or 'no gh-quota shim to dispatch through'})", nxt)
+            return
+        workflow, ref, repo, number = str(act["workflow"]), str(act["ref"]), e["repo"], str(e["number"])
+        with self.lock:
+            self.check(e)
+            sent = self.dispatch_sent(e, workflow, head)
+            if sent is not None:
+                left = float(sent.get("at") or 0) + LAND_DISPATCH_WAIT - self.now
+                if left > 0:
+                    self.history(e, "dispatch_waiting", head=head[:12], workflow=workflow, left=round(left))
+                    self.wait(e, {"kind": "retry", "why": f"{workflow} dispatched at {head[:12]}: its status is "
+                                  "judged once it posts"}, min(left, max(LAND_DISPATCH_SETTLE, 300.0)))
+                else:
+                    self.stop(e, str(answer.get("code") or "command"),
+                              f"{workflow} was dispatched at {head[:12]} {round(self.now - float(sent.get('at') or 0))}"
+                              f" s ago and land_judge still names it: {land_reason(answer.get('reason'))}", nxt)
+                return
+            sends = self.dispatch_sends(repo, workflow)
+            cap = int(land_seconds(self.config().get("dispatchPerHour"), LAND_DISPATCH_PER_WINDOW, 1.0, 1000.0))
+            if len(sends) >= cap:
+                room = sends[len(sends) - cap] + LAND_DISPATCH_WINDOW - self.now
+                self.history(e, "dispatch_capped", head=head[:12], workflow=workflow, sent=len(sends), cap=cap)
+                self.count("dispatch_capped")
+                self.wait(e, {"kind": "retry", "why": f"{workflow}: {len(sends)} dispatches in the last "
+                              f"{LAND_DISPATCH_WINDOW / 60:.0f} min, the cap; sent when one ages out"},
+                          max(60.0, room + 1.0))
+                return
+            self.claim(e, "dispatch", workflow=workflow, ref=ref)
+            mine = [d for d in e.get("dispatchSent") or [] if isinstance(d, dict)]
+            e["dispatchSent"] = (mine + [{"head": head, "workflow": workflow, "ref": ref, "at": self.now}]
+                                 )[-LAND_DISPATCH_KEEP:]
+            self.history(e, "dispatch_sent", head=head[:12], workflow=workflow, ref=ref)
+            self.count("dispatch_sent")
+            self.save(e)
+        got = self.call([gh, "workflow", "run", workflow, "-R", repo, "--ref", ref, "-f", f"pr={number}"],
+                        LAND_GH_DEADLINE, e)
+        named = None
+        with self.lock:
+            if got.returncode not in (0, 124):  # refused: not sent (a timeout may have reached GitHub: it stays sent)
+                e["dispatchSent"] = [d for d in e.get("dispatchSent") or []
+                                     if not (isinstance(d, dict) and d.get("head") == head
+                                             and d.get("workflow") == workflow)]
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"dispatched {workflow} at {head[:12]}: its status is judged "
+                              "next"}, LAND_DISPATCH_SETTLE)
+            else:
+                named = self.step_refused(e, "dispatch", head, got)
+        if named == "update_branch":
+            self.update_branch(e, head, named=True)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv

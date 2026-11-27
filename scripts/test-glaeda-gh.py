@@ -27900,7 +27900,8 @@ class LandWorld:
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] \
                 else "close" if words[:2] == ["pr", "close"] else "reopen" if words[:2] == ["pr", "reopen"] \
-                else "ready" if words[:2] == ["pr", "ready"] else "other"
+                else "ready" if words[:2] == ["pr", "ready"] else "dispatch" if words[:2] == ["workflow", "run"] \
+                else "other"
             rc = self.gh_rc.get(kind, 0)
             return subprocess.CompletedProcess(argv, rc, self.gh_out.get(kind, "") if rc == 0 else "",
                                                "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
@@ -29106,6 +29107,159 @@ class LandTest(Base):
         act = gg.land_action({"ok": False, "code": "compile_missing", "repo": "o/r", "number": "1", "next": text,
                               "action": {"v": 1, "kind": "command", "text": text}}, LA)
         self.assertEqual((act["kind"], act["head"]), ("compile_check", LA))
+
+    GATES = "gh workflow run cmux-next-fast-gates.yml -R o/r --ref feat-cmux-next -f pr=1"
+
+    def gates_refusal(self, head: str, text: str | None = None, code: str = "checks_running") -> tuple[int, dict]:
+        # leo-workspace ci_required.running_step / base_red.fast_gates_tip_step: the dispatch, then a wait on the PR
+        nxt = text or f"{self.GATES} && glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout 1800"
+        return refusal(code, head, {"kind": "command", "text": nxt}, nxt,
+                       f"land-judge: refused: checks still running at {head}: cmux-next/fast-gates: not posted yet")
+
+    def gates_allowed(self) -> None:
+        self.w.config["dispatchWorkflows"] = {"o/r": {"cmux-next-fast-gates.yml": ["feat-cmux-next"]}}
+
+    def dispatches(self) -> list[list[str]]:
+        return self.w.gh_calls("workflow", "run")
+
+    def test_a_fast_gates_dispatch_is_sent_by_the_queue_once_per_head_and_the_row_keeps_waiting(self):
+        # cmux#56020 and cmux#49678, 2026-11-27: stopped on a fast-gates dispatch command a person then ran by hand.
+        self.gates_allowed()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.dispatches(), [["workflow", "run", "cmux-next-fast-gates.yml", "-R", "o/r", "--ref",
+                                              "feat-cmux-next", "-f", "pr=1"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "dispatch", 0))
+        self.assertEqual([(d["head"], d["workflow"]) for d in e["dispatchSent"]], [(LA, "cmux-next-fast-gates.yml")])
+        self.assertIn("dispatch_sent", [h["event"] for h in e["history"]])
+        # named again at the same head (its status not posted yet): never sent twice, the row waits, no strike
+        for _ in range(4):
+            self.w.answers.append(self.gates_refusal(LA))
+        for _ in range(4):
+            e = self.tick(gg.LAND_DISPATCH_SETTLE + 300 + 1)
+            if not self.w.answers:
+                break
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertIn("dispatch_waiting", [h["event"] for h in e["history"]])
+        # past LAND_DISPATCH_WAIT from the send and still named: it stops, naming the dispatch it sent
+        self.w.answers.append(self.gates_refusal(LA))
+        for _ in range(12):
+            e = self.tick(301)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_running"))
+        self.assertIn("was dispatched at", e["stop"]["reason"])
+        # the status posted and passed: merged at the head, as any land
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual(len(self.dispatches()), 1)
+
+    def test_a_relanded_head_already_dispatched_is_not_dispatched_again_and_a_new_head_is(self):
+        self.gates_allowed()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        self.tick()
+        self.land()  # a land by hand of the same head: the send is kept on the row (duplicate guard)
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual(e["state"], "waiting")
+        self.pr(LB)  # a new head: its own dispatch
+        self.land()
+        self.w.answers.append(self.gates_refusal(LB))
+        for _ in range(8):
+            e = self.tick(gg.LAND_DISPATCH_SETTLE + 1)
+            if not self.w.answers:
+                break
+        self.assertEqual(self.w.answers, [], (e["state"], e.get("wait"), e.get("stop")))
+        self.assertEqual(len(self.dispatches()), 2)
+        self.assertEqual([d["head"] for d in e["dispatchSent"]], [LA, LB])
+
+    def test_the_dispatch_rate_limit_waits_for_room_and_never_stops(self):
+        self.gates_allowed()
+        self.w.config["dispatchPerHour"] = 1
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        self.tick()
+        self.assertEqual(len(self.dispatches()), 1)
+        # a new head inside the hour: the cap's one send is spent, so the row waits for it to age out
+        self.pr(LB)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LB))
+        for _ in range(8):
+            e = self.tick(gg.LAND_DISPATCH_SETTLE + 1)
+            if not self.w.answers:
+                break
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIn("dispatch_capped", [h["event"] for h in e["history"]])
+        self.assertGreater(e["wakeAt"] - self.t, gg.LAND_DISPATCH_WINDOW / 2)
+        self.assertEqual([d["head"] for d in e["dispatchSent"]], [LA])
+        # past the hour it is sent
+        self.w.answers.append(self.gates_refusal(LB))
+        for _ in range(8):
+            e = self.tick(gg.LAND_DISPATCH_WINDOW / 4)
+            if not self.w.answers:
+                break
+        self.assertEqual(len(self.dispatches()), 2)
+
+    def test_a_refused_dispatch_is_not_counted_as_sent(self):
+        self.gates_allowed()
+        self.w.gh_rc["dispatch"] = 1
+        self.w.gh_err["dispatch"] = "HTTP 403: Resource not accessible by integration"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertFalse(e.get("dispatchSent"))
+        self.assertEqual(e["lastAction"]["kind"], "dispatch")
+        self.assertIn("step_refused", [h["event"] for h in e["history"]])
+
+    def test_only_an_allowlisted_gate_workflow_of_this_pr_is_dispatched(self):
+        # not in the allowlist: stops as the command it was, nothing sent
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.dispatches(), [])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_running"))
+        self.assertIn("not a gate workflow", e["stop"]["reason"])
+        # every other shape stays a command (land_action), before any allowlist is read
+        for text in (
+            "gh workflow run cmux-next-fast-gates.yml -R o/r --ref feat-cmux-next -f pr=2",
+            "gh workflow run cmux-next-fast-gates.yml -R x/y --ref feat-cmux-next -f pr=1",
+            "gh workflow run cmux-next-fast-gates.yml -R o/r --ref feat-cmux-next -f pr=1 -f force=1",
+            "gh workflow run cmux-next-fast-gates.yml -R o/r --ref feat-cmux-next -f pr=1; rm -rf /",
+            "gh workflow run cmux-next-fast-gates.yml -R o/r --ref feat-cmux-next -f pr=1 && glaeda-gh wait pr o/r#2",
+            "gh workflow run cmux-next-fast-gates.yml -R o/r --ref $(id) -f pr=1",
+        ):
+            act = gg.land_action({"ok": False, "code": "checks_running", "repo": "o/r", "number": "1", "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text}}, LA)
+            self.assertEqual(act["kind"], "command", text)
+        for text in (self.GATES, f"gh workflow run cmux-next-fast-gates.yml -R o/r --ref 'feat-cmux-next' -f pr=1 && "
+                     f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 900"):
+            act = gg.land_action({"ok": False, "code": "red_not_excused", "repo": "o/r", "number": "1", "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text}}, LA)
+            self.assertEqual((act["kind"], act["workflow"], act["ref"]),
+                             ("dispatch", "cmux-next-fast-gates.yml", "feat-cmux-next"), text)
+        # an allowed workflow on a ref neither the allowlist nor the PR's base names
+        self.gates_allowed()
+        self.assertIn("not 'main'", self.q.dispatch_allowed(
+            {"key": self.KEY, "repo": "o/r", "number": 1},
+            {"workflow": "cmux-next-fast-gates.yml", "ref": "main"}))
+        self.assertEqual(self.q.dispatch_allowed({"key": self.KEY, "repo": "o/r", "number": 1},
+                                                 {"workflow": "cmux-next-fast-gates.yml", "ref": "feat-cmux-next"}), "")
+        self.assertIn("cmux-next-fast-gates.yml", gg.LAND_DISPATCH_WORKFLOWS["manaflow-ai/cmux"])
 
     def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
         self.broker = True
