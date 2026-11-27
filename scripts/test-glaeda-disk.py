@@ -17761,6 +17761,126 @@ class DeadMountTests(unittest.TestCase):
                 Path("/x").is_dir()
 
 
+class GhrunIdleRunnerTest(unittest.TestCase):
+    """Another account's runner directories (GHRUN_FAMILY): read and deleted with sudo -n, confined, never when live."""
+
+    ROOT = Path("/home/ghrun")
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.receipt = self.base / "receipt.jsonl"
+        self.calls: list[list[str]] = []
+        self.listing = ["/home/ghrun/r1/_work/cmux", "/home/ghrun/r1/_work/_tool", "/home/ghrun/r2/_work/cmux",
+                        "/home/ghrun/.cache/go-build"]
+        self.changed: set[str] = set()
+        self.realpaths: dict[str, str] = {}
+        self.sudo_ok = True
+        self.cmds = "/home/ghrun/r2/bin/Runner.Listener run --startuptype service\n"
+
+    def fake_sudo(self, args: list[str], timeout: float = 0) -> tuple[int, str]:
+        self.calls.append(list(args))
+        if not self.sudo_ok:
+            return -1, "sudo -n is not available here"
+        if args[0] == "find" and "-prune" in args:
+            return 0, "\n".join(self.listing + ["/home/ghrun/r1/_work/../../x", "/home/ghrun/r1/_diag/y"]) + "\n"
+        if args[0] == "find":
+            return 0, next((p + "/f\n" for p in self.changed if args[1] == p), "")
+        if args[0] == "du":
+            return 0, f"1048576\t{args[-1]}\n"
+        if args[0] == "realpath":
+            return 0, self.realpaths.get(args[-1], args[-1]) + "\n"
+        if args[0] == "rm":
+            return 0, ""
+        return 1, "unexpected"
+
+    def run_in(self, fn, *args, **kw):
+        with mock.patch.object(gd, "ghrun_sudo", self.fake_sudo), \
+                mock.patch.object(gd, "process_evidence", lambda: ([], self.cmds)):
+            return fn(*args, **kw)
+
+    def items(self) -> dict[str, "gd.Item"]:
+        return {i.path: i for i in self.run_in(gd.ghrun_items, self.ROOT)}
+
+    def removed(self) -> list[str]:
+        return [c[-1] for c in self.calls if c[0] == "rm"]
+
+    def test_target_confinement(self) -> None:
+        ok = gd.ghrun_target_ok
+        for good in ("/home/ghrun/r1/_work/cmux", "/home/ghrun/o2/work/cmuxterm-hq", "/home/ghrun/r1/_work/_tool",
+                     "/home/ghrun/.cache/go-build"):
+            self.assertTrue(ok(good, self.ROOT), good)
+        for bad in ("/home/ghrun", "/home/ghrun/r1", "/home/ghrun/r1/_work", "/home/ghrun/r1/_diag/x",
+                    "/home/ghrun/r1/bin/x", "/home/ghrun/r1/.runner", "/home/ghrun/r1/_work/_actions",
+                    "/home/ghrun/r1/_work/_temp", "/home/ghrun/r1/work/_tool", "/home/ghrun/r1/_work/../bin",
+                    "/home/ghrun/r1/_work/cmux/../../bin", "/home/ghrun/../etc", "/home/ghrun/.cache/go-build/x",
+                    "/home/ghrun/.cache", "/home/ghrun/r1/_work/.git", "/home/ghrun/r1/_work/cmux/sub",
+                    "home/ghrun/r1/_work/cmux", "/home/other/r1/_work/cmux", "/home/ghrun//r1/_work/cmux", ""):
+            self.assertFalse(ok(bad, self.ROOT), bad)
+
+    def test_items_judge_each_runner_and_the_go_cache(self) -> None:
+        items = self.items()
+        self.assertEqual(set(items), set(self.listing))  # the `..` and _diag lines never become items
+        self.assertEqual(items["/home/ghrun/r1/_work/cmux"].verdict, "reclaimable")
+        self.assertEqual(items["/home/ghrun/r1/_work/_tool"].verdict, "reclaimable")
+        self.assertEqual(items["/home/ghrun/r2/_work/cmux"].verdict, "in-use")  # its Listener runs
+        self.assertEqual(items["/home/ghrun/.cache/go-build"].verdict, "reclaimable")  # no Worker anywhere
+
+    def test_a_live_worker_keeps_its_runner_and_the_go_cache(self) -> None:
+        self.cmds += "/home/ghrun/o3/bin/Runner.Worker spawnclient 1 2\n"
+        items = self.items()
+        self.assertEqual(items["/home/ghrun/.cache/go-build"].verdict, "in-use")
+        self.assertEqual(items["/home/ghrun/r1/_work/cmux"].verdict, "reclaimable")  # another runner's Worker only
+        self.cmds += "/home/ghrun/r1/bin/Runner.Worker spawnclient 1 2\n"
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "in-use")
+
+    def test_recent_change_keeps_an_item(self) -> None:
+        self.changed.add("/home/ghrun/r1/_work/cmux")
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "recent")
+
+    def test_no_sudo_reports_blocked_and_deletes_nothing(self) -> None:
+        self.sudo_ok = False
+        (item,) = self.run_in(gd.ghrun_items, self.ROOT)
+        self.assertEqual((item.verdict, item.path), ("unchecked", "/home/ghrun"))
+        self.assertIn("blocked", item.reasons[0])
+        self.assertEqual(self.run_in(gd.apply_ghrun, self.receipt, root=self.ROOT), 0)
+        self.assertEqual(self.removed(), [])
+
+    def test_apply_deletes_only_reclaimable_and_logs_each_path(self) -> None:
+        released = self.run_in(gd.apply_ghrun, self.receipt, root=self.ROOT)
+        self.assertEqual(sorted(self.removed()), sorted(["/home/ghrun/r1/_work/cmux", "/home/ghrun/r1/_work/_tool",
+                                                         "/home/ghrun/.cache/go-build"]))
+        self.assertTrue(all(c[:4] == ["rm", "-rf", "--one-file-system", "--"] for c in self.calls if c[0] == "rm"))
+        self.assertEqual(released, 3 * 1048576)
+        logged = [json.loads(line) for line in self.receipt.read_text().splitlines()]
+        self.assertEqual({r["path"] for r in logged}, set(self.removed()))
+        self.assertTrue(all(r["outcome"] == "reclaimed" and r["bytes"] == 1048576 for r in logged))
+
+    def test_a_symlink_escape_is_refused(self) -> None:
+        self.realpaths["/home/ghrun/r1/_work/cmux"] = "/home/ghrun/r1/bin"  # _work/cmux is a link to bin
+        why = self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/cmux", self.ROOT)
+        self.assertIn("refusing", why)
+        self.assertEqual(self.removed(), [])
+        self.realpaths["/home/ghrun/r1/_work/_tool"] = "/etc"
+        self.assertIn("refusing", self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/_tool", self.ROOT))
+        self.assertIn("refusing", self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/../bin", self.ROOT))
+        self.assertEqual(self.removed(), [])
+
+    def test_liveness_is_rechecked_just_before_deleting(self) -> None:
+        self.run_in(gd.ghrun_items, self.ROOT)  # judged reclaimable ...
+        self.cmds += "/home/ghrun/r1/bin/Runner.Worker spawnclient 1 2\n"  # ... then a job starts
+        self.assertEqual(self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/cmux", self.ROOT), "a runner is live now")
+        self.assertEqual(self.removed(), [])
+
+    def test_no_process_evidence_keeps_everything(self) -> None:
+        def none() -> tuple[list[str], str]:
+            raise gd.NoEvidence("no /proc")
+        with mock.patch.object(gd, "ghrun_sudo", self.fake_sudo), mock.patch.object(gd, "process_evidence", none):
+            self.assertTrue(all(i.verdict == "unchecked" for i in gd.ghrun_items(self.ROOT)))
+            self.assertIn("no process evidence", gd.ghrun_remove("/home/ghrun/r1/_work/cmux", self.ROOT))
+        self.assertEqual(self.removed(), [])
+
+
 class DockerStoreTest(unittest.TestCase):
     """The container image store (DOCKER_IMAGES): by image and tag, reclaimed only by docker's own commands."""
 
