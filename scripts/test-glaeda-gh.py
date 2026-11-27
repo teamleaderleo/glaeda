@@ -10420,6 +10420,27 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_waited_prs_a_probe_confirms_are_read_before_the_ones_that_need_a_full_read(self) -> None:
+        """The land host, 2026-11-27: waited PRs needing full reads (1.5-4 s each) went in deferral order ahead of the
+        probe-eligible ones (~0.5 s), so a window stored ~30 of ~330. The cheap ones lead, order kept within a group."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        for n in range(1, 5):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        cheap = {"pr:o/r#3", "pr:o/r#4"}
+        seen: list[list[str]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                seen.append([e["key"] for e in entries])
+            return []
+        with mock.patch.object(self.daemon, "probe_ok", side_effect=lambda e: e["key"] in cheap), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
+        self.assertEqual(set(order[:2]), cheap, order)
+
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
         left, and `checks --consumer merge-hold` said "unread (not read yet)" until the hour turned. A head with no
@@ -19677,6 +19698,25 @@ class PostTest(unittest.TestCase):
         self.assertEqual(t.calls[1][1], "/repos/o/r/pulls?state=open&head=o%3Alane/x&base=main")
         state = gg.post_state(item["id"])
         self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/3"))
+
+    def test_a_filled_auto_drafts_ready_mark_goes_on_a_poster_app_when_the_login_made_the_create(self) -> None:
+        """Before: the ready mark of a filled auto-draft was the login's GraphQL whenever no App made the create
+        (cmux#61434, 2026-11-27: "API rate limit already exceeded for user"). After: a free poster App makes it."""
+        self.no_env_token()
+        asked = self.app_writer("quota-goblin")
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "mine")
+        exists = (422, {}, {"message": "Validation Failed",
+                            "errors": [{"message": "A pull request already exists for o:lane/x."}]})
+        draft = {"html_url": "https://github.com/o/r/pull/3", "number": 3, "node_id": "PR_3", "draft": True,
+                 "body": gg.AUTO_DRAFT_MARK + "\nDraft opened automatically"}
+        ready = (200, {}, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"number": 3, "isDraft": False}}}})
+        d, t = self.daemon(exists, (200, {}, [draft]), (200, {}, {"number": 3}), ready)
+        d.transport, seen = self.authed(t)
+        self.step(d, NOW)
+        self.assertEqual(t.calls[3][1], "/graphql")
+        self.assertEqual(seen[3], "Bearer " + self.APP_TOKEN)
+        self.assertIn(["broker-actor", "post", "o/r"], asked)
+        self.assertIn("marked ready", gg.post_state(item["id"])["note"])
 
     def test_an_open_auto_draft_for_the_head_is_filled_in_and_marked_ready(self) -> None:
         """2026-11-26: cmux#59774 and cmuxterm-hq#30522 were opened by `cmux-gh post pr ... --body-file` (wt push's
@@ -33036,6 +33076,22 @@ class LandTest(Base):
         self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
         self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
+    def test_a_waiting_row_whose_checks_finish_but_the_label_gated_one_is_judged_at_the_next_read(self):
+        # cmux#61127, 2026-11-27: waiting on `risk evidence` (12:05Z); it finished 12:11Z, leaving only
+        # cmux/land-tier ("Cheap tier: ... runs when ready-to-land ... is added"). No feed event follows a status or
+        # that run, so the row slept to its wake and nobody pulsed the label until a person did at 12:19Z.
+        said = "Cheap tier: the full tier runs when ready-to-land or full-ci is added"
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        e = self.tick()
+        self.assertEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "COMPLETED", "SUCCESS"),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(self.w.answers, [], "land_judge was not asked once only the gated check was left")
+
     def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
         # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
         # stop that invented a label would send its reader to add one no workflow reads.
@@ -35213,14 +35269,17 @@ class LandTest(Base):
         entry parks until the reset and the queue sends `gh pr ready` again itself."""
         for said in ("gh-quota: refused: GitHub's GraphQL rate limit is spent for login until 22:41Z",
                      "GraphQL: API rate limit already exceeded for user ID 1. (markPullRequestReadyForReview)",
-                     "HTTP 403: API rate limit exceeded for user ID 1."):
+                     "HTTP 403: API rate limit exceeded for user ID 1.",
+                     "gh-quota: refused: the shared GraphQL quota is under its low-water floor (floor 500 of 5000; "
+                     "next: retry after 11:42Z (when graphql resets)"):
             self.assertTrue(gg.LAND_STEP_QUOTA.search(said), said)
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
         self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
         self.w.gh_rc["ready"] = 1
-        self.w.gh_err["ready"] = "GraphQL: API rate limit already exceeded for user ID 1. (markPullRequestReadyForReview)"
+        self.w.gh_err["ready"] = ("gh-quota: refused: the shared GraphQL quota is under its low-water floor (floor 500 "
+                                  "of 5000; next: retry after 11:42Z (when graphql resets))")
         self.w.answers.append(ok_answer(LA))
         e = self.tick()
         self.assertEqual(len(self.w.gh_calls("pr", "ready")), 1)
