@@ -34661,6 +34661,30 @@ def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) ->
     return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
 
 
+# The `--until` values a land row's own end answers: it ends merged (exit 0) or stopped (exit 1), which is all a
+# `merged` or `done` wait asks. `green` and `required` ask about CI before any merge, which the row's end can answer
+# only late, so those keep land_row_wait_refusal and its `next:`.
+LAND_ROW_WAIT_ANSWERS = ("merged", "done")
+
+
+def land_row_wait_runs(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+                       sha: str | None) -> int:
+    """`wait pr --until merged|done` on a PR ROW already holds: run the wait land_row_wait_refusal's `next:` names,
+    `land N --wait T`, here, and say so in one line, instead of exiting 64 with a command for the caller to retype
+    (Leo, 2026-11-21: "the tool itself should be improved"). It is still no second GitHub watcher: `land --wait`
+    blocks on this row in the local queue. Pinned to the row's own commit (or --sha, which land_row_watched_here
+    already matched to it), so re-requesting the land re-arms that row and never re-pins it to a new head read.
+    Exit codes are `land --wait`'s: 0 merged, 1 stopped, 2 still going at the timeout."""
+    name = key_name(key)
+    wait, ceiling, capped = land_agent_wait_cap(name, max(1.0, float(timeout)), ceiling)
+    pin = sha or row.get("pinSha") or row.get("head") or None
+    say_waiting(f"glaeda-gh: {name} is already a {row.get('state')} row in this host's land queue, so this waits on "
+                f"that row as `glaeda-gh land {name} --wait {int(wait):d}` (no second GitHub watcher)")
+    if capped:
+        say_waiting(capped)
+    return cmd_land(name, [], None, wait, as_json, pin, None, ceiling, None)
+
+
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
     """A daemon-ruled wait that cannot be ruled on: ((64, its --json object or nothing), its stderr lines)."""
     out = json.dumps({"ok": False, "code": code, "reason": reason, "next": nxt}) + "\n" if req.get("json") else ""
@@ -44521,6 +44545,8 @@ def main(argv: list[str] | None = None) -> int:
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
             row = land_row_watched_here(pr_key, args.sha)
+            if row is not None and args.until in LAND_ROW_WAIT_ANSWERS:
+                return land_row_wait_runs(pr_key, row, args.timeout, args.max, args.json, args.sha)
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))

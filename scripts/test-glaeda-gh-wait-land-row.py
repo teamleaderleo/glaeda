@@ -19,8 +19,10 @@ starting the real wait they are entitled to, which would be the network read thi
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -116,6 +118,40 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         self.assertEqual(p.returncode, 64, f"exit {p.returncode}; out={p.stdout[-400:]!r} err={p.stderr[-400:]!r}")
         self.assertEqual(json.loads(p.stdout.strip())["code"], "land_row_watching")
         self.assertLess(took, 8, "it must refuse at once, not after waiting out the timeout")
+
+    def test_merged_wait_runs_the_land_wait_itself(self) -> None:
+        """`wait pr --until merged|done` on a held PR runs `land N --wait T` on the row's own commit and says so in
+        one line, instead of exiting 64 with that command for the caller to retype."""
+        for until in gg.LAND_ROW_WAIT_ANSWERS:
+            with self.subTest(until=until):
+                write_row(16, "waiting")
+                calls, said = [], []
+                real_land, real_say = gg.cmd_land, gg.say_waiting
+                gg.cmd_land = lambda *a, **k: calls.append(a) or 0
+                gg.say_waiting = said.append
+                try:
+                    code = gg.main(["wait", "pr", f"{REPO}#16", "--until", until, "--timeout", "600"])
+                finally:
+                    gg.cmd_land, gg.say_waiting = real_land, real_say
+                self.assertEqual(code, 0, "the land wait's own exit comes back")
+                self.assertEqual(len(calls), 1, "exactly one land wait, no refusal")
+                target, after, notify, wait, as_json, pin = calls[0][:6]
+                self.assertEqual((target, after, notify, pin), (f"{REPO}#16", [], None, HEAD))
+                self.assertTrue(0 < wait <= 600)
+                self.assertFalse(any("land_row_watching" in w or "next:" in w for w in said))
+                self.assertTrue(any(f"glaeda-gh land {REPO}#16 --wait" in w for w in said), said)
+
+    def test_green_wait_still_refuses(self) -> None:
+        """A row's end answers merged/done only; a green wait keeps the refusal and its `next:`."""
+        write_row(17, "waiting")
+        real_land = gg.cmd_land
+        gg.cmd_land = lambda *a, **k: self.fail("a green wait must not run the land wait")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                code = gg.main(["wait", "pr", f"{REPO}#17", "--until", "green", "--timeout", "60"])
+        finally:
+            gg.cmd_land = real_land
+        self.assertEqual(code, 64)
 
     # a legitimate wait must still work
     def test_cli_with_no_row_still_takes_the_normal_wait_path(self) -> None:
