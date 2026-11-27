@@ -11061,6 +11061,30 @@ class Daemon:
             else:
                 write_json(path, before)
 
+    def upstream_follow_feed(self) -> None:
+        """On an upstream host, follow the controller's change feed for its own view (feed_live_since, feed_marks,
+        saved in UPSTREAM_FEED_FILE), every CONTROLLER_FEED_EVERY: the feed needs no controller token, and nothing
+        else of the controller is used here (no hooks, no run baselines). land_feed_quiet and wait_starved rule with
+        it when the upstream's view of a PR does not vouch for its copy (UPSTREAM_OWN_FEED). Out (an error), the view
+        is dropped and asked again after CONTROLLER_RETRY."""
+        if self.controller is None or self.now < self.controller_down_until \
+                or self.now - self.controller_feed_at < CONTROLLER_FEED_EVERY:
+            return
+        self.controller_feed_at = self.now
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        if not self.controller_room():
+            return
+        try:
+            pages = self.read_feed()
+        except WatchError:
+            self.feed_live_since = None  # what the feed misses while out is not known
+            self.controller_down_until = self.now + CONTROLLER_RETRY
+            self.save_feed_view()
+            return
+        self.controller_feed_error = None  # a later page that failed: the cursor stays at the pages taken
+        self.took_feed(pages)
+        self.save_feed_view()
+
     def upstream_left(self) -> float:
         """Seconds left of this tick's UPSTREAM_TICK_BUDGET for one upstream run, at most UPSTREAM_DEADLINE."""
         return min(float(UPSTREAM_DEADLINE), self.upstream_end - time.monotonic())
@@ -11069,6 +11093,12 @@ class Daemon:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
+        try:
+            with self.phase("feed"):
+                self.upstream_follow_feed()
+        except Exception as error:  # noqa: BLE001  the feed only spares reads: a fault must not stop them
+            self.feed_live_since = None
+            self.errors.append(f"feed: {describe(error)} at {error_site(error)}"[:UPSTREAM_ERROR_MAX])
         if lane_vm_poster():
             try:
                 with self.phase("outbox"):
@@ -14633,8 +14663,8 @@ class Daemon:
         if land_pending_status((read_cache(key) or {}).get("data") or {}):
             return False  # a commit status ending its wait reaches the feed as no event (land_pending_status)
         view = self.upstream_feed.get(key)
-        if view is not None:
-            return upstream_feed_quiet(view, sha, since, self.now)
+        if view is not None and upstream_feed_quiet(view, sha, since, self.now):
+            return True  # else this host's own feed, when it follows one (UPSTREAM_OWN_FEED), may still vouch
         if not key.startswith("pr:") or self.feed_live_since is None or self.feed_live_since > since:
             return False
         if not self.fed(key):
@@ -16370,6 +16400,13 @@ LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch'
 # a path more than one VM read. The upstream host's daemon now keeps its feed view in UPSTREAM_FEED_FILE (written each
 # time it reads the feed), `read` answers each PR key with it (feed_view), and the downstream rules with that view
 # (upstream_feed_quiet) exactly as land_feed_quiet does with its own feed.
+# UPSTREAM_OWN_FEED: the upstream's view went stale all the same. cmux-cp-1's copy of a waited PR was routinely past
+# UPSTREAM_DIRECT_AFTER (a lane VM's daemon.json, 2026-11-27 02:4xZ: staleWaited pr 437 s, run 199 s), and its feed view
+# with it, so each wait re-read its PR through the broker anyway: glaeda-upstream made 3,194 of the read pool's 24,743
+# App requests in the hour to 02:40Z (check-runs 673, actions/runs 666, pulls/N 645), the largest single caller. The
+# "no controller token" above was never a reason: /v1/github/events answers without one. So an upstream host's
+# daemon now follows the feed itself (Daemon.upstream_follow_feed), and a copy its own feed vouches for is current
+# (land_feed_quiet, own_feed_quiet in wait_starved), however old the upstream's copy and view are.
 UPSTREAM_FEED_FILE = "feed-view.json"  # under BASE: {"liveSince", "okAt", "fedRepos", "marks"} (Daemon.save_feed_view)
 UPSTREAM_FEED_FRESH = 3 * UPSTREAM_EVERY  # a downstream trusts a key's feed view this long after the upstream gave it
 UPSTREAM_FEED_SKEW = 5.0  # seconds of clock difference between hosts an event time is given against a copy's dataAt
@@ -34128,6 +34165,14 @@ def note_direct_quiet(req: dict, before: str | None, after: str | None, error: s
         req.pop("directQuiet", None)
 
 
+def own_feed_quiet(key: str, entry: dict | None, since: float, now: float) -> bool:
+    """upstream_feed_quiet from this host's own feed view (UPSTREAM_FEED_FILE, which an upstream host's daemon keeps
+    since UPSTREAM_OWN_FEED): nothing reached KEY's PR, its head or its branch since SINCE, and the feed answered
+    after it. False with no fresh view."""
+    view = feed_view(key, (entry or {}).get("data"), read_json(BASE / UPSTREAM_FEED_FILE), now)
+    return view is not None and upstream_feed_quiet({**view, "answeredAt": view["at"]}, "", since, now)
+
+
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     """How old the data a wait is blocked on is, when it is starved: the wait has run STALE_DATA_AFTER and nothing was
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
@@ -34162,6 +34207,8 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
         # current, however old. Before, every wait on a lane VM re-read its PR directly every UPSTREAM_DIRECT_AFTER
         # (huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of 11,257 glaeda-upstream GETs a path that VM had read before).
         return None
+    if not never_read and upstream_command() is not None and own_feed_quiet(req["key"], entry, float(seen), now):
+        return None  # this host's own feed vouches for the copy (UPSTREAM_OWN_FEED)
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
     return age_s if age_s > bound else None
 

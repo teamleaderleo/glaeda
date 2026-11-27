@@ -3434,6 +3434,42 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
 
+    def test_an_upstream_host_follows_the_feed_itself_when_the_upstreams_view_is_stale(self) -> None:
+        """UPSTREAM_OWN_FEED: cmux-cp-1's copy and feed view of a waited PR went stale (staleWaited pr 437 s), so each
+        lane VM's wait re-read it through the broker: glaeda-upstream 3,194 of 24,743 App requests in an hour. The
+        lane VM's daemon follows the token-less feed itself, and a copy its own feed vouches for is current."""
+        ctl = FakeController()
+        ctl.token = None
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon.controller = ctl  # a lane VM's Controller.from_env: no token file there
+        bound, gg.UPSTREAM_DIRECT_AFTER = gg.UPSTREAM_DIRECT_AFTER, 10  # the copy below is past it
+        self.addCleanup(setattr, gg, "UPSTREAM_DIRECT_AFTER", bound)
+        key, sha = "pr:o/r#7", "a" * 40
+        gg.register(key)
+        self.daemon.tick(now=NOW - 60)  # the feed's cursor: quiet starts here
+        since = NOW - 30
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since}  # the upstream gives no view of it
+        ctl.suites = [{"id": 1, "repo": "o/r", "head_sha": "b" * 40, "status": "completed", "pull_requests": []}]
+        self.daemon.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.daemon.controller_status["why"], "reads through upstream")
+        entry = gg.read_cache(key)
+        self.assertIsNone(entry.get("upstreamFeed"))
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "this host's own feed vouches")
+        req = {"key": key, "kind": "pr", "began": NOW - 600}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 1), "no direct read for a quiet PR")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + gg.CONTROLLER_FRESH + 1), "a view gone stale")
+            ctl.suites = [{"id": 2, "repo": "o/r", "head_sha": sha, "status": "completed", "pull_requests": []}]
+            self.daemon.tick(now=NOW + 2)
+            self.assertFalse(self.daemon.land_feed_quiet(key, sha, since), "an event for its head")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + 3), "an event after the copy: read it")
+        ctl.down = True
+        self.daemon.tick(now=NOW + 4)
+        self.assertIsNone(self.daemon.feed_live_since, "a feed that is out vouches for nothing")
+
     def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
         """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
         feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
