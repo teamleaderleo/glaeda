@@ -3434,6 +3434,42 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
 
+    def test_an_upstream_host_follows_the_feed_itself_when_the_upstreams_view_is_stale(self) -> None:
+        """UPSTREAM_OWN_FEED: cmux-cp-1's copy and feed view of a waited PR went stale (staleWaited pr 437 s), so each
+        lane VM's wait re-read it through the broker: glaeda-upstream 3,194 of 24,743 App requests in an hour. The
+        lane VM's daemon follows the token-less feed itself, and a copy its own feed vouches for is current."""
+        ctl = FakeController()
+        ctl.token = None
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon.controller = ctl  # a lane VM's Controller.from_env: no token file there
+        bound, gg.UPSTREAM_DIRECT_AFTER = gg.UPSTREAM_DIRECT_AFTER, 10  # the copy below is past it
+        self.addCleanup(setattr, gg, "UPSTREAM_DIRECT_AFTER", bound)
+        key, sha = "pr:o/r#7", "a" * 40
+        gg.register(key)
+        self.daemon.tick(now=NOW - 60)  # the feed's cursor: quiet starts here
+        since = NOW - 30
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since}  # the upstream gives no view of it
+        ctl.suites = [{"id": 1, "repo": "o/r", "head_sha": "b" * 40, "status": "completed", "pull_requests": []}]
+        self.daemon.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.daemon.controller_status["why"], "reads through upstream")
+        entry = gg.read_cache(key)
+        self.assertIsNone(entry.get("upstreamFeed"))
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "this host's own feed vouches")
+        req = {"key": key, "kind": "pr", "began": NOW - 600}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 1), "no direct read for a quiet PR")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + gg.CONTROLLER_FRESH + 1), "a view gone stale")
+            ctl.suites = [{"id": 2, "repo": "o/r", "head_sha": sha, "status": "completed", "pull_requests": []}]
+            self.daemon.tick(now=NOW + 2)
+            self.assertFalse(self.daemon.land_feed_quiet(key, sha, since), "an event for its head")
+            self.assertIsNotNone(gg.wait_starved(req, entry, NOW + 3), "an event after the copy: read it")
+        ctl.down = True
+        self.daemon.tick(now=NOW + 4)
+        self.assertIsNone(self.daemon.feed_live_since, "a feed that is out vouches for nothing")
+
     def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
         """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
         feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
@@ -10632,11 +10668,11 @@ class TickBudgetTest(Base):
         self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
         self.daemon.rest_room = lambda cost: False  # REST lean, its share spent (both brokers: "rest": "lean")
         keys = [f"pr:o/r#{n}" for n in range(1, waited + 1)]
-        bad = set(keys[::max(1, waited // max(1, heavy))][:heavy])
+        bad = set(keys[:heavy])  # the oldest data: on both brokers the PRs GitHub 502s on are the oldest (cmux#54153)
         clock, spent, sent, queries = [NOW], [0.0], {k: 0 for k in keys}, {"pr": 0, "head": 0}
         for i, key in enumerate(keys):  # read once, a while ago, alike but for a second apart
-            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 900 + i,
-                                                               "dataAt": NOW - 900 + i, "error": None,
+            at = NOW - (20000 if key in bad else 900 - i)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at, "error": None,
                                                                "data": {"state": "OPEN"}})
 
         def take(seconds: float) -> None:
@@ -10672,12 +10708,7 @@ class TickBudgetTest(Base):
                 for key in keys:  # read lately (the broker's answers touch them)
                     os.utime(gg.watch_dir() / gg.file_name(key), (clock[0], clock[0]))
                 spent[0] = 0.0
-                q0 = queries["pr"]
-                status = self.daemon.tick(clock[0])
-                if os.environ.get("SIM_TRACE"):
-                    print(f"T{tick} spent={spent[0]:.1f} prq={queries['pr'] - q0} deferred={status.get('deferred')} "
-                          f"modes={status.get('modes')} oldest={max((clock[0] - ((gg.read_cache(k) or {}).get('dataAt') or NOW)) for k in keys if k not in bad):.0f}",
-                          file=sys.stderr)
+                self.daemon.tick(clock[0])
                 for key in keys:
                     if key not in bad:
                         worst = max(worst, clock[0] - ((gg.read_cache(key) or {}).get("dataAt") or NOW))
@@ -10688,14 +10719,20 @@ class TickBudgetTest(Base):
 
     def test_a_broker_reads_every_waited_pr_behind_502ing_batches(self) -> None:
         """cmux-cp-2, 2026-11-27 02:20Z: ~40 waited PRs "not read for 1298s (14 due ticks, its query sent on 0)", ticks
-        spending 545 of 600 s in read pr and read head, a pr batch of 10 answered 502 after 10.7 s. Every readable
-        waited PR is read within a few ticks, whatever the heavy ones cost, and at any PR count."""
-        for waited in [int(n) for n in os.environ.get("SIM_WAITED", "40,160").split(",")]:
-            got = self.broker_waited_starve(waited=waited, heads=int(os.environ.get("SIM_HEADS", "6")),
-                                            hours=float(os.environ.get("SIM_HOURS", "1")))
+        spending 545 of 600 s in read pr and read head, pr batches of 10 answered 502 after 10.7 s. The PRs whose
+        chunks kept failing were read alone ahead of every batch, tick after tick, and failing alone kept their data
+        oldest, so they went first again. Before (half an hour, 15 of them 502ing, 40 heads a tick): 13 of 40 and 213
+        of 240 waited PRs never sent, oldest readable data 2,632 s. After: every one sent, 1,430 s and 1,772 s."""
+        for i, waited in enumerate(int(n) for n in os.environ.get("SIM_WAITED", "40,240").split(",")):
+            if i:  # each shape on a fresh daemon and cache, as the first
+                self.tearDown()
+                self.setUp()
+            got = self.broker_waited_starve(waited=waited, heads=int(os.environ.get("SIM_HEADS", "40")),
+                                            heavy=int(os.environ.get("SIM_HEAVY", "15")),
+                                            hours=float(os.environ.get("SIM_HOURS", "0.5")))
             print(f"\nbroker shape, {waited} waited: {got}", file=sys.stderr)
             self.assertEqual(got["neverSent"], 0, got)
-            self.assertLess(got["waitedAgeMax"], gg.STALE_DATA_AFTER * (1 + waited // 40), got)
+            self.assertLess(got["waitedAgeMax"], 3 * gg.STALE_DATA_AFTER, got)
 
 
 CHILD_PRELUDE = """
@@ -33990,6 +34027,44 @@ class LandTest(Base):
                 self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
+
+    def test_a_merge_past_a_red_or_pending_check_records_its_verdict_and_each_excused_check(self):
+        # LAND_MERGE_RECORD: four merges on one land host went past a red or pending ws-check and the "merged" row said
+        # only "merged pinned". Each own merge now names its verdict, every non-green check at the head and why, and an
+        # override's reason, as leo-workspace#12618's landing record does.
+        cases = (("red, judged ok", [("ws-check", "COMPLETED", "FAILURE"), ("ci", "COMPLETED", "SUCCESS")], None,
+                  ok_answer(LA), "ok", [("ws-check", "red")]),
+                 # a pending status context land_judge let through (a running one keeps the queue waiting)
+                 ("pending, judged ok", [("ws-check", "PENDING", None, "runs when ready-to-land is added")], None,
+                  ok_answer(LA), "ok",
+                  [("ws-check", "pending")]),
+                 ("red, override", [("ws-check", "COMPLETED", "FAILURE")], dict(self.OVERRIDE),
+                  refusal("own_red", LA, {"kind": "rerun_failed", "runs": [7]}), "override_pinned (own_red)",
+                  [("ws-check", "red")]),
+                 ("all green", [("ci", "COMPLETED", "SUCCESS")], None, ok_answer(LA), "ok", []))
+        for name, checks, override, answer, verdict, excused in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=checks)
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                                **({"override": override} if override else {}))
+                self.w.answers.append(answer)
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                [row] = [h for h in e["history"] if h["event"] == "merged"]
+                said = row.get("landJudge")
+                self.assertIsNotNone(said, "the merged row names no verdict")
+                self.assertEqual(said, e.get("landJudge"))
+                self.assertEqual(said["verdict"], verdict)
+                self.assertEqual([(x["name"], x["state"]) for x in said["excused"]], excused)
+                if override:
+                    self.assertEqual(said["override_reason"], override["reason"])
+                    self.assertTrue(all(x["why"] == "override: " + override["reason"] for x in said["excused"]))
+                else:
+                    self.assertNotIn("override_reason", said)
+                    self.assertTrue(all(x["why"].startswith("land_judge ok") for x in said["excused"]))
 
     def test_land_override_pinned_row_merges_at_its_pin_past_the_merge_trains_retry(self):
         # manaflow-ai/cmux#58296, 2026-11-26: queued pinned at 30061064 with an override at 12:11:43Z, judged

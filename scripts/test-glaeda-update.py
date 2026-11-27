@@ -1069,6 +1069,51 @@ class UpdateTest(unittest.TestCase):
         response.__enter__.return_value = response
         return response
 
+    def test_a_host_with_a_controller_probes_through_it_and_never_asks_github(self) -> None:
+        answer = {"repo": "teamleaderleo/glaeda", "tag": "ota-channels", "status": 200,
+                  "assets": {"control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"}}
+        asked = []
+
+        def urlopen(request, timeout):
+            asked.append(request.full_url)
+            if isinstance(answer, Exception):
+                raise answer
+            response = mock.MagicMock()
+            response.read.return_value = json.dumps(answer).encode()
+            response.__enter__.return_value = response
+            return response
+        github = mock.Mock(side_effect=AssertionError("github.com asked"))
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "", "CMUX_CI_CONTROLLER": ""}), \
+                mock.patch.object(gu.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(gu.urllib.request, "build_opener", github):
+            config = Path(home) / gu.PROBE_CONTROLLER_CONFIG
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"controller": "http://100.89.225.106:18765/"}))
+            seen = gu.channel_fingerprint("stable", home=Path(home))
+            self.assertEqual(asked, ["http://100.89.225.106:18765/v1/github-release-probe/teamleaderleo/glaeda/ota-channels"])
+            self.assertEqual(seen, {"repo": gu.REPOSITORY, "via": "controller",
+                                    "control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"})
+            self.assertEqual(gu.channel_fingerprint("canary", home=Path(home))["canary.json"], "absent")
+            answer["assets"]["stable.json"] = "3:2026-11-27T00:05:00Z:21"
+            self.assertNotEqual(gu.channel_fingerprint("stable", home=Path(home)), seen)
+            answer["status"], answer["assets"] = 404, {}  # no channel release yet: both files absent
+            self.assertEqual(gu.channel_fingerprint("stable", home=Path(home))["control.json"], "absent")
+            answer["status"] = 500  # GitHub refused the controller: no answer, and no github.com fallback
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.HTTPError("u", 503, "the controller is starting", {}, None)
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.URLError("offline")
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            with mock.patch.dict(os.environ, {"CMUX_CI_CONTROLLER": "http://10.0.0.1:18765"}):
+                self.assertEqual(gu.probe_controller(Path(home)), "http://10.0.0.1:18765")
+            with mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"}):
+                self.assertIsNone(gu.probe_controller(Path(home)))
+            config.write_text("not json")
+            self.assertIsNone(gu.probe_controller(Path(home)))
+        github.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"})  # this host's controller, if any, is not the test's
     def test_the_channel_fingerprint_is_the_asset_each_file_redirects_to(self) -> None:
         location = "https://release-assets.githubusercontent.com/github-production-release-asset/1/{}?sig=x&se=1"
         answers = {"control.json": urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("c1")}, None),

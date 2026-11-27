@@ -3871,10 +3871,34 @@ SOCKET_PATH_MAX = 103  # sockaddr_un.sun_path on macOS is 104 bytes with its NUL
 LAN_RELAY_SH = "/bin/sh"
 LAN_RELAY_LOOP = ('c=$1 w=$2 p=$3; shift 3; for a do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; '
                   '[ "$s" -eq 1 ] || exit "$s"; done; exit 1')
+# LAN_RELAY_FOLLOW (glaeda_fleet_labels.lan_relay_follow): with lanRelayFollow the loop first asks this mini's
+# tailscaled (LocalAPI whois over its Unix socket, Apple's /usr/bin/curl; nothing reaches the network) for the declared
+# tailnet node, checks its stable ID, and puts every IPv4 endpoint the node advertises under the declared prefix ahead
+# of the declared addresses (Apple's /usr/bin/plutil reads the JSON). An endpoint that is not digits and dots, or
+# outside the prefix, is never tried. curl gets /dev/null and plutil a pipe, so nothing reads the client's bytes before
+# a connect. When tailscaled cannot answer, or names another node, the declared addresses alone are tried, as before.
+LAN_RELAY_TAILSCALED = "/var/run/tailscaled.socket"
+LAN_RELAY_FOLLOW_LOOP = (
+    'c=$1 w=$2 p=$3 t=$4 n=$5 x=$6 k=$7; shift 7; f=; '
+    'j=$(/usr/bin/curl -sf --max-time "$c" --unix-socket "$k" -H "Host: local-tailscaled.sock" '
+    '"http://local-tailscaled.sock/localapi/v0/whois?addr=$t" </dev/null 2>/dev/null); '
+    'if [ -n "$j" ] && [ "$(printf %s "$j" | /usr/bin/plutil -extract Node.StableID raw -o - - 2>/dev/null)" = "$n" ]; '
+    'then m=$(printf %s "$j" | /usr/bin/plutil -extract Node.Endpoints raw -o - - 2>/dev/null); '
+    'case $m in ""|*[!0-9]*) m=0;; esac; i=0; '
+    'while [ "$i" -lt "$m" ] && [ "$i" -lt 64 ]; do '
+    'e=$(printf %s "$j" | /usr/bin/plutil -extract "Node.Endpoints.$i" raw -o - - 2>/dev/null); a=${e%:*}; i=$((i+1)); '
+    'case $a in ""|*[!0-9.]*) continue;; esac; '
+    'case $a in "$x"*) case " $f " in *" $a "*) ;; *) f="$f $a";; esac;; esac; '
+    'done; fi; '
+    'for a in $f "$@"; do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; [ "$s" -eq 1 ] || exit "$s"; done; exit 1')
 
 
 def relay_of(ctx: Any) -> str | list[str] | None:
     return (dedicated_of(ctx) or {}).get("lanRelay")
+
+
+def relay_follow_of(ctx: Any) -> dict[str, str] | None:
+    return (dedicated_of(ctx) or {}).get("lanRelayFollow")
 
 
 def relay_label(ctx: Context) -> str:
@@ -3891,8 +3915,16 @@ def relay_plist_path(ctx: Context) -> Path | None:
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
-    relay = relay_of(ctx)
-    if isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
+    relay, follow = relay_of(ctx), relay_follow_of(ctx)
+    if follow:  # LAN_RELAY_FOLLOW: the node's own LAN endpoints first, then the declared addresses
+        declared = relay if isinstance(relay, list) else [relay]
+        net, bits = follow["within"].split("/")  # glaeda_fleet_labels.follow_prefix: "10.1.2.0/24" -> "10.1.2."
+        prefix = ".".join(net.split(".")[: int(bits) // 8]) + "."
+        argv = [LAN_RELAY_SH, "-c", LAN_RELAY_FOLLOW_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
+                str(LAN_RELAY_IDLE_S), declared[0].rsplit(":", 1)[1], follow["tailnetIp"], follow["node"],
+                prefix, LAN_RELAY_TAILSCALED,
+                *(r.rsplit(":", 1)[0] for r in declared)]
+    elif isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
         port = relay[0].rsplit(":", 1)[1]
         argv = [LAN_RELAY_SH, "-c", LAN_RELAY_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
                 str(LAN_RELAY_IDLE_S), port, *(r.rsplit(":", 1)[0] for r in relay)]
