@@ -39145,6 +39145,24 @@ class LandTest(Base):
         self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
                                                     "have been met, add the --auto flag"))
 
+    def test_a_lane_vm_update_branch_is_not_held_by_the_logins_create_pause(self):
+        # On a lane VM the update-branch goes to the broker's land tool, which no create pause holds (the shim admits
+        # it: gh_quota.py broker_lands). The queue's own read of the pause held it anyway: 39 of 85 base_update
+        # update-branches in a day on one lane VM were step_held. Sent now; a retarget is still held.
+        self.broker = True
+        self.q = self.queue()
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--match-head-commit", LA]])
+        self.assertNotIn("step_held", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stepQuotaParked"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
     def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
         # one lane VM, 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
         # "content writes are paced until reset (60s ...)", each a refusal row on the fleet's paced count (goal
@@ -41412,6 +41430,41 @@ class LandTest(Base):
         self.assertNotEqual(self.q.entries[fresh]["state"], "forwarded")
         self.assertNotEqual(self.q.entries[chained]["state"], "forwarded")
         self.assertEqual(self.explained(), [])  # nothing judged here: the one worker stayed busy throughout
+
+    def test_an_overflowed_row_a_peer_hands_back_is_queued_here_again(self):
+        """hq#32407, 2026-11-27: cmux-cp-1 overflowed the row to cmux-cp-2, cp-2 overflowed it back 18 min later with
+        the same request id, and cp-1's apply skipped it as a request already applied: both rows "forwarded" to each
+        other, nothing judging the PR. A row forwarded here that comes back is queued here again; a plain resend of a
+        request this host holds open is still applied once."""
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "idle-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[dict] = []
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append(req)
+            if req["op"] == "room":
+                return {"ok": True, "room": 1, "host": cmd[1], "readable": {o: "" for o in req.get("owners") or []}}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual(e["state"], "forwarded")
+        sent = [r for q in asked if q["op"] == "batch" for r in q["requests"]][0]
+        gen = e["gen"]
+        with self.q.lock:  # the peer's own overflow of it, the same request id
+            self.q.apply({**sent, "sha": "c" * 40}, key, "o/r", 11)
+        e = self.q.entries[key]
+        self.assertEqual((e["state"], e["pinSha"], e["gen"]), ("queued", "c" * 40, gen + 1))
+        self.assertEqual(e["history"][-1]["event"], "queued")
+        with self.q.lock:  # a resend of the same request, now open here: applied once
+            self.q.apply({**sent, "sha": "c" * 40}, key, "o/r", 11)
+        self.assertEqual(self.q.entries[key]["gen"], gen + 1)
 
     def test_a_peer_that_refuses_or_is_down_leaves_the_rows_here(self):
         self.w.config["workers"] = 1
