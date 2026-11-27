@@ -5204,5 +5204,40 @@ class RemoteStatusTests(unittest.TestCase):
         self.assertTrue(command.endswith("; exit 0"))
 
 
+
+class LanFallbackTests(unittest.TestCase):
+    """An untagged tailnet node drops port 22; its manifest lan_ip is the way in (cmux25-34, 2026-11-27)."""
+    MANIFEST = {"hosts": {"new": {"lan_ip": "172.20.22.58"}, "up": {"lan_ip": "172.20.22.9"},
+                          "aws": {"lan_ip": "172.20.22.7", "ssh_jump_host": "cmux-lawrence"}, "bare": {}}}
+
+    def probe(self, address, timeout):
+        if address[0] == "new":
+            raise OSError("timed out")
+        return mock.Mock()
+
+    def test_only_a_silent_name_goes_to_its_lan_address(self):
+        with mock.patch.object(mf.socket, "create_connection", side_effect=self.probe), \
+                mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_LAN": "1"}):
+            path, names = mf.lan_fallback(self.MANIFEST, ["new", "up", "aws", "bare"])
+        self.assertEqual(names, ["new"])
+        text = Path(path).read_text()
+        self.assertIn("Host new\n  HostName 172.20.22.58\n  HostKeyAlias new\n", text)
+        self.assertNotIn("Host up", text)
+        self.assertTrue(text.rstrip().endswith("Include /etc/ssh/ssh_config"))
+
+    def test_nothing_when_every_name_answers_or_it_is_off(self):
+        with mock.patch.object(mf.socket, "create_connection", return_value=mock.Mock()):
+            self.assertEqual(mf.lan_fallback(self.MANIFEST, ["up"]), (None, []))
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_LAN": "0"}):
+            self.assertEqual(mf.lan_fallback(self.MANIFEST, ["new"]), (None, []))
+
+    def test_every_local_ssh_starts_with_the_shared_argv(self):
+        source = (ROOT / "scripts" / "glaeda-mini-fleet").read_text()
+        local = [l for l in source.splitlines() if "[SSH," in l]
+        self.assertEqual(len(local), 2, local)
+        self.assertIn("return [SSH, *SSH_LAN]", local[0])
+        self.assertIn("inner = [SSH,", local[1], "only the hop a fleet host runs uses plain SSH")
+
+
 if __name__ == "__main__":
     unittest.main()
