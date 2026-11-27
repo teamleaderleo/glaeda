@@ -458,10 +458,16 @@ class MiniSetupTest(unittest.TestCase):
         installed = self.home / ".local/bin"
         installed.mkdir(parents=True)
         shutil.copy2(scripts / "disk-pressure.sh", installed / "disk-pressure.sh")
+        # Identical pre-existing tools are unowned only when their mode also matches.
+        # Carrier checkouts may materialize source scripts without executable bits.
+        (installed / "disk-pressure.sh").chmod(0o755)
         (gen / ".complete").write_text(tag + "\n")
         (update / "state.json").write_text(json.dumps({"current": tag, "previous": None}))
         with mock.patch.object(ms, "SCRIPT_DIR", scripts), mock.patch.object(ms, "REPO", scripts.parent):
-            self.invoke("--gh-only", "--apply")
+            first = self.invoke("--gh-only", "--apply")
+        preexisting = next(a for a in first["actions"] if a.get("path") == str(installed / "disk-pressure.sh"))
+        self.assertEqual(preexisting["state"], "unchanged")
+        self.assertFalse(preexisting["owned"])
         (installed / "glaeda-disk").write_bytes(b"local edit")
         (scripts / "glaeda-update").write_bytes(b"different release bytes")
         with mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
@@ -1117,7 +1123,8 @@ class MiniSetupTest(unittest.TestCase):
         ctx.hygiene_only = True
         ctx.profile_flag = "--update-only"
         ctx.skip_launchctl = False
-        actions = ms.plan_install(ctx)
+        with mock.patch.object(ms, "agent_loaded", return_value=False):
+            actions = ms.plan_install(ctx)
 
         def start(context, path):
             config = json.loads(context.update_config.read_text())
@@ -1134,6 +1141,25 @@ class MiniSetupTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
         self.assertEqual(self.tree(), before)
+
+    def test_update_only_preserves_prior_ownership_when_config_is_missing(self) -> None:
+        self.invoke("--gh-only", "--apply")
+        (self.home / ".config/glaeda/update.json").unlink()
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
+    def test_update_only_refuses_non_object_config_without_mutation(self) -> None:
+        path = self.home / ".config/glaeda/update.json"
+        path.parent.mkdir(parents=True)
+        for value in ([], None, "invalid", 7):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value))
+                before = self.tree()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+                self.assertEqual(self.tree(), before)
 
     def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
         """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and

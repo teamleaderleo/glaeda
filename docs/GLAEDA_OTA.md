@@ -361,8 +361,9 @@ LaunchDaemon domain. Plan without `--apply` first. A host with no glaeda units i
 not a candidate; the caller owns this inventory decision.
 
 `--update-only` preserves service roles and installs no hygiene, runner or GitHub
-watcher services. It refuses an existing different updater profile: continue that
-host's recorded `setupArgs` instead. Setup writes the profile before starting the recurring updater. The profile persists across releases and
+watcher services. It refuses an existing different updater or setup receipt profile:
+continue that host's recorded `setupArgs` instead, restoring a missing config first.
+Setup writes the profile before starting the recurring updater. The profile persists across releases and
 checks only the updater's health and bytes. Older releases that lack the flag
 are refused before setup, as with other unsupported persisted flags.
 
@@ -371,7 +372,9 @@ script `~/.cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune`, using the same
 atomic replacement and newer-operator-copy protection as the seed scripts.
 It creates no CAS role, storage, binary, wrapper or unit and restarts no CAS
 service. The installer remains responsible for those surfaces through its
-registry deploy runner. `converge.json` exposes `running.casScripts` and
+registry deploy runner. Operator symlinks at the script, install directory, or
+source stamp are preserved; linked scripts remain unknown in convergence.
+`converge.json` exposes `running.casScripts` and
 `running.libexecScripts` with installed/release SHA-256 identities; a differing
 service script makes convergence false, including a protected operator copy.
 The launch directory's `.glaeda-source.json` records the source release identity.

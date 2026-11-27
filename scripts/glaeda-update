@@ -156,7 +156,7 @@ MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
          "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh",
-         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
+         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry", "cmux-idle-repair", "cmux-mini-health")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
 # what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "cmux-gh", "cmux-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"
@@ -1236,6 +1236,10 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
     live on the next run with nothing to restart. An operator copy staged no earlier than the release and not an
     ancestor of it is kept, exactly as the staged runner copy is (SOURCE_STAMP)."""
     target = (HOME / LIBEXEC_RELATIVE) if target is None else target
+    linked = [path.name for path in (target, target / SOURCE_STAMP, *(target / name for name in names))
+              if path.is_symlink()]
+    if linked:
+        return "kept (operator symlink: " + ", ".join(linked) + ")"
     if not target.is_dir():
         return "absent"
     present = [name for name in names if (target / name).is_file()]
@@ -1261,14 +1265,23 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
         return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
     for name in stale:
         data, dest = (src / name).read_bytes(), target / name
-        tmp = target / f".{name}.glaeda-update"
-        tmp.write_bytes(data)
-        tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
-        os.replace(tmp, dest)
+        with tempfile.NamedTemporaryFile(dir=target, prefix=f".{name}.glaeda-update-", delete=False) as staged:
+            tmp = Path(staged.name)
+            staged.write(data)
+        try:
+            tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
     source = json.loads((gen / "release.json").read_text()).get("source")
-    tmp = target / f".{SOURCE_STAMP}.glaeda-update"
-    tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
-    os.replace(tmp, target / SOURCE_STAMP)
+    with tempfile.NamedTemporaryFile(dir=target, prefix=f".{SOURCE_STAMP}.glaeda-update-", mode="w", delete=False) as staged:
+        tmp = Path(staged.name)
+        staged.write(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
+    try:
+        tmp.chmod(0o644)
+        os.replace(tmp, target / SOURCE_STAMP)
+    finally:
+        tmp.unlink(missing_ok=True)
     return f"refreshed {', '.join(stale)} to {tag}"
 
 
@@ -1699,14 +1712,16 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
             out["promotionAdmit"] = {"installedSha256": installed, "releaseSha256": release,
                                      "current": installed == release}
     libexec = home / LIBEXEC_RELATIVE  # step 6c: the seed scripts this host has, by content against the release
-    seeds = {name: file_sha256(libexec / name) for name in LIBEXEC_FILES if (libexec / name).is_file()}
+    seeds = {name: None if libexec.is_symlink() or (libexec / name).is_symlink() else file_sha256(libexec / name)
+             for name in LIBEXEC_FILES if (libexec / name).is_file() or (libexec / name).is_symlink()}
     if seeds:
         out["libexecScripts"] = {name: {"installedSha256": have, "releaseSha256": file_sha256(scripts / name),
                                         "current": have is not None and have == file_sha256(scripts / name)}
                                  for name, have in seeds.items()}
     cas = home / ".cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune"
-    if cas.exists():
-        have, want = file_sha256(cas), file_sha256(scripts / cas.name)
+    if cas.exists() or cas.is_symlink():
+        have = None if cas.is_symlink() or cas.parent.is_symlink() else file_sha256(cas)
+        want = file_sha256(scripts / cas.name)
         out["casScripts"] = {cas.name: {"installedSha256": have, "releaseSha256": want,
                                        "current": have is not None and have == want}}
     return out
