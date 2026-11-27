@@ -73,6 +73,8 @@ os.environ["GLAEDA_LAND_AGENT_WAIT_CAP"] = "0"  # likewise for an agent shell's 
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
+# Nor the wt checkouts the session running the suite owns: a bare number with no origin would name their repository.
+gg.WT_CHECKOUTS = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-wt-checkouts-{os.getpid()}"
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 # Nor may a lane VM's own broker name (its lane-gh client mark) rename the host every test reads update.json for.
 gg.LANE_VM_NAME_FILE = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-lane-vm-name-{os.getpid()}"
@@ -4170,6 +4172,121 @@ class DaemonTest(Base):
             with self.assertRaises(gg.WatchError) as refused:
                 gg.parse_key("pr", "7051")
         self.assertIn("OWNER/REPO#7051", str(refused.exception))
+
+    # Every subcommand form that takes a PR (or its thread) as its target, as an agent types it with a bare number.
+    # A new one goes here; the test below holds it to the same resolution as the rest.
+    BARE_PR_CALLS = (
+        (("wait", "34241"), "pr"), (("wait", "#34241"), "pr"), (("wait", "pr", "34241"), "pr"),
+        (("wait", "comment", "34241"), "comment"),
+        (("status", "34241"), "pr"), (("status", "#34241"), "pr"), (("status", "pr", "34241"), "pr"),
+        (("status", "comment", "34241"), "comment"),
+        (("land", "34241"), "pr"), (("land", "pr", "34241"), "pr"),
+        (("land", "status", "34241"), "pr"), (("land", "cancel", "34241"), "pr"),
+        (("post", "comment", "34241", "--body", "x"), "comment"), (("post", "review", "34241", "--body", "x"), "comment"),
+    )
+
+    def run_bare(self, call: tuple[str, ...]) -> tuple[int, list[str], str]:
+        """main(CALL) with every command's work stubbed to the key its target resolves to (parse_key, land_key, as
+        the real ones read it first); nothing reaches the daemon, a queue or GitHub."""
+        keys: list[str] = []
+
+        def pr(target, *a, **k):
+            keys.append(gg.land_key(target)[0])
+            return 0
+
+        def by_kind(kind, target, *a, **k):
+            keys.extend(gg.status_keys(kind, target if isinstance(target, list) else [target]))
+            return 0
+
+        def comment(target, *a, **k):
+            keys.append(gg.parse_key("comment", target))
+            return 0
+
+        def post(args):
+            keys.append(gg.parse_key("comment", args.target))
+            return 0
+
+        err = io.StringIO()
+        with mock.patch.multiple(gg, cmd_land=mock.DEFAULT, cmd_land_status=mock.DEFAULT, cmd_land_cancel=mock.DEFAULT,
+                                 cmd_status=mock.DEFAULT, subscribe_wait=mock.DEFAULT, cmd_wait_comment=mock.DEFAULT,
+                                 cmd_post=mock.DEFAULT, land_row_watched_here=mock.DEFAULT,
+                                 cache_warm_cap=mock.DEFAULT, land_agent_wait_cap=mock.DEFAULT,
+                                 say_waiting=mock.DEFAULT) as m, \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            m["say_waiting"].side_effect = lambda line: print(line, file=err)
+            m["cmd_land"].side_effect = pr
+            m["cmd_land_status"].side_effect = pr
+            m["cmd_land_cancel"].side_effect = pr
+            m["cmd_status"].side_effect = by_kind
+            m["subscribe_wait"].side_effect = by_kind
+            m["cmd_wait_comment"].side_effect = comment
+            m["cmd_post"].side_effect = post
+            m["land_row_watched_here"].return_value = None
+            m["cache_warm_cap"].side_effect = lambda kind, target, timeout, mx: (timeout, mx, "")
+            m["land_agent_wait_cap"].side_effect = lambda target, wait, mx: (wait, mx, "")
+            try:
+                code = gg.main(list(call))
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, keys, err.getvalue()
+
+    def test_every_pr_target_takes_a_bare_number(self) -> None:
+        """2026-11-27: `cmux-gh wait 34241` on gcp-agent-lane-2 refused with a usage block ("argument kind: invalid
+        choice: '34241'") and cost the caller a turn, though `wait pr 34241` already read it. Every form in
+        BARE_PR_CALLS resolves through one rule (bare_number_repo): the origin of the checkout, else the one
+        repository of this session's wt checkouts (a lane VM's agent standing in its home)."""
+        for where in ("checkout", "lane"):
+            origin = "manaflow-ai/cmuxterm-hq" if where == "checkout" else None
+            owned = [] if where == "checkout" else ["manaflow-ai/cmuxterm-hq"]
+            with mock.patch.object(gg, "cwd_repo", lambda *a: origin), \
+                    mock.patch.object(gg, "session_checkout_repos", lambda *a: owned):
+                for call, kind in self.BARE_PR_CALLS:
+                    code, keys, err = self.run_bare(call)
+                    self.assertEqual((code, keys), (0, [f"{kind}:manaflow-ai/cmuxterm-hq#34241"]), (where, call, err))
+                    self.assertNotIn("usage:", err, (where, call))
+
+    def test_an_ambiguous_bare_number_names_each_long_form(self) -> None:
+        """No origin and several repositories in this session's checkouts: a refusal naming each candidate's
+        whole target, never a usage dump; and none at all names the one long form."""
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None), \
+                mock.patch.object(gg, "session_checkout_repos", lambda *a: ["manaflow-ai/cmux", "manaflow-ai/cmuxterm-hq"]):
+            for call, kind in self.BARE_PR_CALLS:
+                code, keys, err = self.run_bare(call)
+                self.assertEqual((code, keys), (64, []), call)
+                self.assertNotIn("usage:", err, call)
+                for repo in ("manaflow-ai/cmux", "manaflow-ai/cmuxterm-hq"):
+                    self.assertIn(f"`{kind} {repo}#34241`", err, call)
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None), \
+                mock.patch.object(gg, "session_checkout_repos", lambda *a: []):
+            code, keys, err = self.run_bare(("wait", "34241"))
+        self.assertEqual((code, keys), (64, []))
+        self.assertIn("`pr OWNER/REPO#34241`", err)
+        self.assertNotIn("usage:", err)
+
+    def test_a_kindless_bare_number_is_a_pr_or_a_run_by_its_width(self) -> None:
+        self.assertEqual(gg.infer_kind(["wait", "34241", "--timeout", "9"])[0], ["wait", "pr", "34241", "--timeout", "9"])
+        self.assertEqual(gg.infer_kind(["status", "#5", "6"])[0], ["status", "pr", "#5", "6"])
+        self.assertEqual(gg.infer_kind(["wait", "44884634507"])[0], ["wait", "run", "44884634507"])
+        for same in (["wait", "123456789"], ["wait", "pid", "4242"], ["land", "34241"]):
+            self.assertEqual(gg.infer_kind(list(same))[0], same)  # 8-9 digits is not guessed; land needs no kind
+
+    def test_session_checkout_repos_reads_this_sessions_wt_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for repo, sid, name in (("o/mine", "S1", "x"), ("o/theirs", "S2", "y"), ("o/named", "", "me")):
+                admin = root / "admin" / repo.replace("/", "-")
+                admin.mkdir(parents=True)
+                (admin / "wt-owner.json").write_text(json.dumps(
+                    {"repo": repo, "owner": {"ids": [sid] if sid else [], "session_id": sid, "name": name}}))
+                tree = root / repo.split("/")[1] / "lane--x"
+                tree.mkdir(parents=True)
+                (tree / ".git").write_text(f"gitdir: {admin}\n")
+            plain = root / "plain" / "clone" / ".git"
+            plain.mkdir(parents=True)  # a clone's .git directory: not a wt worktree, skipped
+            with mock.patch.dict(os.environ, {"ACPMUX_SESSION_ID": "S1", "ACPMUX_SESSION_NAME": "host/me"}):
+                self.assertEqual(gg.session_checkout_repos(root), ["o/mine", "o/named"])
+            with mock.patch.dict(os.environ, {"ACPMUX_SESSION_ID": "", "ACPMUX_SESSION_NAME": ""}):
+                self.assertEqual(gg.session_checkout_repos(root), [])
 
     def test_kindless_inference_keeps_the_strict_forms(self) -> None:
         """`o/r/12345678901` with no kind is a run, as it was before the loose key forms: infer_kind reads
@@ -26823,13 +26940,20 @@ class DirectReadAppPoolTest(unittest.TestCase):
                 return "sent"
         return Fake()
 
+    def made(self, fake):
+        """Daemon(...) answering FAKE, which keeps the token it was given (no_login_reader reads it)."""
+        def make(**kw):
+            fake.token_source = kw.get("token")
+            return fake
+        return make
+
     def pool(self, owners, token="ghs_" + "a" * 36):
         return gg.AppPool(role="quota-goblin", mint=lambda owner: token, owners=lambda: owners, ready=lambda: True)
 
     def read(self, pool, key="pr:manaflow-ai/cmuxterm-hq#25577"):
         sent = []
         fake = self.fake_daemon(pool, sent)
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             got = gg._read_one({"key": key, "kind": "pr", "began": time.time()}, None)
         return got, sent
 
@@ -26838,21 +26962,169 @@ class DirectReadAppPoolTest(unittest.TestCase):
         self.assertEqual(sent, ["pr:manaflow-ai/cmuxterm-hq#25577"], "the read was refused before the App was asked")
         self.assertEqual(got, "sent")
 
-    def test_the_login_stop_still_holds_a_read_no_app_answers(self) -> None:
+    def test_a_read_no_app_answers_never_goes_on_the_login(self) -> None:
+        # Spent or not, the login is not asked: the wait waits for the daemon (interim-coord-2, cosmic-gray 2026-11-27).
         for pool in (None, self.pool(["teamleaderleo"]), self.pool(["manaflow-ai"], token=None)):
             got, sent = self.read(pool)
-            self.assertEqual((got, sent), (gg.DIRECT_QUOTA, []), pool and pool.owners_fn())
+            self.assertEqual((got, sent), (gg.DIRECT_NO_LOGIN, []), pool and pool.owners_fn())
 
     def test_a_straggler_read_with_the_login_rest_spent_goes_to_the_app_pool(self) -> None:
         fake = self.fake_daemon(self.pool(["manaflow-ai"]), [])
         fake.get = lambda path, etag: ("fresh", {"path": path}, {})
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             got = gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"])
         self.assertEqual(got, {"actions/jobs/1": {"path": "/repos/manaflow-ai/cmux/actions/jobs/1"}})
         fake.app_pool = None
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             self.assertEqual(gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"]),
-                             {"actions/jobs/1": gg.DIRECT_QUOTA})
+                             {"actions/jobs/1": gg.DIRECT_NO_LOGIN})
+
+
+class FallbackNeverOnLoginTest(Base):
+    """interim-coord-2 (cosmic-gray, 2026-11-27): "glaeda-gh falls back to reading GitHub with Leo's login whenever the
+    build controller answers 429, about 60 times in the past hour; those calls go through a forwarder that skips the
+    spend logs." A fallback waits (bounded by the caller's deadline) or uses an App token, never the login, and every
+    path logs its spend in the daemon's spend log."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("upstream_command", "direct_command"):
+            pin = mock.patch.object(gg, name, return_value=None)  # a host with a login, as cosmic-gray
+            pin.start()
+            self.addCleanup(pin.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+
+    def no_app_daemon(self, sent: list):
+        real = gg.Daemon
+
+        def make(*args, **kw):
+            kw.update(app_pool=None, transport=lambda *a, **k: sent.append(a) or (200, {}, b"{}"))
+            return real(*args, **kw)
+        return make
+
+    def test_a_direct_read_no_app_answers_never_asks_for_the_login_token(self) -> None:
+        sent: list = []
+        login = mock.Mock(side_effect=AssertionError("the login token was read"))
+        with mock.patch.object(gg, "gh_token", login), mock.patch.object(gg, "Daemon", self.no_app_daemon(sent)):
+            for kind, key in (("pr", "pr:o/r#7"), ("run", "run:o/r#9"), ("comment", "comment:o/r#7")):
+                with self.subTest(kind=kind):
+                    got = gg._read_one({"key": key, "kind": kind, "began": time.time()}, None)
+                    self.assertEqual(got, gg.DIRECT_NO_LOGIN)
+            self.assertEqual(gg.straggler_get("o/r", ["actions/jobs/1"]), {"actions/jobs/1": gg.DIRECT_NO_LOGIN})
+        login.assert_not_called()
+        self.assertEqual(sent, [], "a fallback read went to GitHub with no App to send it on")
+
+    def test_detector_no_daemon_outside_the_serving_one_reaches_the_login(self) -> None:
+        # Static: every Daemon built outside the serving daemon on a host with a login (controller=None,
+        # upstream=None) names its token; only free_account_reading's free GET /rate_limit keeps the login's.
+        source = (ROOT / "scripts" / "glaeda-gh").read_text()
+        tree = __import__("ast").parse(source)
+        ast = __import__("ast")
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for call in ast.walk(fn):
+                if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "Daemon":
+                    words = {k.arg: k.value for k in call.keywords}
+                    outside = all(isinstance(words.get(w), ast.Constant) and words[w].value is None
+                                  for w in ("controller", "upstream"))
+                    if outside and "token" not in words and fn.name != "free_account_reading":
+                        offenders.append(f"{fn.name}:{call.lineno}")
+        self.assertEqual(offenders, [], "a Daemon outside the serving daemon reads with the login token")
+        # Runtime: the token every such Daemon is given refuses before a request is sent.
+        sent: list = []
+        daemon = gg.Daemon(transport=lambda *a, **k: sent.append(a) or (200, {}, b"{}"), token=gg.fallback_no_login,
+                           controller=None, upstream=None, app_pool=None)
+        for method, path, body in (("GET", "/repos/o/r/pulls/1", None), ("POST", "/graphql", {"query": "{x}"})):
+            with self.subTest(path=path), self.assertRaisesRegex(gg.WatchError, "never goes on this host's login"):
+                daemon.request(method, path, body)
+        self.assertEqual(sent, [])
+        # And job logs: on a controller 429 no path reads the log with the login (job_log_read's REST, the shim's gh).
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (429, b"")), \
+                mock.patch.object(gg, "gh_cache_child", side_effect=AssertionError("gh ran on the login")):
+            ctl = gg.Controller("http://127.0.0.1:9", "tok")
+            text, _, why = gg.job_log_read("o/r", 5, ctl, rest=mock.Mock(side_effect=AssertionError("REST read")),
+                                           deadline=time.monotonic() + 0.5)
+            self.assertEqual((text, why), (None, gg.JOB_LOG_429_WHY))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gg.gh_job_log_answer("/bin/false", ["api", "repos/o/r/actions/jobs/5/logs"],
+                                                      "o/r", 5, {}, ctl), gg.BROKER_EXIT_REFUSED)
+
+    def test_a_controller_429_waits_its_retry_after_and_asks_once_more(self) -> None:
+        answers = [(429, b"", 2.0), (200, b"the log\n", None)]
+        asked, slept = [], []
+
+        def controller_job_log(ctl, repo, job, deadline=None, said=None):
+            status, body, wait = answers[len(asked)]
+            asked.append(job)
+            if said is not None and wait is not None:
+                said["retryAfter"] = wait
+            return status, body
+        rest = mock.Mock(side_effect=AssertionError("REST read on the login"))
+        with mock.patch.object(gg, "controller_job_log", controller_job_log), \
+                mock.patch.object(gg.time, "sleep", slept.append):
+            text, source, why = gg.job_log_read("o/r", 6, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                                deadline=time.monotonic() + 60)
+        self.assertEqual((text, source, why, slept, len(asked)), (b"the log\n", "controller", "", [2.0], 2))
+        # a Retry-After past the caller's deadline is not waited for: the read says why, with no REST
+        asked.clear()
+        answers[:] = [(429, b"", 30.0)]
+        with mock.patch.object(gg, "controller_job_log", controller_job_log):
+            got = gg.job_log_read("o/r", 7, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                  deadline=time.monotonic() + 5)
+        self.assertEqual((got, len(asked)), ((None, "", gg.JOB_LOG_429_WHY), 1))
+        rest.assert_not_called()
+
+    def test_a_lane_vm_still_reads_through_its_broker_on_a_controller_429(self) -> None:
+        rest = mock.Mock(return_value=(True, b"x\n", ""))
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (429, b"")), \
+                mock.patch.object(gg, "upstream_command", return_value=["lane-gh"]):
+            got = gg.job_log_read("o/r", 8, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                  deadline=time.monotonic() + 0.5)
+        self.assertEqual(got, (b"x\n", "rest", ""))
+
+    def test_every_fallback_path_logs_its_spend_in_the_daemons_spend_log(self) -> None:
+        # a direct read's rows, and the shim's job-log read, reach spend.json through the serving daemon
+        gg.spend_side_add({int(time.time() // 60): {"graphql\tpr-direct\tpr\to/r": [1, 0, 3]}})
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (404, b"")), \
+                mock.patch.object(gg, "gh_cache_child", return_value=(0, b"log\n", b"")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gg.gh_job_log_answer("/bin/false", ["api", "repos/o/r/actions/jobs/5/logs"], "o/r", 5, {},
+                                 gg.Controller("http://127.0.0.1:9", "tok"))
+        self.assertTrue((gg.BASE / gg.SPEND_SIDE_FILE).exists())
+        self.daemon.save_spend(force=True)
+        self.assertFalse((gg.BASE / gg.SPEND_SIDE_FILE).exists(), "the daemon took the side rows")
+        rows = {(r["bucket"], r["name"], r.get("why", "")): (r["requests"], r["counted"], r["points"])
+                for r in gg.Daemon.spend_rows(self.daemon)}
+        self.assertEqual(rows.get(("graphql", "pr-direct", "")), (1, 0, 3))
+        self.assertEqual(rows.get(("rest", gg.route_of("GET", "/repos/o/r/actions/jobs/5/logs"), "gh-shim")),
+                         (1, 1, 0))
+        saved = gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))
+        self.assertTrue(any("gh-shim" in k for rows in saved.values() for k in rows), saved)
+
+    def test_a_direct_read_on_an_app_books_its_spend(self) -> None:
+        class Fake:
+            app_pool = object()
+            now = 0.0
+            tick_deadline = 0.0
+            spend = {123: {"rest\tGET /repos/{owner}/{repo}/actions/jobs/{id}\tpr\to/r": [1, 0, 0]}}
+
+            def mode(self, bucket):
+                return "normal"
+
+            def charge_rest(self, minute, n):
+                pass
+
+            def calling(self, *args):
+                return contextlib.nullcontext()
+
+            def get(self, path, etag):
+                return "fresh", {}, {}
+        with mock.patch.object(gg, "Daemon", return_value=Fake()), \
+                mock.patch.object(gg, "app_reads_key", return_value=True):
+            gg.straggler_get("o/r", ["actions/jobs/1"])
+        self.assertEqual(gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_SIDE_FILE)), Fake.spend)
 
 
 class TempFileTest(unittest.TestCase):
@@ -27455,9 +27727,18 @@ class LogJobTest(Base):
 
     def test_rest_only_where_the_controller_cannot_serve(self) -> None:
         ctl = self.controller()
-        self.controller_logs[14] = (429, b"log reads spent")
+        self.controller_logs[14] = (404, b"not kept")
         self.gh.job_logs[14] = self.DONE
         self.assertEqual(self.log(14, ctl)[:2], (0, self.DONE))
+        self.assertEqual(self.rest_reads(), 1)
+        # spent (429): asked once more after its wait, then no REST read on the login (FallbackNeverOnLoginTest)
+        self.controller_logs[16] = (429, b"log reads spent")
+        self.gh.job_logs[16] = self.DONE
+        with mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg.time, "sleep", lambda s: None):
+            code, out, err = self.log(16, ctl)
+        self.assertEqual((code, out), (gg.EXIT_FAIL, b""))
+        self.assertIn("429", err)
         self.assertEqual(self.rest_reads(), 1)
         self.controller_logs[15] = (410, b"gone")  # GitHub expired it: REST would 410 too
         code, out, err = self.log(15, ctl)
@@ -27554,7 +27835,8 @@ class LogScanTest(Base):
                 since = int(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["since"][0])
                 return {"records": [r for r in test.records if gg.iso_epoch(r["at"]) >= since], "more": False}
 
-        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
+        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None,
+                               said: dict | None = None) -> tuple[int, bytes]:
             test.ctl_reads.append(job)
             return test.ctl_logs.get(job, (404, b""))
 
@@ -37392,6 +37674,39 @@ class LandTest(Base):
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
         self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
+    def test_a_forward_the_far_queue_holds_open_tells_no_verdict_only_once_the_hold_lapses(self):
+        # LAND_FORWARD_QUIET_HELD: gcp-agent-lane-19, 30 h to 2026-11-27 20:15Z: 42 no-verdict fyis, each about a row
+        # cmux-cp-1 answered it held open (land_tier_pending); each woke its idle requester to re-queue what the far
+        # queue then merged and told itself. Before: told at LAND_FORWARD_QUIET. After: no word while it is held.
+        e = self.handed_off()
+        at = float(e["handedOff"]["at"])
+        self.w.outcomes = {"o/r#1": {"state": "waiting", "updated": self.t, "stop": None}}  # the far queue holds it
+        while self.t - at < gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 600:
+            self.pr(LA)  # every read shows it still open at the handed head
+            e = self.tick(120)
+        self.assertEqual(e["forwardHeld"]["state"], "waiting")
+        self.assertEqual(self.quiet_notices(), [], "held open there: its queue tells the outcome")
+        self.assertTrue(any(h.get("event") == "forward_quiet_held" for h in e["history"]), e["history"][-4:])
+        self.assertNotIn("forwardQuietTold", e)
+        # the far host stops answering: once its last hold is past the ask bound the requester is told, once
+        self.w.outcomes = {}
+        for _ in range(20):
+            self.pr(LA)
+            self.tick(120)
+        self.assertEqual(len(self.quiet_notices()), 1, self.q.entries[self.KEY]["history"][-4:])
+
+    def test_a_held_forward_whose_head_someone_else_moved_still_tells_with_the_live_sha(self):
+        # the land pinned at the old head cannot merge, held or not: the requester re-pins (LAND_FORWARD_QUIET_HELD)
+        self.fresh_head = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})
+        e = self.handed_off()
+        at = float(e["handedOff"]["at"])
+        self.w.outcomes = {"o/r#1": {"state": "waiting", "updated": self.t, "stop": None}}
+        while self.t - at < gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 600 and not self.quiet_notices():
+            self.tick(120)
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", sent[-1])
+
     def test_a_forward_stop_told_as_fyi_is_superseded_by_its_merge_and_told_once_per_take_back(self):
         # LAND_NOTICE_SUPERSEDE: huge-blue, cmux#45156, 2026-11-27: ~20 forward_no_outcome fyis (one per re-arm of a
         # bound take-back) sat in the requester's inbox after cmux-cp-1 merged it, and were relayed 8 h later as a stall
@@ -37424,6 +37739,38 @@ class LandTest(Base):
         self.assertEqual(len(merged), 1, "once: a second word on the same stop is no news")
         self.assertEqual(merged[0][merged[0].index("--class") + 1], "fyi")
         self.assertEqual(merged[0][merged[0].index("--supersede") + 1], key)
+
+    def test_a_forward_merge_after_a_read_no_verdict_fyi_sends_no_second_merged_word(self):
+        # LAND_MERGED_FYI_READ: gcp-agent-lane-19, 2026-11-27, cmux#60756: cmux-cp-1 told "merged at 0a416a3b" 09:57Z,
+        # this host's bare "merged" fyi (superseding a no-verdict fyi read long before) woke the lane again 11:01Z
+        def turn_at(t: float) -> dict:
+            ms = int(t * 1000)
+            tid = f"{ms:012x}7" + "0" * 19
+            tid = f"{tid[:8]}-{tid[8:12]}-{tid[12:16]}-{tid[16:20]}-{tid[20:]}"
+            return {"status": "ready", "inputSince": None, "pendingPermissions": 0, "queued": 0,
+                    "lastTurn": {"turnId": tid, "endedAt": (t + 30) * 1000}}
+
+        replay = {"before": 0, "after": 0}
+        for read, label in ((True, "turn since"), (False, "no turn since")):
+            e = self.handed_off()
+            e.update(forwardQuietTold={"at": self.t - 600, "since": self.t - 2400, "to": "huge-blue"},
+                     forwardOutcomeTold=None, state=gg.LAND_FORWARDED, stop=None)
+            self.w.session_info = turn_at(self.t - 60 if read else self.t - 1200)
+            sent = len(self.w.sent())
+            with self.q.lock:
+                self.q.merged(e, "", "forwarded to huge-blue: the cache shows it merged")
+            bare = [c for c in self.w.sent()[sent:] if c[-1].endswith(" merged")]
+            replay["after"] += len(bare)
+            replay["before"] += 1  # before: outcome_over_fyi sent it either way
+            if read:
+                self.assertEqual(bare, [], f"{label}: the no-verdict fyi was delivered; the far queue tells the merge")
+            else:
+                self.assertEqual(len(bare), 1, f"{label}: the fyi may still be queued, so the merge supersedes it")
+                self.assertEqual(bare[0][bare[0].index("--supersede") + 1], f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}")
+            self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertEqual(replay, {"before": 2, "after": 1})
+        self.assertEqual(gg.land_last_turn_began(json.dumps(turn_at(1795808408.355))), 1795808408.355)
+        self.assertIsNone(gg.land_last_turn_began('{"lastTurn": {"turnId": "not-a-uuid"}}'))
 
     def test_a_land_fyi_to_an_acpmux_without_supersede_is_sent_again_without_it(self):
         e = self.handed_off()
@@ -45724,7 +46071,8 @@ class BrokerJobLogTest(BrokerBase):
     def test_the_controller_answers_with_no_gh_and_a_down_one_is_skipped(self) -> None:
         asked: list[int] = []
 
-        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
+        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None,
+                               said: dict | None = None) -> tuple[int, bytes]:
             asked.append(job)
             return (200, self.DONE.encode()) if job == 80 else (0, b"")
         with mock.patch.object(gg, "controller_job_log", controller_job_log):
