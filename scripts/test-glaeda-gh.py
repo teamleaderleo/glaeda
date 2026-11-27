@@ -18673,6 +18673,28 @@ class PostTest(unittest.TestCase):
         self.assertEqual((t.calls, asked), ([], []))
         self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
 
+    def test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_in_a_pause(self) -> None:
+        """cmux's CLA reads the opener of a PR into main only: before, every cmux PR waited out the login's pause
+        (cosmic-gray 2026-11-27 09:50Z: 8 into feat-cmux-next); after, one into feat-cmux-next asks broker-actor
+        with its base and goes on the lander."""
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.queue("pr", "manaflow-ai/cmux", "--head", "lane/x", "--base", "feat-cmux-next", "--title", "t",
+                        "--body", "b")
+        d, t = self.daemon((201, {}, {"number": 8, "html_url": "https://github.com/manaflow-ai/cmux/pull/8"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[:2] for c in t.calls], [("POST", "/repos/manaflow-ai/cmux/pulls")])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
+        self.assertEqual(asked, [["broker-actor", "create", "manaflow-ai/cmux", "--base", "feat-cmux-next"]])
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+        self.assertTrue(gg.app_create_never({"kind": "pr", "repo": "manaflow-ai/cmux", "base": "main"}))
+        self.assertTrue(gg.app_create_never({"kind": "pr", "repo": "manaflow-ai/cmux"}))
+        self.assertTrue(gg.app_create_never({"kind": "issue", "repo": "manaflow-ai/cmux"}))
+        self.assertFalse(gg.app_create_never({"kind": "pr", "repo": "o/r", "base": "main"}))
+
     def test_app_creates_off_keeps_prs_and_issues_on_the_login(self) -> None:
         self.no_env_token()
         asked = self.app_writer("lander")

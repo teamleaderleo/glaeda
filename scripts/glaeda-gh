@@ -4009,6 +4009,22 @@ APP_CREATES_ENV = "GLAEDA_APP_CREATES"
 APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
 APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
 APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+# ... of a PR into main only (cmux .github/workflows/cla.yml: pull_request_target branches [main]). A PR into another
+# base asks `broker-actor create REPO --base BASE`, and gh-app-roles.json bot_authored_write_bases says whether the
+# lander may open it (feat-cmux-next: yes). On 2026-11-27 09:50Z cosmic-gray's outbox held 8 cmux PRs into
+# feat-cmux-next behind the login's create pause while the lander had its hour left. Detector:
+# test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_in_a_pause.
+APP_CREATE_CLA_BASES = frozenset({"main"})
+
+
+def app_create_never(item: dict) -> bool:
+    """Whether ITEM's repo keeps every create on the login (APP_CREATE_NEVER): all but a PR into a base its CLA does
+    not read, which broker-actor's --base decides."""
+    if str(item.get("repo") or "").lower() not in APP_CREATE_NEVER:
+        return False
+    base = str(item.get("base") or "")
+    return item.get("kind") != "pr" or not base or base in APP_CREATE_CLA_BASES
+
 APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
 
 # Comments on a POOL of poster Apps (Leo, 2026-11-24: "but i already have github apps made. quota-goblin... etc. well,
@@ -8341,7 +8357,7 @@ class Daemon:
         op = APP_CREATE_OP.get(str(item.get("kind")))
         if not op or not app_creates_on() or item.get("appCreates") is False:
             return False
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+        if app_create_never(item) or item.get("appRefused"):
             return False
         return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
 
@@ -8435,7 +8451,7 @@ class Daemon:
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+        if op != "comment" and app_create_never(item):
             return None
         role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
@@ -8461,13 +8477,16 @@ class Daemon:
         tool = app_pool_tool()
         if not tool:
             return None
-        key = (op, str(item["repo"]).lower())
+        # A PR in a repo whose CLA reads the opener names its base: broker-actor decides by it (app_create_never)
+        base = ["--base", str(item["base"])] if op == "create" and item.get("base") and \
+            str(item.get("repo") or "").lower() in APP_CREATE_NEVER else []
+        key = (op, str(item["repo"]).lower(), *base)
         cached = self.app_actors.get(key)
         if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
             return cached[1]
         actor = None
         try:
-            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
+            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"], *base], timeout=12)
             found = json.loads(result.stdout) if not result.returncode else None
             if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
                     re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
