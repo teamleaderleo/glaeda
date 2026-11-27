@@ -17542,8 +17542,12 @@ LAND_LATE_WHY_EVERY = 60.0
 # it ended. Now a row is told only on a read that shows its PR still open, once per PR ever (forwardQuietTold, kept on
 # the row), as an inbox fyi; a read that never lands tells nobody: forward_follow's give-up reads it live and settles it.
 LAND_FORWARD_QUIET = LAND_DUE_LATE
-LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before giving up on it, telling nobody
-LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)  # a due-late row's reason is rewritten at most this often (note_late)
+# LAND_FORWARD_READ_WAIT: how long the told-once waits on that one read before giving up on it, telling nobody, and
+# how fresh a cached read must be, or how long an asked one may take, before a no-outcome stop (outcome_read).
+# One value, set once: it was set here to 300.0 and again below to 900.0, so 900.0 ruled both uses and this line's
+# 300 was never in force.
+LAND_FORWARD_READ_WAIT = 900.0
+LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)
 # A cached read that never lands was the end of it: forward_quiet read=False told=False, and the row sat until the
 # give-up. 2026-11-27, two lands: manaflow-ai/cmux#60557 (53 min) and one in a private repo (~45 min) ended
 # their history on exactly that; on #60557 the far queue's own bot had merged the base into the branch at 06:13Z, so
@@ -17978,7 +17982,6 @@ LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
 LAND_FORWARD_STOPPED_ASK_EVERY = 1800.0
 LAND_FORWARD_ASK_EVERY = 600.0
 LAND_FORWARD_LOST_ASKS = 2
-LAND_FORWARD_READ_WAIT = 900.0
 LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "waiting", LAND_FORWARDED, "requested"})
 # A far answer holding a row open (forwardHeld) restarted its give-up clock on every ask, so a row its far queue kept
 # open never reached the give-up: whatever loop held it there held it here too, with no verdict and nobody told.
