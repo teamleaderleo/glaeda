@@ -8,7 +8,7 @@
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
 keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
-X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
+T5 EVO SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
 then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within about a minute of
 the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
 
@@ -28,7 +28,7 @@ as it was: the archive asks the trusted seeder, which never connects to the arch
 
 Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
 tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
-sparse bundle on the (ExFAT) X10 Pro, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
+sparse bundle on the (ExFAT) T5 EVO, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
 /usr/bin/python3 write into an attached disk image but not onto the external volume itself (measured on
 cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
 same way). Each run attaches the image if it is not mounted; `install --apply`, run over SSH, creates it. The
@@ -57,6 +57,11 @@ drive under the image), how many sit quarantined as .corrupt-*, and a few exampl
 disk-error row where NOW reads this service's health (leo-workspace tools/now_host_services.py, the registry's
 `disk_errors`), not as a crash loop (cmux-lawrence 2026-11-27: 19 of 341 entries read EIO and a copy without the
 per-entry guard restarted every 15 s; cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md).
+
+HOST_VOLUME is the T5 EVO since 2026-11-27: the X10 Pro under the first image failed reads (113,007 kernel read
+errors on its USB bridge, no SMART; 19 seeds read EIO), and the image was copied by hand to the T5 EVO and attached
+from there (cmuxterm-hq build-fleet/FLEET-HEALTH.md "Controller host disk errors"). Each run attaches IMAGE when
+MOUNT is not mounted, so a default left on the X10 Pro would reattach the failing copy after the next reboot.
 """
 
 from __future__ import annotations
@@ -77,13 +82,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path(os.path.expanduser("~"))
-HOST_VOLUME = Path("/Volumes/X10 Pro")
+HOST_VOLUME = Path("/Volumes/T5 EVO")
 IMAGE = HOST_VOLUME / "glaeda-seed-archive.sparsebundle"
 IMAGE_SIZE = "1t"  # the most it can grow to; BUDGET keeps it below
 MOUNT = Path("/Volumes/glaeda-seed-archive")
 ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
 # The first version kept the files directly on the X10 Pro, where launchd jobs cannot write; install moves them.
-OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
+OLD_ARCHIVE = Path("/Volumes/X10 Pro/glaeda-seed-archive")
 HDIUTIL = "/usr/bin/hdiutil"
 SUFFIX = ".tar.zst"
 CORRUPT = ".corrupt-"  # quarantine()'s prefix for a seed whose entry read an OSError
@@ -309,7 +314,7 @@ def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str
 
 
 def free_bytes(archive: Path) -> int:
-    """Free space for the archive: the image's own, and the X10 Pro's under it."""
+    """Free space for the archive: the image's own, and HOST_VOLUME's under it."""
     free = shutil.disk_usage(archive).free
     if archive.is_relative_to(MOUNT) and os.path.ismount(HOST_VOLUME):
         free = min(free, shutil.disk_usage(HOST_VOLUME).free)
