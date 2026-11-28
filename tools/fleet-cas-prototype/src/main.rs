@@ -93,9 +93,6 @@ struct Stats {
     up_errors: AtomicU64,
     /// Fleet-store calls skipped during the backoff after a failure.
     up_skipped: AtomicU64,
-    /// Forwarded writes retried after a transient failure (each retry that
-    /// then succeeded is a write the marker check no longer loses).
-    up_write_retries: AtomicU64,
     /// Fetched objects whose recomputed ID did not match (answered as misses).
     up_cas_verify_fail: AtomicU64,
     /// Closure prefetches: calls, objects kept, bytes kept.
@@ -229,7 +226,6 @@ impl Stats {
             ("up_micros", &self.up_micros),
             ("up_errors", &self.up_errors),
             ("up_skipped", &self.up_skipped),
-            ("up_write_retries", &self.up_write_retries),
             ("up_cas_verify_fail", &self.up_cas_verify_fail),
             ("up_prefetch_calls", &self.up_prefetch_calls),
             ("up_prefetched", &self.up_prefetched),
@@ -421,20 +417,6 @@ fn open_key_log(root: &Path) -> std::io::Result<std::fs::File> {
 }
 
 const UPSTREAM_BACKOFF_MS: u64 = 30_000;
-
-/// Tries per forwarded write. A writer build gets its marker only if no
-/// write failed, and one failed write opens the backoff, which then skips
-/// every later write of that build: so a busy store's occasional timeout or
-/// dropped connection (a late keepalive ack) is retried before it counts.
-const WRITE_ATTEMPTS: u32 = 3;
-
-/// A failure worth retrying: the call may simply not have arrived in time.
-fn retryable_write(e: &Status) -> bool {
-    matches!(
-        classify_failure(e),
-        UpstreamFailureCode::Timeout | UpstreamFailureCode::Unavailable
-    )
-}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -778,30 +760,6 @@ impl Store {
             .store(now_ms() + UPSTREAM_BACKOFF_MS, Relaxed);
     }
 
-    /// Forward one write, retrying a transient failure (with a short pause)
-    /// up to WRITE_ATTEMPTS times; only the last failure is returned.
-    async fn forward_write<T, F, Fut>(
-        &self,
-        operation: UpstreamOperation,
-        mut call: F,
-    ) -> Result<T, Status>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T, Status>>,
-    {
-        let mut attempt = 1;
-        loop {
-            match self.stats.upstream(operation, call()).await {
-                Err(e) if attempt < WRITE_ATTEMPTS && retryable_write(&e) => {
-                    self.stats.up_write_retries.fetch_add(1, Relaxed);
-                    tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
-                    attempt += 1;
-                }
-                r => return r,
-            }
-        }
-    }
-
     /// A forwarded write failed or was skipped: the build gets an error (and
     /// compiles on), and nothing is published half-way.
     fn write_unavailable(&self, operation: UpstreamOperation, e: Option<Status>) -> Status {
@@ -895,12 +853,10 @@ impl Store {
             if self.upstream_backing_off(UpstreamOperation::CasPut) {
                 return Err(self.write_unavailable(UpstreamOperation::CasPut, None));
             }
+            let req = cas::CasPutRequest { data: Some(obj) };
             let resp = self
-                .forward_write(UpstreamOperation::CasPut, || {
-                    up.cas.clone().put(cas::CasPutRequest {
-                        data: Some(obj.clone()),
-                    })
-                })
+                .stats
+                .upstream(UpstreamOperation::CasPut, up.cas.clone().put(req))
                 .await
                 .map_err(|e| self.write_unavailable(UpstreamOperation::CasPut, Some(e)))?
                 .into_inner();
@@ -1358,7 +1314,8 @@ impl Store {
                 value: Some(value.clone()),
             };
             let resp = s
-                .forward_write(UpstreamOperation::KvPut, || up.kv.clone().put_value(fwd.clone()))
+                .stats
+                .upstream(UpstreamOperation::KvPut, up.kv.clone().put_value(fwd))
                 .await
                 .map_err(|e| s.write_unavailable(UpstreamOperation::KvPut, Some(e)))?
                 .into_inner();
@@ -1708,9 +1665,7 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
                 .connect_timeout(std::time::Duration::from_secs(2))
                 .timeout(std::time::Duration::from_secs(30))
                 .http2_keep_alive_interval(std::time::Duration::from_secs(10))
-                // A busy store answers a ping late while it takes large
-                // puts; 5 s dropped the connection and every call on it.
-                .keep_alive_timeout(std::time::Duration::from_secs(20))
+                .keep_alive_timeout(std::time::Duration::from_secs(5))
                 .keep_alive_while_idle(true)
                 .connect_lazy();
             Some(Upstream {
@@ -2044,52 +1999,6 @@ mod tests {
         assert!(first.contains("\"up_calls\":1"));
         assert!(first.contains("\"up_micros\":"));
         assert!(!first.contains("fleet store"));
-    }
-
-    #[tokio::test]
-    async fn forwarded_write_retries_a_transient_failure_before_counting_it() {
-        let store = Store {
-            root: PathBuf::new(),
-            read_only_kv: false,
-            writers: None,
-            allow_file_paths: false,
-            upstream: None,
-            sign_key: None,
-            trusted: None,
-            strip_signatures: true,
-            upstream_down_until: AtomicU64::new(0),
-            stats: Stats::default(),
-            clients: window::Clients::new(window::MAX_CLIENTS),
-            key_log: None,
-        };
-        let calls = std::sync::atomic::AtomicU32::new(0);
-        let r = store
-            .forward_write(UpstreamOperation::KvPut, || {
-                let n = calls.fetch_add(1, Relaxed);
-                async move {
-                    if n == 0 {
-                        Err(Status::unavailable("http2 error: keep-alive timed out"))
-                    } else {
-                        Ok(7u32)
-                    }
-                }
-            })
-            .await;
-        assert_eq!(r.unwrap(), 7);
-        assert_eq!(calls.load(Relaxed), 2);
-        assert_eq!(store.stats.up_write_retries.load(Relaxed), 1);
-        assert_eq!(store.stats.up_errors.load(Relaxed), 0);
-
-        // A refusal is not retried.
-        calls.store(0, Relaxed);
-        let r: Result<u32, Status> = store
-            .forward_write(UpstreamOperation::KvPut, || {
-                calls.fetch_add(1, Relaxed);
-                async { Err(Status::permission_denied("no")) }
-            })
-            .await;
-        assert!(r.is_err());
-        assert_eq!(calls.load(Relaxed), 1);
     }
 
     #[tokio::test]
