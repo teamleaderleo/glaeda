@@ -104,6 +104,11 @@ _sweep_cargo_targets = gd.sweep_cargo_targets
 gd.sweep_cargo_targets = (lambda receipt, roots=None, *args, **kw:
                           {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
                           if roots is None else _sweep_cargo_targets(receipt, roots, *args, **kw))
+# Nor measure or cap the shared Cargo targets of the host running the suite: only a test's own roots.
+_enforce_cargo_target_cap = gd.enforce_cargo_target_cap
+gd.enforce_cargo_target_cap = (lambda receipt, roots=None, *args, **kw:
+                               {"roots": {}, "bytes": 0, "units": 0}
+                               if roots is None else _enforce_cargo_target_cap(receipt, roots, *args, **kw))
 # Nor repack the shared mirrors of the host running the suite: only a test's own home's.
 _compact_shared_mirrors = gd.compact_shared_mirrors
 gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
@@ -8355,6 +8360,67 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((first["outcome"], first["verdict"], first["reasons"][-1]),
                          ("failed:exit-128", "failed", "gc failed:exit-128"))
         self.assertIn("its last gc failed within 24h", second["reasons"][0])
+
+    def test_a_noindex_mirror_is_found_once_and_named(self) -> None:
+        # cmux16, 2026-11-27: spotlight_noindex moved ~/Projects/.wt-mirrors to .wt-mirrors.noindex and left a symlink;
+        # shared_mirrors skipped the symlink and never saw the real folder, so no mirror was ever folded
+        home = self.root / "home"
+        mirror = home / "Projects/.wt-mirrors.noindex/o/r.git"
+        mirror.parent.mkdir(parents=True)
+        self._git("init", "-q", "--bare", os.fspath(mirror))
+        (home / "Projects/.wt-mirrors").symlink_to(".wt-mirrors.noindex")
+        self.assertEqual(gd.shared_mirrors(home), [mirror])
+        self.assertEqual(gd.mirror_repo(mirror), "o/r")
+
+    def test_a_seed_lock_is_no_hold_but_any_other_lock_is(self) -> None:
+        # cmux16: ~/Library/Caches/cmux-worktree-seed/<key> read blocked:bundle-failed on every pass ("locked worktree")
+        rec = self.root / "rec"
+        rec.mkdir()
+        self.assertFalse(gd.worktree_locked(rec))  # no lock file
+        for reason, held in (("cmux-worktree seed: clean checkout new worktrees clone; never edit it", False),
+                             ("wt base: the tree new checkouts clone copy-on-write; nobody works here", False),
+                             ("wt new: checking out (pid 1 on h)", True), ("", True), ("a person's", True)):
+            (rec / "locked").write_text(reason + "\n")
+            self.assertEqual(gd.worktree_locked(rec), held, reason)
+
+    def test_removing_a_seed_drops_its_locked_record_but_not_a_persons(self) -> None:
+        root, origin = self.root / "trees", self.root / "origin"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        for name, reason in (("seed", "cmux-worktree seed: clean checkout new worktrees clone; never edit it"),
+                             ("mine", "kept by hand")):
+            self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(root / name))
+            self._git("-C", str(origin), "worktree", "lock", "--reason", reason, str(root / name))
+            shutil.rmtree(root / name)
+        gd.prune_removed_seed_records(str(origin / ".git"))
+        listed = self._git("-C", str(origin), "worktree", "list", "--porcelain")
+        self.assertNotIn(str(root / "seed"), listed)
+        self.assertIn(str(root / "mine"), listed)
+
+    def test_a_seed_keeps_no_reflog_bundle_but_a_persons_locked_worktree_keeps_the_item(self) -> None:
+        # cmux16: the seed's bundle asked for room for the whole 11.4 GiB mirror ("no room") for a clean seed tree
+        root, origin = self.root / "trees", self.root / "origin"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        for name, reason in (("seed", "cmux-worktree seed: clean checkout new worktrees clone; never edit it"),
+                             ("mine", "kept by hand")):
+            item = root / name
+            item.mkdir()
+            self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(item / "wt"))
+            self._git("-C", str(origin), "worktree", "lock", "--reason", reason, str(item / "wt"))
+            self._git("-C", str(item / "wt"), "commit", "-q", "--allow-empty", "-m", "reflog only")
+            self._git("-C", str(item / "wt"), "checkout", "-q", "--detach", "main")
+        external: dict = {}
+        why, gitdirs, trees = gd.mirror_repos(root / "seed", external)
+        self.assertEqual((why, external), ("", {}))
+        why, *_ = gd.mirror_repos(root / "mine", {})
+        self.assertIn("locked worktree", why)
 
     def _shared_mirror(self, packs: int = 4) -> tuple[Path, Path, str]:
         """A home whose tools/wt mirror ~/Projects/.wt-mirrors/o/r.git holds packs packs, one of them an object
@@ -17346,6 +17412,49 @@ class CargoStaleArtifactsTest(unittest.TestCase):
             gd.sweep_cargo_targets(self.receipt, [cache], stale_hours=gd.POLICY_DEFAULTS["pressure_cargo_stale_hours"])
         self.assertFalse(old.exists(), "a pressure pass trims what sat unused past its shorter window")
         self.assertTrue(new.exists(), "the newest unit of the crate stem stays")
+
+    def fixture_in(self, cache: Path) -> dict[str, Path]:
+        rel = cache / "cmux/debug"
+        for d in ("deps", "incremental"):
+            (rel / d).mkdir(parents=True)
+        (rel / ".cargo-lock").write_text("")
+        old, new = rel / "incremental/acpmux-0fjl8gce3js7d", rel / "incremental/acpmux-24cir4ig20wvn"
+        for unit, hours in ((old, 2), (new, 0.001)):  # 2 h: inside cargo_stale_hours, past the cap's 1 h step
+            unit.mkdir()
+            (unit / "query-cache.bin").write_bytes(b"x" * 8192)
+            when = time.time() - hours * 3600
+            os.utime(unit / "query-cache.bin", (when, when))
+            os.utime(unit, (when, when))
+        return {"old": old, "new": new}
+
+    def test_cap_trims_a_root_over_its_size_oldest_first_and_stops_under_90_percent(self) -> None:
+        cache = self.root / "cache/cargo-target"
+        f = self.fixture_in(cache)
+        sizes = iter([100 * gd.GIB])  # measured once; later bytes come from what the sweeps removed
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, size=lambda p: next(sizes))
+        (root, rec), = res["roots"].items()
+        self.assertEqual(root, os.fspath(cache))
+        self.assertEqual(rec["before"], 100 * gd.GIB)
+        self.assertGreater(res["units"], 0, "units older than the shortest window go")
+        self.assertFalse(f["old"].exists())
+        self.assertTrue(f["new"].exists(), "the newest unit of a crate stem stays whatever the cap says")
+        self.assertIn(gd.CARGO_CAP_FAMILY, self.receipt.read_text())
+
+    def test_cap_leaves_a_root_under_it_and_report_mode_removes_nothing(self) -> None:
+        cache = self.root / "cache/cargo-target"
+        f = self.fixture_in(cache)
+        under = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, size=lambda p: 10 * gd.GIB)
+        self.assertEqual((under["roots"], under["units"]), ({}, 0))
+        over = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, apply=False,
+                                           size=lambda p: 99 * gd.GIB)
+        self.assertEqual(over["units"], 0)
+        self.assertTrue(f["old"].exists())
+        self.assertEqual(gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=0, size=lambda p: 10**15)["roots"], {})
+
+    def test_cap_default_names_the_shared_target(self) -> None:
+        self.assertIn("~/.cache/cargo-target", gd.POLICY_DEFAULTS["cargo_cap_roots"])
+        self.assertGreater(gd.POLICY_DEFAULTS["cargo_cap_gib"], 0)
 
     def test_policy_roots_reach_lane_worktrees(self) -> None:
         self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])
