@@ -10313,6 +10313,33 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIn(self.SIDE_LIGHT, self.gate.cap_labels, "a union never drops a receipt label")
         self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "the disagreement is published, not swallowed")
 
+    def test_a_role_runner_carrying_another_roles_label_never_listens(self) -> None:
+        """ROLE_LABEL_MISMATCH (cmux run 46077298852, 2026-11-27): a workflow_dispatch job with runs-on mac-gateway sat
+        queued 25 min, then went to the sim-first runner, whose job-started refused it; the rescue does not watch a
+        dispatch run, so it ended red. A refused job cannot be re-queued, so the gate holds a gateway, sim-first or
+        small runner whose labels (receipt or dispatched) include another role's label."""
+        sim = hook.RunnerScope(sim=True)
+        gateway = hook.RunnerScope(gateway=True)
+        small = hook.RunnerScope(small=True)
+        stale = frozenset({"glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim", "mac-gateway"})
+        self.assertIn("mac-gateway", hook.role_label_mismatch(sim, stale) or "")
+        self.assertIn("glaeda-gateway-xcode-26.6",
+                      hook.role_label_mismatch(small, frozenset({"glaeda-small-xcode-26.6",
+                                                                 "glaeda-gateway-xcode-26.6"})) or "")
+        self.assertIsNone(hook.role_label_mismatch(sim, frozenset({"glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim"})))
+        self.assertIsNone(hook.role_label_mismatch(gateway, frozenset({"glaeda-gateway-xcode-26.6", "mac-gateway"})))
+        self.assertIsNone(hook.role_label_mismatch(hook.RunnerScope(), stale), "a pool runner is not a role runner")
+        self.assertIsNone(hook.role_label_mismatch(sim, None))
+        # at the gate: GitHub dispatched a gateway job to this sim-first runner, so it stops listening
+        self.receipt(["glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim"])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2", labels=["glaeda-gateway-xcode-26.6"]),
+                     self.job("queued")]  # the feed keeps only jobs with a glaeda- label
+        self.poll()
+        with mock.patch.object(hook, "runner_scope", return_value=sim):
+            self.assertIn("glaeda-gateway-xcode-26.6", self.gate.role_mismatch() or "")
+        with mock.patch.object(hook, "runner_scope", return_value=hook.RunnerScope()):
+            self.assertIsNone(self.gate.role_mismatch(), "a pool runner is not held for it")
+
     def test_with_no_job_of_its_own_the_label_set_stays_the_receipts(self) -> None:
         # The other half of the rule: no observed dispatch changes nothing, so a runner the feed says nothing about
         # keeps exactly today's behaviour. A job on a sibling runner of the same host is not this runner's evidence.
@@ -18858,6 +18885,27 @@ class RunnerTest(unittest.TestCase):
             kept, _ = cr.member_labels(manifest, "mini-std", ["glaeda-sim-xcode-26.6"])
             lost, _ = cr.member_labels(manifest, "mini-std", ["glaeda-std-xcode-26.6"])
         self.assertEqual((kept["simRunners"], lost["simRunners"]), (1, 0))
+
+    def test_a_kept_registration_s_role_label_picks_the_hook_role(self) -> None:
+        """LIVE_ROLE, 2026-11-27 12:26-13:14Z: cmux14-glaeda-16 held the gateway label while its hook ran --sim-runner
+        and refused every gateway job. With no relabel, the hook follows the role label it is registered with."""
+        def ctx(**roles):
+            return types.SimpleNamespace(**{"gateway_runner": False, "sim_runner": False, "small_runner": False, **roles})
+        stuck = ctx(sim_runner=True)
+        note = cr.role_from_labels(stuck, ["self-hosted", "glaeda-mini", "glaeda-gateway-xcode-26.6"])
+        self.assertEqual((stuck.gateway_runner, stuck.sim_runner, stuck.small_runner), (True, False, False))
+        self.assertIn("route gateway jobs", note)
+        same = ctx(sim_runner=True)
+        self.assertIsNone(cr.role_from_labels(same, ["glaeda-sim-xcode-26.6"]))
+        self.assertTrue(same.sim_runner)
+        pool = ctx(small_runner=True)
+        self.assertIsNone(cr.role_from_labels(pool, ["glaeda-mini", "glaeda-std-xcode-26.6"]), "no role label: kept")
+        self.assertIsNone(cr.role_from_labels(pool, None), "nothing read: kept")
+        self.assertIsNone(cr.role_from_labels(pool, ["glaeda-sim-xcode-26.6", "glaeda-small-xcode-26.6"]), "two: kept")
+        self.assertTrue(pool.small_runner)
+        plain = ctx()
+        cr.role_from_labels(plain, ["glaeda-small-xcode-26.6"])
+        self.assertTrue(plain.small_runner)
 
     def test_no_sim_count_reaches_a_runner_hook_and_the_label_has_none(self) -> None:
         """SIM_DYNAMIC: simSlots is ignored, no hook is given --sim-slots, and a simulator mini's glaeda-ios-sim
