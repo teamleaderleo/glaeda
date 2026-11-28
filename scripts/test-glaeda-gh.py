@@ -43731,6 +43731,48 @@ class LandTest(Base):
         self.assertEqual(self.w.sent()[-1][3], "hostx/sid-1")
         self.assertEqual(e["history"][0]["via"], "$ACPMUX_SESSION_ID")
 
+    def test_a_land_over_ssh_records_the_callers_session_as_its_notify_target(self):
+        # 2026-11-28: `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'` recorded no requester (no session crosses a
+        # plain ssh hop), and over reach the session's ACPMUX_FROM was recorded as cmux-cp-1/NAME, a session that does
+        # not exist there. Either way the caller heard no merge and no stop.
+        keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
+        ssh = {**keys, "CMUX_AGENT_HOST": "", "SSH_CONNECTION": "100.64.0.9 50000 100.64.0.1 22"}
+        reach = {**ssh, "ACPMUX_FROM": "claude-sr2-coord-old", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72",
+                 "CMUX_AGENT_HOST": "cosmic-gray"}
+        with mock.patch.object(gg, "policy_host", return_value="cmux-cp-1"):
+            with mock.patch.dict(os.environ, reach):
+                self.assertEqual(gg.land_requester_from(None), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from(""), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from("coord"), ("cosmic-gray/coord", "--notify"))
+                self.assertEqual(gg.land_requester_from("air-blue/x"), ("air-blue/x", "--notify"))
+            with mock.patch.dict(os.environ, {**reach, "ACPMUX_FROM": "cmux-cp-1/own"}):
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/own", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, {**reach, "CMUX_AGENT_HOST": "cmux-cp-1"}):
+                # a caller on this host: its own host, as before
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/claude-sr2-coord-old", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, ssh):
+                self.assertEqual(gg.land_requester_from(""), ("", ""))
+                note = gg.land_no_requester_note()
+                self.assertIn("no --notify and no session", note)
+                self.assertIn("--notify-to YOURHOST/SESSION", note)
+                self.assertIn("reach HOST", note)
+            with mock.patch.dict(os.environ, {**ssh, "SSH_CONNECTION": ""}):
+                self.assertNotIn("--notify-to", gg.land_no_requester_note())
+            for argv, env, want, via in (
+                    (["land", "o/r#1", "--notify", "--json"], reach, "cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"),
+                    (["land", "o/r#1", "--notify-to", "cosmic-gray/claude-sr2-coord-old", "--json"], ssh,
+                     "cosmic-gray/claude-sr2-coord-old", "--notify")):
+                for f in gg.LandQueue.entries_dir().glob("*.json"):
+                    f.unlink()
+                with mock.patch.dict(os.environ, env), mock.patch.object(gg, "daemon_running", return_value=True), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gg.main(argv), 0, argv)
+                self.pr(LA)
+                self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+                e = self.tick()
+                self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), (want, via, "stopped"), argv)
+                self.assertEqual(self.w.sent()[-1][3], want, argv)
+
     def test_nobody_to_tell_is_a_notice_not_silence(self):
         self.pr(LA)
         self.land(requester="")
@@ -52341,6 +52383,45 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
+    def test_slow_full_reads_spread_over_more_workers_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 04:0xZ: 70 waited cmux PRs at 2.7 s a full read. A worker's WAITED_POOL_BUDGET (50 s)
+        holds floor(50 / 5.4) queries of 2, so 18 PRs. Before: 3 workers of 30, 30, 10 read 18 + 18 + 10 = 46 at best (the
+        pool logged 21-26). After: chunks sized to the measure, 6 workers of 12 (or fewer), every one read in budget."""
+        per = 2.7
+        waited = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 71)]
+
+        def run(measure):
+            d = gg.Daemon.__new__(gg.Daemon)
+            d.now, d.deferred_since = 10000.0, {}
+            d.oldest_waited_age = lambda waited: 9999.0
+            if measure:
+                d.full_pr_secs = {"manaflow-ai/cmux": per}
+            sizes = []
+
+            def read_many(keys, budget):  # queries of 2 full reads, serial, cut by the worker's budget
+                sizes.append(len(keys))
+                fits = int(budget // (2 * per)) * 2
+                return {k: (None if i < fits else "not read: deferred, the tick's time ran out") for i, k in enumerate(keys)}
+            with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                    mock.patch.object(gg, "upstream_command", lambda: None):
+                futures, handed = d.start_waited_pool(waited)
+                done = {}
+                for f in futures:
+                    done.update(f.result(timeout=5))
+            return sorted(sizes, reverse=True), sum(1 for v in done.values() if v is None)
+        self.assertEqual(run(False), ([30, 30, 10], 46))  # before: no measure, the fixed chunk
+        sizes, read = run(True)
+        self.assertEqual(sizes, [12, 12, 12, 12, 12, 10])  # 50 * 0.7 / 2.7 = 12 a worker, 6 workers
+        self.assertEqual(read, 70)
+
+    def test_a_fast_repo_keeps_the_fixed_chunk_and_the_in_flight_bound(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.full_pr_secs = 10000.0, {"o/r": 0.5, "o/slow": 10.0}
+        self.assertEqual(d.waited_pool_chunk("o/r"), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(d.waited_pool_chunk("o/slow"), 3)
+        self.assertEqual(d.waited_pool_chunk("o/unmeasured"), gg.WAITED_POOL_CHUNK)
+
+
 class SuitesPastOnePagePaged(unittest.TestCase):
     """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
     so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
@@ -52372,6 +52453,28 @@ class SuitesPastOnePagePaged(unittest.TestCase):
 
     def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
         d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_rest_pages_complete_the_head_when_graphql_refuses(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "rate limited"}]}]), self.commit()
+        got = []
+
+        def get(path, etag):
+            got.append(path)
+            n = 100 if path.endswith("page=1") else 30
+            return "fresh", {"total_count": 130, "check_suites": [
+                {"node_id": f"R{len(got)}_{i}", "latest_check_runs_count": 1} for i in range(n)]}, None
+        d.get = get
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])
+
+    def test_a_short_rest_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "x"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
         d.page_more_suites("o/r", commit)
         self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
 
