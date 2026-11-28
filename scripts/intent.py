@@ -30,6 +30,7 @@ passes the same vectors (tools/intent_vectors.json). Detector: tools/test_intent
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import difflib
 import io
@@ -154,6 +155,8 @@ def _walk(parser, argv: list) -> dict:
                 pass  # after a word in a subcommand's place: whose flag it is cannot be read yet
             elif action is None:
                 unknown.append((i, len(levels) - 1))
+                if not eq and _child_takes_value(sub, name, argv[i + 1:i + 2], before):
+                    i += 1  # `--wait 120 who N`: a subcommand's flag typed before it keeps its value
             elif not eq and _takes_value(action) and not (len(name) > 2 and not name.startswith("--")):
                 i += 1
             i += 1
@@ -176,6 +179,18 @@ def _walk(parser, argv: list) -> dict:
             positionals.append(i)
         i += 1
     return {"levels": levels, "bad_sub": bad_sub, "unknown": unknown, "positionals": positionals}
+
+
+def _child_takes_value(sub, name: str, nxt: list, before: int) -> bool:
+    """NAME, unknown here, is a flag of a subcommand under SUB that takes a value, and NXT (the word after it) is that
+    value rather than the subcommand word: `pr-owner --wait 120 who N` (2026-11-23 re-mine)."""
+    if sub is None or before > 0 or not nxt or nxt[0].startswith("-") or nxt[0] in sub.choices:
+        return False
+    for child in dict.fromkeys(sub.choices.values()):
+        action = _lookup(name, _options(child))
+        if action is not None and _takes_value(action):
+            return True
+    return False
 
 
 def _positionals_before(parser, sub) -> int:
@@ -210,7 +225,8 @@ class _Rerun(Exception):
         self.argv = argv
 
 
-_state = {"depth": 0, "trial": False, "top": None, "argv": None, "prog": None, "installed": False, "done": False}
+_state = {"depth": 0, "trial": False, "top": None, "argv": None, "prog": None, "installed": False, "done": False,
+          "loose": False}
 _orig: dict = {}
 
 
@@ -238,9 +254,17 @@ def _try(parser, argv: list) -> str | None:
     held = None if _state["installed"] else (cls.error, cls.exit)
     if held:  # not installed (fix(), repair() called directly): the trial's own error and exit, for this call only
         cls.error, cls.exit = _error, _exit
+    # A tool's own subclass that overrides error/exit (pr-owner's prints a next step and exits 2) would hide the
+    # refusal's text ("invalid choice") behind "exit 2", and no subcommand edit would be tried: the trial uses ours.
+    subs = {k: (k.__dict__.get("error"), k.__dict__.get("exit")) for k in _classes(parser)
+            if k is not cls and ("error" in k.__dict__ or "exit" in k.__dict__)}
+    for k in subs:
+        k.error, k.exit = _error, _exit
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            _orig.get("parse_args", argparse.ArgumentParser.parse_args)(parser, list(argv))
+            # A parse_known_args caller (lane-place) forwards flags it does not know: the trial takes them too.
+            how = "parse_known_args" if _state["loose"] else "parse_args"
+            _orig.get(how, getattr(argparse.ArgumentParser, how))(parser, list(argv))
         return None
     except _Fail as fail:
         return fail.message
@@ -254,6 +278,26 @@ def _try(parser, argv: list) -> str | None:
         _state["trial"] = was
         if held:
             cls.error, cls.exit = held
+        for k, (err, ext) in subs.items():
+            for name, fn in (("error", err), ("exit", ext)):
+                if fn is None:
+                    delattr(k, name)
+                else:
+                    setattr(k, name, fn)
+
+
+def _classes(parser, seen=None) -> set:
+    """The parser classes in PARSER's tree (a tool's subclass among them)."""
+    seen = seen if seen is not None else set()
+    if id(parser) in seen:
+        return set()
+    seen.add(id(parser))
+    out = {type(parser)}
+    for a in parser._actions:  # noqa: SLF001
+        if isinstance(a, argparse._SubParsersAction):  # noqa: SLF001
+            for p in a.choices.values():
+                out |= _classes(p, seen)
+    return out
 
 
 # ---- the edits ----------------------------------------------------------------------------------------------
@@ -312,6 +356,16 @@ def _flag_edits(parser, argv: list, walk: dict, tbl: dict) -> list:
     if not out and sub is not None and not eq and name.lstrip("-") in sub.choices and level == len(levels) - 1:
         word = name.lstrip("-")  # `land --status X`: the flag names the subcommand
         out.append(("glued", argv[:i] + [word] + argv[i + 1:], f"subcommand `{word}` for {name}"))
+    if not out and level > 0 and levels[level - 1]["sub"] is not None:  # a sibling subcommand's flag: shown, not run
+        here_p, word = levels[level]["parser"], argv[levels[level - 1]["sub"]]
+        sib = _sub_action(levels[level - 1]["parser"])
+        owners = [n for n, c in sib.choices.items() if c is not here_p and _lookup(name, _options(c)) is not None
+                  and name in _options(c)]
+        if owners:
+            action = _options(sib.choices[owners[0]])[name]
+            take = 2 if (not eq and _takes_value(action) and i + 1 < len(argv)) else 1
+            out.append(("drop", argv[:i] + argv[i + take:],
+                        f"without {' '.join(argv[i:i + take])}: `{owners[0]}`'s flag, `{word}` takes none"))
     return out
 
 
@@ -429,6 +483,38 @@ def _unsafe(parser, argv: list, tbl: dict, prog: str) -> str | None:
     return next((w for w in words if unsafe_word(w, tbl)), None)
 
 
+def _reading(word: str, prog: str, tbl: dict) -> bool:
+    return word in (tbl.get("reads") or ()) or word in ((tbl.get("cli") or {}).get(prog, {}).get("safe") or ())
+
+
+def _supplied_write(parser, typed: list, new: list, tbl: dict, prog: str) -> str | None:
+    """The word the layer would supply that is not a known read, else None. A word it puts in (a subcommand or a
+    choice: `docs pull` -> `docs sync`, `exec` -> `run`) runs only when it is a read (the table's `reads` or the
+    CLI's `safe`), or is part of a subcommand path that ends in one (`land-status` -> `land status`): a write's
+    verb is never supplied, whether or not the unsafe list names it. Flags and reordering supply no new word."""
+    added = collections.Counter(t for t in new if not t.startswith("-")) - collections.Counter(
+        t for t in typed if not t.startswith("-"))
+    if not added:
+        return None
+    walk = _walk(parser, new)
+    subs = [lv["sub"] for lv in walk["levels"] if lv["sub"] is not None]
+    reads_at = next((i for i in subs if _reading(new[i], prog, tbl)), None)  # the first reading subcommand word
+    leaf_reads = bool(subs) and _reading(new[subs[-1]], prog, tbl)
+
+    def ok(i: int) -> bool:  # the word at I is a read, or sits under one (`status checks` -> `status pr`)
+        if _reading(new[i], prog, tbl) or leaf_reads:
+            return True
+        return reads_at is not None and (i not in subs or i > reads_at)
+
+    left = collections.Counter(added)
+    for i, w in enumerate(new):
+        if left[w] > 0 and not w.startswith("-"):
+            left[w] -= 1
+            if not ok(i):
+                return w
+    return None
+
+
 def _read_only(parser, argv: list, tbl: dict, prog: str) -> bool:
     """Whether ARGV runs a subcommand that only reads: its last subcommand word is one of the table's `reads` (or
     the CLI's `safe`), is not on the CLI's `exact` list, and the form holds no unsafe word. A CLI with no
@@ -441,7 +527,19 @@ def _read_only(parser, argv: list, tbl: dict, prog: str) -> bool:
     return path[-1] in (tbl.get("reads") or []) or path[-1] in (part.get("safe") or [])
 
 
-def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None) -> dict:
+def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None, loose: bool | None = None) -> dict:
+    """LOOSE: the parser is read with parse_known_args (its unknown flags pass through); None: as this parse is."""
+    if loose is None:
+        return _repair(parser, argv, prog, tbl)
+    was = _state["loose"]
+    _state["loose"] = loose
+    try:
+        return _repair(parser, argv, prog, tbl)
+    finally:
+        _state["loose"] = was
+
+
+def _repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None) -> dict:
     """What ARGV, which PARSER refuses, meant. {"outcome": "ran" | "candidates" | "exact" | "none" | "ok",
     "argv": the one form to run (ran), "candidates": [{argv, notes}] (at most MAX_SHOWN), "error": the refusal}."""
     tbl = table() if tbl is None else tbl
@@ -453,14 +551,14 @@ def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None)
     if _writes_files(parser):
         return {"outcome": "none", "argv": argv, "candidates": [], "error": first}
     seen = {tuple(argv)}
-    queue = [(argv, [], first)]
+    queue = [(argv, [], first, [])]
     parsed, tried = [], 0
     while queue and tried < MAX_STATES:
-        cur, notes, message = queue.pop(0)
+        cur, notes, message, classes = queue.pop(0)
         if len(notes) >= MAX_EDITS:
             continue
         walk = _walk(parser, cur)
-        if walk["unknown"]:
+        if walk["unknown"] and not _state["loose"]:  # a loose parser's unknown flags are someone else's: kept as typed
             edits = _flag_edits(parser, cur, walk, tbl)
         elif walk["bad_sub"] is not None and ("invalid choice" in message or "required" in message):
             edits = _sub_edits(parser, cur, walk, tbl, prog)
@@ -476,16 +574,21 @@ def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None)
             tried += 1
             again = _try(parser, new)
             if again is None:
-                parsed.append({"argv": new, "notes": notes + [note], "classes": [cls]})
+                parsed.append({"argv": new, "notes": notes + [note], "classes": classes + [cls]})
             else:
-                queue.append((new, notes + [note], again))
+                queue.append((new, notes + [note], again, classes + [cls]))
     if not parsed:
         return {"outcome": "none", "argv": argv, "candidates": [], "error": first}
     fewest = min(len(p["notes"]) for p in parsed)
     parsed = [p for p in parsed if len(p["notes"]) == fewest][:MAX_SHOWN]
     if len(parsed) == 1:
         word = _unsafe(parser, parsed[0]["argv"], tbl, prog) or next(
-            (w for w in argv if w.startswith("-") and unsafe_word(w, tbl)), None)
+            (w for w in argv if w.startswith("-") and unsafe_word(w, tbl)), None) or _supplied_write(
+            parser, argv, parsed[0]["argv"], tbl, prog)
+        if not word and "drop" in parsed[0]["classes"]:  # a dropped flag changes what was asked: never run
+            word = next(n.split(":")[0] for n in parsed[0]["notes"] if n.startswith("without "))
+            return {"outcome": "exact", "argv": argv, "candidates": parsed, "error": first, "word": word,
+                    "dropped": True}
         if word:
             return {"outcome": "exact", "argv": argv, "candidates": parsed, "error": first, "word": word}
         return {"outcome": "ran", "argv": parsed[0]["argv"], "candidates": parsed, "error": first}
@@ -522,6 +625,10 @@ def say(prog: str, argv: list, result: dict, err=None) -> None:
     if result["outcome"] == "ran":
         notes = "; ".join(result["candidates"][0]["notes"])
         print(f"{prog}: ran `{_show(prog, result['argv'])}` for `{_show(prog, argv)}` ({notes})", file=err)
+    elif result["outcome"] == "exact" and result.get("dropped"):
+        print(f"{prog}: `{_show(prog, argv)}` is not a form of {prog} ({'; '.join(result['candidates'][0]['notes'])}),"
+              f" so nothing ran: the form {prog} takes is\n  {_show(prog, result['candidates'][0]['argv'])}",
+              file=err)
     elif result["outcome"] == "exact":
         print(f"{prog}: `{_show(prog, argv)}` is not a form of {prog}, and `{result['word']}` is destructive or "
               f"outward, so nothing ran: the exact form is needed. Did you mean:\n  "
@@ -646,8 +753,10 @@ def alias(argv: list, prog: str, tbl: dict | None = None):
     for rule in (tbl.get("cli") or {}).get(prog, {}).get("aliases") or []:
         under, frm, to = rule.get("under") or [], rule.get("from") or [], rule.get("to") or []
         at = len(under)
+        end = argv.index("--") if "--" in argv else len(argv)
         if frm and to and argv[:at] == under and argv[at:at + len(frm)] == frm and not _write_words(
-                frm, under + to, tbl) and not _exact_path(prog, under + to, tbl):
+                frm, under + to, tbl) and not _exact_path(prog, under + to, tbl) and _reading(
+                to[-1], prog, tbl) and not any(t.startswith("-") and unsafe_word(t, tbl) for t in argv[:end]):
             return argv[:at] + list(to) + argv[at + len(frm):], rule
     return None
 
@@ -665,18 +774,32 @@ def _wrap(name: str):
                 json.dump(dict(spec_of(self), prog=self.prog, loose=name == "parse_known_args"), fh)
             raise SystemExit(0)
         given = list(sys.argv[1:] if args is None else args)
-        _state.update(depth=1, top=self, argv=given)
+        _state.update(depth=1, top=self, argv=given, loose=name == "parse_known_args")
+        # A tool's subclass with its own error() (pr-owner's adds a next step) shadows ours: for this parse it runs
+        # through ours first, and its own error() is the refusal printed when nothing is repaired.
+        own = {k: k.__dict__["error"] for k in _classes(self)
+               if k is not argparse.ArgumentParser and "error" in k.__dict__}
+        _state["own"] = own
+        for k in own:
+            k.error = _error
         try:
             return original(self, given, namespace)
         except _Rerun as rerun:
             _state["done"] = True  # one repair per parse: the repaired form's own refusal is argparse's to print
             return original(self, rerun.argv, namespace)
         finally:
-            _state.update(depth=0, top=None, argv=None)
+            for k, fn in own.items():
+                k.error = fn
+            _state.update(depth=0, top=None, argv=None, own={}, loose=False)
 
     parse.__name__ = name
     parse.__doc__ = original.__doc__
     return parse
+
+
+def _refuse(self, message):
+    """The tool's own refusal: its subclass's error() when it has one, else argparse's."""
+    return (_state.get("own") or {}).get(type(self), _orig["error"])(self, message)
 
 
 def _error(self, message):
@@ -684,20 +807,20 @@ def _error(self, message):
         raise _Fail(message, self)
     top, argv = _state["top"], _state["argv"]
     if top is None or _state["done"] or os.environ.get("INTENT_OFF"):
-        return _orig["error"](self, message)
+        return _refuse(self, message)
     _state["done"] = True
     prog = _state["prog"] or top.prog
     try:
         result = repair(top, argv, prog)
     except Exception:  # noqa: BLE001 (the layer never costs a CLI its own refusal)
-        return _orig["error"](self, message)
+        return _refuse(self, message)
     if result["outcome"] == "ok":
-        return _orig["error"](self, message)
+        return _refuse(self, message)
     _log(prog, argv, result)
     say(prog, argv, result)
     if result["outcome"] == "ran":
         raise _Rerun(result["argv"])
-    return _orig["error"](self, message)
+    return _refuse(self, message)
 
 
 def _exit(self, status=0, message=None):

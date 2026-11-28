@@ -2,6 +2,7 @@
  "schema": "intent-vectors.v1",
  "about": "The contract of tools/intent.py and its Rust twin: a parser spec, an argv it refuses, the outcome. Spec: flags {\"--a,-b\": \"value\"|\"int\"|\"switch\"|[choices]}, required [flag], args [name | {name, choices, int, optional}], subs {name: spec}. cli: the table's per-CLI part for that vector.",
  "parsers": {
+  "forum": {"subs": {"docs": {"args": [{"name": "action", "choices": ["list", "sync"]}, "dir"]}}},
   "disk": {"subs": {"report": {"flags": {"--json": "switch"}}, "keepup": {"flags": {"--floor": "int"}}}},
   "gh2": {
    "flags": {"--repo": "value"},
@@ -20,13 +21,17 @@
   "amb": {"subs": {"show": {"args": ["id"], "flags": {"--field": "value", "--find": "value"}}, "get": {"args": ["id"]}, "list": {}}},
   "amb2": {"flags": {"--field": "value", "--find": "value"}, "args": ["id"]},
   "amb3": {"subs": {"remember": {"args": ["id"], "flags": {"--field": "value", "--find": "value"}}, "list": {}}},
+  "owner2": {"flags": {"--repo": "value"}, "subs": {"who": {"args": [{"name": "pr", "int": true}], "flags": {"--wait": "value", "--json": "switch"}}, "claim": {"args": [{"name": "pr", "int": true}], "flags": {"--as": "value"}}, "orphans": {"flags": {"--wait": "value"}}}},
   "flat": {"flags": {"--dry-run": "switch", "--reason": "value", "--force": "switch", "--wait": "int"}, "args": ["name"]}
  },
  "vectors": [
   {"name": "synonym subcommand (glaeda-disk status)", "parser": "disk", "argv": ["status"], "outcome": "ran", "to": ["report"]},
   {"name": "synonym with a flag kept", "parser": "disk", "argv": ["show", "--json"], "outcome": "ran", "to": ["report", "--json"]},
-  {"name": "close subcommand", "parser": "disk", "argv": ["keepupp", "--floor", "5"], "outcome": "ran", "to": ["keepup", "--floor", "5"]},
+  {"name": "close subcommand that writes: printed, not run", "parser": "disk", "argv": ["keepupp", "--floor", "5"], "outcome": "exact", "to": [["keepup", "--floor", "5"]]},
   {"name": "unique prefix subcommand", "parser": "disk", "argv": ["rep"], "outcome": "ran", "to": ["report"]},
+  {"name": "a choice that writes is never supplied (synonym)", "parser": "forum", "argv": ["docs", "pull", "./d"], "outcome": "exact", "to": [["docs", "sync", "./d"]]},
+  {"name": "a choice that writes is never supplied (close)", "parser": "forum", "argv": ["docs", "snc", "./d"], "outcome": "exact", "to": [["docs", "sync", "./d"]]},
+  {"name": "a choice that reads is supplied", "parser": "forum", "argv": ["docs", "lst", "./d"], "outcome": "ran", "to": ["docs", "list", "./d"]},
   {"name": "nothing close", "parser": "disk", "argv": ["zzzz"], "outcome": "none"},
   {"name": "a form that parses", "parser": "disk", "argv": ["report"], "outcome": "ok"},
   {"name": "glued subcommand (glaeda-gh land-status REPO)", "parser": "gh2", "argv": ["land-status", "o/r"], "outcome": "ran", "to": ["land", "status", "o/r"]},
@@ -61,6 +66,9 @@
   {"name": "two read-only meanings: the best runs (the other is named)", "parser": "amb", "argv": ["info", "x"], "outcome": "ran", "to": ["show", "x"]},
   {"name": "two close flags on a read: the best runs", "parser": "amb", "argv": ["show", "x", "--fild", "a"], "outcome": "ran", "to": ["show", "x", "--field", "a"]},
   {"name": "two meanings, one a write: listed, nothing runs", "parser": "amb2", "argv": ["x", "--fild", "a"], "outcome": "candidates", "to": [["x", "--field", "a"], ["x", "--find", "a"]]},
-  {"name": "two meanings under a write subcommand: listed", "parser": "amb3", "argv": ["remember", "x", "--fild", "a"], "outcome": "candidates", "to": [["remember", "x", "--field", "a"], ["remember", "x", "--find", "a"]]}
+  {"name": "two meanings under a write subcommand: listed", "parser": "amb3", "argv": ["remember", "x", "--fild", "a"], "outcome": "candidates", "to": [["remember", "x", "--field", "a"], ["remember", "x", "--find", "a"]]},
+  {"name": "a subcommand's flag and its value typed before it (pr-owner --wait 120 who N)", "parser": "owner2", "argv": ["--wait", "120", "who", "5"], "outcome": "ran", "to": ["who", "--wait", "120", "5"]},
+  {"name": "a sibling subcommand's flag under a write: the form without it is printed, nothing runs (pr-owner claim N --wait 120)", "parser": "owner2", "argv": ["claim", "5", "--wait", "120"], "cli": {"owner2": {"exact": ["claim"]}}, "outcome": "exact", "to": [["claim", "5"]]},
+  {"name": "a sibling subcommand's flag is never dropped to run, even with no exact entry", "parser": "owner2", "argv": ["--repo", "o/r", "claim", "5", "--wait", "1"], "outcome": "exact", "to": [["--repo", "o/r", "claim", "5"]]}
  ]
 }

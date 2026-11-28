@@ -60,8 +60,106 @@
   "rotate", "revoke", "approve", "apply", "yes", "y", "f", "pay", "charge", "refund", "transfer", "evict", "retire",
   "archive", "unlink", "truncate", "erase", "steer", "interrupt", "override"
  ],
- "reads": ["status", "show", "info", "get", "view", "describe", "inspect", "list", "ls", "search", "find", "wait", "watch", "check", "log", "logs", "history", "help", "diff", "who", "path", "outcome", "outcomes", "read"],
+ "reads": ["status", "show", "info", "get", "view", "describe", "inspect", "list", "ls", "search", "find", "wait", "watch", "check", "log", "logs", "history", "help", "diff", "who", "path", "outcome", "outcomes", "read", "report"],
  "cli": {
+  "acpmux": {
+   "exact": [
+    "dispatch",
+    "task new",
+    "task done",
+    "task blocked",
+    "task failed",
+    "deliver",
+    "register",
+    "new",
+    "ensure",
+    "continue",
+    "retry",
+    "compare",
+    "race new",
+    "bridge connect",
+    "forum announce",
+    "forum ack",
+    "watch add",
+    "briefs report",
+    "inbox ack",
+    "bead link",
+    "preset",
+    "defaults",
+    "unarchive",
+    "resume-here",
+    "stdio",
+    "cli-agent",
+    "uniichat-agent",
+    "machine add",
+    "machine join",
+    "machine leave",
+    "machine leave-intent",
+    "machine enroll-self",
+    "machine enroll",
+    "machine setup",
+    "machine update",
+    "machine self-update",
+    "machine hold",
+    "machine notice",
+    "machine tunnel",
+    "machine vault pull",
+    "machine vault keep",
+    "machine vault forget",
+    "machine consent grant",
+    "machine approvals add",
+    "machine approvals enroll",
+    "machine approvals unenroll",
+    "machine dedicated",
+    "machine deps",
+    "machine ticket new",
+    "machine ticket full-access",
+    "harness install",
+    "harness add",
+    "harness login",
+    "harness enable",
+    "harness disable",
+    "harness run",
+    "harness secret",
+    "harness restore",
+    "harness codex-runtime install",
+    "session allow",
+    "session deny",
+    "session answer",
+    "session set",
+    "session pause",
+    "session wake",
+    "session move",
+    "session import",
+    "session fork",
+    "session route",
+    "session detach",
+    "session rename",
+    "session tag",
+    "session rules",
+    "session limits",
+    "session turn-cap",
+    "session resume",
+    "daemon run",
+    "daemon start",
+    "daemon config",
+    "daemon reload",
+    "daemon retention",
+    "daemon service install",
+    "hand pair",
+    "hand run",
+    "share-host on",
+    "share-host off",
+    "share-host start",
+    "share-host move",
+    "share-host link",
+    "group move",
+    "group tidy",
+    "worktree restore",
+    "process start",
+    "process background"
+   ]
+  },
   "agent-forum": {
    "exact": [
     "ask",
@@ -110,12 +208,117 @@
     "receipt",
     "reason",
     "install"
+   ],
+   "safe": [
+    "trace"
+   ]
+  },
+  "cmux": {
+   "exact": [
+    "vm pause",
+    "vm resume",
+    "vm exec",
+    "vm ssh",
+    "vm new",
+    "vm run",
+    "vm start",
+    "vm fork",
+    "vm snapshot",
+    "vm access",
+    "vm key",
+    "vm move",
+    "vm reassign",
+    "vm sign-in",
+    "vm sign-out",
+    "vm pause-machine",
+    "vm resume-machine",
+    "vm resize-machine",
+    "vm fork-machine",
+    "vm hand-off-machine",
+    "vm deliver-secrets",
+    "vm file-write",
+    "vm restore-machine",
+    "vm snapshot-machine",
+    "vm promote-machine-to-template",
+    "vm port-forward",
+    "vm preview-share",
+    "vm tunnel-attach",
+    "vm firewall-create",
+    "vm set-network-access",
+    "vm move-to-machine",
+    "vm apply-machine-config",
+    "vm setup-github",
+    "vm setup-desktop",
+    "device add",
+    "device invite",
+    "machine add",
+    "machine reconnect",
+    "remote connect",
+    "remote install",
+    "remote enroll",
+    "remote forward",
+    "remote ssh",
+    "customize apply",
+    "customize keep",
+    "customize discard",
+    "chief engine",
+    "chief move",
+    "history clear",
+    "history resume",
+    "link open",
+    "setup trust",
+    "setup harness",
+    "setup machine",
+    "setup account"
+   ]
+  },
+  "cmux-ci": {
+   "aliases": [
+    {
+     "from": [
+      "logs"
+     ],
+     "to": [
+      "log"
+     ]
+    },
+    {
+     "from": [
+      "show"
+     ],
+     "to": [
+      "log"
+     ]
+    },
+    {
+     "from": [
+      "job"
+     ],
+     "to": [
+      "log"
+     ]
+    }
    ]
   },
   "fleet-state": {
    "exact": [
     "drop",
     "forget"
+   ]
+  },
+  "gh-quota": {
+   "aliases": [
+    {
+     "from": [
+      "status"
+     ],
+     "to": [
+      "usage"
+     ]
+    }
+   ],
+   "safe": [
+    "usage"
    ]
   },
   "glaeda-disk": {
@@ -146,6 +349,16 @@
       "land",
       "status"
      ]
+    },
+    {
+     "count": 3,
+     "from": [
+      "status"
+     ],
+     "to": [
+      "status",
+      "pr"
+     ]
     }
    ],
    "default": {
@@ -173,6 +386,17 @@
    ]
   },
   "pr-owner": {
+   "aliases": [
+    {
+     "count": 4,
+     "from": [
+      "show"
+     ],
+     "to": [
+      "who"
+     ]
+    }
+   ],
    "exact": [
     "claim",
     "tidy",
@@ -194,9 +418,22 @@
    ]
   },
   "tbd-leo": {
+   "aliases": [
+    {
+     "from": [
+      "show"
+     ],
+     "to": [
+      "card"
+     ]
+    }
+   ],
    "exact": [
     "answer",
     "drop"
+   ],
+   "safe": [
+    "card"
    ]
   },
   "wt": {
