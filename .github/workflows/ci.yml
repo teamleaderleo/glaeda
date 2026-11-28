@@ -55,6 +55,8 @@ jobs:
       go: ${{ steps.scope.outputs.go }}
       fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
       code: ${{ steps.scope.outputs.code }}
+      runner: ${{ steps.scope.outputs.runner }}
+      gh: ${{ steps.scope.outputs.gh }}
 
     steps:
       - name: Check out repository
@@ -71,7 +73,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\nrunner=true\ngh=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
@@ -117,7 +119,30 @@ jobs:
             esac
           done < "$RUNNER_TEMP/changed"
           if test "$rust" = true; then code=true; fi
-          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\n' "$rust" "$go" "$fleet_cas" "$code" | tee -a "$GITHUB_OUTPUT"
+          # runner-tests and glaeda-gh-tests (about 7.2k of glaeda's 11.3k runner-minutes a day) read a few files
+          # each, listed in scripts/ci-job-inputs.json: of 241 commits to main over two days, 65 changed one that
+          # runner-tests reads and 161 one that glaeda-gh-tests reads. A suite runs when the change touches one of its
+          # files, or anything outside scripts/ and config/ but Markdown no script names and the other workflows.
+          runner=false
+          gh=false
+          if test "$code" = true; then
+            jq -r '."runner-tests".inputs[]' scripts/ci-job-inputs.json > "$RUNNER_TEMP/runner-inputs"
+            jq -r '."glaeda-gh-tests".inputs[]' scripts/ci-job-inputs.json > "$RUNNER_TEMP/gh-inputs"
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/ci.yml|scripts/ci-job-inputs.json) runner=true; gh=true ;;
+                scripts/*|config/*)
+                  if grep -qxF -- "$path" "$RUNNER_TEMP/runner-inputs"; then echo "runner-tests reads $path"; runner=true; fi
+                  if grep -qxF -- "$path" "$RUNNER_TEMP/gh-inputs"; then echo "glaeda-gh-tests reads $path"; gh=true; fi
+                  ;;
+                *.md) if grep -rqF -- "$path" scripts; then runner=true; gh=true; fi ;;
+                .github/*|.claude/*|skills/*) ;;
+                *) echo "$path is outside scripts/ and config/"; runner=true; gh=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed"
+          fi
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\nrunner=%s\ngh=%s\n' \
+            "$rust" "$go" "$fleet_cas" "$code" "$runner" "$gh" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -181,6 +206,8 @@ jobs:
         run: python3 scripts/glaeda-cmux-tour-floor-check
 
       - name: Validate and test scripts
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           python3 scripts/gh_auth_token_lint.py
           python3 - <<'PY'
@@ -377,10 +404,25 @@ jobs:
           # step ends red with a verdict. The bound is about 3x the slowest healthy suite
           # (test-glaeda-promotion-admit, 98 s of the step's 499 s).
           suite_seconds=${GLAEDA_SUITE_TIMEOUT_SECONDS:-300}
+          # The slowest suites (about 420 s of the step's 490 s) read a few files each, listed in
+          # scripts/ci-suite-inputs.json. A pull request that changes none of a listed suite's files, and nothing a
+          # suite could read without listing it (src/, tools/, ci.yml, the list), skips that suite and says so.
+          # Unlisted suites and pushes to main run everything.
+          scope_skip=""
+          if [ "$EVENT" = pull_request ]; then
+            git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/suite-scope-changed"
+            scope_skip=$(python3 scripts/ci_suite_scope.py "$RUNNER_TEMP/suite-scope-changed")
+          fi
+          skipped=()
           # A python unittest suite is green only when its output ends with its own verdict: the last `Ran N tests`
           # line (N > 0) followed by OK. Since glaeda#2376 a real os.execve in scripts/test-glaeda-gh.py replaced the
           # test process with a stand-in that exits 0 at about test 298 of 2261: no verdict, and the step read green.
           suite() {
+            if [ -n "$scope_skip" ] && grep -qxF -- "${*: -1}" <<<"$scope_skip"; then
+              echo "suite skipped: this change touches none of its files in scripts/ci-suite-inputs.json: $*"
+              skipped+=("$*")
+              return 0
+            fi
             echo "::group::$*"
             local start=$SECONDS rc=0 out rcf
             out=$(mktemp) rcf=$(mktemp)
@@ -425,6 +467,7 @@ jobs:
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
           suite python3 scripts/test-scripts-no-shadow.py
+          suite python3 scripts/test-ci-job-inputs.py
           suite python3 scripts/test-intent-glaeda.py
           suite python3 scripts/test-glaeda-disk-registry.py
           suite python3 scripts/test-glaeda-hook-pin.py
@@ -460,6 +503,7 @@ jobs:
           suite python3 scripts/test-delivery-concurrency.py
           suite python3 scripts/test-workflow-job-bounds.py
           suite python3 scripts/test-ci-suite-bound.py
+          suite python3 scripts/test-ci-suite-inputs.py
           suite python3 scripts/test-hot-pressure-shadow.py
           suite python3 scripts/test-hot-run.py
           suite python3 scripts/test-verify-focused.py
@@ -507,6 +551,10 @@ jobs:
             echo "### Script suites: ${#failed[@]} failed"
             for f in "${failed[@]}"; do echo "- \`$f\`"; done
             # Which suites own the step's wall clock, so the next read of a slow step needs no log archaeology.
+            if [ "${#skipped[@]}" -gt 0 ]; then
+              echo "### ${#skipped[@]} suites skipped: the change touches none of their inputs"
+              for s in "${skipped[@]}"; do echo "- \`$s\`"; done
+            fi
             echo "### Slowest suites of ${#timings[@]}, each bounded at ${suite_seconds}s"
             printf '%s\n' "${timings[@]}" | sort -rn | head -10 |
               while read -r took name; do echo "- ${took}s \`$name\`"; done
@@ -590,7 +638,7 @@ jobs:
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
     needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
+    if: ${{ needs.changes.outputs.runner == 'true' }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
@@ -622,7 +670,7 @@ jobs:
   # the process exits 0 with no verdict.
   glaeda-gh-tests:
     needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
+    if: ${{ needs.changes.outputs.gh == 'true' }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:

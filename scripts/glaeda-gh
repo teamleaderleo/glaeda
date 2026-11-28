@@ -686,6 +686,14 @@ HEADS_MIN_SHARE = 20
 WAITED_POOL_MIN = 12
 WAITED_POOL_WORKERS = 3
 WAITED_POOL_CHUNK = 30
+# ... and a repository whose full reads are slow gets smaller chunks in more workers, so each worker's chunk fits its
+# WAITED_POOL_BUDGET at the measured seconds a PR (full_pr_secs, WAITED_POOL_FILL of the budget), within the same bound of
+# PRs in flight (WAITED_POOL_WORKERS * WAITED_POOL_CHUNK) and at most WAITED_POOL_WORKERS_MAX workers. cmux-cp-2,
+# 2026-11-28 04:0xZ: ~70 waited cmux PRs at 2.7 s a full read went to 3 workers of 30, 30 and 10; each worker's 50 s held
+# ~18 full reads, so 21 to 26 a pool were read, the rest deferred by "the tick's time (TICK_BUDGET) ran out", and the
+# oldest waited PR's data stayed 3,000 to 4,000 s old.
+WAITED_POOL_WORKERS_MAX = 8
+WAITED_POOL_FILL = 0.7
 WAITED_POOL_BUDGET = 50.0
 # ... and only once the serial reads fall behind: the oldest waited PR's data past WAITED_POOL_STALE_S (half the stale
 # bound, so the pool starts before NOW's red at STALE_DATA_AFTER and stops once the serial reads keep up again). cmux-cp-2,
@@ -1557,8 +1565,12 @@ contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } n
 # requests in each PR of the batched read, 20 points for a batch of ten. The suites whose newest attempt ran nothing
 # (on a cmux head about 15 of 55, mostly apps' suites that never run anything) are read by id instead, where each
 # suite is one request: a suite that never ran anything comes back with no runs and adds nothing.
-SUITE_ATTEMPTS = ("checkSuites(first: 100) { totalCount pageInfo { hasNextPage } nodes { id "
+SUITE_ATTEMPTS = ("checkSuites(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { id "
                   "latest: checkRuns(first: 1) { totalCount } } }")
+SUITES_MORE = """query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String) {
+rateLimit { limit remaining resetAt cost } repository(owner: $owner, name: $name) { object(oid: $oid) { ... on Commit {
+checkSuites(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id latest: checkRuns(first: 1) { totalCount } } } } } } }"""
+SUITES_MORE_PAGES = 10  # pages of 100 suites past the first one a head is followed through (1,100 suites in all)
 SUITE_RUNS_BATCH = 100  # suite ids per SUITE_RUNS query: GitHub's nodes(ids:) takes at most 100
 PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
 # A PR's fingerprint (pr_fingerprint): what a verdict or a wait reads from a PR, as counts. The full read above costs
@@ -1586,6 +1598,7 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # its time in them while the land queue's PR data aged past 7,000 s. So fetch_prs splits its full reads into queries
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
+MEASURE_HOLD_S = 1800.0  # a cut query's measure is not lowered by answers for this long (note_query_secs)
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
 # The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
 # host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
@@ -3971,6 +3984,49 @@ APP_POOL_ROLE = "ci-watch"
 # (graphqlLoginWhy "pool-resting") while both yaps, pushed to every host, sat at 9,431 and 12,488 of 12,500.
 APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
+# Then every other read pool this host holds (Leo, 2026-11-27: "use the apps we have"): NOW 22:31Z had this daemon the
+# login's top GraphQL spender, 3852 points on the controller host and 928 on another, while quota-goblin-9002, -9005, -9014 and
+# -9016 (lw#13144), read pools of machines/gh-app-roles.json pushed to the hosts, were on no chain here. A role marked
+# `pool` and not `read_pool: false` or `actions_only` (runner-pool-1's bucket is the workflows') whose key or pushed
+# token is on this host goes after the listed chain, in the file's order. GLAEDA_GH_APP_SPARES set (even "") is the
+# whole list, as before, with nothing added.
+APP_POOL_DISCOVER = "GLAEDA_GH_APP_SPARES" not in os.environ
+
+
+def app_pool_read_roles(doc: Any) -> list[str]:
+    """The read-pool roles of a gh-app-roles.json DOC, in its order: `pool`, not `read_pool: false`, not
+    `actions_only`."""
+    roles = doc.get("roles") if isinstance(doc, dict) else None
+    if not isinstance(roles, dict):
+        return []
+    return [name for name, spec in roles.items() if isinstance(spec, dict) and spec.get("pool")
+            and spec.get("read_pool", True) is not False and not spec.get("actions_only")]
+
+
+def app_pool_held_read_roles(now: float | None = None, doc: Any = "config") -> list[str]:
+    """app_pool_read_roles of this host's gh-app-roles.json whose key files or a usable pushed token are here (file
+    reads, no request; AppPool.held_here's test). [] with no config beside the tool or APP_POOL_DIR unreadable."""
+    tool = app_pool_tool()
+    if doc == "config":
+        doc = read_json(tool.parent.parent / "machines" / "gh-app-roles.json") if tool else None
+    held = []
+    for role in app_pool_read_roles(doc):
+        keyed = tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file()
+        if keyed or app_pool_pushed_owners(role, now):
+            held.append(role)
+    return held
+
+
+def app_pool_roles(now: float | None = None) -> list[str]:
+    """APP_POOL_SPARES, then (APP_POOL_DISCOVER) every other read pool held here: the roles app_pool_chain orders."""
+    listed = list(APP_POOL_SPARES)
+    if not APP_POOL_DISCOVER:
+        return listed
+    try:
+        extra = app_pool_held_read_roles(now)
+    except (OSError, ValueError, TypeError):
+        extra = []
+    return listed + [r for r in extra if r not in listed]
 
 
 def app_pool_chain(roles: "tuple[str, ...] | list[str]", primary: str = APP_POOL_ROLE) -> list[str]:
@@ -5827,7 +5883,7 @@ def status_path(root: str, sha: str) -> str:
 
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
     """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
-    return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
+    return (any(finished_status(c).lower() != "completed" for c in checks.get("check_runs") or [])
             or any(str(s.get("state") or "").lower() in {"pending", "expected"} for s in statuses))
 
 
@@ -6165,10 +6221,10 @@ def parse_pr(node: dict) -> dict:
             order = (0, c.get("createdAt") or "")
         else:
             workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
-            check = {"name": c.get("name"), "workflow": workflow, "status": c.get("status"),
+            check = {"name": c.get("name"), "workflow": workflow, "status": finished_status(c),
                      "conclusion": c.get("conclusion"), "url": c.get("detailsUrl"), "id": c.get("id"),
                      "runId": run_id or None, "startedAt": c.get("startedAt"), "completedAt": c.get("completedAt")}
-            if c.get("status") != "COMPLETED" and c.get("databaseId"):
+            if check["status"] != "COMPLETED" and c.get("databaseId"):
                 check["jobId"] = c["databaseId"]  # an unfinished run's Actions job, for straggler_cut's jobs read
             # databaseId first: a queued rerun has no startedAt yet but is still the newer attempt
             order = (c.get("databaseId") or 0, c.get("startedAt") or "")
@@ -6510,6 +6566,21 @@ def heads_repos(keys: list[str]) -> list[str]:
     return out
 
 
+def finished_status(node: dict) -> str:
+    """A check run NODE's status, COMPLETED when it carries a conclusion and a completion time, whatever its status
+    says (GraphQL `completedAt`, REST `completed_at`; the case of the status is kept). GitHub keeps torn records:
+    manaflow-ai/cmux#52236's "cmux-next push head preflight" at dd25ad19 read IN_PROGRESS beside SUCCESS and a
+    completedAt 7 s after it started (job 137944317666, its run completed success at 19:29Z), so its head never read
+    settled, every wait on it was "running", and glaeda land stopped it checks_stuck after 409 min. A conclusion
+    without its completion time is still unfinished: the one rule land_judge's _is_finished and hq's handbook page
+    finished-check-read-as-running keep, so the daemon and the judge never disagree on whether a check ended."""
+    status = str(node.get("status") or "")
+    if status.lower() == "completed" or node.get("conclusion") is None \
+            or not (node.get("completedAt") or node.get("completed_at")):
+        return status
+    return "completed" if status.islower() else "COMPLETED"
+
+
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
                   order: dict | None = None, failed: dict | None = None) -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
@@ -6534,9 +6605,10 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         owner = (((suite.get("workflowRun") or {}).get("workflow") or {}).get("name") or slug or "check")
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
-        runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
+        status = finished_status(item).lower()
+        runs.setdefault(key, []).append((item.get("databaseId") or 0, status, conclusion))
         if order is not None:  # head_data's `runs`: each run's own id and times, and its identity (run_identity)
-            order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
+            order.setdefault(key, []).append([item.get("databaseId") or 0, status,
                                               conclusion, item.get("startedAt") or "", item.get("completedAt") or "",
                                               run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
@@ -6874,7 +6946,7 @@ class Daemon:
         self.login_cause = ""  # why the most recent request went on the login (note_login_fallback's cause), or ""
         # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
         # every read on the login.
-        chain = app_pool_chain(APP_POOL_SPARES)
+        chain = app_pool_chain(app_pool_roles())
         self.app_pool: AppPool | None = (
             AppPool(role=chain[0], clock=lambda: self.clock()).with_spares(chain[1:]).restore_bench()
             if app_pool == "auto" else app_pool)
@@ -10139,15 +10211,42 @@ class Daemon:
         for e in waited:
             by_repo.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)
         chunks: list[list[dict]] = []
-        for group in sorted(by_repo.values(), key=len, reverse=True):
-            for i in range(0, len(group), WAITED_POOL_CHUNK):
-                chunks.append(group[i:i + WAITED_POOL_CHUNK])
-        chunks.sort(key=lambda g: min(self.deferred_since.get(e["key"], self.now) for e in g))
-        chunks = chunks[:WAITED_POOL_WORKERS]
+
+        def data_at(e: dict) -> float:  # never stored (0) first, then the oldest data
+            at = (e.get("cache") or {}).get("dataAt")
+            return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
+        for repo, group in sorted(by_repo.items(), key=lambda kv: len(kv[1]), reverse=True):
+            group.sort(key=data_at)  # the oldest data of a repository in the first chunk, not whichever came first
+            size = self.waited_pool_chunk(repo)
+            for i in range(0, len(group), size):
+                chunks.append(group[i:i + size])
+        chunks.sort(key=lambda g: (min(data_at(e) for e in g),
+                                   min(self.deferred_since.get(e["key"], self.now) for e in g)))
+        # the same PRs in flight as WAITED_POOL_WORKERS full chunks, in as many workers as their cost needs
+        cap, taken, picked = WAITED_POOL_WORKERS * WAITED_POOL_CHUNK, 0, []
+        for g in chunks:
+            if len(picked) >= max(WAITED_POOL_WORKERS, WAITED_POOL_WORKERS_MAX) or (picked and taken + len(g) > cap):
+                break
+            picked.append(g)
+            taken += len(g)
+        chunks = picked
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="waited-pr")
         futures = [pool.submit(land_direct_read_many, [e["key"] for e in g], WAITED_POOL_BUDGET) for g in chunks]
         pool.shutdown(wait=False)
         return futures, [e for g in chunks for e in g]
+
+    def waited_pool_chunk(self, repo: str) -> int:
+        """How many of REPO's waited PRs one pool worker takes: WAITED_POOL_CHUNK, or fewer when the repository's measured
+        seconds a full read (full_pr_secs, or a cut query's hold while it lasts) would not fit WAITED_POOL_FILL of the
+        worker's WAITED_POOL_BUDGET."""
+        secs = (self.__dict__.get("full_pr_secs") or {}).get(repo)
+        hold = (self.__dict__.get("full_pr_secs_held") or {}).get(repo)
+        if hold is not None and self.now - hold[1] < MEASURE_HOLD_S:
+            secs = max(secs or 0.0, hold[0])
+        if not secs:
+            return WAITED_POOL_CHUNK
+        return max(1, min(WAITED_POOL_CHUNK, int(WAITED_POOL_BUDGET * WAITED_POOL_FILL / secs)))
 
     def finish_waited_pool(self, futures: list[concurrent.futures.Future], handed: list[dict]) -> None:
         """Wait for the workers (their own budget bounds them), then put back for the serial read any entry one could not
@@ -10449,7 +10548,10 @@ class Daemon:
                            # a reader came after the last fetch: a rerun or reopen may have changed it
                            or e["touched"] > c.get("fetchedAt", 0)):
                 since = self.now - c.get("fetchedAt", 0)
-                if kind == "run" and c.get("missing") and not c.get("data") and since < RUN_MISSING_RETRY \
+                if kind == "run" and since < RUN_MISSING_RETRY and (
+                        (c.get("missing") and not c.get("data"))
+                        # a run GraphQL no longer finds (deleted) keeps its old data and was read every cycle for ever
+                        or str(c.get("error") or "").startswith("graphql: no workflow run at this URL")) \
                         and not (self.waited(e) and self.wait_start(e) > c.get("fetchedAt", 0)):  # a new wait is read once
                     continue  # not found: settled, asked again only now and then (it was read every cycle)
                 if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
@@ -11093,7 +11195,7 @@ class Daemon:
             if lead is not None:
                 self.waited_tried[lead["key"]] = self.now
                 with self.waited_spend():
-                    left = self.batched("pr", [lead], lambda chunk: self.fetch_aliased(chunk, "pr"))
+                    left = self.batched("pr", [lead], self.fetch_full_sized)
                 if left and self.rest_admits("pr", lead):
                     self.read_rest(left, left)
                 prs = [e for e in prs if e["key"] != lead["key"]]
@@ -11120,7 +11222,10 @@ class Daemon:
                     self.errors.append(f"waited: {error}")
                     return
                 full += changed
-            for kind, todo, fetch in (("pr", full, lambda chunk: self.fetch_aliased(chunk, "pr")),
+            # Full reads sized by the measure (fetch_full_sized), as every other path: this pass sent whole chunks of
+            # the batch size, 5 or 10 cmux PRs a query that GitHub cut at 10.5 s, tick after tick (cmux-cp-2,
+            # 2026-11-28 02-03Z: 127 PR reads stored in 600 s, 475 of the tick's 536 s in read pr, data 38+ min old).
+            for kind, todo, fetch in (("pr", full, self.fetch_full_sized),
                                       ("run", runs, self.graphql_fetch["run"])):
                 size = max(1, self.batch[kind])
                 for i in range(0, len(todo), size):
@@ -12696,6 +12801,7 @@ class Daemon:
                         kept.add(i)
                         continue
                     commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+                    self.page_more_suites("/".join(split_key(entries[i]["key"])[1:3]), commit)
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
         suite_runs, suites_error = self.suite_runs(
@@ -13025,9 +13131,16 @@ class Daemon:
             full += changed
         # The full reads in queries sized by their measured cost (PR_FULL_QUERY_SECONDS), not the batch's size. One that
         # fails stops the rest: batched() splits the chunk, and the PRs read here are probed then, which is cheap.
-        size = self.full_pr_size(full)
-        for i in range(0, len(full), size):
-            error = self.fetch_aliased(full[i:i + size], "pr")
+        return self.fetch_full_sized(full) if full else None
+
+    def fetch_full_sized(self, chunk: list[dict]) -> str | None:
+        """Full reads of CHUNK (one repository's) in queries sized by the measured cost (full_pr_size), as fetch_prs
+        sends them. A batched refresh and the waited pool's workers sent the whole chunk (batch 10, halved to 5 after a
+        cut and back up in each throwaway Daemon): 5 cmux PRs a query, cut by GitHub at 10.5 s, 10 of them in 15 minutes
+        on cmux-cp-1 (2026-11-28 02:03Z) after the measure was held, because this path never read it."""
+        size = self.full_pr_size(chunk)
+        for i in range(0, len(chunk), size):
+            error = self.fetch_aliased(chunk[i:i + size], "pr")
             if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
                 return error
         return None
@@ -13066,10 +13179,34 @@ class Daemon:
         per = seconds / len(entries)
         measured = self.__dict__.setdefault(attr, {})
         known = measured.get(repo)
+        path = getattr(self, path_attr, None)
+        held_path = path.with_name(path.name + ".held") if path is not None else None
+        # The holds live in a file beside the measure: the waited pool's workers are Daemons of their own, each loading the
+        # measure at its start, so a hold kept in one instance's memory was lowered again by the next (the 5-PR sawtooth
+        # went on after the in-memory hold: cmux-cp-1, 2026-11-28 01:03-01:18Z, 8 cut queries of 5 in 15 minutes).
+        held = self.__dict__.setdefault(attr + "_held", {})
+        if held_path is not None:
+            with contextlib.suppress(Exception):  # an unreadable hold file is no hold
+                saved = read_json(held_path)
+                for k, v in (saved.items() if isinstance(saved, dict) else ()):
+                    if isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v) \
+                            and (k not in held or held[k][1] < v[1]):
+                        held[k] = (float(v[0]), float(v[1]))
         if answered:
             measured[repo] = per if known is None else known + (per - known) / 3
+            # A cut query's measure is held for MEASURE_HOLD_S: queries of cache-warm PRs answer in 0.5 s a PR and pulled
+            # the measure back down a third a time, so the next query carried 5 again and GitHub cut it at 10.5 s (the
+            # sawtooth: cmux-cp-1, 2026-11-27, 156 cut queries in 80 min, 27 min of ticks).
+            hold = held.get(repo)
+            if hold is not None and self.now - hold[1] < MEASURE_HOLD_S:
+                measured[repo] = max(measured[repo], hold[0])
         elif seconds >= PR_FULL_SLOW_AT:
             floor = seconds * 1.25 / len(entries)
+            held[repo] = (floor, self.now)
+            if held_path is not None:
+                with contextlib.suppress(OSError):
+                    write_json(held_path, {k: [round(v[0], 3), round(v[1], 1)] for k, v in held.items()
+                                           if self.now - v[1] < MEASURE_HOLD_S})
             if known is None or known < floor:
                 measured[repo] = floor
                 log({"event": event, "repo": repo, "seconds": round(floor, 2),
@@ -13424,8 +13561,15 @@ class Daemon:
                 self.refund(e["key"])
             return message
         # Suites whose newest attempt ran nothing, in each head and its check-of-record commit: one read for the batch.
-        attempts = {alias: ran_nothing_suites((data.get(alias) or {}).get("object"))
-                    for i in range(len(entries)) for alias in (f"h{i}", f"m{i}")}
+        attempts = {}
+        for i in range(len(entries)):
+            for alias in (f"h{i}", f"m{i}"):
+                obj = (data.get(alias) or {}).get("object")
+                _, owner, repo, sha = split_key(entries[i]["key"])
+                if alias[0] == "m":  # the check-of-record commit lives in another repository
+                    owner, repo = CHECKS_OF_RECORD.get((owner, repo), (owner, repo))
+                self.page_more_suites(f"{owner}/{repo}", obj, str(sha))
+                attempts[alias] = ran_nothing_suites(obj)
         suite_runs, suites_error = self.suite_runs(
             [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
             route=heads_repos([e["key"] for e in entries]))
@@ -13491,6 +13635,62 @@ class Daemon:
             return [], suites
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
+
+    def page_more_suites(self, repo_key: str, commit: dict | None, oid: str = "") -> None:
+        """Fill COMMIT's checkSuites past its first page (more than 100 suites: a cmux head has up to a few hundred):
+        read the next pages by cursor and append them, so ran_nothing_suites sees every suite and the head's verdict
+        reads whole instead of "more than 100 check suites" (cmux#62623, 2026-11-28: a land verdict that ran out its 229 s
+        merge-check deadline on that partial, 68 cached heads with the same error). Any page that cannot be read leaves
+        the commit as it was: still partial, never greener."""
+        suites = (commit or {}).get("checkSuites")
+        if not isinstance(suites, dict) or not (suites.get("pageInfo") or {}).get("hasNextPage"):
+            return
+        owner, _, name = repo_key.partition("/")
+        oid, cursor = oid or str((commit or {}).get("oid") or ""), (suites.get("pageInfo") or {}).get("endCursor")
+        nodes = list(suites.get("nodes") or [])
+        reason, self.gql_reason = self.gql_reason, "suites-more"
+        try:
+            for _ in range(SUITES_MORE_PAGES):
+                if not (owner and name and oid and cursor):
+                    return
+                doc, error = self.graphql(SUITES_MORE, {"owner": owner, "name": name, "oid": oid, "after": cursor})
+                page = (((doc or {}).get("data") or {}).get("repository") or {}).get("object") or {}
+                page = page.get("checkSuites") if isinstance(page, dict) else None
+                if error or doc.get("errors") or not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                    self.page_suites_rest(repo_key, oid, suites)  # GraphQL stopped or refused: REST pages carry the same
+                    return
+                nodes += page["nodes"]
+                info = page.get("pageInfo") or {}
+                if not info.get("hasNextPage"):
+                    suites["nodes"] = nodes
+                    suites["pageInfo"] = {"hasNextPage": False, "endCursor": info.get("endCursor")}
+                    return
+                cursor = info.get("endCursor")
+        finally:
+            self.gql_reason = reason
+
+    def page_suites_rest(self, repo_key: str, oid: str, suites: dict) -> None:
+        """page_more_suites over REST, for when GraphQL is stopped (rate limited) or refuses a page: GET
+        commits/SHA/check-suites pages carry each suite's node id and its latest run count, the two fields the
+        last-real-attempt read uses. Replaces SUITES' nodes only with every suite read (as many as total_count says);
+        any error or short count leaves the head partial, never greener."""
+        if not (repo_key and oid):
+            return
+        nodes: list[dict] = []
+        total = None
+        for page in range(1, SUITES_MORE_PAGES + 2):
+            state, doc, _ = self.get(f"/repos/{repo_key}/commits/{oid}/check-suites?per_page=100&page={page}", None)
+            listed = doc.get("check_suites") if state != "error" and isinstance(doc, dict) else None
+            if not isinstance(listed, list) or not all(isinstance(c, dict) and c.get("node_id") for c in listed):
+                return
+            total = doc.get("total_count")
+            nodes += [{"id": c["node_id"], "latest": {"totalCount": c.get("latest_check_runs_count")}} for c in listed]
+            if not isinstance(total, int) or len(nodes) >= total or not listed:
+                break
+        if isinstance(total, int) and len(nodes) == total and all(
+                isinstance((n["latest"] or {}).get("totalCount"), int) for n in nodes):
+            suites["nodes"] = nodes
+            suites["pageInfo"] = {"hasNextPage": False, "endCursor": None}
 
     def suite_runs(self, suites: list[str], paced: bool = True,
                    route: "list[str] | None" = None) -> tuple[dict[str, list[dict] | str], str | None]:
@@ -13867,7 +14067,15 @@ class Daemon:
         # is also why it is the one read the REST share does not hold back: a wait cannot rule on a
         # failed run without it, and one request per failed attempt is what keeps every waiter off gh.
         attempt = run.get("run_attempt") or 1
-        failed_attempt = (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
+        # A completed re-run that passed, holding the failed list of an attempt before it (cmux#63263, 2026-11-28:
+        # run 46098181805's attempt 2 passed, yet its kept list stayed attempt 1's two failed jobs, "attempt 2 not
+        # read yet", in every `status --jobs` and land-judge read, so the land refused it on reds gone for good): a
+        # list that names a failure the run no longer has is read once for the new attempt, like a failed one.
+        superseded_red = (0 < jobs_attempt(prior.get("jobs")) < attempt
+                          and any(isinstance(j, dict) and j.get("conclusion") not in (None, *RUN_OK)
+                                  for j in prior.get("jobs") or []))
+        failed_attempt = (run.get("status") == "completed"
+                          and (run.get("conclusion") not in RUN_OK or superseded_red)
                           and self.mode("rest") != "stop"
                           and (fresh or jobs_attempt(prior.get("jobs")) < attempt)
                           # past the REST share, once per attempt, answered or not: an error or an empty
@@ -15919,7 +16127,7 @@ def land_own_token_pool(now: float | None = None) -> bool:
     as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
     through the broker and holds none reads GitHub only through the broker (LAND_PEER_SILENT's comment)."""
     tool = app_pool_tool()
-    for role in app_pool_chain(APP_POOL_SPARES):
+    for role in app_pool_chain(app_pool_roles(now)):
         if tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file():
             return True
         if app_pool_pushed_owners(role, now):
@@ -16138,7 +16346,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
                      "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
-                left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
+                left = daemon.batched("pr", full, daemon.fetch_full_sized) if full else []
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")
@@ -18545,7 +18753,8 @@ LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_c
 # on it as a command, and a person or agent ran it and landed again (cmux#57574 and #56907, 2026-11-26). Now the queue
 # sends it itself, in the background (`--background`: the controller queues it and the client returns), for the
 # judged head only, and waits LAND_COMPILE_WAIT before judging again; a head still missing its compile after that is
-# sent once more with `--urgent` (the controller moves a queued check ahead), and past LAND_COMPILE_SENDS sends it
+# sent once more with `--urgent` in place of `--background` (the controller moves a queued check ahead; the client
+# refuses the two together, which stopped cmux#61298 on 2026-11-27), and past LAND_COMPILE_SENDS sends it
 # stops as before, naming the command. Only that exact command, for a compile_missing answer at the judged head.
 LAND_COMMAND_COMPILE = re.compile(r"\s*cmux-ci compile-check --ref ([0-9a-f]{40}) --app --release\s*")
 LAND_COMPILE_WAIT = 600.0
@@ -22589,6 +22798,11 @@ class LandQueue:
             self.ended(e, state, merge_sha, "re-arm: the PR's cached state shows it")
             return False
         at = float(st.get("at") or 0)
+        # An OPEN copy read before the stop is no proof the PR is still open: manaflow-ai/cmux#52236 closed at
+        # 2026-11-24 10:49Z and was re-armed and judged hour after hour on its OPEN copy until 00:03Z, as a red it
+        # could never land. Its state is read before the re-armed judgment (state_first), once.
+        read_at = (self.cache_of(e["key"]) or {}).get("dataAt")
+        stale_copy = not isinstance(read_at, (int, float)) or isinstance(read_at, bool) or read_at < at
         cleared = code == "retry_deadline" and self.mh_changed_at > at
         latched = code == "retry_deadline" and self.latch_owed(e, at)
         if not cleared and not latched and self.now - at < LAND_REARM_AFTER:
@@ -22601,6 +22815,8 @@ class LandQueue:
         e["rearms"] = {"day": day, "n": n + 1, "at": self.now, "code": code}  # attributable to the stop it answered
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
+        if stale_copy:
+            e["stateFirst"] = "re-armed on a copy read before its stop"
         if latched:
             e["waitBudget"] = None  # its budget was spent by the latch, not by land_judge: a whole one
         why = "land_judge's checkout was refreshed" if cleared else "the login's latch that held it cleared" \
@@ -27669,8 +27885,8 @@ class LandQueue:
                           f"verdict: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
             return
         argv = [self.path("cmuxCi", Path(shutil.which("cmux-ci") or "cmux-ci")).as_posix(), "compile-check",
-                "--ref", head, "--app", "--release", "--background",
-                "--reason", f"glaeda land {e['repo']}#{e['number']}"] + (["--urgent"] if n else [])
+                "--ref", head, "--app", "--release", "--urgent" if n else "--background",
+                "--reason", f"glaeda land {e['repo']}#{e['number']}"]
         with self.lock:
             self.claim(e, "compile_check", head=head, n=n + 1)
             e["compileSent"] = {"head": head, "n": n + 1, "at": self.now}
@@ -29048,8 +29264,9 @@ class LandQueue:
 
     def state_due(self, e: dict, kind: str | None) -> bool:
         """Under the lock. Whether the PR's state is read before KIND is taken: GitHub said the PR is closed
-        (closedSeen), or a base-changing step on an upstream host's copy older than LAND_REFRESH_AFTER."""
-        if e.get("closedSeen"):
+        (closedSeen), E was re-armed on a copy read before its stop (stateFirst: rearm), or a base-changing step on an
+        upstream host's copy older than LAND_REFRESH_AFTER."""
+        if e.get("closedSeen") or e.get("stateFirst"):
             return True
         if kind not in LAND_STATE_FIRST_KINDS or not self.reads_upstream():
             return False
@@ -29070,11 +29287,13 @@ class LandQueue:
             self.check(e)
             seen = e.get("closedSeen") or {}
             self.history(e, "state_read", state=state or "unreadable", before=kind,
-                         why="GitHub said it is closed" if seen else "stale copy before a base-changing step")
+                         why="GitHub said it is closed" if seen else e.get("stateFirst")
+                         or "stale copy before a base-changing step")
             if self.ended(e, state, merge_sha, "a state read shows it"):
                 return False
             if state == "OPEN":
                 e.pop("closedSeen", None)
+                e.pop("stateFirst", None)
                 e.pop("stateUnread", None)
                 e["stateReadAt"] = self.now
                 if seen:

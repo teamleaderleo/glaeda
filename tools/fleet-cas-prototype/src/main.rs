@@ -396,8 +396,13 @@ struct Store {
     /// Answer Xcode (a unix-socket node): drop the signature entry, which is
     /// not part of Xcode's record. A fleet store keeps it for its readers.
     strip_signatures: bool,
-    /// Unix millis until which fleet-store calls are skipped after a failure.
+    /// Unix millis until which fleet-store calls are skipped after the store
+    /// could not be reached (refused, reset, no connection).
     upstream_down_until: AtomicU64,
+    /// Unix millis until which fleet-store lookups (not writes) are skipped
+    /// after a call timed out: a busy store answers lookups as local misses
+    /// for a while, but the writes a marker needs still go through.
+    reads_down_until: AtomicU64,
     stats: Stats,
     /// The lookups, puts and errors of each TCP peer, for `/stats`.
     clients: window::Clients,
@@ -433,6 +438,27 @@ fn retryable_write(e: &Status) -> bool {
     matches!(
         classify_failure(e),
         UpstreamFailureCode::Timeout | UpstreamFailureCode::Unavailable
+    )
+}
+
+/// Writes forwarded to the fleet store at once, and how long a write waits
+/// for a turn. All of a node's calls share one HTTP/2 connection, and the
+/// channel's 30 s deadline starts when a call is handed to it: an Xcode build
+/// that put thousands of objects at once had them queue on that connection
+/// until some ran out their deadline while the store answered each in
+/// milliseconds (cmux15 catch-up fills, 2026-11-27: 12 "Timeout expired"
+/// writes in one fill, store errors 0). A write now waits here, where waiting
+/// costs no deadline, and its 30 s starts when it is sent.
+const UPSTREAM_WRITES: usize = 32;
+const UPSTREAM_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+static UPSTREAM_WRITE_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(UPSTREAM_WRITES));
+
+/// A lookup, which degrades to a local miss; a write fails the marker.
+const fn is_read(operation: UpstreamOperation) -> bool {
+    matches!(
+        operation,
+        UpstreamOperation::CasGet | UpstreamOperation::KvGet | UpstreamOperation::ClosureGet
     )
 }
 
@@ -535,6 +561,11 @@ fn upstream_err(e: Status) -> Status {
 }
 
 fn classify_failure(error: &Status) -> UpstreamFailureCode {
+    // tonic reports the channel's own per-call timeout as Cancelled with
+    // "Timeout expired": that is a timeout, not an unreachable store.
+    if error.message().contains("Timeout expired") {
+        return UpstreamFailureCode::Timeout;
+    }
     match error.code() {
         tonic::Code::DeadlineExceeded => UpstreamFailureCode::Timeout,
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
@@ -545,7 +576,6 @@ fn classify_failure(error: &Status) -> UpstreamFailureCode {
         | tonic::Code::FailedPrecondition
         | tonic::Code::DataLoss
         | tonic::Code::Internal => UpstreamFailureCode::Protocol,
-        _ if error.message().contains("Timeout expired") => UpstreamFailureCode::Timeout,
         _ => UpstreamFailureCode::Other,
     }
 }
@@ -751,7 +781,9 @@ impl Store {
     }
 
     fn upstream_backing_off(&self, operation: UpstreamOperation) -> bool {
-        let skip = now_ms() < self.upstream_down_until.load(Relaxed);
+        let now = now_ms();
+        let skip = now < self.upstream_down_until.load(Relaxed)
+            || (is_read(operation) && now < self.reads_down_until.load(Relaxed));
         if skip {
             self.stats.up_skipped.fetch_add(1, Relaxed);
             self.stats.record_skip(operation);
@@ -767,31 +799,52 @@ impl Store {
     }
 
     /// A fleet-store call failed: count it, log it (the first few, then every
-    /// hundredth, so an outage cannot flood the log), and back off.
+    /// hundredth, so an outage cannot flood the log), and back off. A store
+    /// that cannot be reached skips every call for a while. A timeout skips
+    /// only lookups: one slow write used to skip every write for 30 s, and
+    /// any skipped write voids the fill's marker (cmux15, 2026-11-27: 12
+    /// timeouts, 1310 writes skipped, no marker in 10 fills).
     fn upstream_failed(&self, operation: UpstreamOperation, code: UpstreamFailureCode, what: &str) {
         let n = self.stats.up_errors.fetch_add(1, Relaxed);
         self.stats.record_failure(operation, code);
         if n < 5 || n % 100 == 0 {
             eprintln!("fleet store call failed ({} so far): {what}", n + 1);
         }
-        self.upstream_down_until
-            .store(now_ms() + UPSTREAM_BACKOFF_MS, Relaxed);
+        let until = now_ms() + UPSTREAM_BACKOFF_MS;
+        match code {
+            UpstreamFailureCode::Timeout => self.reads_down_until.store(until, Relaxed),
+            _ => self.upstream_down_until.store(until, Relaxed),
+        }
     }
 
-    /// Forward one write, retrying a transient failure (with a short pause)
-    /// up to WRITE_ATTEMPTS times; only the last failure is returned.
-    async fn forward_write<T, F, Fut>(
+    /// Forward one write: wait for a write slot (no deadline runs while it
+    /// waits), send it, and retry a transient failure (a timeout or an
+    /// unavailable store) up to WRITE_ATTEMPTS tries in all, so one slow or
+    /// dropped answer does not void the marker. The slot is taken per try and
+    /// released before the pause, so a backing-off write holds no slot.
+    async fn forward_write<T, Fut>(
         &self,
         operation: UpstreamOperation,
-        mut call: F,
+        mut call: impl FnMut() -> Fut,
     ) -> Result<T, Status>
     where
-        F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
         let mut attempt = 1;
         loop {
-            match self.stats.upstream(operation, call()).await {
+            let wait = tokio::time::timeout(UPSTREAM_WRITE_WAIT, UPSTREAM_WRITE_SLOTS.acquire());
+            let slot = match wait.await {
+                Ok(Ok(slot)) => slot,
+                Ok(Err(_)) => return Err(Status::unavailable("write slots closed")),
+                Err(_) => {
+                    return Err(Status::deadline_exceeded(
+                        "Timeout expired waiting for a write slot",
+                    ));
+                }
+            };
+            let result = self.stats.upstream(operation, call()).await;
+            drop(slot);
+            match result {
                 Err(e) if attempt < WRITE_ATTEMPTS && retryable_write(&e) => {
                     self.stats.up_write_retries.fetch_add(1, Relaxed);
                     tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
@@ -895,11 +948,11 @@ impl Store {
             if self.upstream_backing_off(UpstreamOperation::CasPut) {
                 return Err(self.write_unavailable(UpstreamOperation::CasPut, None));
             }
+            let req = cas::CasPutRequest { data: Some(obj) };
             let resp = self
                 .forward_write(UpstreamOperation::CasPut, || {
-                    up.cas.clone().put(cas::CasPutRequest {
-                        data: Some(obj.clone()),
-                    })
+                    let (mut client, req) = (up.cas.clone(), req.clone());
+                    async move { client.put(req).await }
                 })
                 .await
                 .map_err(|e| self.write_unavailable(UpstreamOperation::CasPut, Some(e)))?
@@ -1358,7 +1411,10 @@ impl Store {
                 value: Some(value.clone()),
             };
             let resp = s
-                .forward_write(UpstreamOperation::KvPut, || up.kv.clone().put_value(fwd.clone()))
+                .forward_write(UpstreamOperation::KvPut, || {
+                    let (mut client, fwd) = (up.kv.clone(), fwd.clone());
+                    async move { client.put_value(fwd).await }
+                })
                 .await
                 .map_err(|e| s.write_unavailable(UpstreamOperation::KvPut, Some(e)))?
                 .into_inner();
@@ -1700,9 +1756,10 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let upstream = match &upstream_url {
         Some(url) => {
             // Lazy: the node starts (and serves local hits) while the fleet
-            // store is down. Each call is bounded, and after a failure calls
-            // are skipped for UPSTREAM_BACKOFF_MS, so a dead store costs a
-            // build at most one timeout per backoff window.
+            // store is down. Each call is bounded; after the store cannot be
+            // reached every call is skipped for UPSTREAM_BACKOFF_MS, and after
+            // a timeout lookups are, so a dead or slow store costs a build at
+            // most one timeout per backoff window (writes: see forward_write).
             let ch = tonic::transport::Endpoint::from_shared(url.clone())?
                 .tcp_nodelay(true)
                 .connect_timeout(std::time::Duration::from_secs(2))
@@ -1735,6 +1792,7 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         trusted,
         strip_signatures: !listen.starts_with("tcp:"),
         upstream_down_until: AtomicU64::new(0),
+        reads_down_until: AtomicU64::new(0),
         stats: Stats {
             instance: AtomicU64::new(now_ms() ^ u64::from(std::process::id()) << 44),
             ..Stats::default()
@@ -2004,6 +2062,84 @@ mod tests {
         assert_eq!(operation.last_success_ms.load(Relaxed), 0);
     }
 
+    fn bare_store() -> Store {
+        Store {
+            root: PathBuf::new(),
+            read_only_kv: false,
+            writers: None,
+            allow_file_paths: false,
+            upstream: None,
+            sign_key: None,
+            trusted: None,
+            strip_signatures: true,
+            upstream_down_until: AtomicU64::new(0),
+            reads_down_until: AtomicU64::new(0),
+            stats: Stats::default(),
+            clients: window::Clients::new(window::MAX_CLIENTS),
+            key_log: None,
+        }
+    }
+
+    #[test]
+    fn the_channels_own_timeout_reads_as_a_timeout() {
+        // What tonic returned on cmux15: Cancelled, "Timeout expired".
+        let e = Status::cancelled("Timeout expired");
+        assert!(matches!(classify_failure(&e), UpstreamFailureCode::Timeout));
+        assert!(matches!(
+            classify_failure(&Status::cancelled("connection reset")),
+            UpstreamFailureCode::Unavailable
+        ));
+    }
+
+    #[test]
+    fn a_timeout_skips_lookups_but_not_writes() {
+        let store = bare_store();
+        store.upstream_failed(UpstreamOperation::CasPut, UpstreamFailureCode::Timeout, "t");
+        assert!(!store.upstream_backing_off(UpstreamOperation::CasPut));
+        assert!(!store.upstream_backing_off(UpstreamOperation::KvPut));
+        assert!(store.upstream_backing_off(UpstreamOperation::KvGet));
+        assert!(store.upstream_backing_off(UpstreamOperation::CasGet));
+    }
+
+    #[test]
+    fn an_unreachable_store_skips_every_call() {
+        let store = bare_store();
+        store.upstream_failed(UpstreamOperation::KvGet, UpstreamFailureCode::Unavailable, "u");
+        for operation in UpstreamOperation::all() {
+            assert!(store.upstream_backing_off(operation), "{}", operation.name());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_write_is_sent_again() {
+        let store = bare_store();
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let r = store
+            .forward_write(UpstreamOperation::CasPut, || {
+                let n = tries.fetch_add(1, Relaxed);
+                async move {
+                    if n == 0 {
+                        Err(Status::cancelled("Timeout expired"))
+                    } else {
+                        Ok(7_u8)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(tries.load(Relaxed), 2);
+        // Timeouts past WRITE_ATTEMPTS tries are the caller's failure.
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let r = store
+            .forward_write(UpstreamOperation::KvPut, || {
+                tries.fetch_add(1, Relaxed);
+                async { Err::<u8, _>(Status::cancelled("Timeout expired")) }
+            })
+            .await;
+        assert!(r.is_err());
+        assert_eq!(tries.load(Relaxed), WRITE_ATTEMPTS as usize);
+    }
+
     #[test]
     fn failures_and_backoff_skips_have_fixed_safe_attribution() {
         let stats = Stats::default();
@@ -2058,6 +2194,7 @@ mod tests {
             trusted: None,
             strip_signatures: true,
             upstream_down_until: AtomicU64::new(0),
+            reads_down_until: AtomicU64::new(0),
             stats: Stats::default(),
             clients: window::Clients::new(window::MAX_CLIENTS),
             key_log: None,
@@ -2104,6 +2241,7 @@ mod tests {
             trusted: None,
             strip_signatures: true,
             upstream_down_until: AtomicU64::new(0),
+            reads_down_until: AtomicU64::new(0),
             stats: Stats::default(),
             clients: window::Clients::new(window::MAX_CLIENTS),
             key_log: None,
