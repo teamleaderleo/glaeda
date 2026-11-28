@@ -9435,6 +9435,51 @@ class XcodeToolchainTest(unittest.TestCase):
                     why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
                     self.assertEqual(why, "toolchain: xcrun resolves /x", "the Xcode refusal keeps its own words")
 
+    def test_a_missing_receipt_toolchain_is_installed_not_refused(self) -> None:
+        """RUST_SELF_INSTALL: cmux31-glaeda-13 refused hq's synthetic probes (run 46094599116) with "rust toolchain
+        1.100.0-aarch64-apple-darwin is not installed", and nothing re-placed them; installing it took 7 s. The hook
+        installs the receipt's toolchain itself, bounded and under a lock, and refuses only when that fails."""
+        want = {"rustcVersion": "rustc 1.100.0 (0ef1bc386 2026-11-09)", "cargoVersion": "cargo 1.100.0",
+                "zigVersion": "0.16.0", "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+        installed = ["1.95.0-aarch64-apple-darwin (default)"]
+        calls: list[list[str]] = []
+        fail = {"install": False}
+
+        def answer(argv, env, cwd, deadline):
+            calls.append(argv)
+            if argv[:3] == ["rustup", "toolchain", "install"]:
+                if not fail["install"]:
+                    installed.append(argv[3])
+                return ("", False)
+            if argv[:3] == ["rustup", "toolchain", "list"]:
+                return ("\n".join(installed), False)
+            return ({"rustc": "rustc 1.95.0", "cargo": "cargo 1.100.0", "zig": "0.16.0", "python3": "3.13",
+                     "gh": "gh version 2", "xcodebuild": "Xcode 26.6\nBuild version 17F113", "xcrun": "26.5",
+                     "rustup": "Default host: aarch64-apple-darwin"}.get(argv[0], ""), False)
+
+        self.enterContext(mock.patch.object(hook.Path, "home", return_value=self.tmp))
+        self.enterContext(mock.patch.object(hook, "_probe_answer", side_effect=answer))
+        self.enterContext(mock.patch.object(hook, "toolchain_missing", return_value=None))
+        why, note = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertNotIn("is not installed", why or "", "the missing toolchain is installed, not refused")
+        self.assertIn("installed rust toolchain 1.100.0-aarch64-apple-darwin", note)
+        self.assertIn(["rustup", "toolchain", "install", "1.100.0-aarch64-apple-darwin", "--profile", "minimal",
+                       "--no-self-update"], calls)
+        self.assertTrue((self.tmp / hook.RUST_INSTALL_LOCK).exists(), "the install ran under the lock")
+        calls.clear()
+        hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertFalse(any(c[:3] == ["rustup", "toolchain", "install"] for c in calls), "installed once")
+        installed[:] = ["1.95.0-aarch64-apple-darwin (default)"]
+        fail["install"] = True
+        why, _ = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertIn("rust toolchain 1.100.0-aarch64-apple-darwin is not installed; rustup toolchain install", why)
+        with mock.patch.object(hook, "RUST_SELF_INSTALL", False):
+            calls.clear()
+            why, _ = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+            self.assertIn("self-install is off", why)
+            self.assertFalse(any(c[:3] == ["rustup", "toolchain", "install"] for c in calls))
+        self.assertEqual(hook.install_receipt_toolchain("1.1.1-x; rm -rf ~", {}, self.tmp)[0], False)
+
     def test_a_busy_node_whose_probes_run_out_of_time_is_admitted_not_refused(self) -> None:
         """A busy machine makes a job slower, never makes it fail. cmux8s-mac-mini-glaeda-13 at load ~200 failed the
         cmux app compile at "Set up runner" (manaflow-ai/cmux run 43683149857) because its probes ran out of time,
@@ -12769,6 +12814,54 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"),
                                         self.state).confirmed(), "a root runner's compiles need no console")
             read.assert_not_called()
+
+    def test_job_started_eligibility_refusal_holds_every_gate_at_once(self) -> None:
+        # INELIGIBLE_AT_ONCE: cmux31, 2026-11-28: job-started refused synthetic-probes' notify-banner-click for a
+        # missing pinned rustc while the gate kept listening; the refusal itself now holds every gate on the mini.
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m5pro-24 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        why = "node not eligible (rust toolchain 1.100.0-aarch64-apple-darwin is not installed)"
+        hook.note_eligibility_refusal(self.state, "node not eligible (the state probe timed out after 20s)")
+        self.assertIsNone(hook.eligibility_refused(self.state), "a probe timeout is a busy mini, no evidence")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = mock.patch.object(hook, "toolchain_missing", return_value=None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        def settle() -> None:
+            if gate.eligible_look is not None:
+                gate.eligible_look.join(120)
+
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            self.assertIsNone(gate.claimed())
+            settle()
+            self.assertIsNone(gate.claimed(), "eligible by the gate's own look")
+        hook.note_eligibility_refusal(self.state, why)
+        self.assertEqual(hook.eligibility_refused(self.state)[0], why)
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
+            self.assertEqual(gate.claimed(), f"ineligible: {why}", "held at the next poll, no recheck")
+            self.assertEqual(gate.job_end(), f"ineligible: {why}", "the listener stops before its next job")
+            settle()
+            self.assertEqual(look.call_count, 1, "the refusal starts a fresh look at once")
+            self.assertEqual(gate.claimed(), f"ineligible: {why}", "the look agrees: still held")
+        other = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(other, "saturated", return_value=None), \
+                mock.patch.object(other, "hot", return_value=None), \
+                mock.patch.object(hook, "eligibility_refusal", return_value=why):
+            self.assertEqual(other.claimed(), f"ineligible: {why}", "every gate on the mini, a new one too")
+            other.eligible_look.join(120)
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "a look after the refusal finds it eligible: listening again")
+        self.assertIsNone(hook.eligibility_refused(self.state), "and the note is gone")
 
     def test_a_require_eligible_runner_holds_while_its_node_would_be_refused(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

@@ -3298,6 +3298,16 @@ GATE_ELIGIBLE_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_LOO
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
+# INELIGIBLE_AT_ONCE: job-started's own eligibility refusal (node_refusal or toolchain_refusal under
+# --require-eligible), written to the mini's state dir, so every gate on the mini holds its listener off at its next
+# poll instead of waiting for its own look (GATE_ELIGIBLE_EVERY_S, then a recheck). The admit is the authority: a job
+# it refused is a job the gate let through, and every further job the listener takes fails the same way in "Set up
+# runner". cmux31's runners (m5pro-24 receipt pinning rustc 1.100.0, not installed) refused jobs from 2026-11-27
+# 23:38Z to a hand install at 01:54Z, one of them synthetic-probes' notify-banner-click (cmuxterm-hq run
+# 46092564119), which read as a probe red. Held, a gate listens again only once a look it started after the refusal
+# finds the node eligible; that look also removes the note. A refusal that names a probe timeout is no evidence (a
+# busy mini) and writes no note: the gate's own recheck decides those.
+ELIGIBILITY_REFUSED_FILE = "eligibility-refused.json"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
@@ -4441,6 +4451,60 @@ def fleet_toolchain_missing(home: Path | None = None) -> str | None:
     return toolchain_missing(workload_env(), home)
 
 
+# RUST_SELF_INSTALL: a node whose receipt names a rustup toolchain it lacks installs it (bounded, under a per-user
+# lock), instead of refusing the job. 2026-11-27: cmux31's class receipt moved to rustc 1.100.0 while the mini had
+# only 1.95.0, so cmux31-glaeda-13 refused every job at setup with "rust toolchain 1.100.0-aarch64-apple-darwin is
+# not installed" (hq synthetic-probes, run 46094599116), and that workflow_dispatch had no rescue to re-place it.
+# By hand the install took 7 s. Leo: "YOU MUST FIX THESE TYPES OF THINGS ASAP. ALL." The gate's look installs too,
+# so a held listener heals itself instead of waiting for mini-health. GLAEDA_RUNNER_RUST_SELF_INSTALL=0 turns it off.
+RUST_SELF_INSTALL = os.environ.get("GLAEDA_RUNNER_RUST_SELF_INSTALL", "1") != "0"
+RUST_INSTALL_BUDGET_S = float(os.environ.get("GLAEDA_RUNNER_RUST_INSTALL_BUDGET_S") or 300.0)
+RUST_INSTALL_LOCK = ".cache/glaeda/rust-toolchain-install.lock"  # under home: one install per user at a time
+RUST_TOOLCHAIN_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def install_receipt_toolchain(toolchain: str, env: dict[str, str], home: Path) -> tuple[bool, str]:
+    """(installed, note): rustup toolchain install TOOLCHAIN --profile minimal, at most RUST_INSTALL_BUDGET_S in
+    all (the lock wait included), under RUST_INSTALL_LOCK so the runners of one user install it once. A toolchain
+    another runner installed while this one waited counts as installed."""
+    if not RUST_SELF_INSTALL:
+        return False, "self-install is off (GLAEDA_RUNNER_RUST_SELF_INSTALL=0)"
+    if not RUST_TOOLCHAIN_NAME.fullmatch(toolchain):
+        return False, f"refused to install an unsafe toolchain name {toolchain!r}"
+    deadline = time.monotonic() + RUST_INSTALL_BUDGET_S
+
+    def listed() -> bool:
+        out = _probe(["rustup", "toolchain", "list"], env, home, max(deadline, time.monotonic() + 10))
+        return any(line.split()[0] == toolchain for line in out.splitlines() if line.strip())
+
+    lock = home / RUST_INSTALL_LOCK
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return False, f"cannot open {lock}: {e}"
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False, f"another install held {lock} past {RUST_INSTALL_BUDGET_S:.0f} s"
+                time.sleep(1.0)
+        if listed():
+            return True, f"rust toolchain {toolchain} was installed by another runner here"
+        started = time.monotonic()
+        out, timed_out = _probe_answer(["rustup", "toolchain", "install", toolchain, "--profile", "minimal",
+                                        "--no-self-update"], env, home, deadline)
+        if not listed():
+            why = "timed out" if timed_out else "failed"
+            return False, f"rustup toolchain install {toolchain} {why} after {time.monotonic() - started:.0f} s"
+        return True, f"installed rust toolchain {toolchain} in {time.monotonic() - started:.0f} s (RUST_SELF_INSTALL)"
+    finally:
+        os.close(fd)
+
+
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
     """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
     match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
@@ -4492,7 +4556,13 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                                                  str(want.get("rustcVersion") or "")))), note
         names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
                  if line.strip()]
-        if toolchain not in names:
+        if toolchain not in names and names:
+            installed, why = install_receipt_toolchain(toolchain, env, home)
+            if not installed:
+                return f"node not eligible (rust toolchain {toolchain} is not installed; {why})", note
+            note = why
+            deadline = time.monotonic() + ELIGIBILITY_BUDGET_S  # the install spent the probes' budget
+        elif toolchain not in names:
             return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)", not names), note
         if align:
             current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
@@ -4501,7 +4571,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             if now != [toolchain]:
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
-            note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            note = "; ".join(x for x in (note, f"set the rustup default to {toolchain} "
+                                               f"(was {current[0] if current else 'none'})") if x)
             # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
             # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
             # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
@@ -4509,7 +4580,7 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
-            note = f"would set the rustup default to {toolchain}"
+            note = "; ".join(x for x in (note, f"would set the rustup default to {toolchain}") if x)
     python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return out_of_time(f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile "
@@ -12286,6 +12357,10 @@ class Gate:
         if self.eligible_why and TOOLCHAIN_MISSING in self.eligible_why:
             self.eligible_why = None  # never carried across a reload: the per-poll check reads it afresh
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
+        # INELIGIBLE_AT_ONCE: job-started's refusal note this gate holds for, its mtime, and when the gate saw it
+        self.refused_why: str | None = None
+        self.refused_stamp = 0
+        self.refused_seen_at = 0.0
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
@@ -13637,8 +13712,15 @@ class Gate:
             gate_log(f"the eligibility look has not answered in {now - self.eligible_at:.0f} s; starting a new one")
             self.eligible_gen += 1
             running = False
+        note = eligibility_refused(self.state_dir)  # INELIGIBLE_AT_ONCE: one stat and a small read per poll
+        if note is not None and note[1] != self.refused_stamp:
+            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], now
+            gate_log(f"job-started refused a job here: {note[0]}; held off at once so another runner takes the "
+                     "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
+            if not running:
+                self.eligible_at = -GATE_ELIGIBLE_EVERY_S  # the look that may release it starts now
         if not running and now - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
-            self.eligible_at = now
+            self.eligible_at = started = now
             self.eligible_gen += 1
             gen = self.eligible_gen
             if self.eligible_first_at is None:
@@ -13651,10 +13733,24 @@ class Gate:
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
                 if gen != self.eligible_gen:
-                    return  # replaced (ELIGIBLE_LOOK_BOUND): a newer look owns the answer
+                    return  # replaced (ELIGIBLE_LOOK_BOUND): a newer look owns the answer, and a refusal's release
                 self.eligible_looked = True
+                if self.refused_why is not None:
+                    if why is None and started >= self.refused_seen_at:
+                        gate_log(f"a look after job-started's refusal finds the node eligible; listening again "
+                                 f"(was: {self.refused_why})")
+                        clear_eligibility_refusal(self.state_dir, self.refused_stamp)
+                        self.refused_why = None
+                    elif why is None:  # a look that began before the refusal says nothing about it: look again
+                        self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
                 if why and TOOLCHAIN_MISSING in why:
                     return  # the per-poll toolchain_missing owns that answer; the held one, if any, stands
+                if why and self.refused_why is not None:
+                    self.eligible_new = None  # job-started already refused: no recheck needed to hold
+                    if why != self.eligible_why:
+                        gate_log(f"eligibility: {why}; held off so another runner takes the job")
+                    self.eligible_why = why
+                    return
                 if why and not self.eligible_why and not self.eligible_new:
                     self.eligible_new = why  # look again soon; hold only if that look refuses too
                     self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
@@ -13667,7 +13763,7 @@ class Gate:
 
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
-        if self.child is None and not self.eligible_why:
+        if self.child is None and not self.eligible_why and not self.refused_why:
             # FIRST_LOOK_FIRST: with no listener up, nothing is lost by waiting for the look, and a listener started
             # first took jobs that job-started then refused for the very eligibility the look was reading
             if self.eligible_new:
@@ -13675,7 +13771,8 @@ class Gate:
             if not self.eligible_looked and self.eligible_first_at is not None \
                     and now - self.eligible_first_at < GATE_FIRST_LOOK_MAX_S:
                 return "ineligible: waiting for the first eligibility look before the listener starts"
-        return f"ineligible: {self.eligible_why}" if self.eligible_why else None
+        held = self.eligible_why or self.refused_why
+        return f"ineligible: {held}" if held else None
 
     def off_tailnet(self) -> str | None:
         """Why this mini is off the tailnet, from the last looks (GATE_TAILNET_EVERY_S, in a thread so no poll waits on
@@ -13863,7 +13960,8 @@ class Gate:
         with contextlib.suppress(OSError):
             self.job_end_marker().unlink()
         try:
-            return self.full(fresh=True)
+            # INELIGIBLE_AT_ONCE: a job job-started refused for eligibility stops the listener before its next job
+            return self.full(fresh=True) or self.ineligible()
         except Exception:  # noqa: BLE001  (the regular poll looks again)
             return None
 
@@ -14636,6 +14734,36 @@ def note_waiter_refusal(state_dir: Path, why: str) -> None:
         # runners), so a plain utime could repeat the last stamp and the gates would miss the new refusal.
         stamp = max(time.time_ns(), last + 1_000)
         os.utime(path, ns=(stamp, stamp))
+
+
+def note_eligibility_refusal(state_dir: Path, why: str) -> None:
+    """INELIGIBLE_AT_ONCE: record job-started's eligibility refusal for every gate on this mini. Never raises."""
+    if "timed out" in why:
+        return
+    with contextlib.suppress(OSError):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = state_dir / f".{ELIGIBILITY_REFUSED_FILE}.{os.getpid()}"
+        tmp.write_text(json.dumps({"why": why, "at": time.time()}) + "\n")
+        os.replace(tmp, state_dir / ELIGIBILITY_REFUSED_FILE)
+
+
+def eligibility_refused(state_dir: Path) -> tuple[str, int] | None:
+    """(why, the note's mtime in ns) for job-started's last eligibility refusal on this mini, or None."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    try:
+        stamp = path.stat().st_mtime_ns
+        why = json.loads(path.read_text()).get("why")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (why, stamp) if isinstance(why, str) and why else None
+
+
+def clear_eligibility_refusal(state_dir: Path, stamp: int) -> None:
+    """Remove the note when it is still the one with this mtime (a newer refusal stands). Never raises."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    with contextlib.suppress(OSError):
+        if path.stat().st_mtime_ns == stamp:
+            path.unlink()
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:
@@ -17276,6 +17404,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.require_eligible:
             why, want = node_refusal(args.fleet_class)
             if why:
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
         if args.toolchain_xcode:  # the listener's env, which every step inherits (listener_env)
             given = {k: v for k, v in os.environ.items() if k != "SDKROOT" or not under_xcrun_shim(sys.executable)}
@@ -17625,6 +17754,7 @@ def main(argv: list[str] | None = None) -> int:
             why, aligned = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode)
             if why:
                 release_host_lock(args.state_dir)
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
