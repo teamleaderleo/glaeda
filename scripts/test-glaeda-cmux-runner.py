@@ -21119,8 +21119,11 @@ class DedicatedRunnerTest(unittest.TestCase):
             argvs = [e["argv"] for e in self.log() if e["tool"] == "launchctl"]
             self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.relay"], argvs)
             self.assertIn(["bootstrap", "system", os.fspath(daemons / f"{label}.relay.plist")], argvs)
+            # the fake launchctl tracks labels, not domains: say the gui agent is gone for good
+            (self.state / "loaded.json").write_text("[]")
             again = self.invoke(*args)
             self.assertEqual(self.by_kind(again)["relay"]["state"], "unchanged")
+            self.assertNotIn("legacyAgent", self.by_kind(again)["relay"])
 
     def test_a_lan_relay_list_forwards_to_the_first_adapter_address_that_connects(self) -> None:
         """LAN_RELAY_ADAPTERS: the relay's loop runs nc to each declared address in order, stops at the first that
