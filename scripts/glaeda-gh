@@ -12049,7 +12049,12 @@ class Daemon:
             line = said.replace("\n  ", " ").replace("\nnext: ", "; next: ").replace("\n", " ") + "\n"
             path = d / f"{rid}.out.state"
             if not path.is_file() or path.read_text() != line:
-                path.write_text(line)
+                # Whole or not at all: the blocker reads this file while the daemon writes it, and a truncate-then-
+                # write let a read land on the empty file between the two (glaeda#3185's shard 2, 2026-11-28: a bare
+                # third "still waiting" line, WaitStateNotMovingTest). A rename is atomic on one filesystem.
+                part = path.with_name(path.name + f".{os.getpid()}.part")
+                part.write_text(line)
+                os.replace(part, path)
         except Exception:  # noqa: BLE001  a progress line never stops a wait from being ruled on
             pass
 
@@ -36857,8 +36862,9 @@ while :; do
   if [ "$every" -gt 0 ] && [ $((SECONDS - said)) -ge "$every" ]; then
     said=$SECONDS state=
     [ -f "$out.state" ] && IFS= read -r state < "$out.state"
-    if [ -n "$state" ] && [ "$state" = "$last" ]; then
-      : # the state it printed last time, to the character: say nothing until something changes
+    if [ -n "$last" ] && { [ -z "$state" ] || [ "$state" = "$last" ]; }; then
+      : # the state it printed last time, to the character, or a read that found the file missing or half-written
+      # after a state was said: say nothing until something changes
     elif [ -z "$sayer" ] || ! kill -0 "$sayer" 2>/dev/null; then
       [ -n "$state" ] && last=$state  # an empty read is a read that did not happen, not a new state: keeping the
       # last state it printed is what stops the same paragraph coming back after one poll found the file missing
