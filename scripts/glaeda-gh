@@ -44483,6 +44483,11 @@ def post_one_call_args(kind: str, args: argparse.Namespace) -> tuple[list[str], 
     where = f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}"  # as typed: parse_key lowercases its key
     if args.title or args.head or args.base or args.reviewer:
         raise WatchError("--head, --base, --title and --reviewer are for post pr")
+    if kind in ("issue-comment", "pr-comment"):
+        body = read_body(args.body, args.body_file)
+        command = "issue" if kind == "issue-comment" else "pr"
+        return ([command, "comment", str(number), "-R", where, "--body", body],
+                {"kind": "comment", "repo": where, "number": number, "body": body})
     if kind == "label":
         labels, off = post_one_call_labels(args), (getattr(args, "remove_label", None) or [])
         if not labels and not off:
@@ -45656,7 +45661,7 @@ POST_ELSEWHERE = {
 # POST_KIND_CHOICES puts every word in the parser's choices, so argparse refuses nothing it can run, and
 # CHOICE_SYNONYMS carries the looser spellings (`bug`, `tag`, `closed`).
 POST_ONE_CALL = {"issue": "issue", "label": "label", "close": "close",
-                 "issue-comment": "comment", "pr-comment": "comment"}
+                 "issue-comment": "issue-comment", "pr-comment": "pr-comment"}
 POST_QUEUED_KINDS = ("comment", "pr", "review", "status", "update-branch")
 POST_KIND_CHOICES = POST_QUEUED_KINDS + tuple(POST_ONE_CALL)
 
@@ -46000,7 +46005,7 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true")
     po = sub.add_parser("post", help="queue a comment, PR or review; the daemon posts it, paced for every session")
     po.add_argument("kind", choices=POST_KIND_CHOICES, metavar="KIND",
-                    help="comment, pr, review, update-branch (queued and paced), status, or issue, label, close, issue-comment "
+                    help="comment, pr, review, update-branch (queued and paced), status, or issue, label, close, issue-comment, pr-comment "
                          "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
     po.add_argument("--body", "--comment", dest="body",
@@ -47251,8 +47256,10 @@ def main(argv: list[str] | None = None) -> int:
                           f"a comment on it (a new pull request takes OWNER/REPO with --head, --base and --title)",
                           file=sys.stderr)
                     args.kind = "comment"
-            if one == "comment":
-                args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
+            if one == "issue-comment" or one == "pr-comment":
+                return cmd_post_one_call(one, args)
+            elif one == "comment":
+                args.kind = "comment"  # the ordinary queued comment remains PR-aware
             elif one == "issue" and post_issue_queued():
                 args.kind = "issue"  # queued like a PR: the daemon makes it on the issues App (APP_CREATE_ROLE)
             elif one:
