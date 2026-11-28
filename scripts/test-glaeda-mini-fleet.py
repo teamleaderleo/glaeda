@@ -3577,6 +3577,16 @@ class ShareTests(unittest.TestCase):
                 self.assertFalse(ok)
                 self.assertEqual(placed.read_bytes(), b"something else")
 
+    def test_a_copy_below_the_minimum_rate_fails_fast_not_after_the_timeout(self) -> None:
+        """share_recv exits 75 when the copy gains too little; share_one says so instead of "rerun to resume"."""
+        self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "10.0.8.7"
+        codes = iter([1, mf.SHARE_TOO_SLOW])  # share_have: absent; the copy pipeline: too slow
+        with mock.patch.object(mf, "routed_ssh_stream", side_effect=lambda *a, **k: next(codes)):
+            ok, detail = mf.share_one(self.manifest, "xcode", "build-mini-1", "build-mini-2",
+                                      ["/Applications/Xcode.app", "1", "1"], None, True)
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("too slow:"), detail)
+
     def test_share_command_needs_a_source_and_refuses_never_touch(self) -> None:
         for argv, error in ((["share", "xcode", "build-mini-2"], "--from HOST"),
                             (["share", "xcode", "build-mini-2", "--from", "coordinator-mini"], "never_touch"),
@@ -4187,7 +4197,7 @@ class RepairTests(unittest.TestCase):
         code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
                                        manifest=self.manifest, after=after)
         self.assertEqual(code, 0, out)
-        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
+        order = ("lock reservation; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
                  ENROLL, "lock none; runner_release")
         self.assertEqual([next(k for k in order if k in remote_call(c[1])) for c in calls], list(order))
         enroll = calls_to(calls, ENROLL)[0]
@@ -4346,7 +4356,7 @@ class UpgradeTests(unittest.TestCase):
         code, out, calls, _ = self.upgrade(fleet, "--yes", "--glaeda-ref", "e" * 40, after=after)
         self.assertEqual(code, 0, out)
         syncs = [remote_call(c[1]) for c in calls_to(calls, "glaeda_sync")]
-        self.assertEqual(syncs, ["lock; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
+        self.assertEqual(syncs, ["lock reservation; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
         # A blocking unknown still blocks when the old checkout is the only failure.
         unknown = {h: re.sub(r"pf_pmset\t.*\n", "", text) for h, text in fleet.items()}
         code, out, calls, _ = self.upgrade(unknown)
@@ -5232,6 +5242,16 @@ class RemoteStatusTests(unittest.TestCase):
         self.assertIn("_glaeda_remote_status=$?", command)
         self.assertTrue(command.endswith("; exit 0"))
 
+
+class StartDrainTest(unittest.TestCase):
+    def test_the_drain_keeps_its_stdin_so_the_waiter_lives_until_closed(self) -> None:
+        # The library's `exec </dev/null` (no KEEP_STDIN) ended host_drain's perl at once: the waiter entry vanished
+        # and an AWS onboard --wait sat at a host lock that never freed (aws-m4pro-2 and -7, 2026-11-22).
+        with mock.patch.object(mf.subprocess, "Popen") as popen:
+            mf.start_drain({"hosts": {"aws-m4pro-2": {"ssh_user": "ec2-user"}}}, "aws-m4pro-2")
+        command = popen.call_args.args[0][-1]
+        self.assertIn("KEEP_STDIN=1", command)
+        self.assertIn("host_drain", command)
 
 
 class LanFallbackTests(unittest.TestCase):

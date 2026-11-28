@@ -141,6 +141,7 @@ RUNNER_CACHE_KEEP = 2  # versions kept after a download; older ones are removed 
 API_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")  # the gh-free path's optional API auth, sent on curl's stdin
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
+GATE_RETRY_S = 300  # GATE_RETRY: how long a runner runs without its dead gate before a fresh gate is tried
 DEDICATED_ADMIT = "dedicated-admit.sh"  # a --dedicated runner's own admission, which job-started runs
 DEDICATED_ENV_KEYS = ".glaeda-dedicated-env.json"  # the .env keys keep_runner_env wrote, so a removed key goes too
 HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
@@ -403,6 +404,7 @@ class Context:
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.github_labels = getattr(args, "github_labels", None)
+        self.github_labels_unread = getattr(args, "github_labels_unread", None)  # why the fleet's read failed
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
     def take_token(self, endpoint: str) -> str | None:
@@ -498,7 +500,34 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
     if major is None:
         prefix = rule.MACOS_LABEL_PREFIX
         major = next((label[len(prefix):] for label in prior_labels or [] if label.startswith(prefix)), None)
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major)
+    extra: dict[str, Any] = {}
+    if hasattr(rule, "pool_xcode_first"):  # POOL_XCODE: the pool Xcode is the one the class receipt accepted
+        hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+        host = hosts.get(member) if isinstance(hosts, dict) else None
+        hardware = host.get("hardware") if isinstance(host, dict) else None
+        # TOOLCHAIN_PIN_ORDER: the host's own class receipt first, the manifest's acceptance only where the host has
+        # none. The receipt is what the hook's gate judges on this Mac; the manifest's acceptance names the class's
+        # build, which a host whose receipt was re-run on another Xcode does not have, and labels from it put the
+        # runner on a pool whose jobs its gate then refuses.
+        extra["accepted_build"] = host_class_xcode_build(hardware) or rule.accepted_xcode_build(manifest, hardware)
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major,
+                              **extra)
+
+
+def host_class_xcode_build(hardware: Any, home: Path | None = None) -> str | None:
+    """The xcodeBuild this host's class receipt (~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json, the
+    file the hook's gate judges) records, or None. The trimmed manifest a mini installs from carries no hardware
+    table, so the receipt on the host names the build the gate will hold the runner to (POOL_XCODE)."""
+    if not isinstance(hardware, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", hardware):
+        return None
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or (home or Path.home()) / ".config")
+    try:
+        receipt = json.loads((base / "glaeda" / "cmux-fleet" / "class-acceptance" / f"{hardware}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    toolchain = receipt.get("toolchain") if isinstance(receipt, dict) else None
+    build = toolchain.get("xcodeBuild") if isinstance(toolchain, dict) else None
+    return build if isinstance(build, str) and build.strip() and build != "unknown" else None
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -919,6 +948,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "    done\n"
         "    return 1\n"
         "}\n"
+        "# the frozen, idle listener stops (its run.sh when no listener matched); thaw lets the frozen tree go on\n"
+        "stop_listener() { /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" || /usr/bin/pkill -TERM -f \"$re/run\"; }\n"
+        "thaw() { /usr/bin/pkill -CONT -f \"$sup\"; }\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    # idle only by the hook's own test (no Worker, no request its listener took: exit 3), decided with the\n"
@@ -928,10 +960,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "        freeze; frozen=$?\n"
         f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
         "        if [ \"$frozen\" -eq 0 ] && [ \"$busy\" -eq 3 ]; then\n"
-        "            /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" ||\n"
-        "                /usr/bin/pkill -TERM -f \"$re/run\"\n"
+        "            stop_listener\n"
         "        fi\n"
-        "        /usr/bin/pkill -CONT -f \"$sup\"\n"
+        "        thaw\n"
         "        sleep 5\n"
         "    done\n"
         "    exit 1\n"
@@ -943,8 +974,41 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         " this runner's registration; leaving the retry to a fresh gate\"\n"
         "    exit 1\n"
         "fi\n"
-        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
-        "exec ./run.sh\n"
+        # GATE_RETRY: the runner without its gate was meant for a gate that cannot run, but it ran until run.sh
+        # exited, which a healthy runner never does: cmux22-glaeda-13's gate died on a full disk (exit 120,
+        # 2026-11-26 22:48Z) and the runner then listened ungated for 14 h, taking jobs during a fleet lease (and
+        # past capacity) only for job-started to refuse each one (cmux run 45970667586 "frames": refused, green on
+        # re-run elsewhere). So the ungated runner is bounded: every GATE_RETRY_S, once the hook answers and the
+        # runner is idle (the same frozen busy look as above), its listener stops and this wrapper exits 1, so
+        # launchd starts a fresh gate. A hook that still cannot answer keeps the runner as before.
+        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it"
+        f" until a fresh gate can run (a retry every {GATE_RETRY_S} s)\"\n"
+        "./run.sh &\n"
+        "runner=$!\n"
+        "trap 'stopping=1; kill -TERM \"$runner\" 2>/dev/null' TERM INT\n"
+        f"retry_s=${{GLAEDA_GATE_RETRY_S:-{GATE_RETRY_S}}}\n"
+        "retry_at=$((SECONDS + retry_s))\n"
+        "retried=\n"
+        "while kill -0 \"$runner\" 2>/dev/null; do\n"
+        "    if [ -z \"$stopping\" ] && [ \"$SECONDS\" -ge \"$retry_at\" ]; then\n"
+        "        freeze; frozen=$?\n"
+        f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
+        "        if [ \"$frozen\" -eq 0 ] && [ \"$busy\" -eq 3 ]; then\n"
+        "            echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the hook answers and the ungated runner is"
+        " idle; stopping it so a fresh gate starts\"\n"
+        "            retried=1\n"
+        "            stop_listener\n"
+        "        else\n"
+        "            retry_at=$((SECONDS + retry_s))\n"
+        "        fi\n"
+        "        thaw\n"
+        "    fi\n"
+        "    sleep 1 & wait $!\n"
+        "done\n"
+        "wait \"$runner\"\n"
+        "rc=$?\n"
+        "[ -n \"$retried\" ] && [ -z \"$stopping\" ] && exit 1  # launchd restarts this wrapper: a fresh gate\n"
+        "exit \"$rc\"\n"
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
     roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
@@ -1314,6 +1378,31 @@ def release_plan_labels(script: str, argv: list[str]) -> list[str] | None:
     return labels if isinstance(labels, list) else None
 
 
+def role_from_labels(ctx: Context, labels: list[str] | None) -> str | None:
+    """LIVE_ROLE: when a runner keeps the labels it registered with (no relabel this apply: unchanged, skipped on an
+    unread label set, or blocked by a busy runner), its hook takes the role those labels route jobs to, not the one
+    the manifest now computes. On 2026-11-27 12:26-13:14Z cmux14-glaeda-16 was registered with the gateway label while
+    its hook ran --sim-runner, so every gateway job GitHub handed it was refused ("the sim-first runner takes only
+    simulator jobs"): 27 of 47 fast Mac PR failures that hour. Returns a note when it changed the role, else None.
+    No role label in `labels` (or none read): the computed role stands."""
+    if not isinstance(labels, list):
+        return None
+    rule = fleet_labels()
+    prefixes = {"gateway": getattr(rule, "GATEWAY_PREFIX", "gateway"), "sim": getattr(rule, "SIM_PREFIX", "sim"),
+                "small": getattr(rule, "SMALL_PREFIX", "small")}
+    found = [role for role, prefix in prefixes.items()
+             if any(str(label).startswith(f"glaeda-{prefix}-xcode-") for label in labels)]
+    if len(found) != 1:
+        return None
+    computed = [role for role in prefixes if getattr(ctx, f"{role}_runner", False) is True]
+    if computed == found:
+        return None
+    for role in prefixes:
+        setattr(ctx, f"{role}_runner", role == found[0])
+    return (f"its registered labels route {found[0]} jobs, so its hook is the {found[0]} runner's "
+            f"(the manifest computes {computed[0] if computed else 'a pool runner'}); a relabel changes both")
+
+
 def label_drift(against: str, registered: list[str], wanted: list[str]) -> dict[str, Any] | None:
     """How `wanted` (this version's labels) differs from `registered`; None when they match."""
     added = sorted(set(wanted) - set(registered))
@@ -1414,14 +1503,19 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                 reg.update(state="unchanged")
         elif github_listed and github_found is None:
             reg.update(state="blocked", note=f"GitHub does not list runner {ctx.name}; refusing to replace an unknown registration")
-        elif ctx.apply and ctx.token_stdin:
-            # An operator supplied a fresh registration token for apply.  If the read-only
-            # lookup is unavailable, let the same-name --replace repair proceed, but never
-            # claim the receipt proves the current server-side labels.
-            reg.update(state="relabel", previousLabels=had or [],
-                       note="GitHub labels could not be read; re-registering with the supplied token")
-            if runner_busy(ctx):
-                reg.update(state="blocked", busy=True, note="the runner is running a job; re-run when it is idle")
+        elif ctx.token_stdin:
+            # LABELS_UNREAD_SKIPS: GitHub's labels could not be read here and the fleet passed none (its own read
+            # failed: glaeda-cmux-runner-fleet --github-labels-unread names why). This used to re-register in place
+            # with the supplied token, a relabel planned on no reading: on 2026-11-27 a fleet apply's runner list
+            # failed for one repository, the plan re-registered three idle dedicated runners of cmux24 and drained six
+            # busy ones for a relabel to the labels GitHub already held (labels == previousLabels in every receipt),
+            # and the drains held those runners off for up to an hour beside their own queue. With no reading there is
+            # nothing to compare, so the relabel is skipped and nothing drains: the next apply that reads the labels
+            # relabels if they differ. An operator without gh can pass --github-labels themselves.
+            why = getattr(ctx, "github_labels_unread", None)
+            reg.update(state="unchanged", labelsUnread=True,
+                       note="GitHub's labels could not be read" + (f" ({why})" if isinstance(why, str) and why else "")
+                            + "; skipped the relabel: the next apply that reads them relabels if they differ")
         else:
             reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
                        "re-run with GitHub access or --apply --token-stdin")
@@ -1464,6 +1558,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         drifts.append(label_drift("receipt", had, ctx.labels))
         if github_listed and github_found is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
             drifts.append(label_drift("github", github_found.get("labels") or [], ctx.labels))
+    if reg["state"] in {"unchanged", "blocked"}:
+        # LIVE_ROLE: the labels stay what GitHub (else the receipt) holds, so the hook takes the role they route to
+        live = reg.get("githubLabels") or (had if isinstance(had, list) else None)
+        if (why := role_from_labels(ctx, live)):
+            reg["liveRole"] = why
     if any(drifts):
         reg["drift"] = [d for d in drifts if d]
         if reg["state"] == "unchanged":
@@ -1500,8 +1599,16 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             act["label"] = companions[path][1]
             if kind == "relay":
                 act["socket"] = os.fspath(relay_socket(ctx))
-            act["loaded"] = None if ctx.skip_launchctl else run(
-                [LAUNCHCTL, "print", f"{agent_domain(ctx)}/{act['label']}"])[0] == 0
+            act["loaded"] = None if ctx.skip_launchctl else companion_loaded(ctx, act["label"])
+            if kind == "relay":
+                legacy = relay_legacy_agent_path(ctx)
+                stale = legacy.exists() or (not ctx.skip_launchctl and
+                                            run([LAUNCHCTL, "print", f"{agent_domain(ctx)}/{act['label']}"])[0] == 0)
+                if stale:
+                    act["legacyAgent"] = os.fspath(legacy)
+                    if state == "unchanged":
+                        act["state"] = state = "update"
+                        act["note"] = "moves the relay off its gui LaunchAgent (it dies at logout)"
         if kind == "agent":
             act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
@@ -1521,7 +1628,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         for old in [a for a in (receipt or {}).get("actions", [])
                     if a.get("kind") in COMPANIONS and a.get("kind") not in declared and a.get("owned")]:
             current = sha256_file(Path(str(old.get("path"))))
-            loaded = not ctx.skip_launchctl and run([LAUNCHCTL, "print", f"{agent_domain(ctx)}/{old.get('label')}"])[0] == 0
+            loaded = not ctx.skip_launchctl and companion_loaded(ctx, str(old.get("label")))
             if current is not None or loaded:
                 # a plist removed by hand while launchd still runs the job: ours by the receipt, booted out all the same
                 ours = current is None or current == old.get("ownedSha256")
@@ -1937,6 +2044,53 @@ def note_drain_end(act: dict[str, Any], ended: bool | None) -> None:
                                               f"stays held until it expires (at most {DRAIN_TTL_S / 60:g} min)"]))
 
 
+# GATE_RETRY for a runner already ungated: a listen.sh from before it exec'd run.sh when its gate died, so the runner
+# listened on with no gate to stop it for a lease, a drain or a toolchain refusal, and no gate came back until the
+# runner exited (cmux22-glaeda-13: ungated 14 h after a gate ENOSPC, refusing jobs under a fleet lease). A wrapper is
+# not rewritten by --refresh-hooks, so the refresh heals it: an idle runner with a listener and no gate is stopped
+# (SIGINT to its listener, as the gate's own stop), and launchd starts its wrapper again, which starts a gate first.
+UNGATED_STOPPED = "listening with no gate; stopped while idle so its wrapper starts a fresh gate (GATE_RETRY)"
+
+
+def ungated_listeners(runner_dir: Path, ps_text: str) -> list[int]:
+    """This runner's Runner.Listener pids when no gate (`listen --runner-dir DIR`) of it runs, else []."""
+    listeners, gated = [], False
+    root = re.escape(os.fspath(runner_dir))
+    for line in ps_text.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid.isdigit():
+            continue
+        if re.search(r"(?:^|\s)listen\s+--runner-dir[ =]" + root + r"(?:\s|$)", command):
+            gated = True
+        elif supervisor_role(runner_dir, command.strip()) == "listener":
+            listeners.append(int(pid))
+    return [] if gated else listeners
+
+
+def heal_ungated(runner_dir: Path) -> str | None:
+    """Stop an idle runner that listens with no gate (UNGATED_STOPPED); None when there is nothing to heal."""
+    try:
+        ps = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not ungated_listeners(runner_dir, ps):
+        return None
+    with listeners_frozen(runner_dir) as frozen:
+        if not frozen or worker_running(runner_dir):
+            return None  # a job runs (or this cannot tell): the next refresh looks again
+        try:
+            ps = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        pids = ungated_listeners(runner_dir, ps)
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGINT)  # delivered on the thaw below
+    return UNGATED_STOPPED if pids else None
+
+
 def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_ok: bool = True) -> bool:
     """Run stop (default: boot this runner's agent out) only when it has no job, deciding with its listeners and
     their spawners frozen. listener_ok=False also refuses while a listener of it lives (a re-registration under a
@@ -2139,7 +2293,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
-        elif kind == "relay" and state in {"create", "update", "remove"} and act.get("loaded") and runner_busy(ctx):
+        elif kind == "relay" and state in {"create", "update", "remove"} \
+                and (act.get("loaded") or act.get("legacyAgent")) and runner_busy(ctx):
             # a job may be talking through the relay: unloading it now would cut that connection
             act["state"], act["note"] = "failed", ("the runner has a job that may use the relay; nothing changed, "
                                                    "re-run when idle")
@@ -2148,17 +2303,21 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             # sees the change again instead of an "unchanged" plist under an old process
             if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
                 act["state"], act["note"] = "failed", f"launchd still has the old {kind} agent; nothing written, re-run"
-            elif kind == "relay" and (why := prepare_relay_dir(ctx)):
+            elif kind == "relay" and (why := prepare_relay_dir(ctx) or drop_legacy_relay(ctx, act)):
                 act["state"], act["note"] = "failed", why[:400]
             else:
                 data, mode = desired_files(ctx)[Path(act["path"])]
-                write_atomic(Path(act["path"]), data, mode)
-                act["applied"] = act["owned"] = True
-                act["ownedSha256"] = act["sha256"]
-                if not ctx.skip_launchctl:
-                    restart_watch(ctx, act)
+                try:
+                    install_companion_file(ctx, act, data, mode)
+                except OSError as error:
+                    act["state"], act["note"] = "failed", f"cannot write {act['path']}: {error}"[:400]
+                else:
+                    act["applied"] = act["owned"] = True
+                    act["ownedSha256"] = act["sha256"]
+                    if not ctx.skip_launchctl:
+                        restart_watch(ctx, act)
         elif kind in COMPANIONS and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
-            if kind == "relay" and (why := prepare_relay_dir(ctx)):
+            if kind == "relay" and (why := prepare_relay_dir(ctx) or drop_legacy_relay(ctx, act)):
                 act["state"], act["note"] = "failed", why[:400]
             else:
                 restart_watch(ctx, act)
@@ -2167,8 +2326,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 # still owned, plist kept: the next apply plans the removal again
                 act["state"], act["note"] = "failed", f"launchd still has the {kind} agent; its plist is kept, re-run"
             else:
-                Path(act["path"]).unlink(missing_ok=True)
+                remove_companion_file(ctx, act)
                 if kind == "relay":
+                    relay_legacy_agent_path(ctx).unlink(missing_ok=True)
                     remove_relay_socket(ctx, act)
                 act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent-move" and state == "move":
@@ -2392,8 +2552,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
                     f"launchd still has the {act['kind']} agent; nothing else removed, re-run" if other is act
                     else f"kept: the {act['kind']} agent did not unload")
             return
-        Path(act["path"]).unlink(missing_ok=True)
+        remove_companion_file(ctx, act)
         if act["kind"] == "relay":
+            relay_legacy_agent_path(ctx).unlink(missing_ok=True)
             remove_relay_socket(ctx, act)
         act["applied"] = True
     removing = [act for act in removing if act["kind"] not in COMPANIONS]
@@ -3100,6 +3261,8 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
             runner_dir = Path(str(receipt.get("runnerDir") or "")) if isinstance(receipt, dict) else Path()
             doc["runners"].append({"receipt": os.fspath(path),
                                    **refresh_hook_dir(runner_dir, receipt, apply, sources, history, hold)})
+            if apply and runner_dir.is_dir() and (healed := heal_ungated(runner_dir)):
+                doc["runners"][-1]["ungated"] = healed
             if apply and doc["runners"][-1].get("note") == JOB_RUNNING:
                 waiting.append((len(doc["runners"]) - 1, receipt, runner_dir))
         # a busy runner is swapped in the gap between its jobs, not only if a run happens to land in one
@@ -3253,6 +3416,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--github-labels", metavar="LABELS",
                    help="the labels GitHub lists for this runner now (comma-separated), as glaeda-cmux-runner-fleet "
                         "read them with its admin gh; used when this machine's gh cannot read them itself")
+    p.add_argument("--github-labels-unread", metavar="WHY",
+                   help="glaeda-cmux-runner-fleet could not read this runner's GitHub labels (WHY); the relabel is "
+                        "skipped (LABELS_UNREAD_SKIPS)")
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
@@ -3418,11 +3584,15 @@ def main(argv: list[str] | None = None) -> int:
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
-        if is_root or nightly:
+        if is_root or nightly or ctx.gui_runner:
             # A static handle on this one runner, so no job ever writes a runner label: a root runner for cmux's
             # warm affinity (the picker reads which runner kept a warm build and names it in runs-on), and the
             # nightly slot for cmux's owned signing pick (scripts/ci/signing_runner.py), which offers only a runner
             # it can pin. Without it no slot was ever offered, and nightly signing always went to Blacksmith.
+            # A gui runner for HQ's paired probes (paired-probes.yml): a pair of jobs needs two Macs at once, and
+            # on the shared gui label the second side queues behind every older job while the first holds its Mac
+            # for up to an hour (2026-11-27: the host ran on one Mac while the viewer sat
+            # queued 2 h 45 min). With a handle per runner the pair is placed on two idle gui runners at once.
             ctx.labels.append(runner_label(ctx.name))
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
@@ -3834,10 +4004,10 @@ def watch_plist(ctx: Context) -> dict[str, Any]:
 def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
     """Unload a watch agent; True once launchd no longer has it (print exits LAUNCHCTL_NOT_FOUND), as bootout does
     for the runner. False: still loaded, or launchctl could not tell, and its plist must stay so a re-run retries."""
-    domain = f"{agent_domain(ctx)}/{label}"
-    run([LAUNCHCTL, "bootout", domain])
+    domain = f"{companion_domain(ctx, label)}/{label}"
+    run(priv(ctx, [LAUNCHCTL, "bootout", domain]))
     deadline = time.monotonic() + wait_s
-    while run([LAUNCHCTL, "print", domain])[0] != LAUNCHCTL_NOT_FOUND:
+    while run(priv(ctx, [LAUNCHCTL, "print", domain]))[0] != LAUNCHCTL_NOT_FOUND:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)
@@ -3846,8 +4016,8 @@ def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
 
 def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
     """Load the watch agent's plist (after watch_unloaded). The watch loop holds no job, so it is never waited for."""
-    domain = agent_domain(ctx)
-    code, out = run([LAUNCHCTL, "bootstrap", domain, act["path"]])
+    domain = companion_domain(ctx, act["label"])
+    code, out = run(priv(ctx, [LAUNCHCTL, "bootstrap", domain, act["path"]]))
     act["bootstrapped"] = code == 0
     if code != 0:
         act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
@@ -3913,8 +4083,83 @@ def relay_socket(ctx: Context) -> Path:
 
 
 def relay_plist_path(ctx: Context) -> Path | None:
-    """The dedicated runner's LAN relay LaunchAgent, or None when its entry declares no lanRelay."""
-    return ctx.agents / f"{relay_label(ctx)}.plist" if relay_of(ctx) else None
+    """The dedicated runner's LAN relay LaunchDaemon (system domain: it must outlive a logout), or None when its entry
+    declares no lanRelay. A sandbox HOME keeps it under HOME/Library/LaunchDaemons."""
+    if not relay_of(ctx):
+        return None
+    base = ctx.home / "Library/LaunchDaemons" if ctx.sandbox else SYSTEM_DAEMON_DIR
+    return base / f"{relay_label(ctx)}.plist"
+
+
+def relay_legacy_agent_path(ctx: Context) -> Path:
+    """Where earlier installs put the relay: a gui/<uid> LaunchAgent, which dies at logout (incident #1174)."""
+    return ctx.agents / f"{relay_label(ctx)}.plist"
+
+
+def priv(ctx: Any, argv: list[str]) -> list[str]:
+    """argv run as root through sudo (a sandbox HOME, or root itself, runs it as is)."""
+    return argv if getattr(ctx, "sandbox", False) or os.geteuid() == 0 else [SUDO, *argv]
+
+
+def companion_domain(ctx: Any, label: str) -> str:
+    """The launchd domain a companion loads into: the relay is a system LaunchDaemon, the watch loop a LaunchAgent."""
+    return "system" if label.endswith(".relay") else agent_domain(ctx)
+
+
+def companion_loaded(ctx: Any, label: str) -> bool:
+    return run(priv(ctx, [LAUNCHCTL, "print", f"{companion_domain(ctx, label)}/{label}"]))[0] == 0
+
+
+def install_companion_file(ctx: Context, act: dict[str, Any], data: bytes, mode: int) -> None:
+    """Write a companion plist: the relay's is root-owned in /Library/LaunchDaemons (through sudo), a watch agent's is
+    this user's."""
+    if act["kind"] == "relay":
+        install_system_file(ctx, Path(act["path"]), data, mode)
+    else:
+        write_atomic(Path(act["path"]), data, mode)
+
+
+def install_system_file(ctx: Any, path: Path, data: bytes, mode: int) -> None:
+    if getattr(ctx, "sandbox", False):
+        write_atomic(path, data, mode)
+        return
+    with tempfile.NamedTemporaryFile(prefix="glaeda-runner-", suffix=".plist", delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), mode)
+        staged = Path(tmp.name)
+    try:
+        code, out = run(priv(ctx, ["/usr/bin/install", "-o", "root", "-g", "wheel", "-m", oct(mode)[2:],
+                                   os.fspath(staged), os.fspath(path)]))
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def remove_companion_file(ctx: Any, act: dict[str, Any]) -> None:
+    path = Path(act["path"])
+    if act.get("kind") == "relay" and not getattr(ctx, "sandbox", False):
+        run(priv(ctx, ["/bin/rm", "-f", os.fspath(path)]))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def drop_legacy_relay(ctx: Context, act: dict[str, Any]) -> str | None:
+    """Boot out and remove the relay's old gui/<uid> LaunchAgent (the daemon binds the same socket). The reason it
+    could not, else None."""
+    legacy = relay_legacy_agent_path(ctx)
+    if not ctx.skip_launchctl:
+        domain = f"{agent_domain(ctx)}/{act['label']}"
+        run([LAUNCHCTL, "bootout", domain])
+        deadline = time.monotonic() + 15
+        while run([LAUNCHCTL, "print", domain])[0] != LAUNCHCTL_NOT_FOUND:
+            if time.monotonic() >= deadline:
+                return f"launchd still has the old gui relay agent {domain}; nothing else changed, re-run"
+            time.sleep(0.25)
+    legacy.unlink(missing_ok=True)
+    act["legacyAgentRemoved"] = True
+    return None
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
@@ -3934,10 +4179,14 @@ def relay_plist(ctx: Context) -> dict[str, Any]:
     else:
         address, port = relay.rsplit(":", 1)
         argv = [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S), address, port]
+    info = pwd.getpwuid(ctx.uid)
     return {"Label": relay_label(ctx),
             "ProgramArguments": argv,
+            "UserName": info.pw_name,
             "inetdCompatibility": {"Wait": False},
+            # launchd binds a daemon's socket as root: keep it this runner user's own, mode 0600
             "Sockets": {"Listener": {"SockPathName": os.fspath(relay_socket(ctx)), "SockPathMode": 0o600,
+                                     "SockPathOwner": ctx.uid, "SockPathGroup": getattr(info, "pw_gid", 20),
                                      "SockType": "stream"}},
             "ProcessType": "Interactive",
             "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.relay.err")}

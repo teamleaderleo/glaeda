@@ -1406,6 +1406,17 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "78c3d27524ce96a98d7ea914c56453b3ef29ed5fd481e0957a787209dd5174f9",
     "3921da1635191cfb276af97c9b26c958da208c45374345920c0cb0db7d0d5676",
     "6a47948dae3e9ed806e2d7c548dba5c96a629c667559c43decdeb98ec8104b30",
+    "8e5b471e25981713d59c03435509aa08fb4c3135ef061ad67d296d64d603de81",
+    "cce703733549062e116dd3735b9c9ab404329e26090aecdbb1c81727dd2a9769",
+    "cffd38e9b8e60d31b87b66d0bade72659421212904f918a03cbf1c8fe429166c",
+    "5cc1ca3c6311dbaed553d70a1985143da97d89ae1fe3f565ad08e0815be75abc",
+    "87e7f6c73d44ee1cf79c6d5e38197e95aa0b0677b1f3a995e634d70edc7a0f6e",
+    "437ef961cf402a93c693170bd9c71bb1ab59467a069059467e9881b31a1fb3fb",
+    "3291efc58cc15135884ac79cf75416db6fbc5e600b093f078d6546a11ac7db19",
+    "a9b0e15f31397e59776c441dc9aab5971b459dedede3f0b993527d0baa9c5309",
+    "c0656b6cb5f3214deb03a4365a20c032a35c6319ddc6a63a3a24b7e87b03d535",
+    "5c5208e6088a6b5001fe4cea951de8c9c2a2f2516b025108b2b0d3ec9196152d",
+    "9f931ed199e70854a876f2a0de8679de33ad1bf551d85f96f3dbd972ae4da52d",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2595,6 +2606,7 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    "tmp_transcript_hold_hours": 6.0,  # tmp_transcript_hold: a temp entry a recent agent transcript names stays
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
     # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
@@ -2688,6 +2700,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # a pressure pass (under the floor) trims units unused this long instead: least recently used first by age, the
     # newest unit of every crate stem and anything open still stay. 0: the pressure pass uses cargo_stale_hours too
     "pressure_cargo_stale_hours": 1.0,
+    # a size cap on the shared Cargo targets (enforce_cargo_target_cap): a root in cargo_cap_roots over cargo_cap_gib
+    # is trimmed, oldest units first, until it is under 90% of the cap. gcp-agent-lane-21 (2026-11-27) grew
+    # ~/.cache/cargo-target by 117 GB a day with every unit inside the 6 h window. 0 or [] turns it off.
+    "cargo_cap_roots": ["~/.cache/cargo-target"],
+    "cargo_cap_gib": 48.0,
     # The fleet controller's base URL (http://host:port, over the tailnet). Set, shared-mirror-compact asks its
     # POST /v1/seeds/release before a fold deletes a mirror's packs and folds only on "ok" (seed_release_veto).
     # "" (the default): no call; the seed heartbeat that fills the controller's holder index is not built yet, so
@@ -3270,6 +3287,16 @@ SIM_DEVICE_MIN_BYTES = 512 * 1024 ** 2  # dataPathSize under this: a fresh or er
 SIM_DEVICE_BUDGET_S = 300.0  # one pass erases for at most this long; the next pass continues
 
 
+def _device_plist_age_hours(home: str, now: float) -> float | None:
+    """Hours since CoreSimulator last rewrote HOME/device.plist, which it does on every state change (boot, shutdown,
+    erase). simctl on Xcode 26.6 and 27.2 (macOS 27) lists no lastBootedAt for any device: cmux21 2026-11-27, 0 of 32
+    devices, 16 GB held by 6 shutdown ones, so every device read "no last-boot time" and none was ever erased."""
+    try:
+        return (now - os.stat(os.path.join(home, "device.plist")).st_mtime) / 3600
+    except OSError:
+        return None
+
+
 def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: float | None = None,
                      leases: str | None = None) -> list[Item]:
     """Judge simulator devices (`simctl list devices -j`) for erasing. Reclaimable only when shutdown, available,
@@ -3290,6 +3317,10 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             sized = isinstance(size, int) and not isinstance(size, bool)
             size = size if sized else 0
             idle = _iso_age_hours(d.get("lastBootedAt"), now)
+            data = d.get("dataPath")
+            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
+            if idle is None and home is not None:
+                idle = _device_plist_age_hours(home, now)  # simctl lists no lastBootedAt: its last state change
             reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
             keep = []
             if d.get("state") != "Shutdown":
@@ -3302,8 +3333,6 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append("its data is already small")
             if idle is None:
                 keep.append("no last-boot time")
-            data = d.get("dataPath")
-            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
             if home is None:
                 keep.append("no data path")
             elif in_cwd(home, opened):
@@ -5381,6 +5410,54 @@ def sweep_cargo_targets(receipt: Path, roots: list[Path] | None = None, apply: b
     return out
 
 
+CARGO_CAP_FAMILY = "cargo-target-cap"
+CARGO_CAP_TARGET_SHARE = 0.9
+CARGO_CAP_STEP_HOURS = (3.0, 1.0, 0.25, 1 / 60)  # least recently used first: ever shorter unused windows
+
+
+def enforce_cargo_target_cap(receipt: Path, roots: list[Path] | None = None, cap_gib: float | None = None,
+                             apply: bool = True, halt=None, size=None) -> dict[str, Any]:
+    """The growth bound the 6 h cargo-stale pass cannot give: a shared Cargo target root (cargo_cap_roots) whose
+    bytes exceed CAP_GIB (cargo_cap_gib) is trimmed with sweep_cargo_targets over ever shorter unused windows
+    (CARGO_CAP_STEP_HOURS: oldest units first) until it is under CARGO_CAP_TARGET_SHARE of the cap. The same
+    protections hold: the newest unit of each crate stem, anything a process has open, a profile a build locks.
+    With APPLY false it only measures. Returns {roots: {path: {before, after, over}}, bytes, units}."""
+    cap_gib = float(POLICY.get("cargo_cap_gib") or 0) if cap_gib is None else cap_gib
+    out: dict[str, Any] = {"roots": {}, "bytes": 0, "units": 0}
+    if cap_gib <= 0:
+        return out
+    roots = capture_dedupe_roots(list(POLICY.get("cargo_cap_roots") or []), None) if roots is None else roots
+    size = du_bytes if size is None else size
+    cap, goal = int(cap_gib * GIB), int(cap_gib * GIB * CARGO_CAP_TARGET_SHARE)
+    for root in roots:
+        used = size(root)
+        if used is None or used <= cap:
+            continue
+        rec = out["roots"][os.fspath(root)] = {"before": used, "after": used, "over": used - cap}
+        if not apply:
+            continue
+        for hours in CARGO_CAP_STEP_HOURS:
+            res = sweep_cargo_targets(receipt, [root], halt=halt, stale_hours=hours)
+            used = max(0, used - res["bytes"])
+            out["bytes"] += res["bytes"]
+            out["units"] += res["units"]
+            rec["after"] = used
+            if used <= goal or res["stopped"]:
+                break
+    if apply and out["roots"]:
+        line = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": CARGO_CAP_FAMILY,
+                "outcome": "reclaimed" if out["bytes"] else "none", "bytes": out["bytes"], "items": out["units"],
+                "cap_gib": cap_gib, "roots": out["roots"]}
+        with contextlib.suppress(OSError), receipt.open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    return out
+
+
+def cargo_cap_text(res: dict[str, Any], applied: bool) -> str:
+    return "; ".join(f"  {'trimmed' if applied else 'over its cap'} {r['before'] / GIB:.1f}G -> {r['after'] / GIB:.1f}G  "
+                     f"{p} ({CARGO_CAP_FAMILY})" for p, r in res["roots"].items())
+
+
 def cargo_stale_text(res: dict[str, Any], applied: bool) -> str:
     """One line for a cargo-stale-artifacts pass: what it freed (or would free) and where most of it was."""
     top = sorted(res["by_target"].items(), key=lambda kv: -kv[1])[:3]
@@ -5769,9 +5846,15 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def worker_cargo_target(path: Path) -> bool:
+def worker_cargo_target(path: Path, _nested: bool = False) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
-    real directory (not a symlink) that holds no version control of its own."""
+    real directory (not a symlink) that holds no version control of its own; or a directory of nothing but such
+    targets, one per source tree.
+
+    The hq worker's CARGO_TARGET_DIR is cache/cmux-tui-target/src-<hash> (one target per source tree), so the family
+    item cache/cmux-tui-target holds targets and is none itself: it read "report-only" and "unchecked" under pressure
+    while cmux21 (24 GiB free) and cmux17 (21 GiB) sat under their gui-light disk floor with 8.5 GiB there and 0.0G
+    reclaimable (2026-11-27). Every in-use veto still holds the whole item while a cargo or rustc names it."""
     try:
         if path.is_symlink() or not path.is_dir():
             return False
@@ -5779,8 +5862,16 @@ def worker_cargo_target(path: Path) -> bool:
         return False
     if any(os.path.lexists(path / m) for m in VCS_MARKERS):
         return False
-    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
-            or (path / ".rustc_info.json").is_file())
+    if (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file()):
+        return True
+    if _nested:
+        return False
+    try:
+        entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(worker_cargo_target(Path(e.path), _nested=True) for e in entries)
 
 
 def worker_build_output(fam: Family, path: Path) -> bool:
@@ -7751,7 +7842,11 @@ SHARED_MIRROR_DOMINANT_SHARE = 0.8
 # folds read as a 22.8 GiB an hour fetch storm (2026-11-09). Lines older than REPACKED_KEEP_S go at the next write.
 SHARED_MIRROR_REPACKED_FILE = "clone-care-repacked"
 SHARED_MIRROR_REPACKED_KEEP_S = 2 * 3600
-SHARED_MIRROR_GLOBS = (".wt-mirrors/*/*.git", "*/.wt-mirrors/*/*.git")  # wt's root is home or a folder in it
+# wt's root is home or a folder in it. tools/spotlight_noindex moved ~/Projects/.wt-mirrors to .wt-mirrors.noindex and left
+# a symlink at the old name, which shared_mirrors never follows: cmux16 (2026-11-27) held 15 GiB of mirrors, 130 packs in
+# one, and no fold ran on any host that had the rename.
+WT_MIRROR_DIRS = (".wt-mirrors", ".wt-mirrors.noindex")
+SHARED_MIRROR_GLOBS = tuple(g for d in WT_MIRROR_DIRS for g in (f"{d}/*/*.git", f"*/{d}/*/*.git"))
 # The full repack's memory: unbounded, the cmuxterm-hq mirror's took 9.6 GB resident; two threads with a
 # bounded delta window took 5.3 GB and 209 s for the same 3.5 GiB pack, a background job beside builds.
 SHARED_MIRROR_REPACK_ARGS = ("repack", "-a", "-d", "-k", "-l", "-q", "--threads=2", "--window-memory=256m")
@@ -7843,7 +7938,7 @@ SEED_PACK_NAME = re.compile(r"pack-(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 def mirror_repo(gitdir: Path) -> str:
     """owner/name of a tools/wt mirror (<root>/.wt-mirrors/<owner>/<name>.git), or ""."""
-    if gitdir.suffix != ".git" or gitdir.parent.parent.name != ".wt-mirrors":
+    if gitdir.suffix != ".git" or gitdir.parent.parent.name not in WT_MIRROR_DIRS:
         return ""
     return f"{gitdir.parent.name}/{gitdir.stem}"
 
@@ -8193,6 +8288,104 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
+# An agent session's own notes in the temp dir. A live Claude session kept a folder of 40 notes at /tmp/<name>, wrote
+# it last at 18:35Z, then waited on a model gateway outage for two hours; at 19:33Z the "tmp" family (one hour window)
+# found it idle, unheld (no process has a file open there between tool calls) and named by no running command, and
+# took it while the session was alive (2026-11-27). On that host the same pass took 64 top-level /tmp entries in 24 h,
+# and most of them are named in a transcript that went on being written after the delete. The session that writes a
+# path names it in its transcript, so a top-level temp entry a transcript names is held while that transcript was
+# written within the policy's tmp_transcript_hold_hours (6 by default): it goes once no session that named
+# it has written for that long. The index reads each transcript once and then only what was appended
+# (TRANSCRIPT_TMP_INDEX), so a pass costs the bytes written since the last one, not the transcripts' size.
+TMP_NAME_RE = re.compile(rb"/(?:private/)?tmp/([A-Za-z0-9._@+=-]{1,200})")
+_TRANSCRIPT_TMP_NAMES: dict[str, str] | None = None
+_TRANSCRIPT_TMP_AT = 0.0
+_TRANSCRIPT_TMP_HOME: Path | None = None
+TRANSCRIPT_TMP_FRESH_S = 30.0  # apply's fresh re-check rereads appended bytes at most this often, not once per item
+
+
+def transcript_tmp_index_path() -> Path:
+    return HOME / ".cache/glaeda-disk/transcript-tmp-names.json"
+
+
+def recent_transcripts(window_s: float, now: float | None = None) -> list[tuple[Path, os.stat_result]]:
+    """Claude (every config dir, subagents too) and Codex transcripts written within window_s."""
+    cutoff = (time.time() if now is None else now) - window_s
+    roots = [c / "projects" for c in claude_config_dirs()] + [HOME / ".codex/sessions"]
+    out = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    out.append((path, st))
+    return out
+
+
+def transcript_tmp_names(fresh: bool = False) -> dict[str, str]:
+    """Top-level temp entry name -> the newest recent transcript that names it, read incrementally (see above)."""
+    global _TRANSCRIPT_TMP_NAMES, _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME
+    if (_TRANSCRIPT_TMP_NAMES is not None and _TRANSCRIPT_TMP_HOME == HOME
+            and (not fresh or time.monotonic() - _TRANSCRIPT_TMP_AT < TRANSCRIPT_TMP_FRESH_S)):
+        return _TRANSCRIPT_TMP_NAMES
+    window_s = float(POLICY["tmp_transcript_hold_hours"]) * 3600
+    index_path = transcript_tmp_index_path()
+    try:
+        old = json.loads(index_path.read_text())
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    index: dict[str, dict] = {}
+    names: dict[str, tuple[float, str]] = {}
+    for path, st in recent_transcripts(window_s):
+        key = os.fspath(path)
+        prev = old.get(key) if isinstance(old.get(key), dict) else {}
+        same = prev.get("ino") == st.st_ino and isinstance(prev.get("offset"), int) and prev["offset"] <= st.st_size
+        offset = prev["offset"] if same else 0
+        found = set(prev.get("names", [])) if same else set()
+        if offset < st.st_size:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(st.st_size - offset)
+            except OSError:
+                chunk = b""
+            end = chunk.rfind(b"\n") + 1  # a line still being written is read whole next pass
+            found.update(m.decode("ascii", "replace") for m in TMP_NAME_RE.findall(chunk[:end]))
+            offset += end
+        index[key] = {"ino": st.st_ino, "offset": offset, "names": sorted(found)}
+        for n in found:
+            if n not in names or names[n][0] < st.st_mtime:
+                names[n] = (st.st_mtime, key)
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index_path.with_name(f"{index_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(index))
+        os.replace(tmp, index_path)
+    except OSError:
+        pass  # an unwritten index only costs the next pass a full read
+    _TRANSCRIPT_TMP_NAMES = {n: k for n, (_m, k) in names.items()}
+    _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME = time.monotonic(), HOME
+    return _TRANSCRIPT_TMP_NAMES
+
+
+def tmp_transcript_hold(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why a top-level temp entry is held by an agent session that names it ("" when none does)."""
+    if fam.id not in ("tmp", STALE_TMP_SCRATCH) or path.parent != fam.root:
+        return ""
+    transcript = transcript_tmp_names(fresh).get(path.name)
+    if not transcript:
+        return ""
+    hours = float(POLICY["tmp_transcript_hold_hours"])
+    return f"named by an agent session written in the last {hours:g}h ({Path(transcript).name})"
+
+
 # A Linux lane VM's own families (lane_vm_families). One reached 100% (4.2 GB free of 495 GB) and its tests failed
 # with ENOSPC while this script found 0.0G reclaimable in 141 GiB: /tmp/wt-rd 23G, /tmp/claude-<uid> 17G, /tmp/bsz 13G
 # and /tmp/acpmux-<uid> 11G were each one "tmp" item, in use or unchecked as a whole, because a live session's
@@ -8514,11 +8707,13 @@ def git_outside_index(fresh: bool = False) -> list[tuple[str, str, str]]:
                 out.append((co, target, "a checkout's .git file points into it"))
         elif dotgit.is_dir():
             out += [(co, alt, "a checkout borrows its objects (alternates)") for alt in _alternates(dotgit)]
-    mirrors = HOME / "Projects/.wt-mirrors"
-    for depth in ("*", "*/*", "*/*/*"):
-        for g in glob.glob(os.fspath(mirrors / depth)):
-            if g.endswith(".git") and os.path.isdir(g):
-                out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
+    for mirrors in (HOME / "Projects" / d for d in WT_MIRROR_DIRS):
+        if mirrors.is_symlink():
+            continue  # .wt-mirrors points at .wt-mirrors.noindex: read once, through the real folder
+        for depth in ("*", "*/*", "*/*/*"):
+            for g in glob.glob(os.fspath(mirrors / depth)):
+                if g.endswith(".git") and os.path.isdir(g):
+                    out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
     _GIT_OUTSIDE_INDEX = out
     return out
 
@@ -10093,7 +10288,7 @@ def git_loss(path: Path) -> str:
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
             return "repository inside the worktree"
-        if os.path.lexists(os.path.join(own.strip(), "locked")):
+        if worktree_locked(own.strip()):
             return "locked worktree"
         # refs/bisect and refs/worktree belong to the worktree and go with it
         refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
@@ -11455,7 +11650,7 @@ def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
             return False
         if named != tree:
             continue
-        if os.path.lexists(rec / "locked"):
+        if worktree_locked(rec):
             return False
         tips = local_tips(rec, worktree_only=True)
         if tips is None:
@@ -11510,11 +11705,13 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         common = git_common_dir(root)
         if not common:
             return f"{where}: unreadable worktree", {}, []
-        if os.path.lexists(os.path.join(own.strip(), "locked")):  # as git_loss: wherever its repository is
+        if worktree_locked(own.strip()):  # as git_loss: wherever its repository is
             return f"{where}: locked worktree", {}, []
         if (os.path.realpath(common) + "/").startswith(inside):
             gitdirs[os.path.realpath(common)] = Path(common)
             continue
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
+            continue  # a seed's lock (worktree_locked let it through): its owner re-creates it, so its reflog keeps nothing
         tips = local_tips(Path(own.strip()), worktree_only=True)
         if tips and external is not None:
             tips = _present_commits(Path(common), tips)  # a reflog entry gc already took is lost already
@@ -11594,6 +11791,43 @@ def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
         except OSError as e:
             return f"unreadable below it: {e.__class__.__name__}"
     return ""
+
+
+# The reasons a seed tree's worktree is git-locked with, so git never prunes it: tools/wt's BASE_REASON ("wt base: the
+# tree new checkouts clone copy-on-write; nobody works here") and cmux's worktree seed ("cmux-worktree seed: clean
+# checkout new worktrees clone; never edit it"). Both say nobody works there and both are rebuilt by their owner.
+WT_SEED_LOCK_PREFIXES = ("wt base:", "cmux-worktree seed:")
+
+
+def worktree_locked(gitdir) -> bool:
+    """Whether a linked worktree's git dir holds a lock that means someone works there. A wt base's own lock
+    (wt registers each copy-on-write seed tree under it so git does not prune it, and says nobody works there) is
+    no hold: cmux16's ~/Library/Caches/cmux-worktree-seed/<key> was blocked:bundle-failed on it every pass, 63 h
+    idle (2026-11-27), because a wt-locked worktree read as unbundleable. A `wt new` still checking out holds
+    "wt new: checking out" and a person's own lock keeps whatever reason it has: both still hold."""
+    lock = Path(gitdir) / "locked"
+    try:
+        return not lock.read_text(errors="replace").strip().startswith(WT_SEED_LOCK_PREFIXES)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def prune_removed_seed_records(common: str) -> None:
+    """git worktree prune, after dropping the lock of each record whose tree is gone and whose lock is a seed's
+    (worktree_locked): prune never drops a locked record, and the owner's next `git worktree add` of the seed's
+    path then refuses on the missing-but-locked one."""
+    with contextlib.suppress(OSError):
+        for rec in Path(common, "worktrees").iterdir():
+            try:
+                tree = Path((rec / "gitdir").read_text().strip()).parent
+            except (OSError, ValueError):
+                continue
+            if not os.path.lexists(tree) and (rec / "locked").is_file() and not worktree_locked(rec):
+                with contextlib.suppress(OSError):
+                    (rec / "locked").unlink()
+    subprocess.run(["git", "--git-dir", common, "worktree", "prune"], capture_output=True, timeout=60)
 
 
 def mount_below_why(why: str) -> str:
@@ -13312,6 +13546,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
+        if (why := tmp_transcript_hold(fam, path)):
+            reasons.append(why)
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
         if fam.id == WT_CARGO_TARGET and not blind and (why := wt_checkout_hold(path, opened, cmds)):
@@ -16698,6 +16934,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
+                or tmp_transcript_hold(fam, p, fresh=True)
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
                 or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
@@ -16823,8 +17060,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                             if bdev in budget_left:
                                 budget_left[bdev] -= took  # anything a budget family gives back counts toward it
                 if common:  # drop the deleted worktree's record from its repository
-                    subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
-                                   capture_output=True, timeout=60)
+                    prune_removed_seed_records(common)
             except SlotTaken as e:
                 outcome = "changed:in-use"
                 if str(e):
@@ -19159,6 +19395,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             RUN["cargo_stale_gib"] = round(cargo_stale_freed / GIB, 1)
             if cargo_stale["units"] or cargo_stale["stopped"]:
                 print(cargo_stale_text(cargo_stale, applied=True))
+            cargo_cap = enforce_cargo_target_cap(a.receipt, halt=halt)
+            cargo_stale_freed += cargo_cap["bytes"]
+            if cargo_cap["roots"]:
+                print(cargo_cap_text(cargo_cap, applied=True))
         logical_released = (stale_marker_released + cas_budget_freed + cargo_stale_freed
                             + apply_pass([i for i in items if id(i) not in last]))
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
@@ -19788,6 +20028,10 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if DEAD_MOUNTS:  # paths a walk skipped on ENOTCONN/ESTALE/EIO: a dying drive or a dead mount, as a count and names
+        # (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md), not only a line on stderr
+        row["unreadable_entries"] = len(DEAD_MOUNTS)
+        row["unreadable_examples"] = sorted(DEAD_MOUNTS)[:5]
     if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
         row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass

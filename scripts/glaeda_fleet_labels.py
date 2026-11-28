@@ -501,12 +501,37 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
     return [a for a in apps if isinstance(a, dict)] if isinstance(apps, list) else []
 
 
+# POOL_XCODE: xcodeApps[0] is the pool Xcode, what a gated runner's job-started hook names as --toolchain-xcode and
+# its listener's DEVELOPER_DIR. The gate refuses every job while that Xcode differs from the class receipt, so the
+# pool Xcode is the ready app on the build the class was accepted on, not the manifest's newest. 2026-11-27: the
+# manifest put Xcode_27.2 first while every class receipt was on 26.6 (17F113); a signing mini's gated runners
+# re-installed onto 27.2 and were held off ("toolchain drifted from the m4pro-48 class receipt") for 9 h. With no
+# accepted build known, manifest order stands.
+def accepted_xcode_build(manifest: Any, hardware: Any) -> str | None:
+    """The manifest's hardware.<hardware>.acceptance.xcode_build, or None."""
+    table = manifest.get("hardware") if isinstance(manifest, dict) else None
+    entry = table.get(hardware) if isinstance(table, dict) and isinstance(hardware, str) else None
+    acceptance = entry.get("acceptance") if isinstance(entry, dict) else None
+    build = acceptance.get("xcode_build") if isinstance(acceptance, dict) else None
+    return build if isinstance(build, str) and build.strip() else None
+
+
+def pool_xcode_first(ready: list[dict[str, Any]], accepted_build: str | None) -> list[str]:
+    """The ready apps' paths, the first one on accepted_build moved to the front (POOL_XCODE)."""
+    paths = [str(a.get("path")) for a in ready]
+    hit = next((i for i, a in enumerate(ready) if accepted_build and str(a.get("build") or "") == accepted_build), None)
+    return paths if hit is None else [paths[hit], *paths[:hit], *paths[hit + 1:]]
+
+
 def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
                   ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None,
-                  macos_major: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+                  macos_major: str | None = None, accepted_build: str | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner).
     macos_major: the observed macOS major version of the host ("27"); it adds glaeda-macos-<major>. None (the
-    declared view, or a host that could not tell) adds no OS label."""
+    declared view, or a host that could not tell) adds no OS label.
+    accepted_build: the Xcode build the member's class receipt was accepted on, as the host reads it; None reads the
+    manifest's hardware.<class>.acceptance.xcode_build (POOL_XCODE)."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
         return None, "manifest has no hosts table"
     host = manifest["hosts"].get(member)
@@ -684,10 +709,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # placement check: simRunners is a class default, so every member of the class reads it, and a member with no
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
+    # A sim-first runner takes pull request jobs, so a trustedRef, non-dedicated or poolPrefix member gets none
+    # rather than a refusal, as smallRunners below. 2026-11-28: the refusal held cmux22 (a trusted-only promote
+    # host whose class default carries simRunners) out of every relabel, and its 19 runners stayed offline.
     sim = sim if ios_sim else 0
-    if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
-        return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
-                      "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    if trusted_ref is not None or availability != "dedicated" or normal_pool_prefix:
+        sim = 0
     if not (isinstance(small, int) and not isinstance(small, bool) and 0 <= small <= MAX_SMALL_RUNNERS):
         return None, f"runner.classes.{klass}.smallRunners must be 0 to {MAX_SMALL_RUNNERS}"
     # A small runner takes pull request jobs, so only a dedicated member without trustedRef, in the default pool
@@ -713,7 +740,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "dedicatedOnly": dedicated_only, "poolUser": pool_user,
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
-            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
+            "hardware": hardware, "xcodeApps": pool_xcode_first(ready, accepted_build or accepted_xcode_build(
+                manifest, hardware)), "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "reserveCores": reserve, "compileSlots": compile_slots,
             "listeners": member_listeners(manifest, hardware, units, reserve),
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,

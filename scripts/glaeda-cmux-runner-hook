@@ -557,6 +557,12 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # like the rest, so the trust rule (only nightly.yml at refs/heads/nightly-next reaches the
                 # signer) is unchanged; it adds no secret and no entitlement. continue-on-error in the workflow.
                 ("nightly.yml", "sign-live-code-variant"),
+                # NIGHTLY_NEXT_PKG (cmux nightly.yml nightly-next-pkg; cmux scripts/ci/signing_runner.py lists it):
+                # "Finish a published nightly-next build" packages, signs and notarizes the published app's .pkg
+                # on glaeda-trusted-next-signing with the release-next keychain. Missing here, every Finish dispatch
+                # was refused ("NEXT nightly needs its exact nightly.yml signing job push or dispatch"; cmux run
+                # 46100308507, 2026-11-28, and each one since 2026-11-25). CMUX_SIGNING_JOBS below is the guard.
+                ("nightly.yml", "nightly-next-pkg"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
@@ -593,6 +599,12 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # persistent-dd: cmux18-glaeda-3") with the host's CPU idle.
                         ("pr-router.yml", "mac"): "isolated", ("pr-router.yml", "mac-fallback"): "isolated",
                         ("pr-router.yml", "ios"): "simulator-step",
+                        # `ios-fast` (the iOS fast verdict: xcodebuild build-for-testing of the changed kit and app
+                        # targets, then their tests in one booted simulator) under both its callers. As an unknown
+                        # job it was a compile (5 units, persistent-dd and a canonical root), so a busy mini turned
+                        # it away and it queued on Blacksmith: cmux#61812 waited 6 min there, then built cold.
+                        ("pr-router.yml", "ios-fast"): "simulator-step",
+                        ("ios-fast-verdict-dispatch.yml", "ios-fast"): "simulator-step",
                         # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
                         # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
                         ("fast-checks.yml", "checks-mac"): "isolated",
@@ -2362,6 +2374,16 @@ def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | N
 SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
 
 
+# STEP_TABLE_UNLISTED: cmux's step table (pr-pipeline.yml, keyed by its caller pr-router.yml) never touches a canonical
+# root or the kept DerivedData (no CMUX_CI_CANONICAL_ROOT or owned-state step in it, cmux feat-cmux-next f65bb4fb71c0),
+# yet each job it added was a compile here until someone listed it: `mac`, `mac-fallback` and `ios` waited 58 min for
+# persistent-dd on cmux18 (2026-11-25), then `ios-fast` up to its 40-min timeout for root 1 (2026-11-27). So a job of
+# it that no table names is isolated (its own units, no shared token). GLAEDA_STEP_TABLE_UNLISTED_ISOLATED=0 costs it
+# as a compile again.
+STEP_TABLE_CALLER = "pr-router.yml"
+STEP_TABLE_UNLISTED_ENV = "GLAEDA_STEP_TABLE_UNLISTED_ISOLATED"
+
+
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
               workflow: str = "") -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). A
@@ -2380,6 +2402,9 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
         # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
         return "light", False
+    if workflow == STEP_TABLE_CALLER and job not in JOB_CLASSES and os.environ.get(STEP_TABLE_UNLISTED_ENV, "1") != "0":
+        # STEP_TABLE_UNLISTED: a job cmux's step table adds builds in its workspace, so it is isolated, not a compile
+        return "isolated", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
@@ -3201,6 +3226,7 @@ CAPTURE_LEASE_REFUSAL = "a capture lease is waiting for the host"  # a capture_l
 WAITER_REFUSALS = (WAITER_REFUSAL, CAPTURE_LEASE_REFUSAL)
 WAITER_SPANS_LOCK_S = 2.0  # waiting for another reader's update; past it every waiter is honoured
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
+GATE_RETRY_S = 300  # GATE_RETRY: how long a runner runs without its broken gate before a fresh one is tried
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
 # A throttled mini (macOS thermal pressure, notifyutil's com.apple.system.thermalpressurelevel: 0 nominal,
 # 1 moderate, 2 heavy, 3 trapping, 4 sleeping) compiles 3 to 14x slower per task (cmuxterm-hq#663), which
@@ -3280,9 +3306,27 @@ TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}  # the app's binary is its CLI onl
 # A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
 # busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
 GATE_ELIGIBLE_RECHECK_S = 30.0
+# FIRST_LOOK_FIRST: a gate with no listener up holds it off until its first eligibility look answers (and while a
+# first refusal is rechecked), for at most GATE_FIRST_LOOK_MAX_S, so a new or restarted gate never starts a listener
+# that takes a job job-started refuses. 2026-11-28: cmux14's restarted gates started their listeners at once, the
+# look answered "node not eligible" after the first poll, and the jobs taken meanwhile failed in "Set up job".
+# ELIGIBLE_LOOK_BOUND: a look still running GATE_ELIGIBLE_LOOK_MAX_S after it started is replaced by a new one and
+# its answer dropped: a hung look kept the last held refusal for good, so the runner never listened again.
+GATE_FIRST_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_LOOK_MAX_S") or 90.0)
+GATE_ELIGIBLE_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_LOOK_MAX_S") or 120.0)
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
+# INELIGIBLE_AT_ONCE: job-started's own eligibility refusal (node_refusal or toolchain_refusal under
+# --require-eligible), written to the mini's state dir, so every gate on the mini holds its listener off at its next
+# poll instead of waiting for its own look (GATE_ELIGIBLE_EVERY_S, then a recheck). The admit is the authority: a job
+# it refused is a job the gate let through, and every further job the listener takes fails the same way in "Set up
+# runner". cmux31's runners (m5pro-24 receipt pinning rustc 1.100.0, not installed) refused jobs from 2026-11-27
+# 23:38Z to a hand install at 01:54Z, one of them synthetic-probes' notify-banner-click (cmuxterm-hq run
+# 46092564119), which read as a probe red. Held, a gate listens again only once a look it started after the refusal
+# finds the node eligible; that look also removes the note. A refusal that names a probe timeout is no evidence (a
+# busy mini) and writes no note: the gate's own recheck decides those.
+ELIGIBILITY_REFUSED_FILE = "eligibility-refused.json"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
@@ -3880,11 +3924,28 @@ RUNNER_DRAIN_FILE = ".glaeda-drain"
 DRAIN_TTL_S = 3600.0
 DRAIN_MAX_BYTES = 4096
 
+# APPLY_DRAIN_IDLE_BOUND: the apply's marker (APPLY_DRAIN_BY) asks the runner to empty so the apply's next look can
+# re-register it; nothing on the mini runs that look. On cmux24 (2026-11-27) a glaeda-cmux-runner-fleet pass at
+# 13:37Z could not read GitHub's labels, planned a blind re-register while six dedicated runners had jobs, and marked
+# them draining. Their jobs ended by 14:11Z, no apply came back (GitHub's labels already matched), and the gates held
+# the idle listeners off until the marker's 1 h expiry: hq-fleet-route, -lan and -lan-2 served nothing for up to an
+# hour with 3 and 6 jobs queued. Now a gate whose listener has stood stopped under an apply's marker for
+# APPLY_DRAIN_IDLE_MAX_S (no job can run then, so the apply had its idle window) moves the marker aside
+# (RUNNER_DRAIN_FILE + ".waived"), logs APPLY_DRAIN_STALE (the alert: grep it, ci-dash reads the gate state line)
+# and listens again under the registration it has. A later apply that still needs the relabel drains again. The
+# clock is kept in the state dir (apply_drain_idle_file) so a reload or a restart of the gate does not restart it.
+# Hand drains and cmux-ci's are untouched: their writers end them. Off: GLAEDA_APPLY_DRAIN_IDLE_MAX_S=0.
+APPLY_DRAIN_IDLE_MAX_S = float(os.environ.get("GLAEDA_APPLY_DRAIN_IDLE_MAX_S") or 600.0)
+APPLY_DRAIN_STALE = "APPLY_DRAIN_STALE"
+
 
 def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
-    no marker, an expired one, or one that cannot be read."""
+    no marker, an expired one, or one that cannot be read. A gateway runner never drains for cmux-ci's measurement
+    pause (GATEWAY_NO_MEASURE_DRAIN)."""
     doc = runner_drain_doc(runner_dir, now) or host_runner_pause_for(runner_dir, now, fleet_dir)
+    if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY and gateway_runner_dir(os.fspath(runner_dir)):
+        doc = None
     return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
@@ -3920,7 +3981,33 @@ def drain_doc_at(path: Path, now: float, owner_uid: int | None = None) -> dict[s
         return None
     if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
+    if measure_drain_overdue(doc, now):
+        return None
     return doc
+
+
+# MEASURE_DRAIN_BOUND: cmux-ci's lend drain rewrites its marker (RUNNER_DRAIN by CMUX_CI_DRAIN_BY, and the host's
+# runner-pause.json) every few minutes with a fresh `until`, so the expiry above never ends a drain the worker keeps
+# asking for. 2026-11-28 02:17-03:20Z: cmux14, cmux22, cmux23, cmux28, cmux29, cmuxs-mac-mini-3 and ultra2 held every
+# runner but the nightly slot off for "cmux-ci lend drain: a measurement waits for this mini", the markers rewritten
+# with until 10 min ahead each pass, and the gateway label read 33 of 113 runners online. The worker now writes the
+# drain's start (`since`) into the marker and ends its own pause after its hard bound (cmuxterm-hq runner_pause.go
+# runnerPauseMaxHold); a marker whose `since` is older than MEASURE_DRAIN_MAX_S is ignored here as well, so a worker
+# that keeps rewriting past its bound (an old release, a bug) still frees the runners. A marker with no `since` (a
+# worker from before it) keeps the expiry alone. Other writers' markers (an apply, a hand drain) are untouched.
+# GLAEDA_MEASURE_DRAIN_MAX_S sets the bound; 0 turns it off.
+MEASURE_DRAIN_MAX_S = float(os.environ.get("GLAEDA_MEASURE_DRAIN_MAX_S") or 60 * 60)
+
+
+def measure_drain_overdue(doc: dict[str, Any], now: float) -> bool:
+    """Whether doc is cmux-ci's measurement drain and has stood past MEASURE_DRAIN_MAX_S since its `since`."""
+    if MEASURE_DRAIN_MAX_S <= 0 or doc.get("by") != CMUX_CI_DRAIN_BY:
+        return False
+    try:
+        since = float(doc.get("since") or 0)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return math.isfinite(since) and 0 < since <= now and now - since > MEASURE_DRAIN_MAX_S
 
 
 # HOST_DRAIN: a hand drain that empties a mini for a repair marks every runner on it (RUNNER_DRAIN), and every listener
@@ -4383,6 +4470,60 @@ def fleet_toolchain_missing(home: Path | None = None) -> str | None:
     return toolchain_missing(workload_env(), home)
 
 
+# RUST_SELF_INSTALL: a node whose receipt names a rustup toolchain it lacks installs it (bounded, under a per-user
+# lock), instead of refusing the job. 2026-11-27: cmux31's class receipt moved to rustc 1.100.0 while the mini had
+# only 1.95.0, so cmux31-glaeda-13 refused every job at setup with "rust toolchain 1.100.0-aarch64-apple-darwin is
+# not installed" (hq synthetic-probes, run 46094599116), and that workflow_dispatch had no rescue to re-place it.
+# By hand the install took 7 s. Leo: "YOU MUST FIX THESE TYPES OF THINGS ASAP. ALL." The gate's look installs too,
+# so a held listener heals itself instead of waiting for mini-health. GLAEDA_RUNNER_RUST_SELF_INSTALL=0 turns it off.
+RUST_SELF_INSTALL = os.environ.get("GLAEDA_RUNNER_RUST_SELF_INSTALL", "1") != "0"
+RUST_INSTALL_BUDGET_S = float(os.environ.get("GLAEDA_RUNNER_RUST_INSTALL_BUDGET_S") or 300.0)
+RUST_INSTALL_LOCK = ".cache/glaeda/rust-toolchain-install.lock"  # under home: one install per user at a time
+RUST_TOOLCHAIN_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def install_receipt_toolchain(toolchain: str, env: dict[str, str], home: Path) -> tuple[bool, str]:
+    """(installed, note): rustup toolchain install TOOLCHAIN --profile minimal, at most RUST_INSTALL_BUDGET_S in
+    all (the lock wait included), under RUST_INSTALL_LOCK so the runners of one user install it once. A toolchain
+    another runner installed while this one waited counts as installed."""
+    if not RUST_SELF_INSTALL:
+        return False, "self-install is off (GLAEDA_RUNNER_RUST_SELF_INSTALL=0)"
+    if not RUST_TOOLCHAIN_NAME.fullmatch(toolchain):
+        return False, f"refused to install an unsafe toolchain name {toolchain!r}"
+    deadline = time.monotonic() + RUST_INSTALL_BUDGET_S
+
+    def listed() -> bool:
+        out = _probe(["rustup", "toolchain", "list"], env, home, max(deadline, time.monotonic() + 10))
+        return any(line.split()[0] == toolchain for line in out.splitlines() if line.strip())
+
+    lock = home / RUST_INSTALL_LOCK
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return False, f"cannot open {lock}: {e}"
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False, f"another install held {lock} past {RUST_INSTALL_BUDGET_S:.0f} s"
+                time.sleep(1.0)
+        if listed():
+            return True, f"rust toolchain {toolchain} was installed by another runner here"
+        started = time.monotonic()
+        out, timed_out = _probe_answer(["rustup", "toolchain", "install", toolchain, "--profile", "minimal",
+                                        "--no-self-update"], env, home, deadline)
+        if not listed():
+            why = "timed out" if timed_out else "failed"
+            return False, f"rustup toolchain install {toolchain} {why} after {time.monotonic() - started:.0f} s"
+        return True, f"installed rust toolchain {toolchain} in {time.monotonic() - started:.0f} s (RUST_SELF_INSTALL)"
+    finally:
+        os.close(fd)
+
+
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
     """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
     match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
@@ -4434,7 +4575,13 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                                                  str(want.get("rustcVersion") or "")))), note
         names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
                  if line.strip()]
-        if toolchain not in names:
+        if toolchain not in names and names:
+            installed, why = install_receipt_toolchain(toolchain, env, home)
+            if not installed:
+                return f"node not eligible (rust toolchain {toolchain} is not installed; {why})", note
+            note = why
+            deadline = time.monotonic() + ELIGIBILITY_BUDGET_S  # the install spent the probes' budget
+        elif toolchain not in names:
             return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)", not names), note
         if align:
             current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
@@ -4443,10 +4590,16 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             if now != [toolchain]:
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
-            note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            note = "; ".join(x for x in (note, f"set the rustup default to {toolchain} "
+                                               f"(was {current[0] if current else 'none'})") if x)
+            # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
+            # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
+            # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
+            # as drifted (cmux run 45932403699, 2026-11-27 03:11Z) while its gate, probing by name, listened on.
+            env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
-            note = f"would set the rustup default to {toolchain}"
+            note = "; ".join(x for x in (note, f"would set the rustup default to {toolchain}") if x)
     python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return out_of_time(f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile "
@@ -6293,7 +6446,12 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # Measured 2026-11-26 22:5xZ on six minis: github.com 200 direct in 0.19-0.22 s against 0.7-4.2 s through
 # the tunnel; cmux info/refs (7.2 MB) 0.36-0.66 s direct against 2.4-10.4 s, and a 30 s timeout on a relayed mini;
 # a depth-1 clone 1.4-1.6 s direct against 8.2-19.9 s; twenty direct info/refs in a row, all 200 (cmuxterm-hq#27837).
-GIT_SHIM_TUNNEL = "http://127.0.0.1:18434"
+# Any loopback proxy is one of those tunnels: github-egress/mini-rollout.sh now writes the first of 18434 (the cp
+# forward), 18435 or 18436 (mini-hetzner-tunnel.sh's ssh -L to hetzner-1/-2) that answers. The shims matched 18434
+# alone, so on a mini set to 18435 they skipped the probe and the token's direct route, and a dead tunnel failed
+# actions/checkout at once ("Failed to connect to 127.0.0.1 port 18435 after 0 ms" three times, cmuxterm-hq
+# onboarding-new-person-production job 140667177526, 2026-11-27 20:09Z). So the shims match this prefix.
+GIT_SHIM_TUNNEL = "http://127.0.0.1:"
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6338,7 +6496,7 @@ case $sub in fetch|ls-remote|submodule) ;; *)
   [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   # one config read on this hot path: a token's call skips the tunnel (GIT_SHIM_TUNNEL), anything else keeps it
   http=$("$real" "${globals[@]}" config --get-urlmatch http https://github.com/ 2>/dev/null) &&
-    printf '%s\n' "$http" | grep -qxF "http.proxy $tunnel" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
+    printf '%s\n' "$http" | grep -q "^http.proxy $tunnel[0-9]*\$" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
     exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   exec "$real" "${orig[@]}" ;; esac
 shift
@@ -6499,7 +6657,7 @@ go_direct() {  # $1: why. This attempt, the rest and the job's later git calls s
 if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
-elif [ "$proxy" = "$tunnel" ] && [ "$kind" != submodule ] && authed; then
+elif [[ $proxy == "$tunnel"* ]] && [ "$kind" != submodule ] && authed; then
   # not a submodule update: its clones are other repositories, with no token, and -c reaches them
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "this fetch carries the job's token, so it goes direct to github.com (the tunnel $proxy is for anonymous fetches)"
@@ -6612,6 +6770,9 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 # 127.0.0.1 port 18434" three times, cmuxterm-hq job 140064510755, 2026-11-26 17:30Z). So any
 # github.com origin an actions/checkout step fetches in an HQ job takes the same probe and mark.
 # A checkout whose git carries the job's token (its extraheader) goes direct with no probe, as the cmux shim's does.
+# Any loopback proxy is a fleet tunnel, not only 18434: a fleet Mac's git config names 127.0.0.1:18435, and with
+# the exact-port test the shim passed that dead tunnel through ("Failed to connect to 127.0.0.1 port 18435"
+# three times, cmuxterm-hq job 140669807034, 2026-11-27 20:14Z, the feature-flows walk).
 HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
@@ -6626,7 +6787,7 @@ case "$url" in
 esac
 "$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
 proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
-[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+case "$proxy" in http://127.0.0.1:[0-9]*|http://localhost:[0-9]*) ;; *) passthrough ;; esac  # any fleet tunnel port
 case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
 if authed; then  # checkout's fetch carries the job's token: the tunnel is only for anonymous fetches (GIT_SHIM_TUNNEL)
   echo "glaeda git shim: this checkout carries the job's token; using direct HTTPS for ${url#https://github.com/}" >&2
@@ -10099,6 +10260,41 @@ def runner_labels(state_dir: Path, name: str | None) -> frozenset[str] | None:
     return None
 
 
+# ROLE_LABEL_MISMATCH: a gateway, sim-first or small runner takes only its own role's jobs and refuses any other at
+# job-started. cmux's owned-pool rescue re-places a refused job only for the workflows it watches; a workflow_dispatch
+# run such as screen-stream-eval (runs-on mac-gateway, run 46077298852, 2026-11-27) is not one, so it ended red on the
+# sim-first runner after 25 minutes queued. GitHub fixes labels at registration, and a role shift (the gateway count
+# or the simulator role changed) re-labels a runner only when the fleet apply finds it idle, so until then the hook's
+# role and GitHub's labels disagree. A refused job cannot be re-queued, so the runner must never take it: its gate
+# holds the listener while the labels it is known to carry (receipt, plus what GitHub dispatched to it) include another
+# role's label. Idle, it is then relabelled by the next apply.
+ROLE_LABEL_PREFIXES = {"gateway": ("glaeda-gateway-xcode-", "mac-gateway"), "sim": ("glaeda-sim-xcode-", "mac-sim"),
+                       "small": ("glaeda-small-xcode-",)}
+
+
+def label_role(label: str) -> str | None:
+    """The single-role runner (gateway, sim, small) a label belongs to, or None for any other label."""
+    for role, prefixes in ROLE_LABEL_PREFIXES.items():
+        if any(label == p or (p.endswith("-") and label.startswith(p)) for p in prefixes):
+            return role
+    return None
+
+
+def role_label_mismatch(scope: "RunnerScope | None", labels: frozenset[str] | None) -> str | None:
+    """Why a gateway, sim-first or small runner must not listen: the labels it carries include another role's, so
+    GitHub can hand it a job its job-started refuses (ROLE_LABEL_MISMATCH). None otherwise."""
+    if scope is None or not labels:
+        return None
+    mine = "gateway" if scope.gateway else "sim" if scope.sim else "small" if scope.small else None
+    if mine is None:
+        return None
+    foreign = sorted(label for label in labels if label_role(label) not in (None, mine))
+    if not foreign:
+        return None
+    return (f"this {mine} runner carries another role's label ({', '.join(foreign)[:120]}): it waits to be relabelled "
+            "rather than take a job it would refuse")
+
+
 def observed_labels(summary: dict[str, Any] | None, name: str | None) -> frozenset[str]:
     """The labels of jobs the feed (load_cap_summary) shows GitHub dispatched to this runner. GitHub hands a job only
     to a runner whose labels cover all of its runs-on, so every one of these is a label GitHub holds for it: a lower
@@ -12017,6 +12213,28 @@ def gate_state_file(state_dir: Path, runner_dir: Path) -> Path:
     return state_dir / f"gate-{runner_dir.name}.json"
 
 
+def apply_drain_idle_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"apply-drain-idle-{runner_dir.name}.json"
+
+
+def apply_drain_idle_since(state_dir: Path, runner_dir: Path, key: str, now: float) -> float:
+    """When the gate first saw this runner's listener stopped under the apply marker `key` (APPLY_DRAIN_IDLE_BOUND),
+    kept on disk across reloads and restarts; a new marker starts a new clock. A clock that cannot be kept starts
+    now each time, which only keeps the old behaviour (the marker's expiry)."""
+    path = apply_drain_idle_file(state_dir, runner_dir)
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        doc = json.loads(path.read_text(encoding="utf-8")[:DRAIN_MAX_BYTES])
+        since = float(doc["since"])
+        if doc.get("key") == key and math.isfinite(since) and since <= now:
+            return since
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}")
+        tmp.write_text(json.dumps({"key": key, "since": now}) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return now
+
+
 def gate_stamp(at: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at))
 
@@ -12107,6 +12325,7 @@ class Gate:
         self.job_done_at: float | None = None  # when the runner's last job ended (claim_stamp), monotonic
         self.job_ending = False  # job-completed left JOB_ENDING: look again the moment the Worker exits
         self.child: subprocess.Popen[bytes] | None = None
+        self.apply_drain_alerted: str | None = None  # the apply marker whose APPLY_DRAIN_STALE move failed, logged once
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
         self.streak = 0
         self.held: str | None = None
@@ -12157,9 +12376,16 @@ class Gate:
         if self.eligible_why and TOOLCHAIN_MISSING in self.eligible_why:
             self.eligible_why = None  # never carried across a reload: the per-poll check reads it afresh
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
+        # INELIGIBLE_AT_ONCE: job-started's refusal note this gate holds for, its mtime, and when the gate saw it
+        self.refused_why: str | None = None
+        self.refused_stamp = 0
+        self.refused_seen_at = 0.0
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.eligible_looked = self.eligible_why is not None  # a look has answered (a reload carries a held answer)
+        self.eligible_gen = 0  # the look whose answer counts (ELIGIBLE_LOOK_BOUND)
+        self.eligible_first_at: float | None = None  # when the first look started (FIRST_LOOK_FIRST)
         self.tailnet_why: str | None = None  # the held off-the-tailnet answer (off_tailnet)
         self.tailnet_seen = 0  # looks in a row that found this mini off the tailnet
         self.tailnet_at = -GATE_TAILNET_EVERY_S
@@ -12350,14 +12576,14 @@ class Gate:
                     or self.fleet_build_yield() or self.waiter_yield())
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = self.host_claim()
-        if why is None and self.waiters and self.waiters_due():
+        if why is None and self.yields_to_waiters() and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
             why = waiter_why(self.host_lock, min(self.waiting))
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.role_mismatch() or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def host_claim(self) -> str | None:
@@ -12365,7 +12591,12 @@ class Gate:
         lock until it has lasted SIGNER_LOCK_SETTLE_S: a probe's seconds do not take the signer offline."""
         scope = runner_scope(self.runner_dir)
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir, nightly_slot=scope.nightly)
-        if why != FLEET_BUILD_HOLDS_HOST or not scope.trusted_signing:
+        if why == FLEET_BUILD_HOLDS_HOST and scope.gateway:
+            return None  # GATEWAY_NO_MEASURE_DRAIN: its client takes no host.lock and about no CPU
+        # SETTLE_DEDICATED: a dedicated runner (cmux15's trusted-main, the only glaeda-trusted-std-xcode-26.6 runner)
+        # settles too. 2026-11-28 03:49-03:55Z its idle listener stopped three times for host.lock holds of 6-80 s
+        # and each stop cost the 60 s restart, so the census read seed signing at 0 online runners.
+        if why != FLEET_BUILD_HOLDS_HOST or not (scope.trusted_signing or scope.dedicated):
             self.lock_held_since = None
             return why
         now = time.monotonic()
@@ -12401,6 +12632,8 @@ class Gate:
         runner only with yieldToWaiters (YIELD_TO_WAITERS), read from its job-started hook on every look so a hook
         refresh counts without restarting the gate's listen.sh argv."""
         scope = runner_scope(self.runner_dir)
+        if scope.gateway:
+            return False  # GATEWAY_NO_MEASURE_DRAIN: a waiting build waits for no gateway client (GATEWAY_NO_HOST_LOCK)
         return scope.waiter_yields if scope.dedicated else self.waiters
 
     def waiter_yield(self) -> str | None:
@@ -12625,6 +12858,10 @@ class Gate:
             gate_log(f"{why}; measured {per:.1f} per core on {os.cpu_count()} cores")
         self.cap_why = why
         return why
+
+    def role_mismatch(self) -> str | None:
+        """ROLE_LABEL_MISMATCH: see role_label_mismatch; holds the listener, so no job is taken to be refused."""
+        return role_label_mismatch(runner_scope(self.runner_dir), self.cap_labels)
 
     def memory_capped(self) -> str | None:
         """MEMORY_CAP: why this listener takes no new job because one will not fit in the mini's memory, or None. Only
@@ -13039,7 +13276,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.role_mismatch() or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
@@ -13056,8 +13293,35 @@ class Gate:
 
     def draining(self) -> str | None:
         """RUNNER_DRAIN: an apply waits to re-register or retire this runner. One small file, read every poll; a
-        dedicated runner drains too."""
-        return runner_drain(self.runner_dir, time.time())
+        dedicated runner drains too. An apply's marker held past APPLY_DRAIN_IDLE_MAX_S with the listener
+        stopped ends here (APPLY_DRAIN_IDLE_BOUND)."""
+        now = time.time()
+        why = runner_drain(self.runner_dir, now)
+        if why is None or self.child is not None:
+            return why  # no drain, or a listener still runs (a job, or one the gate is about to stop)
+        doc = runner_drain_doc(self.runner_dir, now)
+        if doc is None or doc.get("by") != APPLY_DRAIN_BY or APPLY_DRAIN_IDLE_MAX_S <= 0:
+            return why
+        key = f"{doc.get('until')}|{doc.get('reason')}"
+        since = apply_drain_idle_since(self.state_dir, self.runner_dir, key, now)
+        if now - since < APPLY_DRAIN_IDLE_MAX_S:
+            return why
+        marker = self.runner_dir / RUNNER_DRAIN_FILE
+        try:
+            os.replace(marker, marker.with_name(RUNNER_DRAIN_FILE + ".waived"))
+        except OSError as error:  # the marker's expiry still ends it; say so once
+            if self.apply_drain_alerted != key:
+                gate_log(f"{APPLY_DRAIN_STALE}: {why} has held the idle listener off for {(now - since) / 60:.0f} "
+                         f"min with no apply; its marker could not be moved aside ({type(error).__name__}), so it "
+                         "holds until it expires")
+                self.apply_drain_alerted = key
+            return why
+        gate_log(f"{APPLY_DRAIN_STALE}: {why} held the idle listener off for {(now - since) / 60:.0f} min and no "
+                 "apply came to re-register it: the marker is moved aside and the listener serves under its current "
+                 "registration; re-run glaeda-cmux-runner-fleet --apply if the relabel is still due")
+        with contextlib.suppress(OSError):
+            apply_drain_idle_file(self.state_dir, self.runner_dir).unlink()
+        return runner_drain(self.runner_dir, now)
 
     def still_reserved(self) -> str | None:
         """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner
@@ -13459,9 +13723,27 @@ class Gate:
             self.missing_why = missing
         if missing:
             return f"ineligible: {missing}"
-        running =self.eligible_look is not None and self.eligible_look.is_alive()
-        if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
-            self.eligible_at = time.monotonic()
+        now = time.monotonic()
+        running = self.eligible_look is not None and self.eligible_look.is_alive()
+        if running and now - self.eligible_at >= GATE_ELIGIBLE_LOOK_MAX_S:
+            # ELIGIBLE_LOOK_BOUND: a look past its bound (its probes hung past ELIGIBILITY_BUDGET_S) no longer keeps
+            # the held answer: the next look replaces it, and the hung one's answer, if it ever comes, is dropped
+            gate_log(f"the eligibility look has not answered in {now - self.eligible_at:.0f} s; starting a new one")
+            self.eligible_gen += 1
+            running = False
+        note = eligibility_refused(self.state_dir)  # INELIGIBLE_AT_ONCE: one stat and a small read per poll
+        if note is not None and note[1] != self.refused_stamp:
+            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], now
+            gate_log(f"job-started refused a job here: {note[0]}; held off at once so another runner takes the "
+                     "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
+            if not running:
+                self.eligible_at = -GATE_ELIGIBLE_EVERY_S  # the look that may release it starts now
+        if not running and now - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
+            self.eligible_at = started = now
+            self.eligible_gen += 1
+            gen = self.eligible_gen
+            if self.eligible_first_at is None:
+                self.eligible_first_at = now
 
             def look() -> None:
                 try:
@@ -13469,8 +13751,25 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if gen != self.eligible_gen:
+                    return  # replaced (ELIGIBLE_LOOK_BOUND): a newer look owns the answer, and a refusal's release
+                self.eligible_looked = True
+                if self.refused_why is not None:
+                    if why is None and started >= self.refused_seen_at:
+                        gate_log(f"a look after job-started's refusal finds the node eligible; listening again "
+                                 f"(was: {self.refused_why})")
+                        clear_eligibility_refusal(self.state_dir, self.refused_stamp)
+                        self.refused_why = None
+                    elif why is None:  # a look that began before the refusal says nothing about it: look again
+                        self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
                 if why and TOOLCHAIN_MISSING in why:
                     return  # the per-poll toolchain_missing owns that answer; the held one, if any, stands
+                if why and self.refused_why is not None:
+                    self.eligible_new = None  # job-started already refused: no recheck needed to hold
+                    if why != self.eligible_why:
+                        gate_log(f"eligibility: {why}; held off so another runner takes the job")
+                    self.eligible_why = why
+                    return
                 if why and not self.eligible_why and not self.eligible_new:
                     self.eligible_new = why  # look again soon; hold only if that look refuses too
                     self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
@@ -13483,7 +13782,16 @@ class Gate:
 
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
-        return f"ineligible: {self.eligible_why}" if self.eligible_why else None
+        if self.child is None and not self.eligible_why and not self.refused_why:
+            # FIRST_LOOK_FIRST: with no listener up, nothing is lost by waiting for the look, and a listener started
+            # first took jobs that job-started then refused for the very eligibility the look was reading
+            if self.eligible_new:
+                return f"ineligible: {self.eligible_new} (rechecking before the listener starts)"
+            if not self.eligible_looked and self.eligible_first_at is not None \
+                    and now - self.eligible_first_at < GATE_FIRST_LOOK_MAX_S:
+                return "ineligible: waiting for the first eligibility look before the listener starts"
+        held = self.eligible_why or self.refused_why
+        return f"ineligible: {held}" if held else None
 
     def off_tailnet(self) -> str | None:
         """Why this mini is off the tailnet, from the last looks (GATE_TAILNET_EVERY_S, in a thread so no poll waits on
@@ -13671,7 +13979,8 @@ class Gate:
         with contextlib.suppress(OSError):
             self.job_end_marker().unlink()
         try:
-            return self.full(fresh=True)
+            # INELIGIBLE_AT_ONCE: a job job-started refused for eligibility stops the listener before its next job
+            return self.full(fresh=True) or self.ineligible()
         except Exception:  # noqa: BLE001  (the regular poll looks again)
             return None
 
@@ -14347,7 +14656,19 @@ class Gate:
         if self.child is None or self.child.poll() is not None:
             return GATE_FALLBACK
         signalled = False
+        # GATE_RETRY: never ungated for good (cmux22-glaeda-13 listened 14 h without its gate, taking jobs
+        # job-started refused). Every GATE_RETRY_S the idle runner is stopped, so the wrapper tries a fresh gate.
+        retry_s = float(os.environ.get("GLAEDA_GATE_RETRY_S") or GATE_RETRY_S)
+        retry_at = time.monotonic() + retry_s
         while (code := self.child.poll()) is None:
+            if not self.terminating and not signalled and time.monotonic() >= retry_at:
+                retry_at = time.monotonic() + retry_s
+                try:
+                    if not self.busy() and self.stop("GATE_RETRY: the gate failed; stopping the idle runner so a "
+                                                     "fresh gate starts"):
+                        signalled = True
+                except Exception:  # noqa: BLE001 - a gate that cannot look keeps the runner, as before
+                    pass
             if self.terminating and not signalled:  # launchd is stopping the agent: end the runner's session
                 try:
                     signalled = self.stop("the runner agent is stopping")  # False: retried on the next look
@@ -14432,6 +14753,36 @@ def note_waiter_refusal(state_dir: Path, why: str) -> None:
         # runners), so a plain utime could repeat the last stamp and the gates would miss the new refusal.
         stamp = max(time.time_ns(), last + 1_000)
         os.utime(path, ns=(stamp, stamp))
+
+
+def note_eligibility_refusal(state_dir: Path, why: str) -> None:
+    """INELIGIBLE_AT_ONCE: record job-started's eligibility refusal for every gate on this mini. Never raises."""
+    if "timed out" in why:
+        return
+    with contextlib.suppress(OSError):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = state_dir / f".{ELIGIBILITY_REFUSED_FILE}.{os.getpid()}"
+        tmp.write_text(json.dumps({"why": why, "at": time.time()}) + "\n")
+        os.replace(tmp, state_dir / ELIGIBILITY_REFUSED_FILE)
+
+
+def eligibility_refused(state_dir: Path) -> tuple[str, int] | None:
+    """(why, the note's mtime in ns) for job-started's last eligibility refusal on this mini, or None."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    try:
+        stamp = path.stat().st_mtime_ns
+        why = json.loads(path.read_text()).get("why")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (why, stamp) if isinstance(why, str) and why else None
+
+
+def clear_eligibility_refusal(state_dir: Path, stamp: int) -> None:
+    """Remove the note when it is still the one with this mtime (a newer refusal stands). Never raises."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    with contextlib.suppress(OSError):
+        if path.stat().st_mtime_ns == stamp:
+            path.unlink()
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:
@@ -17072,6 +17423,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.require_eligible:
             why, want = node_refusal(args.fleet_class)
             if why:
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
         if args.toolchain_xcode:  # the listener's env, which every step inherits (listener_env)
             given = {k: v for k, v in os.environ.items() if k != "SDKROOT" or not under_xcrun_shim(sys.executable)}
@@ -17233,7 +17585,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                           job_workflow())[0]) not in SIM_FIRST_CLASSES:
             # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
-            # here would jump the side lanes; refused, it is rescued onto its own pool.
+            # here would jump the side lanes. The rescue covers only the workflows cmux watches (not a dispatch run),
+            # so the gate never lets a runner carrying another role's label listen (ROLE_LABEL_MISMATCH).
             return refused("the sim-first runner takes only simulator jobs")
         if owner is None:  # fail closed: with no pinned owner no holder could watch the job
             return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
@@ -17420,6 +17773,7 @@ def main(argv: list[str] | None = None) -> int:
             why, aligned = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode)
             if why:
                 release_host_lock(args.state_dir)
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
