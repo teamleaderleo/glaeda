@@ -797,7 +797,7 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 20)
+        self.assertEqual(len(signing), 21)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
         # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
@@ -3776,6 +3776,29 @@ class HookTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
 
+    def test_every_cmux_signing_job_is_admitted(self) -> None:
+        """cmux's own list of the jobs glaeda gives the whole mini (scripts/ci/signing_runner.py SIGNING_JOBS, by job
+        id) is a subset of SIGNING_JOBS. Both repos claimed the same list "word for word" with nothing comparing
+        them; nightly-next-pkg sat in cmux's and not here, so every Finish dispatch was refused (cmux run
+        46100308507). The fixture is cmux's list at a commit; a new cmux signing job updates it here too."""
+        fixture = json.loads((ROOT / "tests" / "fixtures" / "cmux-signing-jobs.json").read_text())
+        missing = [(workflow, job) for workflow, jobs in fixture["jobs"].items() for job in jobs
+                   if (workflow, job) not in hook.SIGNING_JOBS]
+        self.assertEqual(missing, [], "cmux signing jobs glaeda would refuse; add them to SIGNING_JOBS")
+        ref = "refs/heads/nightly-next"
+        dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
+                    "workflow": ".github/workflows/nightly.yml"}
+        for job in fixture["jobs"]["nightly.yml"]:
+            with self.subTest(job=job):
+                self.assertIsNone(hook.trusted_refusal(
+                    "workflow_dispatch", ref, "manaflow-ai/cmux", dispatch, "refs/heads/main", "manaflow-ai/cmux",
+                    trusted_next_signing=True, job=job, run_attempt="1",
+                    workflow_ref=f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"))
+
+    def test_nightly_next_pkg_holds_the_whole_mini_before_credentials(self) -> None:
+        """The Finish run's pkg job signs with the release-next keychain and must drain the whole Mac."""
+        self._assert_nightly_job_holds_the_whole_mini("nightly-next-pkg")
+
     def test_nightly_next_deltas_holds_the_whole_mini_before_credentials(self) -> None:
         """The post-feed delta job signs with the nightly key and must drain the whole Mac."""
         self._assert_nightly_job_holds_the_whole_mini("nightly-next-deltas")
@@ -4877,7 +4900,7 @@ class HookTest(unittest.TestCase):
         # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
         # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
         for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step"),
-                           ("ios-fast", "simulator-step")):
+                           ("ios-fast", "simulator-step"), ("a-step-added-later", "isolated")):
             with self.subTest(pr_router=job):
                 self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
                 self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
@@ -5737,6 +5760,10 @@ class HookTest(unittest.TestCase):
         # any other workflow's unlisted job stays the compile it was
         self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow="ci.yml"),
                          ("compile", True))
+        # STEP_TABLE_UNLISTED: off, a step-table job no table names is the compile it was
+        with mock.patch.dict(os.environ, {hook.STEP_TABLE_UNLISTED_ENV: "0"}):
+            self.assertEqual(hook.job_class("a-step-added-later", "manaflow-ai/cmux", workflow="pr-router.yml"),
+                             ("compile", True))
 
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
@@ -13032,6 +13059,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "eligibility_refusal", side_effect=slow_look):
             self.assertIn(hook.TOOLCHAIN_MISSING, gate.claimed() or "")
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+            gate.eligible_looked = True  # a look answered before rustup went missing, so FIRST_LOOK_FIRST has no wait
             make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
             self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
             self.assertTrue(gate.eligible_look.is_alive())
