@@ -28912,12 +28912,14 @@ class LandTest(Base):
 
     upstream = False  # this host reads PRs through an upstream (a lane VM)
     fresh_head: str | None = None  # what a direct read (refresh) stores, or None for a read that fails
+    fresh_review: str = ""  # the reviewDecision that read stores ("" leaves it out)
 
     def refresh(self, key: str) -> str | None:
         self.w.refreshed.append(key)
         if self.fresh_head is None:
             return "lane-gh call get: quota"
-        self.w.set_pr(key, land_pr(self.fresh_head), self.t)
+        self.w.set_pr(key, {**land_pr(self.fresh_head),
+                            **({"reviewDecision": self.fresh_review} if self.fresh_review else {})}, self.t)
         return None
 
     def land(self, target: str = "o/r#1", after: list[str] | None = None, requester: str = "host/lane") -> None:
@@ -33840,6 +33842,89 @@ class LandTest(Base):
             [h for h in e["history"] if h["event"] == "judged"][1:])]
         self.assertEqual(waits, [60, 120, 240, 480, 960])
         self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
+
+    REVIEW_REFUSED = ("land-judge (pass): ok: may merge at " + LA + "\nGitHub refused o/r#1 for its base-branch "
+                      "policy (not land-judge): every required check at " + LA[:12] + " has passed, so another rule "
+                      "holds it (a required review, a ruleset's other rule, a stale branch): see the PR's merge box")
+
+    def review_stop(self) -> dict:
+        """A row whose pinned merge GitHub refused for a missing approving review (LAND_REVIEW_REQUIRED)."""
+        self.w.set_pr(self.KEY, {**land_pr(LA), "reviewDecision": "REVIEW_REQUIRED"}, self.t)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        self.w.answers.append(ok_answer(LA))
+        return self.tick()
+
+    def test_a_review_required_stop_spends_no_refusals_and_lands_once_approved(self):
+        # 2026-11-27, the release-candidate freeze: feat-cmux-next wants one approving review, Leo stamps each PR
+        # himself ("am personally stamping thru the approval"). Each such PR took six merge calls and ~31 min of
+        # backoff, then stopped merge_refused, and his approval re-queued none of them.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        e = self.review_stop()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", gg.LAND_REVIEW_REQUIRED), e.get("stop"))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)  # one merge call, no backoff spent
+        self.assertNotIn("stepFail", e)
+        self.assertIn("approves it at " + LA[:12], e["stop"]["next"])
+        judged = len(self.w.explains())
+        # still unapproved: read on its cadence, never judged, never re-armed
+        self.fresh_head, self.fresh_review = LA, "REVIEW_REQUIRED"
+        e = self.tick(gg.LAND_REVIEW_READ_EVERY + 5)
+        self.tick(5)
+        e = self.tick(5)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged))
+        self.assertIn(self.KEY, self.w.refreshed)
+        # Leo approves the head: the next stopped-row read sees it and the same head lands, nobody requeueing it
+        self.fresh_review = "APPROVED"
+        self.w.gh_rc["merge"] = 0
+        self.w.gh_err["merge"] = ""
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(8):  # a read due within LAND_REVIEW_READ_EVERY, the re-arm on the pass after it lands
+            e = self.tick(gg.LAND_REVIEW_READ_EVERY / 4)
+            if e.get("state") in gg.LAND_DONE - {"stopped"}:
+                break
+        self.assertEqual(e.get("state"), "merged", e.get("history", [])[-6:])
+        self.assertTrue(any(h["event"] == "rearmed" and h.get("code") == gg.LAND_REVIEW_REQUIRED
+                            for h in e["history"]))
+
+    def test_a_review_required_stop_is_not_rearmed_by_an_approval_of_another_head(self):
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        e = self.review_stop()
+        self.assertEqual(e["stop"]["code"], gg.LAND_REVIEW_REQUIRED)
+        self.fresh_head, self.fresh_review = LB, "APPROVED"  # a new head: its own approval, its owner's new land
+        for _ in range(4):
+            e = self.tick(gg.LAND_REVIEW_READ_EVERY)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", gg.LAND_REVIEW_REQUIRED))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+
+    def test_a_policy_refusal_with_no_review_wanted_still_counts_as_before(self):
+        # a base that requires no review (no reviewDecision in the copy): the refusal is another rule's
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        e = self.run_hour(lambda: ok_answer(LA))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), gg.LAND_STEP_STOP)
+
+    def test_an_old_merge_refused_stop_for_a_review_becomes_review_required_and_lands_once_approved(self):
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.REVIEW_REFUSED
+        e = self.run_hour(lambda: ok_answer(LA))  # no reviewDecision in the copy yet: the old merge_refused stop
+        self.assertEqual(e["stop"]["code"], "merge_refused")
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.w.answers.clear()
+        self.w.set_pr(self.KEY, {**land_pr(LA), "reviewDecision": "APPROVED"}, self.t + 1)
+        self.w.gh_rc["merge"] = 0
+        self.w.gh_err["merge"] = ""
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(5)
+        e = self.tick(5)
+        self.assertEqual(e.get("state"), "merged", e.get("history", [])[-6:])
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), merges + 1)
 
     def test_alternating_merge_refusals_at_one_head_do_not_reset_each_others_count(self):
         """A non-transient refusal at a head that has not moved is no progress whatever its words, so the count is
@@ -48650,10 +48735,11 @@ class AppPoolChainTest(unittest.TestCase):
         self.assertEqual(gg.app_pool_chain(("glaeda", "ci-watch", "glaeda")), ["glaeda", "ci-watch"])
 
     def test_the_daemon_builds_its_pool_in_the_chain_s_order(self) -> None:
-        saved = (gg.APP_POOL_SPARES, gg.BASE)
+        saved = (gg.APP_POOL_SPARES, gg.BASE, gg.APP_POOL_DISCOVER)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         gg.BASE = Path(tmp.name)
+        gg.APP_POOL_DISCOVER = False  # this host's own pushed tokens are not the test's
         try:
             for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), CHAIN),
                                  (("quota-goblin",), ["ci-watch", "quota-goblin"])):
@@ -48661,7 +48747,37 @@ class AppPoolChainTest(unittest.TestCase):
                 daemon = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
                 self.assertEqual([p.role for p in [daemon.app_pool, *daemon.app_pool.spares]], want)
         finally:
-            gg.APP_POOL_SPARES, gg.BASE = saved
+            gg.APP_POOL_SPARES, gg.BASE, gg.APP_POOL_DISCOVER = saved
+
+    def test_every_held_read_pool_follows_the_listed_chain(self) -> None:
+        """NOW 2026-11-27 22:31Z: this daemon was the login's top GraphQL spender (3852 on the controller host) while
+        quota-goblin-9016 and the other read pools pushed to the host were on no chain. Leo: "use the apps we have"."""
+        doc = {"roles": {
+            "ci-watch": {"writes": []},
+            "quota-goblin-9002": {"pool": True, "writes": []},
+            "yap-goblin-9000": {"pool": True, "read_pool": False},
+            "quota-goblin-9004": {"pool": True, "read_pool": False, "actions_only": True},
+            "runner-pool-1": {"pool": True, "actions_only": True},
+            "ws-status": {"pool": True, "read_pool": False},
+            "quota-goblin-9016": {"pool": True, "writes": []},
+            "quota-goblin-9014": {"pool": True, "writes": []}}}
+        self.assertEqual(gg.app_pool_read_roles(doc), ["quota-goblin-9002", "quota-goblin-9016", "quota-goblin-9014"])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = (gg.APP_POOL_DIR, gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER)
+        try:
+            gg.APP_POOL_DIR = Path(tmp.name)
+            held = {"quota-goblin-9016", "runner-pool-1"}
+            with mock.patch.object(gg, "app_pool_pushed_owners", lambda role, now=None: ["manaflow-ai"] if role in held else []), \
+                    mock.patch.object(gg, "app_pool_tool", lambda: None):
+                self.assertEqual(gg.app_pool_held_read_roles(doc=doc), ["quota-goblin-9016"], "held, read pool only")
+                with mock.patch.object(gg, "app_pool_held_read_roles", lambda now=None: ["quota-goblin-9016", "glaeda"]):
+                    gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER = tuple(CHAIN), True
+                    self.assertEqual(gg.app_pool_chain(gg.app_pool_roles()), [*CHAIN, "quota-goblin-9016"])
+                    gg.APP_POOL_DISCOVER = False  # GLAEDA_GH_APP_SPARES set: its list alone, as before
+                    self.assertEqual(gg.app_pool_chain(gg.app_pool_roles()), CHAIN)
+        finally:
+            gg.APP_POOL_DIR, gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER = saved
 
 
 class ShorthandFlagTest(unittest.TestCase):
