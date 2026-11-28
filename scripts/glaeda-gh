@@ -13086,6 +13086,18 @@ class Daemon:
                 return error
         return None
 
+    def fetch_full_sized(self, chunk: list[dict]) -> str | None:
+        """Full reads of CHUNK (one repository's) in queries sized by the measured cost (full_pr_size), as fetch_prs
+        sends them. A batched refresh and the waited pool's workers sent the whole chunk (batch 10, halved to 5 after a
+        cut and back up in each throwaway Daemon): 5 cmux PRs a query, cut by GitHub at 10.5 s, 10 of them in 15 minutes
+        on cmux-cp-1 (2026-11-28 02:03Z) after the measure was held, because this path never read it."""
+        size = self.full_pr_size(chunk)
+        for i in range(0, len(chunk), size):
+            error = self.fetch_aliased(chunk[i:i + size], "pr")
+            if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
+                return error
+        return None
+
     def full_pr_size(self, full: list[dict]) -> int:
         """How many of FULL (one repository's PRs, as batched() groups them) one full-read query may carry: as many as
         fit PR_FULL_QUERY_SECONDS at the seconds per PR measured for the repository, all of them while none is."""
@@ -16216,7 +16228,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
                      "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
-                left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
+                left = daemon.batched("pr", full, daemon.fetch_full_sized) if full else []
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")

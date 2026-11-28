@@ -52137,6 +52137,14 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(4)))
             self.assertEqual(d.sent, [1, 1, 1, 1])
 
+    def test_a_batched_refresh_sends_full_reads_by_measured_cost(self):
+        """land_direct_read_many's batched() sent whole chunks of 5: the measure was only read by fetch_prs."""
+        d, clock = self.daemon(5.0)
+        d.full_pr_secs = {"manaflow-ai/cmux": 5.0}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_full_sized(self.entries(4)))
+        self.assertEqual(d.sent, [1, 1, 1, 1])
+
     def test_a_fast_repo_keeps_its_batch(self):
         d, clock = self.daemon(0.5)
         with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
