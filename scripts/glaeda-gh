@@ -17465,7 +17465,11 @@ LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unread
 # full_tier_label is the same stop for cmuxterm-hq (land_judge/rules/ci_tier.py: only `ci tier: cheap` passed, so the
 # land adds land-ci): its add went through the broker as pr_edit, which a glaeda job with no lane session cannot
 # lease and whose pr_labels never list land-ci (hq#23688, 2026-11-24, "lease acquisition requires a lane session").
-LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
+# land_tier_pending left this set on 2026-11-28: the lane-gh broker now lets a lane take ready-to-land off its own PR and
+# add it back, so land_judge on a lane VM cycles the label itself (leo-workspace label_lane_cycle), and only a cycle the
+# broker refused is handed off (LAND_HANDOFF_LABEL_REFUSED). Before, every land_tier_pending on a lane VM went to the
+# broker host's queue, and 6 of 11 such hand-offs in one night waited on a person to cycle the label.
+LAND_HANDOFF_BROKER_ONLY = frozenset({"full_tier_label"})
 # And land_judge's tool_error whose read the lane-gh broker refused (leo-workspace tools/land_judge/engine.py
 # TOOL_ERROR_LEAD: "... sent a query the lane-gh broker refuses on every call"): the VM's broker grant (a repo it may not
 # read, "REPO is not a repo VM may use") or the broker's query allowlist refused one of the judgment's reads, the same
@@ -17479,8 +17483,16 @@ LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
 # lane may run, green and idle (cmux#63635, #57830, #57226, 2026-11-28). The broker host's land_judge adds the label
 # with its own login and still decides the merge under the teammate rule (opt-in or idle_pass); a compile_missing
 # whose reason names no broker refusal stays a step here.
-LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error", "compile_missing"})
-LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: ")
+# land_tier_pending is handed off the same way, only when its reason says the lane's broker refused the label write:
+# the remove of ready-to-land ("This lane VM's broker cannot take ready-to-land off", a broker still on the old label
+# list, or a land_judge from before the lane cycle), or full-ci's fallback pulse ("Could not add full-ci through this
+# lane VM's broker", "Took full-ci off but could not add it back"). Any other land_tier_pending is a step here: the
+# cycle (LAND_COMMAND_PULSE), the base merge of a spent cycle, or the label add.
+LAND_HANDOFF_LABEL_REFUSED = (r"|\blane VM's broker cannot take\b|\bCould not (?:add|take off) full-ci through this lane "
+                              r"VM's broker\b|\bTook full-ci off but could not add it back\b")
+LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error", "compile_missing", "land_tier_pending"})
+LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: "
+                                         + LAND_HANDOFF_LABEL_REFUSED)
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
 # live judgments within LAND_EARLY_HANDOFF_WINDOW read nothing for a transient reason (LAND_HANDOFF_UNREAD,
@@ -18484,9 +18496,13 @@ LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (?P<n>\d+) -R (?P<repo>[\w.-]+/[
 # teammate's PR (a `teammate` stop in the history: their label is their opt-in), and never full-ci. Before cmux's
 # cheap-labelled-push rule lands a labelled head runs full and its land-tier is success, so this never fires.
 # Detector: test-glaeda-gh.py -k pulse.
-LAND_COMMAND_PULSE = re.compile(r"\s*gh api -X DELETE repos/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<n>\d+)/labels/"
+# A lane VM's land_judge names the same pulse in the broker's `gh pr edit` form (gh api POST is refused there); it is
+# the same step, sent as land_pulse_args' broker form.
+LAND_COMMAND_PULSE = re.compile(r"\s*(?:gh api -X DELETE repos/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<n>\d+)/labels/"
                                 r"(?P<label>ready-to-land) && gh api -X POST repos/(?P=repo)/issues/(?P=n)/labels -f "
-                                r"'?labels\[\]=(?P=label)'?\s*")
+                                r"'?labels\[\]=(?P=label)'?"
+                                r"|gh pr edit (?P<n2>\d+) -R (?P<repo2>[\w.-]+/[\w.-]+) --remove-label (?P<label2>ready-to-land)"
+                                r" && gh pr edit (?P=n2) -R (?P=repo2) --add-label (?P=label2))\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -19848,10 +19864,12 @@ def land_command_label(act: dict, answer: dict) -> dict | None:
     number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
     pulse = LAND_COMMAND_PULSE.fullmatch(text)
     if pulse:
-        if not repo or pulse.group("repo").lower() != repo.lower() or pulse.group("n") != number:
+        p_repo, p_n = pulse.group("repo") or pulse.group("repo2"), pulse.group("n") or pulse.group("n2")
+        if not repo or p_repo.lower() != repo.lower() or p_n != number:
             return None
         return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "label", "repo": repo,
-                "label": pulse.group("label"), "pulse": True, "text": text.strip(), "from": "command"}
+                "label": pulse.group("label") or pulse.group("label2"), "pulse": True, "text": text.strip(),
+                "from": "command"}
     if not named:
         return None
     n, named_repo, label = (named.group("n") or named.group("n2"), named.group("repo") or named.group("repo2"),
