@@ -258,6 +258,11 @@ def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
 # this mirror starts over when it changes. Without a usable git mirror it fetches from GitHub as before.
 GIT_MIRROR_DIR = os.environ.get("GLAEDA_GIT_MIRROR_DIR") or "/Users/Shared/cmux-build-fleet/git"
 BORROW_RECORD = "glaeda-mirror-borrow.json"
+# Main's head is read from that git mirror too, not fetched from GitHub, when glaeda-git-mirror's last fetch (one a
+# minute, through the controller's git proxy) succeeded within this long. Every run fetched main anonymously from
+# github.com: ~6 an hour on each of ~17 office minis, all from the office's one address, which GitHub answered 403
+# on 2026-11-26. Leo, 2026-11-27: "minis tho," / "we dont wanna like... get banned again ideally".
+MIRROR_FRESH_S = 600
 
 
 def mirror_identity(mirror: Path) -> dict | None:
@@ -300,8 +305,22 @@ def borrow(repo: Path, identity: dict) -> None:
     incoming.rename(repo / BORROW_RECORD)
 
 
+def mirrored_main(source: Path, now: float | None = None) -> str:
+    """Main's head in the mini's git mirror when glaeda-git-mirror's record says its last fetch succeeded within
+    MIRROR_FRESH_S, else ''."""
+    record = source.parent / f"{source.stem}.json"
+    try:
+        fresh = (time.time() if now is None else now) - record.stat().st_mtime < MIRROR_FRESH_S
+        ok = (json.loads(record.read_text()).get("fetch") or {}).get("ok") is True
+        head = git(source, "rev-parse", "--verify", "-q", "refs/heads/main^{commit}", timeout=30).strip()
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return ""
+    return head if fresh and ok and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
 def main_head(work: Path) -> tuple[Path, str]:
-    """A blobless shallow mirror of main, fetched now; returns (mirror, head sha)."""
+    """A blobless shallow mirror of main, brought to main's head now; returns (mirror, head sha). With a usable, fresh
+    git mirror it borrows, the head is the git mirror's (mirrored_main): no request to GitHub at all."""
     mirror = work / "cmux.git"
     source = mirror_identity(Path(GIT_MIRROR_DIR) / "cmux.git")
     alternates, recorded = borrow_state(mirror)
@@ -315,6 +334,10 @@ def main_head(work: Path) -> tuple[Path, str]:
         git(mirror, "remote", "add", "origin", REPO_URL)
     if source is not None and not borrow_state(mirror)[0]:
         borrow(mirror, source)  # earlier objects stay until the mirror is next rebuilt; they are small (trees)
+    local = mirrored_main(Path(GIT_MIRROR_DIR) / "cmux.git") if source is not None else ""
+    if local and borrow_state(mirror)[0] == [source["objects"]]:
+        git(mirror, "update-ref", "refs/remotes/origin/main", local)  # its objects are the git mirror's
+        return mirror, local
     git(mirror, "fetch", "-q", "--filter=blob:none", f"--depth={DEPTH}", "origin",
         "+refs/heads/main:refs/remotes/origin/main")
     return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()

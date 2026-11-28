@@ -108,6 +108,32 @@ class SeedPrefetchTest(PrefetchBase):
         self.assertEqual(again, head)
         self.assertFalse((own / "objects/info/alternates").exists())
 
+    def test_main_comes_from_a_fresh_git_mirror_and_never_github(self):
+        # Leo, 2026-11-27: "we dont wanna like... get banned again ideally": no anonymous fetch from the office.
+        mirror = Path(sp.GIT_MIRROR_DIR) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        record = mirror.parent / "cmux.json"
+        record.write_text(json.dumps({"fetch": {"ok": True, "via": "proxy"}}))
+        head = self.commit()
+        subprocess.run(["git", "-C", os.fspath(mirror), "fetch", "-q", os.fspath(self.repo),
+                        "+refs/heads/main:refs/heads/main"], check=True)
+        sp.REPO_URL = (Path(self.tmp.name) / "no-such-github").as_uri()  # a fetch from "GitHub" would fail
+        work = self.state / ".prefetch"
+        own, got = sp.main_head(work)
+        self.assertEqual(got, head)
+        self.assertEqual(sp.git(own, "rev-parse", "refs/remotes/origin/main").strip(), head)
+        self.assertEqual(sp.git(own, "cat-file", "-t", head).strip(), "commit")
+        # A stale or failed git mirror fetch is not trusted: it fetches as before (here, and fails)
+        record.write_text(json.dumps({"fetch": {"ok": False}}))
+        with self.assertRaises(subprocess.CalledProcessError):
+            sp.main_head(work)
+        record.write_text(json.dumps({"fetch": {"ok": True}}))
+        os.utime(record, (time.time() - sp.MIRROR_FRESH_S - 1,) * 2)
+        self.assertEqual(sp.mirrored_main(mirror), "")
+        os.utime(record, None)
+        self.assertEqual(sp.mirrored_main(mirror), head)
+
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")

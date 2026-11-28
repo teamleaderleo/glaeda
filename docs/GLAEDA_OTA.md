@@ -111,6 +111,25 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    backed-off hours), as an error when the reason is one retrying cannot clear (a quarantined or
    refused release, a hook `--refresh-hooks` keeps), and `ota_stale` when no run has finished for
    three hours. ci-dash shows both in Health, from the report the probe forwards.
+   A new release restarts the host's `since`, but each stale runner row in `running.hooks` keeps its
+   own `staleSince` while its hook bytes stay the same, and `alertAfter` counts from the oldest of
+   them: a runner left on one hook through several releases pages two hours after it fell behind,
+   not two hours after the latest release (before, a ring that released every half hour never let
+   a stuck runner reach `alertAfter`).
+
+   **Unit deploy ownership.** Every host unit has one deploy path; the path that installs the unit
+   also owns refreshing its executable and arguments:
+
+   | Unit family | Unit installer / deploy path |
+   | --- | --- |
+   | `glaeda-update` LaunchAgent or `glaeda-update.timer`/`.service` | `glaeda-update` (the host's OTA timer and service) |
+   | Seed archive LaunchDaemon and seed scripts | `glaeda-seed-archive install --apply`; later bytes for already-installed seed scripts are refreshed by `glaeda-update` |
+   | Fleet-CAS store and store-GC LaunchDaemons | The registry's `glaeda-fleet-cas-rollout ... --apply`, which stages the installer and runs `glaeda-fleet-cas` on the store host |
+
+   `glaeda-update` never creates a missing seed role, fleet-CAS bundle, or fleet-CAS unit. A host
+   that runs one of those units must therefore have its registry installer row (or the seed
+   installer) as the deploy source. This keeps a unit's installed bytes, arguments, and service
+   manager state on the same path that can make them current.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are
@@ -330,3 +349,37 @@ The fleet runtime on the minis (`glaeda` binary, enrollment, class acceptance) s
 cmux build on a seed per hardware class) before other hosts can adopt it. Automating that means a
 canary mini that runs `accept-local` on each stable candidate and publishes the class receipt as
 a release asset for the others to adopt. That work is tracked in #149.
+
+### Enrollment for hosts discovered through service units
+
+The deploy reconciler must include every host with an installed glaeda launchd or
+systemd unit, including units installed by hand, rather than only declared runner
+roles. For an un-enrolled host use `glaeda-mini-setup --update-only --apply` from
+the released tree. This installs only `glaeda-update` and its recurring launchd
+agent or systemd user timer. Use `--headless` for the existing supported system
+LaunchDaemon domain. Plan without `--apply` first. A host with no glaeda units is
+not a candidate; the caller owns this inventory decision.
+
+`--update-only` preserves service roles and installs no hygiene, runner or GitHub
+watcher services. It refuses an existing different updater or setup receipt profile:
+continue that host's recorded `setupArgs` instead, restoring a missing config first.
+Setup writes the profile before starting the recurring updater. The profile persists across releases and
+checks only the updater's health and bytes. Older releases that lack the flag
+are refused before setup, as with other unsupported persisted flags.
+
+Each successful recurring update also refreshes the already-installed direct
+script `~/.cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune`, using the same
+atomic replacement and newer-operator-copy protection as the seed scripts.
+It creates no CAS role, storage, binary, wrapper or unit and restarts no CAS
+service. The installer remains responsible for those surfaces through its
+registry deploy runner. Operator symlinks at the script, install directory, or
+source stamp are preserved; linked scripts remain unknown in convergence.
+A linked script is skipped individually so regular sibling scripts still update.
+`converge.json` exposes `running.casScripts` and
+`running.libexecScripts` with installed/release SHA-256 identities; a differing
+service script makes convergence false, including a protected operator copy.
+The launch directory's `.glaeda-source.json` records the source release identity.
+
+Enrollment availability is not a deployment receipt. A restricted host remains
+read-only until its authorized owner applies enrollment; an unknown wrapper or
+unreadable unit remains unknown in the fleet detector, never current.

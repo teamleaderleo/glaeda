@@ -216,6 +216,106 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+
+class AdmitTests(unittest.TestCase):
+    """admit: new hosts into the manifest from what the probe saw."""
+
+    M5 = ("model\tMac17,9", "chip\tApple M5 Pro", "cpus\t15", f"memory_bytes\t{64 * 2**30}")
+
+    def m5_probe(self, hostname: str, extra_xcode: bool = True, node_id: str | None = None) -> str:
+        text = probe_text(hostname=hostname, node_id=node_id, sudo="password")
+        text = (text.replace("model\tMac16,11", self.M5[0]).replace("chip\tApple M4 Pro", self.M5[1])
+                .replace("cpus\t14", self.M5[2]).replace(f"memory_bytes\t{48 * 2**30}", self.M5[3]))
+        if extra_xcode:
+            text += "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|18A100\n" \
+                    "xcode_app\t/Applications/Xcode-beta.app|symlink|27.1|18B5\n"
+        return text
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "m.json"
+        shutil.copy(EXAMPLE, self.path)
+        self.manifest = mf.load_manifest(self.path)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_new_class_hosts_node_ids_and_installed_xcode_labels(self) -> None:
+        obs = observed(**{"cmux25": self.m5_probe("cmux25"), "cmux26": self.m5_probe("cmux26", extra_xcode=False)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["cmux25", "cmux26"], "std")
+        self.assertEqual(plan["hardware"], {"m5pro-64": {"model": "Mac17,9", "chip": "Apple M5 Pro", "cpus": 15,
+                                                         "memory_gib": 64}})
+        a, b = plan["hosts"]["cmux25"], plan["hosts"]["cmux26"]
+        self.assertEqual((a["node_id"], b["node_id"]), ("cmux-mac-003", "cmux-mac-004"))
+        self.assertEqual((a["hardware"], a["class"], a["availability"], a["roles"], a["sudo"]),
+                         ("m5pro-64", "std", "dedicated", ["ci-runner"], "password"))
+        # The symlinked beta is not a complete app; the real 27.0 becomes a label source.
+        paths = [x["path"] for x in a["overrides"]["xcode"]["apps"]]
+        self.assertIn("/Applications/Xcode_27.0.app", paths)
+        self.assertNotIn("/Applications/Xcode-beta.app", paths)
+        self.assertNotIn("overrides", b)
+        self.assertTrue(any("onboard --acceptance node" in n for n in notes))
+        raw = json.loads(self.path.read_text())
+        raw["hardware"].update(plan["hardware"])
+        raw["hosts"].update(plan["hosts"])
+        merged = mf.load_manifest(self.path, json.dumps(raw))
+        summary, why = mf.labels.member_labels(merged, "cmux25", lambda app: True)
+        self.assertIsNone(why)
+        self.assertIn("xcode-27.0", summary["labels"])
+        self.assertIn("xcode-26.3", summary["labels"])
+
+    def test_matching_hardware_is_reused_and_members_left_alone(self) -> None:
+        obs = observed(**{"build-mini-9": probe_text(hostname="build-mini-9", node_id=None)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["build-mini-9", "build-mini-1"], "xl")
+        self.assertEqual(plan["hardware"], {})
+        self.assertEqual(plan["hosts"]["build-mini-9"]["hardware"], "m4pro-48")
+        self.assertIn("build-mini-1: already a member; left alone", notes)
+
+    def test_refuses_unreachable_never_touch_and_wrong_hardware(self) -> None:
+        with self.assertRaisesRegex(mf.Failure, "not reachable"):
+            mf.admit_plan(self.manifest, {"hosts": {"x": {"reachable": False, "error": "timeout"}}}, ["x"], "std")
+        with self.assertRaisesRegex(mf.Failure, "never_touch"):
+            mf.admit_plan(self.manifest, {"hosts": {}}, ["coordinator-mini"], "std")
+        obs = observed(cmux25=self.m5_probe("cmux25"))
+        with self.assertRaisesRegex(mf.Failure, "not hardware m4pro-48"):
+            mf.admit_plan(self.manifest, obs, ["cmux25"], "std", "m4pro-48")
+
+    def test_cli_dry_run_then_yes_writes_a_manifest_that_loads(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"))))
+        before = self.path.read_text()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path)]), 0)
+        self.assertIn('"m5pro-64"', out.getvalue())
+        self.assertIn("dry run", out.getvalue())
+        self.assertEqual(self.path.read_text(), before)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path), "--yes"]), 0)
+        self.assertEqual(mf.load_manifest(self.path)["hosts"]["cmux25"]["hardware"], "m5pro-64")
+
+
+    def test_bringup_dry_run_prints_the_seed_sequence_and_changes_nothing(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"), cmux26=self.m5_probe("cmux26"))))
+        before = self.path.read_text()
+        proc = subprocess.run([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-mini-bringup"), "cmux25", "cmux26",
+                               "--manifest", os.fspath(self.path), "--observed", os.fspath(obs_path),
+                               "--registry-out", self.tmp.name], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("onboard cmux25 --manifest", out)
+        self.assertIn("--acceptance node", out)
+        self.assertIn("upgrade cmux25", out)
+        self.assertIn("onboard cmux26 --manifest", out)
+        self.assertIn("--from cmux25", out)
+        self.assertIn("--hosts cmux25,cmux26", out)
+        self.assertEqual(self.path.read_text(), before)
+        entry = json.loads((Path(self.tmp.name) / "cmux25.json").read_text())
+        self.assertEqual((entry["runs"], entry["address"]["manaflow"]), (["ci-runner"], "cmux25.tail137216.ts.net"))
+
 class TransportTests(unittest.TestCase):
     def route_manifest(self) -> dict:
         return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {
@@ -1842,6 +1942,34 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("brew unpin $f to upgrade it", "\n".join(lines))
         subprocess.run(["bash", "-n"], input="\n".join(lines), text=True, check=True)
 
+    def test_zig_is_installed_at_ghosttys_series_not_the_newest(self) -> None:
+        # 2026-11-27: brew install zig took 0.17.1 on cmux25-33 and cmux setup.sh refused it (Ghostty needs 0.16.x),
+        # so "setup: builds GhosttyKit" failed on every new mini. fix installs zig@0.16 and links it as bin/zig.
+        self.assertEqual((mf.zig_series("0.16.0"), mf.zig_series("0.16.2-dev.1"), mf.zig_series(None)),
+                         ("0.16", "0.16", None))
+        for text in (preflight_text(zig="0.17.1"), preflight_text(zig="0.17.1", zig_path="")):
+            result = self.result(text, zig_fallback="0.16.0")
+            check = result["checks"]["zig"]
+            self.assertEqual((check["state"], check["action"].get("zig_series")), ("fail", "0.16"), check)
+            self.assertIn("brew install zig@0.16", check["fix"])
+            mine, _ = mf.planned_actions(result)
+            brew = next(a for a in mine if a["kind"] == "brew")
+            self.assertEqual((brew["formulas"], brew["zig_series"]), (["zig"], "0.16"))
+            self.assertIn("zig@0.16 (as zig)", mf.describe(brew))
+        lines = mf.brew_commands("builder", ["rustup", "zig"], False, zig="0.16")
+        script = "\n".join(lines)
+        self.assertIn("for f in rustup; do", script)  # never the newest zig through the shared loop
+        self.assertIn("brew_as install zig@0.16", script)
+        self.assertIn("brew_as link --overwrite --force zig@0.16", script)
+        self.assertIn("brew_as unlink zig;", script)
+        self.assertNotIn("brew_as unpin", script)  # the unversioned keg keeps its pin
+        self.assertEqual(lines[-1], "brew_as pin rustup zig@0.16")
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # Unknown minimum: plain zig as before; a malformed series is refused.
+        self.assertIn("for f in zig; do", "\n".join(mf.brew_commands("builder", ["zig"], False)))
+        with self.assertRaises(mf.Failure):
+            mf.brew_commands("builder", ["zig"], False, zig="0.16; rm -rf /")
+
     def test_missing_gh_is_brew_installed_and_left_unpinned(self) -> None:
         # cmux CI jobs call gh with GH_TOKEN and failed with FileNotFoundError on minis without it.
         result = self.result(preflight_text(gh=""))
@@ -2571,7 +2699,8 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup;",
+                                           "brew_as link --overwrite --force zig@0.16",
                                            "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
@@ -3490,7 +3619,8 @@ class ShareTests(unittest.TestCase):
             self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
             mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
         (host, command, options), (_, plain, plain_options) = calls
-        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        # ControlPath=none: a multiplexed master opened without -A forwards no agent.
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A", "-o", "ControlPath=none"), ()))
         self.assertTrue(remote_call(command).endswith(
             f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
         self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
@@ -3505,6 +3635,76 @@ class ShareTests(unittest.TestCase):
         self.assertIn("waits for --from HOST, a host that has it", waiting[0])
         planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
+
+    def test_every_declared_xcode_is_provisioned_beside_the_pin(self) -> None:
+        # Leo, 2026-11-26: "and also just have more xcode versions installed". A workflow asking for xcode-27.0
+        # waited with no carrier (cmux run 45717448413): an Xcode declared beside the pin is copied like the pin.
+        extra = {"path": "/Applications/Xcode_27.0.app", "version": "27.0", "build": "27A266a"}
+        self.manifest["defaults"]["xcode"]["apps"].append(dict(extra))
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        check = result["checks"]["xcode 27.0"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "self"))
+        self.assertEqual(check["action"], {"kind": "xcode_share", **extra})
+        self.assertEqual(result["checks"]["xcode"]["state"], "ok")  # the pin is unchanged
+        self.assertTrue(result["ready"])  # a missing extra Xcode never blocks the host's pin work
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", side_effect=lambda m, src, thing, log, yes=True, args=None:
+                                  (calls.append(("seed", thing, args)), None)[1]), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes:
+                                  (calls.append(("share", thing, a)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), \
+                mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        self.assertIn(("seed", "xcode", args), calls)
+        self.assertIn(("share", "xcode", args), calls)
+        # Short of disk: a person frees it first, and fix copies nothing.
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|35")
+        tight = mf.preflight_host(self.manifest, "build-mini-1",
+                                  observed(**{"build-mini-1": low})["hosts"]["build-mini-1"])["checks"]["xcode 27.0"]
+        self.assertEqual((tight["state"], tight["group"]), ("todo", "person"))
+        self.assertNotIn("action", tight)
+        self.assertIn(f"needs {mf.XCODE_COPY_GIB + 30}", tight["detail"])
+        # Installed but unlicensed: sudo-plan accepts its licence with its own developer directory.
+        have = preflight_text() + "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|27A266a\n" \
+            "xcode_ready\t/Applications/Xcode_27.0.app|needed|done\n"
+        checks = mf.preflight_host(self.manifest, "build-mini-1",
+                                   observed(**{"build-mini-1": have})["hosts"]["build-mini-1"])["checks"]
+        self.assertEqual(checks["xcode 27.0"]["action"],
+                         {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
+
+    def test_an_xcode_copy_runs_beside_a_build_and_a_busy_seed_still_seeds(self) -> None:
+        # 2026-11-26: fix --wait for Xcode 27.0 on four busy fleet minis copied nothing for an hour: the targets'
+        # build workers free the host lock only between jobs, and every seed that had 27.0 was busy too
+        # (share_prepare exit 20). An Xcode lands on its own path, staged and moved in whole, which no job reads.
+        self.assertIn("xcode_share", mf.BUSY_HOST_REPAIRS)
+        self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
+            commands, options_seen = [], []
+            with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
+                    mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                      (commands.append(c), options_seen.extend(options),
+                                       1 if remote_call(c).startswith("share_have ") else 0)[2]):
+                ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
+            self.assertTrue(ok, thing)
+            # Every command carries the whole library; the call line is what names the step and its gate.
+            have, pipeline, finish = commands
+            self.assertTrue(remote_call(have).startswith("share_have " + thing), remote_call(have))
+            self.assertIn(gate + "share_recv " + thing, pipeline, thing)
+            self.assertTrue(remote_call(finish).startswith(gate + "share_finish " + thing), (thing, remote_call(finish)))
+            self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
+        # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
+        for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
+            seen = []
+            mf.SEEDS_READY.clear()
+            with mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                   (seen.append(remote_call(c)), 0)[1]):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", thing, None, True, args=args))
+            self.assertTrue(seen[0].startswith(func if thing == "xcode" else "lock; " + func), seen)
+        mf.SEEDS_READY.clear()
 
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
@@ -3987,7 +4187,7 @@ class RepairTests(unittest.TestCase):
         code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
                                        manifest=self.manifest, after=after)
         self.assertEqual(code, 0, out)
-        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
+        order = ("lock reservation; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
                  ENROLL, "lock none; runner_release")
         self.assertEqual([next(k for k in order if k in remote_call(c[1])) for c in calls], list(order))
         enroll = calls_to(calls, ENROLL)[0]
@@ -4146,7 +4346,7 @@ class UpgradeTests(unittest.TestCase):
         code, out, calls, _ = self.upgrade(fleet, "--yes", "--glaeda-ref", "e" * 40, after=after)
         self.assertEqual(code, 0, out)
         syncs = [remote_call(c[1]) for c in calls_to(calls, "glaeda_sync")]
-        self.assertEqual(syncs, ["lock; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
+        self.assertEqual(syncs, ["lock reservation; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
         # A blocking unknown still blocks when the old checkout is the only failure.
         unknown = {h: re.sub(r"pf_pmset\t.*\n", "", text) for h, text in fleet.items()}
         code, out, calls, _ = self.upgrade(unknown)
@@ -5038,10 +5238,44 @@ class StartDrainTest(unittest.TestCase):
         # The library's `exec </dev/null` (no KEEP_STDIN) ended host_drain's perl at once: the waiter entry vanished
         # and an AWS onboard --wait sat at a host lock that never freed (aws-m4pro-2 and -7, 2026-11-22).
         with mock.patch.object(mf.subprocess, "Popen") as popen:
-            mf.start_drain({"hosts": {"aws-m4pro-2": {}}}, "aws-m4pro-2")
+            mf.start_drain({"hosts": {"aws-m4pro-2": {"ssh_user": "ec2-user"}}}, "aws-m4pro-2")
         command = popen.call_args.args[0][-1]
         self.assertIn("KEEP_STDIN=1", command)
         self.assertIn("host_drain", command)
+
+
+class LanFallbackTests(unittest.TestCase):
+    """An untagged tailnet node drops port 22; its manifest lan_ip is the way in (cmux25-34, 2026-11-27)."""
+    MANIFEST = {"hosts": {"new": {"lan_ip": "172.20.22.58"}, "up": {"lan_ip": "172.20.22.9"},
+                          "aws": {"lan_ip": "172.20.22.7", "ssh_jump_host": "cmux-lawrence"}, "bare": {}}}
+
+    def probe(self, address, timeout):
+        if address[0] == "new":
+            raise OSError("timed out")
+        return mock.Mock()
+
+    def test_only_a_silent_name_goes_to_its_lan_address(self):
+        with mock.patch.object(mf.socket, "create_connection", side_effect=self.probe), \
+                mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_LAN": "1"}):
+            path, names = mf.lan_fallback(self.MANIFEST, ["new", "up", "aws", "bare"])
+        self.assertEqual(names, ["new"])
+        text = Path(path).read_text()
+        self.assertIn("Host new\n  HostName 172.20.22.58\n  HostKeyAlias new\n", text)
+        self.assertNotIn("Host up", text)
+        self.assertTrue(text.rstrip().endswith("Include /etc/ssh/ssh_config"))
+
+    def test_nothing_when_every_name_answers_or_it_is_off(self):
+        with mock.patch.object(mf.socket, "create_connection", return_value=mock.Mock()):
+            self.assertEqual(mf.lan_fallback(self.MANIFEST, ["up"]), (None, []))
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_LAN": "0"}):
+            self.assertEqual(mf.lan_fallback(self.MANIFEST, ["new"]), (None, []))
+
+    def test_every_local_ssh_starts_with_the_shared_argv(self):
+        source = (ROOT / "scripts" / "glaeda-mini-fleet").read_text()
+        local = [l for l in source.splitlines() if "[SSH," in l]
+        self.assertEqual(len(local), 2, local)
+        self.assertIn("return [SSH, *SSH_LAN]", local[0])
+        self.assertIn("inner = [SSH,", local[1], "only the hop a fleet host runs uses plain SSH")
 
 
 if __name__ == "__main__":

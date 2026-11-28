@@ -85,6 +85,19 @@ What `--apply` does:
      event payload is missing or unreadable. Admitted jobs then run
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
+   - For an HQ checkout, the admitted job gets a job-local Git wrapper through `GITHUB_PATH`.
+     During `actions/checkout`, before a fetch or checkout from the HQ HTTPS origin configured for the fleet loopback proxy,
+     it tests the tunnel with a CONNECT bounded at five seconds. A transport failure before any
+     CONNECT response selects direct HTTPS for that command, including lazy blob downloads.
+     An HTTP denial preserves the proxy, as does an explicit per-remote proxy. The diagnostic
+     `fleet proxy returned no CONNECT response` identifies this recovery in the checkout log.
+     A checkout whose git carries the job's token (`actions/checkout`'s `http.<url>.extraheader`, in the
+     repository's config or its included credentials file) skips the tunnel with no probe (`this checkout carries
+     the job's token`): the tunnel is there for anonymous fetches, which GitHub blocked from the office address.
+     The cmux wrapper does the same for its fetches and other commands (`this fetch carries the job's token`), but
+     not for `git submodule update`, whose clones are other repositories with no token.
+     The cmux mirror and its fetch counts stay scoped to cmux jobs. `GLAEDA_GIT_SHIM=0`
+     disables the wrapper.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
      so a PR job never lands on a mini that is busy with other work. It is refused, so
      cmux's rescue re-runs it on Blacksmith, when the host is reserved
@@ -637,7 +650,12 @@ What `--apply` does:
      its listener (`holding the listener off: disk full ... (DISK_FULL_NO_LISTEN)`, logged once per hold), and a
      full disk seen during a job stops the listener at that job's end, as a reservation does; the job runs on. It
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk
-     holds nothing. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
+     holds nothing. job-started applies the same line to the job it was handed (`DISK_FULL_REFUSES`, 2026-11-22: a listener
+     already online kept taking jobs on cmux17 at 9 GiB beside 8 more, 160 of 646 jobs in a day saw under 1 GiB, and
+     the runners' `_diag` ENOSPC dropped every runner on the mini): after its disk phase and again once capacity is
+     held, under the line or with free disk unreadable it refuses the job before any step (`disk full: ...
+     (DISK_FULL_REFUSES)`) and lets the host lock go, so the rescue re-runs it on a runner with room. The same runners
+     are exempt as from the hold, and nightly jobs keep their own reserve. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
      wrote it down to 1.8 GiB while the lent fleet worker sat at `claim_paused disk` with suites queued 4-5 h.
      **A fleet suite step goes first on a lent mini's disk, for at most 15 minutes per wait (`SUITE_FIRST_HOLD`).**
      The PR jobs on a lent mini took every GiB a job's end freed, so a fleet suite step (20 GiB growth plus the
@@ -820,7 +838,14 @@ What `--apply` does:
      re-registers or retires it and removes the marker. A runner on a busy label used
      to take its next job seconds after each one ended, so the retries never saw it
      idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
-     land, so an older gate reloads one that reads the marker.
+     land, so an older gate reloads one that reads the marker. Nothing on the mini runs
+     that next `--apply`, so an apply's marker is bounded on the idle side too
+     (`APPLY_DRAIN_IDLE_BOUND`): once the listener has stood stopped under it for
+     `APPLY_DRAIN_IDLE_MAX_S` (10 min; `GLAEDA_APPLY_DRAIN_IDLE_MAX_S=0` turns it off),
+     the gate moves it aside to `.glaeda-drain.waived`, logs `APPLY_DRAIN_STALE` and
+     listens under the registration it has (cmux24, 2026-11-27: six dedicated runners
+     held idle up to an hour behind a blind re-register no apply came back for). Hand
+     drains and cmux-ci's lend drain are left to their writers.
    - job-started still refuses a job handed over in the moment before a stop.
    - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
      nightly, fast and dedicated runners included). When every runner on a mini has a live
@@ -1379,6 +1404,13 @@ dispatch as the others. It holds the Developer ID key for its whole run, so it i
 build included: one claim and one drain per nightly, where the two-run pipeline drained the mini once per signing
 job. No other runner class admits it, and main's `nightly.yml` has no such job (a dispatch of it stays refused).
 
+NIGHTLY_DELTA_ADMISSION (cmux#57000) admits `nightly-next-deltas`, the post-feed delta job, on that same exact
+nightly-next workflow and signing runner. Splitting work from a signing job must carry its admission and exclusive
+capacity class with it: this job still holds the nightly signing key. Detectors in `scripts/test-glaeda-cmux-runner.py`:
+`test_nightly_next_deltas_requires_exact_signing_provenance` covers push, dispatch, re-runs and refused provenance;
+`test_nightly_next_deltas_holds_the_whole_mini_before_credentials` checks draining, the exclusive claim and exclusion
+of concurrent jobs. Merge and deploy this admission before enabling the companion workflow job.
+
 AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
 whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
 copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a
@@ -1602,6 +1634,41 @@ busy one as its job ends (`JOB_END_FREEZE`), and starts it again once the claim 
 to a runner that can start it, so a member whose dedicated runners all yield needs a second member with the same
 labels.
 
+### Waiting for the CAS writer's slot (`yieldToFleetBuild`)
+
+The writer mini's catch-up fill (hq `build-fleet/catch-up/fill-main.py`) is the only process that puts into the
+fleet's compile cache. When it is owed a slot it waits for a moment with no `Runner.Worker`, takes `host.lock`
+exclusively and builds for at most its `SLOT_MAX_HOLD` (20 min), yielding meanwhile only to a job past glaeda's
+admission. A ledger runner's job waits for that in `job-started` (it takes the host lock); a dedicated runner takes no
+host lock, so its job went straight past. On cmux15 on 2026-11-26 (hq#25856) the `trusted-main` runner ran Seed
+DerivedData jobs back to back with 8-10 s gaps: the slot took the lock in a gap and lost it to the next seed
+(07:58:48Z, 08:17:22Z), and the store took no put in 6 h.
+
+A runner.dedicated entry with `"yieldToFleetBuild": true` gets the hook's `--yield-to-fleet-build`. Before its own
+admission, `job-started` waits while a fleet build holds `host.lock` exclusively and has not marked itself yielding
+(`<host.lock>.yield`: a spent slot, or a catch-up fill outside one, which stops for the next job anyway). The fill's
+own 20 min bound ends the wait; `YIELD_TO_FLEET_BUILD_WAIT_S` (30 min) is the backstop, after which the job is
+admitted, never refused. Its listener gate reads the same hold (`Gate.fleet_build_yield`) and stops listening through
+it, so a job of a shared label goes to another runner instead of waiting here. Without the key nothing changes.
+
+### Yielding to a build waiting for the host lock (`yieldToWaiters`)
+
+A pool runner's listener gate stops while a build waits for `host.lock` (a fleet build, a lend drain, cmux15's
+catch-up fill in its slot), bounded by `GATE_WAITER_MAX_HOLD_S` (10 min) and then waived for `GATE_WAITER_WAIVE_S`.
+A dedicated runner's gate never read those waiters, so a builder beside a waiter kept starting jobs. A
+runner.dedicated entry with `"yieldToWaiters": true` gets the hook's `--yield-to-waiters`, and its gate reads the
+waiters exactly as a pool gate does: it stops an idle listener and freezes a busy one as its job ends
+(`JOB_END_FREEZE`). `job-started` does not change: a job already handed to it runs. cmux15's `trusted-main` declares
+it. Its Seed DerivedData jobs build from the same local CAS as the catch-up fill, the compiler CAS store's only
+writer, and the label's other servers (cmux7s-mac-mini, ultra1) take the job meanwhile. Without the key nothing
+changes. A `user` entry cannot declare it (the waiter spans are the member user's state).
+
+The same gate also stays off while the yielding build itself holds `host.lock` (`<host lock>.yield`, the fill), not
+only while it waits (`YIELDER_KEEPS_ITS_TURN`). Before this, a pool gate's rule that a yielding holder leaves the host
+free let the listener take the next seed the moment the fill got the lock, and that job preempted it. Seeds come back
+to back, so the fill never finished. The hold is bounded per holder by `GATE_YIELDER_MAX_HOLD_S` (20 min, then waived
+for `GATE_WAITER_WAIVE_S`; 0 turns it off). Pool runners and the nightly slot still listen through a yielding holder.
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and
@@ -1624,6 +1691,16 @@ declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, a
   only when it could not connect; a connected session ends the loop whatever its status). The addresses are
   arguments, never script text, and no name is resolved, so the trust stays these declared addresses of one host,
   one port. A single string, or a list of one, keeps plain nc.
+- A LAN address is a DHCP lease: when it moves, a declared list goes dark, and the next device on an old lease answers
+  there instead (ssh refuses its host key, so the route is lost, not trusted). Beside `lanRelay`, an entry may declare
+  `"lanRelayFollow": {"tailnetIp": "100.x.y.z", "node": "<stable node ID>", "within": "A.B.C.0/24"}`
+  (`LAN_RELAY_FOLLOW`). Per connection the relay's loop then asks the mini's own tailscaled (LocalAPI `whois` over
+  `/var/run/tailscaled.socket`, with Apple's `/usr/bin/curl`; nothing leaves the Mac) for that node, checks the
+  answer's stable ID, and tries first every IPv4 endpoint the node itself advertises inside `within` (a private /8, /16
+  or /24), on `lanRelay`'s one port; then the declared addresses, in order. Apple's `/usr/bin/plutil` reads the
+  JSON. An endpoint outside the prefix, or not digits and dots, is never tried; another node's answer, or no
+  tailscaled, leaves only the declared addresses. The trust stays one host's own addresses on one port inside one
+  private prefix, and ssh still checks the host key it pins.
 - Refused: any address outside RFC 1918, an entry without `trustedRef` (so a pull request's code never runs beside the
   relay), and a member without `runner.dedicatedOnly` (so no other runner of the same user shares the Mac).
 - `glaeda-cmux-runner-fleet --apply --hosts M` installs it. Dropping the key, or `--uninstall`, boots it out and
@@ -1648,7 +1725,8 @@ account's session and a token (cmuxterm-hq#13863): a PR job on the same Mac then
 - Allowed only on a trusted entry (`trustedRef` and `trustedRepo`, registered at that repository even when the
   member's pools are org-scoped), so only merged code of that branch runs in the account (push and schedule jobs).
   Refused: root, the member's own `ssh_user`, a name outside `[a-z_][a-z0-9_-]{0,31}`, and `user` together with
-  `lanRelay` or `yieldToExclusive` (both are the member user's: its relay socket, its capacity ledger).
+  `lanRelay`, `yieldToExclusive` or `yieldToWaiters` (each is the member user's: its relay socket, its capacity
+  ledger, its waiter spans).
 - `glaeda-cmux-runner-fleet --apply` stages the scripts into that account's home and runs
   `glaeda-cmux-runner --dedicated NAME --apply` over `ssh -l USER MEMBER` (the same options; the token on stdin). The
   plan names the user per entry. When ssh as that user fails, that entry alone fails, reported `missing: user-ssh`.
@@ -2182,7 +2260,8 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
   to R2. Runs that fetch and prune nothing are not logged.
 - **Storage.** Each seed is kept as `/Volumes/glaeda-seed-archive/seeds/<KEY>.tar.zst`: the zstd stream
   exactly as cmux15 sent it, about 2.1-2.4 GB against 9 GB unpacked, so serving it is a read. The volume is
-  an APFS sparse bundle on the ExFAT X10 Pro (`glaeda-seed-archive.sparsebundle`, attached by each run).
+  an APFS sparse bundle on the ExFAT T5 EVO (`glaeda-seed-archive.sparsebundle`, attached by each run; on the
+  X10 Pro until 2026-11-27, when that disk failed reads at more LBAs each hour).
   macOS privacy lets a launchd job write into an attached image but not onto the external disk itself. The filler checks every file before renaming it into place: all entries
   under `KEY/`, and the seed manifest present. A seed whose entry reads EIO is renamed to `.corrupt-<name>` (never
   deleted or repaired) and reported as `unreadable` in the run record; the run goes on. The image is unencrypted, so

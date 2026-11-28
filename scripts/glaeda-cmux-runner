@@ -403,6 +403,7 @@ class Context:
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.github_labels = getattr(args, "github_labels", None)
+        self.github_labels_unread = getattr(args, "github_labels_unread", None)  # why the fleet's read failed
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
     def take_token(self, endpoint: str) -> str | None:
@@ -777,6 +778,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
         if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
             scope += " --yield-to-exclusive"
+        if dedicated.get("yieldToFleetBuild"):  # the hook's YIELD_TO_FLEET_BUILD
+            scope += " --yield-to-fleet-build"
+        if dedicated.get("yieldToWaiters"):  # the hook's YIELD_TO_WAITERS (its listener gate reads it)
+            scope += " --yield-to-waiters"
     # DEDICATED_USER: the account's own ledger directory (dedicated_context), for every phase and the gate
     own_ledger = f" --capacity-dir {shlex.quote(os.fspath(capacity_dir))}" if (dedicated or {}).get("user") else ""
     scope += own_ledger
@@ -1035,8 +1040,13 @@ def console_session_runner(ctx: Context) -> bool:
     mapping a SessionCreate session to the console's: `lsappinfo front` reads [ NULL ] from it and xcodebuild dies
     launching the test runner with "IDELaunchServicesLauncher.m:418 Assertion failed: childPID > 0" (cmuxs-mac-mini-3
     and cmux8s, 2026-10-30; a fresh SessionCreate agent there could not see Finder, one without it could). It isolates
-    nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway."""
-    return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False))
+    nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway.
+    A runner.dedicated entry with a user (DEDICATED_USER) runs in that account's own GUI session too: it is a hidden
+    CI account kept logged in for exactly that (gui-ci-users), and its jobs open the app with /usr/bin/open. In a
+    SessionCreate session none came up: cmux8s's hq-app-probe failed every production chat it took, 30 of 30 from
+    2026-11-25 19:56Z, `launch: not within 120 s`, and job_keychain's GUI-session job never read its commands."""
+    return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False)
+                                     or user_entry(ctx))
 
 
 def role_daemon(ctx: Any) -> bool:
@@ -1405,14 +1415,19 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                 reg.update(state="unchanged")
         elif github_listed and github_found is None:
             reg.update(state="blocked", note=f"GitHub does not list runner {ctx.name}; refusing to replace an unknown registration")
-        elif ctx.apply and ctx.token_stdin:
-            # An operator supplied a fresh registration token for apply.  If the read-only
-            # lookup is unavailable, let the same-name --replace repair proceed, but never
-            # claim the receipt proves the current server-side labels.
-            reg.update(state="relabel", previousLabels=had or [],
-                       note="GitHub labels could not be read; re-registering with the supplied token")
-            if runner_busy(ctx):
-                reg.update(state="blocked", busy=True, note="the runner is running a job; re-run when it is idle")
+        elif ctx.token_stdin:
+            # LABELS_UNREAD_SKIPS: GitHub's labels could not be read here and the fleet passed none (its own read
+            # failed: glaeda-cmux-runner-fleet --github-labels-unread names why). This used to re-register in place
+            # with the supplied token, a relabel planned on no reading: on 2026-11-27 a fleet apply's runner list
+            # failed for one repository, the plan re-registered three idle dedicated runners of cmux24 and drained six
+            # busy ones for a relabel to the labels GitHub already held (labels == previousLabels in every receipt),
+            # and the drains held those runners off for up to an hour beside their own queue. With no reading there is
+            # nothing to compare, so the relabel is skipped and nothing drains: the next apply that reads the labels
+            # relabels if they differ. An operator without gh can pass --github-labels themselves.
+            why = getattr(ctx, "github_labels_unread", None)
+            reg.update(state="unchanged", labelsUnread=True,
+                       note="GitHub's labels could not be read" + (f" ({why})" if isinstance(why, str) and why else "")
+                            + "; skipped the relabel: the next apply that reads them relabels if they differ")
         else:
             reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
                        "re-run with GitHub access or --apply --token-stdin")
@@ -3149,7 +3164,8 @@ def preflight(ctx: Context) -> dict[str, Any]:
                   blocking=not ctx.allow_stale)
         else:
             check("scriptCopy", None, f"differs from release {copy['release']} ({what})", "not older; used as is")
-    disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
+    disk = (which("cmux-disk", (os.fspath(ctx.home / ".local/bin/cmux-disk"),))
+            or which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),)))
     check("glaedaDisk", disk is not None or None, disk or "not installed",
           "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
     return {"checks": checks, "blocking": sorted(n for n, c in checks.items() if c["level"] == "block")}
@@ -3243,6 +3259,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--github-labels", metavar="LABELS",
                    help="the labels GitHub lists for this runner now (comma-separated), as glaeda-cmux-runner-fleet "
                         "read them with its admin gh; used when this machine's gh cannot read them itself")
+    p.add_argument("--github-labels-unread", metavar="WHY",
+                   help="glaeda-cmux-runner-fleet could not read this runner's GitHub labels (WHY); the relabel is "
+                        "skipped (LABELS_UNREAD_SKIPS)")
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
@@ -3402,14 +3421,21 @@ def main(argv: list[str] | None = None) -> int:
                if dev or nightly or gateway or ctx.gui_runner or ctx.session_runner or ctx.fast_runner
                else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
+        unify = getattr(fleet_labels(), "with_unified", None)  # RFD 0185 phase 1: the version-free labels, beside these
+        if unify is not None:
+            ctx.labels = unify(ctx.labels)
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
-        if is_root or nightly:
+        if is_root or nightly or ctx.gui_runner:
             # A static handle on this one runner, so no job ever writes a runner label: a root runner for cmux's
             # warm affinity (the picker reads which runner kept a warm build and names it in runs-on), and the
             # nightly slot for cmux's owned signing pick (scripts/ci/signing_runner.py), which offers only a runner
             # it can pin. Without it no slot was ever offered, and nightly signing always went to Blacksmith.
+            # A gui runner for HQ's paired probes (paired-probes.yml): a pair of jobs needs two Macs at once, and
+            # on the shared gui label the second side queues behind every older job while the first holds its Mac
+            # for up to an hour (2026-11-27: the host ran on one Mac while the viewer sat
+            # queued 2 h 45 min). With a handle per runner the pair is placed on two idle gui runners at once.
             ctx.labels.append(runner_label(ctx.name))
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
@@ -3861,10 +3887,34 @@ SOCKET_PATH_MAX = 103  # sockaddr_un.sun_path on macOS is 104 bytes with its NUL
 LAN_RELAY_SH = "/bin/sh"
 LAN_RELAY_LOOP = ('c=$1 w=$2 p=$3; shift 3; for a do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; '
                   '[ "$s" -eq 1 ] || exit "$s"; done; exit 1')
+# LAN_RELAY_FOLLOW (glaeda_fleet_labels.lan_relay_follow): with lanRelayFollow the loop first asks this mini's
+# tailscaled (LocalAPI whois over its Unix socket, Apple's /usr/bin/curl; nothing reaches the network) for the declared
+# tailnet node, checks its stable ID, and puts every IPv4 endpoint the node advertises under the declared prefix ahead
+# of the declared addresses (Apple's /usr/bin/plutil reads the JSON). An endpoint that is not digits and dots, or
+# outside the prefix, is never tried. curl gets /dev/null and plutil a pipe, so nothing reads the client's bytes before
+# a connect. When tailscaled cannot answer, or names another node, the declared addresses alone are tried, as before.
+LAN_RELAY_TAILSCALED = "/var/run/tailscaled.socket"
+LAN_RELAY_FOLLOW_LOOP = (
+    'c=$1 w=$2 p=$3 t=$4 n=$5 x=$6 k=$7; shift 7; f=; '
+    'j=$(/usr/bin/curl -sf --max-time "$c" --unix-socket "$k" -H "Host: local-tailscaled.sock" '
+    '"http://local-tailscaled.sock/localapi/v0/whois?addr=$t" </dev/null 2>/dev/null); '
+    'if [ -n "$j" ] && [ "$(printf %s "$j" | /usr/bin/plutil -extract Node.StableID raw -o - - 2>/dev/null)" = "$n" ]; '
+    'then m=$(printf %s "$j" | /usr/bin/plutil -extract Node.Endpoints raw -o - - 2>/dev/null); '
+    'case $m in ""|*[!0-9]*) m=0;; esac; i=0; '
+    'while [ "$i" -lt "$m" ] && [ "$i" -lt 64 ]; do '
+    'e=$(printf %s "$j" | /usr/bin/plutil -extract "Node.Endpoints.$i" raw -o - - 2>/dev/null); a=${e%:*}; i=$((i+1)); '
+    'case $a in ""|*[!0-9.]*) continue;; esac; '
+    'case $a in "$x"*) case " $f " in *" $a "*) ;; *) f="$f $a";; esac;; esac; '
+    'done; fi; '
+    'for a in $f "$@"; do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; [ "$s" -eq 1 ] || exit "$s"; done; exit 1')
 
 
 def relay_of(ctx: Any) -> str | list[str] | None:
     return (dedicated_of(ctx) or {}).get("lanRelay")
+
+
+def relay_follow_of(ctx: Any) -> dict[str, str] | None:
+    return (dedicated_of(ctx) or {}).get("lanRelayFollow")
 
 
 def relay_label(ctx: Context) -> str:
@@ -3881,8 +3931,16 @@ def relay_plist_path(ctx: Context) -> Path | None:
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
-    relay = relay_of(ctx)
-    if isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
+    relay, follow = relay_of(ctx), relay_follow_of(ctx)
+    if follow:  # LAN_RELAY_FOLLOW: the node's own LAN endpoints first, then the declared addresses
+        declared = relay if isinstance(relay, list) else [relay]
+        net, bits = follow["within"].split("/")  # glaeda_fleet_labels.follow_prefix: "10.1.2.0/24" -> "10.1.2."
+        prefix = ".".join(net.split(".")[: int(bits) // 8]) + "."
+        argv = [LAN_RELAY_SH, "-c", LAN_RELAY_FOLLOW_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
+                str(LAN_RELAY_IDLE_S), declared[0].rsplit(":", 1)[1], follow["tailnetIp"], follow["node"],
+                prefix, LAN_RELAY_TAILSCALED,
+                *(r.rsplit(":", 1)[0] for r in declared)]
+    elif isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
         port = relay[0].rsplit(":", 1)[1]
         argv = [LAN_RELAY_SH, "-c", LAN_RELAY_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
                 str(LAN_RELAY_IDLE_S), port, *(r.rsplit(":", 1)[0] for r in relay)]

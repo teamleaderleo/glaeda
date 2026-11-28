@@ -1,7 +1,5 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
-/// Pure recommendation-only adaptive CI pool routing from bounded evidence.
-pub mod adaptive_ci_routing;
 /// Pure deterministic optimization discovery from bounded verification observations.
 pub mod adaptive_verification_compiler;
 pub mod artifact;
@@ -16,8 +14,6 @@ pub mod cargo_target_observation;
 /// Pure reclaim planning for observed Cargo target trees from reconstructibility.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_reclaim;
-/// Pure projection of measured CMUX product transport/restore receipts into adaptive observations.
-pub mod cmux_product_transport_adapter;
 /// Pure projection of validated CMUX workload results into adaptive verification observations.
 pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
@@ -28,8 +24,6 @@ pub mod compute_workload;
 pub mod debian_package_plan;
 #[cfg(target_os = "linux")]
 pub mod debian_package_probe;
-#[cfg(target_os = "linux")]
-pub mod debian_package_recovery;
 /// Descriptor-bound execution of already reviewed Linux launch plans.
 #[cfg(target_os = "linux")]
 pub mod descriptor_bound_launcher;
@@ -86,8 +80,6 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
-/// Pure bounded failure classification, diagnostic probes, remedies, and preflight learning.
-pub mod failure_diagnostic;
 /// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
 pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
@@ -114,8 +106,6 @@ pub(crate) mod github_scale_set_delivery_state;
 pub mod github_scale_set_protocol;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
-/// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.
-pub mod github_workflow_job_reconciliation;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
@@ -137,8 +127,6 @@ pub mod host_readiness_verdict;
 pub mod host_rootless_podman;
 /// Pure bounded observation-only receipts for blazingly hot execution measurements.
 pub mod hot_execution_performance;
-/// Pure descriptive p50/p90 summaries around exact hot-fleet A-B-B-A comparisons.
-pub mod hot_fleet_latency_summary;
 /// Pure bounded contended fleet-window receipts and exact A-B-B-A comparison evidence.
 pub mod hot_fleet_window;
 /// Read-only, descriptor-bound observation of an explicit Linux hot-run cache root.
@@ -146,8 +134,6 @@ pub mod hot_fleet_window;
 pub mod hot_run_cache_observation;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
-/// Pure transport-independent identity and source observations for immutable build products.
-pub mod immutable_artifact_distribution;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
@@ -203,26 +189,14 @@ pub mod linux_installation_catalog;
 /// Nonblocking coordination for installation-catalog discovery and creation.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog_lock;
-/// Locked, race-free create-or-load orchestration for local project installations.
-#[cfg(target_os = "linux")]
-pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
 #[cfg(target_os = "linux")]
 mod linux_kernel_file_locks;
-/// Durable, revision-checked lease persistence beneath one installation directory.
-#[cfg(target_os = "linux")]
-pub mod linux_lease_store;
-/// Direct command-free observation of the five account-related personal-worker runtime classes.
-#[cfg(target_os = "linux")]
-pub mod linux_personal_worker_runtime_account_evidence;
 /// Descriptor-bound prerequisites for the fixed personal-worker runtime executables.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_executable_prerequisite;
-/// Direct command-free Linux kernel and cgroup-v2 prerequisites for the personal-worker runtime.
-#[cfg(target_os = "linux")]
-pub mod linux_personal_worker_runtime_kernel_prerequisite;
 /// Same-lock snapshot of current executable and dynamic-loader prerequisites.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_linkage_prerequisite;
@@ -242,8 +216,6 @@ pub mod linux_reflink_task_materialization;
 pub mod linux_state;
 #[cfg(target_os = "linux")]
 pub mod linux_state_prepare;
-#[cfg(target_os = "linux")]
-pub mod linux_state_recovery;
 /// Pure fixed offline Cargo command policy for exact local self-builds.
 pub mod local_install_build_command;
 /// Bounded exact-source local self-build execution and artifact evidence.
@@ -273,8 +245,6 @@ pub mod operator_config;
 pub mod operator_config_store;
 /// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
 pub mod operator_error;
-/// Pure non-authorizing remediation applicability, safety, and confidence vocabulary.
-pub mod operator_remediation;
 /// Pure unified personal-worker operator status report and human renderer.
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
@@ -329,9 +299,6 @@ pub mod project_catalog;
 /// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
 #[cfg(unix)]
 pub mod project_checkout_observation;
-/// Read-only, bounded immediate-child discovery beneath one explicit project root.
-#[cfg(unix)]
-pub mod project_discovery;
 /// Pure no-replay lifecycle for one exact formatted project-disk attachment.
 pub mod project_disk_attachment_state;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
@@ -341,21 +308,12 @@ pub mod project_disk_filesystem;
 pub mod project_disk_host_observation;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
-/// Pure bounded validator for the final #628 full project-filesystem correlation receipt.
-pub mod project_filesystem_correlation_receipt;
 pub mod project_workspace_identity;
 /// Pure path-free catalog-wide authority vocabulary for protected cache generations.
 pub mod protected_cache_generation_catalog;
-/// Conservative namespace-wide lease visibility from personal-worker durable state.
-pub mod protected_cache_namespace_lease_visibility;
-/// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
-pub mod protected_cache_replacement_equivalence;
 pub mod quarry_parallel_verification_adapter;
-/// Bounded exact-byte capture from one already-open Quarry verification receipt channel.
-pub mod quarry_parallel_verification_capture;
 /// Strict supplied-receipt-only decoder for Quarry parallel verification receipt v2.
 pub mod quarry_parallel_verification_receipt;
-pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
 pub mod renderprove_native_probe;
@@ -367,8 +325,6 @@ pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
 /// Credentialless, bounded observation of one immutable reviewed repository source.
 pub mod repository_source_observation;
-/// Pure frozen preregistration and sample binding for resident backend comparisons.
-pub mod resident_backend_comparison;
 /// Bounded exact-OID repository evidence for resident trusted-agent work.
 #[cfg(unix)]
 pub mod resident_repo_query;
@@ -408,8 +364,6 @@ pub mod runner_log_reclaim_store;
 pub mod runner_user;
 #[cfg(target_os = "linux")]
 pub mod runner_user_observation;
-/// Pure classification of trusted bounded Rust memory-pressure observations.
-pub mod rust_memory_diagnostic;
 /// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
 pub mod rust_verification_envelope;
 /// Canonical digest binding for reviewed Rust verification envelopes.
@@ -424,8 +378,6 @@ pub mod subordinate_id;
 /// Pure sealed task-private Git clone planning from exact hot-path leases.
 #[cfg(target_os = "linux")]
 pub mod task_private_git_clone_plan;
-/// Pure reviewed identity for one resident Linux guest-control executable generation.
-pub mod trusted_guest_control_binary_generation;
 /// Root-only, closed, one-transaction Linux guest-control dispatcher.
 #[cfg(unix)]
 pub mod trusted_guest_control_dispatcher;
@@ -449,8 +401,6 @@ pub mod trusted_overlay_task_view;
 pub mod trusted_project_block_device_correlation;
 /// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
 pub mod trusted_project_filesystem_correlation;
-/// Opaque composition of exact guest filesystem + whole-block-device evidence.
-pub mod trusted_project_filesystem_full_guest_correlation;
 /// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
 pub mod trusted_project_filesystem_guest_observation;
 /// Canonical path-free payload/result for the guest project-filesystem observation operation.
@@ -470,8 +420,6 @@ pub mod unix_resident_sandbox_store;
 pub mod verification_cache_generation;
 /// Pure fixed repository verification command meanings for identity derivation and later execution.
 pub mod verification_command_semantics;
-/// Pure sealed cross-attempt verification-isolation compatibility.
-pub mod verification_isolation_referee;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
