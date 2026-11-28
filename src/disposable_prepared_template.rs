@@ -474,7 +474,7 @@ fn validate_wire(
         || isolation.ssh_forward_x11_trusted
         || isolation.proxy_environment
         || isolation.built_in_containerd
-        || isolation.rosetta
+        || !isolation.rosetta
         || isolation.display
     {
         return Err(unsafe_policy());
@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2"
+            "sha256:321e7d7165d0b7b7a0b2fb35a22f1f7c1621cbc743b16783b14092b2558d4f9c"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:6a47d79a6a66e0e267104c39b8de7b818aaaffd691c653013a4cce907ae87a15"
+            "sha256:f28bfe21cbab1124c3d3dec21cabc1574b9a8960445cf5e64b14818ee97430af"
         );
     }
 
@@ -666,6 +666,7 @@ mod tests {
             ),
             (&["isolation", "host_mounts"][..], serde_json::json!(true)),
             (&["isolation", "host_resolver"][..], serde_json::json!(true)),
+            (&["isolation", "rosetta"][..], serde_json::json!(false)),
             (
                 &["source_resources", "disk_bytes"][..],
                 serde_json::json!(8 * (1_u64 << 30)),

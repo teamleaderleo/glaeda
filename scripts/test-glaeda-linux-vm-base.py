@@ -22,7 +22,7 @@ base = importlib.util.module_from_spec(SPEC)
 sys.modules[LOADER.name] = base
 LOADER.exec_module(base)
 
-HOST = {"system": "Darwin", "machine": "arm64", "cpus": 14, "memory_gib": 48, "free_gib": 115}
+HOST = {"system": "Darwin", "machine": "arm64", "cpus": 14, "memory_gib": 48, "free_gib": 115, "rosetta": True}
 IDENTITY = json.loads((ROOT / "examples/lima/glaeda-prepared-template.json").read_text())
 PROV = IDENTITY["provisioning"]
 MARKER = json.dumps({
@@ -45,7 +45,7 @@ def ok(stdout="", code=0, stderr=""):
 class FakeLima:
     """A stateful limactl: instances live in LIMA_HOME directories like the real one."""
 
-    def __init__(self, root: pathlib.Path, *, version="2.2.0", guest_arch="aarch64", mounts="", groups=None):
+    def __init__(self, root: pathlib.Path, *, version="2.2.0", guest_arch="aarch64", mounts="/mnt/lima-rosetta virtiofs\n", groups=None):
         self.root = root
         self.version = version
         self.guest_arch = guest_arch
@@ -268,9 +268,21 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(out["plan"], ["verify", "stop"])
 
     def test_host_mount_in_guest_fails_readiness(self):
-        self.fake.mounts = "/mnt/host virtiofs\n"
+        self.fake.mounts = "/mnt/lima-rosetta virtiofs\n/mnt/host virtiofs\n"
         with self.assertRaisesRegex(base.Failed, "guest_host_mounts"):
             self.installer().execute(apply=True)
+
+    def test_missing_rosetta_share_fails_readiness(self):
+        self.fake.mounts = ""
+        with self.assertRaisesRegex(base.Failed, "guest_host_mounts"):
+            self.installer().execute(apply=True)
+
+    def test_host_without_rosetta_is_refused_before_any_change(self):
+        with self.assertRaisesRegex(base.Refused, "install-rosetta"):
+            base.Installer(root=self.root, runner=self.fake, download=self.download, host={**HOST, "rosetta": False},
+                           sleep=lambda s: None).execute(apply=True)
+        self.assertFalse(self.root.exists())
+        self.assertEqual(self.downloads, 0)
 
     def test_interrupted_create_without_instance_is_refused(self):
         self.root.mkdir(parents=True)

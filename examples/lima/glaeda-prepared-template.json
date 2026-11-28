@@ -20,7 +20,7 @@
   },
   "provisioning": {
     "recipe_revision": 7,
-    "lima_template_digest": "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2",
+    "lima_template_digest": "sha256:321e7d7165d0b7b7a0b2fb35a22f1f7c1621cbc743b16783b14092b2558d4f9c",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",
@@ -58,7 +58,7 @@
     "ssh_forward_x11_trusted": false,
     "proxy_environment": false,
     "built_in_containerd": false,
-    "rosetta": false,
+    "rosetta": true,
     "display": false
   }
 }
