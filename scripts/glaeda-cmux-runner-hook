@@ -557,6 +557,12 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # like the rest, so the trust rule (only nightly.yml at refs/heads/nightly-next reaches the
                 # signer) is unchanged; it adds no secret and no entitlement. continue-on-error in the workflow.
                 ("nightly.yml", "sign-live-code-variant"),
+                # NIGHTLY_NEXT_PKG (cmux nightly.yml nightly-next-pkg; cmux scripts/ci/signing_runner.py lists it):
+                # "Finish a published nightly-next build" packages, signs and notarizes the published app's .pkg
+                # on glaeda-trusted-next-signing with the release-next keychain. Missing here, every Finish dispatch
+                # was refused ("NEXT nightly needs its exact nightly.yml signing job push or dispatch"; cmux run
+                # 46100308507, 2026-11-28, and each one since 2026-11-25). CMUX_SIGNING_JOBS below is the guard.
+                ("nightly.yml", "nightly-next-pkg"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
@@ -2368,6 +2374,16 @@ def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | N
 SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
 
 
+# STEP_TABLE_UNLISTED: cmux's step table (pr-pipeline.yml, keyed by its caller pr-router.yml) never touches a canonical
+# root or the kept DerivedData (no CMUX_CI_CANONICAL_ROOT or owned-state step in it, cmux feat-cmux-next f65bb4fb71c0),
+# yet each job it added was a compile here until someone listed it: `mac`, `mac-fallback` and `ios` waited 58 min for
+# persistent-dd on cmux18 (2026-11-25), then `ios-fast` up to its 40-min timeout for root 1 (2026-11-27). So a job of
+# it that no table names is isolated (its own units, no shared token). GLAEDA_STEP_TABLE_UNLISTED_ISOLATED=0 costs it
+# as a compile again.
+STEP_TABLE_CALLER = "pr-router.yml"
+STEP_TABLE_UNLISTED_ENV = "GLAEDA_STEP_TABLE_UNLISTED_ISOLATED"
+
+
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
               workflow: str = "") -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). A
@@ -2386,6 +2402,9 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
         # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
         return "light", False
+    if workflow == STEP_TABLE_CALLER and job not in JOB_CLASSES and os.environ.get(STEP_TABLE_UNLISTED_ENV, "1") != "0":
+        # STEP_TABLE_UNLISTED: a job cmux's step table adds builds in its workspace, so it is isolated, not a compile
+        return "isolated", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
@@ -3287,6 +3306,14 @@ TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}  # the app's binary is its CLI onl
 # A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
 # busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
 GATE_ELIGIBLE_RECHECK_S = 30.0
+# FIRST_LOOK_FIRST: a gate with no listener up holds it off until its first eligibility look answers (and while a
+# first refusal is rechecked), for at most GATE_FIRST_LOOK_MAX_S, so a new or restarted gate never starts a listener
+# that takes a job job-started refuses. 2026-11-28: cmux14's restarted gates started their listeners at once, the
+# look answered "node not eligible" after the first poll, and the jobs taken meanwhile failed in "Set up job".
+# ELIGIBLE_LOOK_BOUND: a look still running GATE_ELIGIBLE_LOOK_MAX_S after it started is replaced by a new one and
+# its answer dropped: a hung look kept the last held refusal for good, so the runner never listened again.
+GATE_FIRST_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_LOOK_MAX_S") or 90.0)
+GATE_ELIGIBLE_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_LOOK_MAX_S") or 120.0)
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
@@ -3925,8 +3952,11 @@ APPLY_DRAIN_STALE = "APPLY_DRAIN_STALE"
 
 def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
-    no marker, an expired one, or one that cannot be read."""
+    no marker, an expired one, or one that cannot be read. A gateway runner never drains for cmux-ci's measurement
+    pause (GATEWAY_NO_MEASURE_DRAIN)."""
     doc = runner_drain_doc(runner_dir, now) or host_runner_pause_for(runner_dir, now, fleet_dir)
+    if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY and gateway_runner_dir(os.fspath(runner_dir)):
+        doc = None
     return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
@@ -3962,7 +3992,33 @@ def drain_doc_at(path: Path, now: float, owner_uid: int | None = None) -> dict[s
         return None
     if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
+    if measure_drain_overdue(doc, now):
+        return None
     return doc
+
+
+# MEASURE_DRAIN_BOUND: cmux-ci's lend drain rewrites its marker (RUNNER_DRAIN by CMUX_CI_DRAIN_BY, and the host's
+# runner-pause.json) every few minutes with a fresh `until`, so the expiry above never ends a drain the worker keeps
+# asking for. 2026-11-28 02:17-03:20Z: cmux14, cmux22, cmux23, cmux28, cmux29, cmuxs-mac-mini-3 and ultra2 held every
+# runner but the nightly slot off for "cmux-ci lend drain: a measurement waits for this mini", the markers rewritten
+# with until 10 min ahead each pass, and the gateway label read 33 of 113 runners online. The worker now writes the
+# drain's start (`since`) into the marker and ends its own pause after its hard bound (cmuxterm-hq runner_pause.go
+# runnerPauseMaxHold); a marker whose `since` is older than MEASURE_DRAIN_MAX_S is ignored here as well, so a worker
+# that keeps rewriting past its bound (an old release, a bug) still frees the runners. A marker with no `since` (a
+# worker from before it) keeps the expiry alone. Other writers' markers (an apply, a hand drain) are untouched.
+# GLAEDA_MEASURE_DRAIN_MAX_S sets the bound; 0 turns it off.
+MEASURE_DRAIN_MAX_S = float(os.environ.get("GLAEDA_MEASURE_DRAIN_MAX_S") or 60 * 60)
+
+
+def measure_drain_overdue(doc: dict[str, Any], now: float) -> bool:
+    """Whether doc is cmux-ci's measurement drain and has stood past MEASURE_DRAIN_MAX_S since its `since`."""
+    if MEASURE_DRAIN_MAX_S <= 0 or doc.get("by") != CMUX_CI_DRAIN_BY:
+        return False
+    try:
+        since = float(doc.get("since") or 0)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return math.isfinite(since) and 0 < since <= now and now - since > MEASURE_DRAIN_MAX_S
 
 
 # HOST_DRAIN: a hand drain that empties a mini for a repair marks every runner on it (RUNNER_DRAIN), and every listener
@@ -4425,6 +4481,60 @@ def fleet_toolchain_missing(home: Path | None = None) -> str | None:
     return toolchain_missing(workload_env(), home)
 
 
+# RUST_SELF_INSTALL: a node whose receipt names a rustup toolchain it lacks installs it (bounded, under a per-user
+# lock), instead of refusing the job. 2026-11-27: cmux31's class receipt moved to rustc 1.100.0 while the mini had
+# only 1.95.0, so cmux31-glaeda-13 refused every job at setup with "rust toolchain 1.100.0-aarch64-apple-darwin is
+# not installed" (hq synthetic-probes, run 46094599116), and that workflow_dispatch had no rescue to re-place it.
+# By hand the install took 7 s. Leo: "YOU MUST FIX THESE TYPES OF THINGS ASAP. ALL." The gate's look installs too,
+# so a held listener heals itself instead of waiting for mini-health. GLAEDA_RUNNER_RUST_SELF_INSTALL=0 turns it off.
+RUST_SELF_INSTALL = os.environ.get("GLAEDA_RUNNER_RUST_SELF_INSTALL", "1") != "0"
+RUST_INSTALL_BUDGET_S = float(os.environ.get("GLAEDA_RUNNER_RUST_INSTALL_BUDGET_S") or 300.0)
+RUST_INSTALL_LOCK = ".cache/glaeda/rust-toolchain-install.lock"  # under home: one install per user at a time
+RUST_TOOLCHAIN_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def install_receipt_toolchain(toolchain: str, env: dict[str, str], home: Path) -> tuple[bool, str]:
+    """(installed, note): rustup toolchain install TOOLCHAIN --profile minimal, at most RUST_INSTALL_BUDGET_S in
+    all (the lock wait included), under RUST_INSTALL_LOCK so the runners of one user install it once. A toolchain
+    another runner installed while this one waited counts as installed."""
+    if not RUST_SELF_INSTALL:
+        return False, "self-install is off (GLAEDA_RUNNER_RUST_SELF_INSTALL=0)"
+    if not RUST_TOOLCHAIN_NAME.fullmatch(toolchain):
+        return False, f"refused to install an unsafe toolchain name {toolchain!r}"
+    deadline = time.monotonic() + RUST_INSTALL_BUDGET_S
+
+    def listed() -> bool:
+        out = _probe(["rustup", "toolchain", "list"], env, home, max(deadline, time.monotonic() + 10))
+        return any(line.split()[0] == toolchain for line in out.splitlines() if line.strip())
+
+    lock = home / RUST_INSTALL_LOCK
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return False, f"cannot open {lock}: {e}"
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False, f"another install held {lock} past {RUST_INSTALL_BUDGET_S:.0f} s"
+                time.sleep(1.0)
+        if listed():
+            return True, f"rust toolchain {toolchain} was installed by another runner here"
+        started = time.monotonic()
+        out, timed_out = _probe_answer(["rustup", "toolchain", "install", toolchain, "--profile", "minimal",
+                                        "--no-self-update"], env, home, deadline)
+        if not listed():
+            why = "timed out" if timed_out else "failed"
+            return False, f"rustup toolchain install {toolchain} {why} after {time.monotonic() - started:.0f} s"
+        return True, f"installed rust toolchain {toolchain} in {time.monotonic() - started:.0f} s (RUST_SELF_INSTALL)"
+    finally:
+        os.close(fd)
+
+
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
     """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
     match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
@@ -4476,7 +4586,13 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                                                  str(want.get("rustcVersion") or "")))), note
         names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
                  if line.strip()]
-        if toolchain not in names:
+        if toolchain not in names and names:
+            installed, why = install_receipt_toolchain(toolchain, env, home)
+            if not installed:
+                return f"node not eligible (rust toolchain {toolchain} is not installed; {why})", note
+            note = why
+            deadline = time.monotonic() + ELIGIBILITY_BUDGET_S  # the install spent the probes' budget
+        elif toolchain not in names:
             return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)", not names), note
         if align:
             current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
@@ -4485,7 +4601,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             if now != [toolchain]:
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
-            note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            note = "; ".join(x for x in (note, f"set the rustup default to {toolchain} "
+                                               f"(was {current[0] if current else 'none'})") if x)
             # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
             # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
             # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
@@ -4493,7 +4610,7 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
-            note = f"would set the rustup default to {toolchain}"
+            note = "; ".join(x for x in (note, f"would set the rustup default to {toolchain}") if x)
     python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return out_of_time(f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile "
@@ -12280,6 +12397,9 @@ class Gate:
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.eligible_looked = self.eligible_why is not None  # a look has answered (a reload carries a held answer)
+        self.eligible_gen = 0  # the look whose answer counts (ELIGIBLE_LOOK_BOUND)
+        self.eligible_first_at: float | None = None  # when the first look started (FIRST_LOOK_FIRST)
         self.tailnet_why: str | None = None  # the held off-the-tailnet answer (off_tailnet)
         self.tailnet_seen = 0  # looks in a row that found this mini off the tailnet
         self.tailnet_at = -GATE_TAILNET_EVERY_S
@@ -12470,7 +12590,7 @@ class Gate:
                     or self.fleet_build_yield() or self.waiter_yield())
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = self.host_claim()
-        if why is None and self.waiters and self.waiters_due():
+        if why is None and self.yields_to_waiters() and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
             why = waiter_why(self.host_lock, min(self.waiting))
@@ -12485,7 +12605,12 @@ class Gate:
         lock until it has lasted SIGNER_LOCK_SETTLE_S: a probe's seconds do not take the signer offline."""
         scope = runner_scope(self.runner_dir)
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir, nightly_slot=scope.nightly)
-        if why != FLEET_BUILD_HOLDS_HOST or not scope.trusted_signing:
+        if why == FLEET_BUILD_HOLDS_HOST and scope.gateway:
+            return None  # GATEWAY_NO_MEASURE_DRAIN: its client takes no host.lock and about no CPU
+        # SETTLE_DEDICATED: a dedicated runner (cmux15's trusted-main, the only glaeda-trusted-std-xcode-26.6 runner)
+        # settles too. 2026-11-28 03:49-03:55Z its idle listener stopped three times for host.lock holds of 6-80 s
+        # and each stop cost the 60 s restart, so the census read seed signing at 0 online runners.
+        if why != FLEET_BUILD_HOLDS_HOST or not (scope.trusted_signing or scope.dedicated):
             self.lock_held_since = None
             return why
         now = time.monotonic()
@@ -12521,6 +12646,8 @@ class Gate:
         runner only with yieldToWaiters (YIELD_TO_WAITERS), read from its job-started hook on every look so a hook
         refresh counts without restarting the gate's listen.sh argv."""
         scope = runner_scope(self.runner_dir)
+        if scope.gateway:
+            return False  # GATEWAY_NO_MEASURE_DRAIN: a waiting build waits for no gateway client (GATEWAY_NO_HOST_LOCK)
         return scope.waiter_yields if scope.dedicated else self.waiters
 
     def waiter_yield(self) -> str | None:
@@ -13610,10 +13737,17 @@ class Gate:
             self.missing_why = missing
         if missing:
             return f"ineligible: {missing}"
+        now = time.monotonic()
         running = self.eligible_look is not None and self.eligible_look.is_alive()
+        if running and now - self.eligible_at >= GATE_ELIGIBLE_LOOK_MAX_S:
+            # ELIGIBLE_LOOK_BOUND: a look past its bound (its probes hung past ELIGIBILITY_BUDGET_S) no longer keeps
+            # the held answer: the next look replaces it, and the hung one's answer, if it ever comes, is dropped
+            gate_log(f"the eligibility look has not answered in {now - self.eligible_at:.0f} s; starting a new one")
+            self.eligible_gen += 1
+            running = False
         note = eligibility_refused(self.state_dir)  # INELIGIBLE_AT_ONCE: one stat and a small read per poll
         if note is not None and note[1] != self.refused_stamp:
-            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], time.monotonic()
+            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], now
             gate_log(f"job-started refused a job here: {note[0]}; held off at once so another runner takes the "
                      "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
             if not running:
@@ -13622,12 +13756,16 @@ class Gate:
         if stamp != self.receipt_seen:
             if self.receipt_seen is not None:
                 gate_log("the class receipt or enrollment changed; looking at eligibility now (RECEIPT_CHANGE_LOOKS)")
-                self.receipt_changed_at = time.monotonic()
+                self.receipt_changed_at = now
                 if not running:
                     self.eligible_at = -GATE_ELIGIBLE_EVERY_S
             self.receipt_seen = stamp
-        if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
-            self.eligible_at = started = time.monotonic()
+        if not running and now - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
+            self.eligible_at = started = now
+            self.eligible_gen += 1
+            gen = self.eligible_gen
+            if self.eligible_first_at is None:
+                self.eligible_first_at = now
 
             def look() -> None:
                 try:
@@ -13635,6 +13773,9 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if gen != self.eligible_gen:
+                    return  # replaced (ELIGIBLE_LOOK_BOUND): a newer look owns the answer, and a refusal's release
+                self.eligible_looked = True
                 if self.refused_why is not None:
                     if why is None and started >= self.refused_seen_at:
                         gate_log(f"a look after job-started's refusal finds the node eligible; listening again "
@@ -13669,6 +13810,14 @@ class Gate:
 
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
+        if self.child is None and not self.eligible_why and not self.refused_why:
+            # FIRST_LOOK_FIRST: with no listener up, nothing is lost by waiting for the look, and a listener started
+            # first took jobs that job-started then refused for the very eligibility the look was reading
+            if self.eligible_new:
+                return f"ineligible: {self.eligible_new} (rechecking before the listener starts)"
+            if not self.eligible_looked and self.eligible_first_at is not None \
+                    and now - self.eligible_first_at < GATE_FIRST_LOOK_MAX_S:
+                return "ineligible: waiting for the first eligibility look before the listener starts"
         held = self.eligible_why or self.refused_why
         return f"ineligible: {held}" if held else None
 

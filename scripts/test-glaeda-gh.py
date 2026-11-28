@@ -7743,9 +7743,9 @@ class ClientTest(Base):
         # a red past the first 100 besides the superseded one: still a failure
         more = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "FAILURE": 1}, "statuses": {}}
         self.assertEqual(gg.verdict("pr", {**base, "checkCounts": more}, "green"), 1)
-        # something still running past the first 100: not decided by the counts
+        # something still running past the first 100: not green yet, and not red either: it decides (cmux#64213)
         running = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "IN_PROGRESS": 1}, "statuses": {}}
-        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
+        self.assertIsNone(gg.verdict("pr", {**base, "checkCounts": running}, "green"))
         # no counts (an older read): the rollup decides, as before
         self.assertEqual(gg.verdict("pr", base, "green"), 1)
         # a superseded red read by suite id (lastRealAttempt) is in no count: it never cancels a red past page 1
@@ -7764,6 +7764,26 @@ class ClientTest(Base):
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"].update(
             checkRunCountsByState=[{"state": "SUCCESS", "count": 1}], statusContextCountsByState=[])
         self.assertEqual(gg.parse_pr(node)["checkCounts"], {"runs": {"SUCCESS": 1}, "statuses": {}})
+
+    def test_over_100_checks_a_superseded_red_waits_for_what_still_runs_past_the_first_100(self) -> None:
+        """manaflow-ai/cmux#64213 at 59ba9a22, 2026-11-28: 2 superseded cancelled private-names twins, 0 failed, 1 context
+        past page 1 still running; `wait` (until green) exited 1 in 163 s naming "a context past the 33 checks read"."""
+        cancelled = [{"name": "check", "workflow": "private-names", "conclusion": "CANCELLED"}] * 2
+        done = gg.parse_pr(pr_node(8, rollup="FAILURE", checks=[check_run("build")]))
+        base = {**done, "checksTruncated": True, "checkState": "FAILURE", "superseded": cancelled}
+        running = {"runs": {"SUCCESS": 29, "CANCELLED": 2, "IN_PROGRESS": 1}, "statuses": {"SUCCESS": 6}}
+        for until in ("green", "done", "required"):
+            self.assertIsNone(gg.verdict("pr", {**base, "checkCounts": running}, until), until)
+        finished = {"runs": {"SUCCESS": 30, "CANCELLED": 2}, "statuses": {"SUCCESS": 6}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": finished}, "green"), 0)
+        # one more red than the superseded ones shown, past page 1: a failure, named by its count
+        red = {"runs": {"SUCCESS": 29, "CANCELLED": 2, "FAILURE": 1, "IN_PROGRESS": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": red}, "green"), 1)
+        note = gg.rollup_red_note({**base, "checkCounts": red})
+        self.assertIn("2 cancelled, 1 failure", note)
+        self.assertIn("private-names / check cancelled", note)
+        self.assertIn("1 still running", note)
+        self.assertEqual(gg.rollup_red_note(base), "")
 
     def test_until_done_waits_for_checks_still_running_past_the_first_100(self) -> None:
         """manaflow-ai/cmux#43515 at f35486bc, 2026-11-15: 247 contexts; an excused "cmux-next CI guard group" red at
@@ -13824,12 +13844,75 @@ class WaitPrNotMergedTest(Base):
         self.assertIsNone(gg.wait_step(req, time.time(), self.get))
         self.land("stopped", stop={"code": "review_required", "reason": "needs an approving review", "next": "x"})
         code, text = gg.wait_step(req, time.time(), self.get)
-        self.assertEqual(code, gg.EXIT_OK, text)  # what the same wait with no land would have said: green, exit 0
-        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        # before 2026-11-28 this was exit 0 ("green ... not merged") and a caller read the 0 as merged: the merge
+        # this wait was chosen for is not coming, so it is never 0 (EXIT_LAND_ENDED), and it says why
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertNotEqual(code, gg.EXIT_OK)
+        self.assertIn("result: land-ended", text)
         self.assertIn("land: the land request stopped (review_required: needs an approving review)", text)
+        self.assertIn("still OPEN and not merged", text)
         self.put(rollup="FAILURE", conclusion="FAILURE")
         req = self.request(None)  # no land request any more: green, so a red fails as before
         self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+
+class WaitLandEndedTest(WaitPrNotMergedTest):
+    """2026-11-28: a `wait pr` with no --until on a PR glaeda land held a request for exited 0 on green checks after
+    that request stopped; the PR was still OPEN and its caller read the 0 as merged. Exit codes before -> after, for
+    the same open green PR: chosen merged then land ended 0 -> 8 (EXIT_LAND_ENDED); --until green|done|required
+    0 -> 0; merged 0 -> 0; a red head after the land ended 1 -> 1."""
+
+    STOP = {"code": "wait_refused", "reason": "ws-check has no data at the head", "next": "glaeda-gh land status o/r#1"}
+
+    def ended_wait(self, state: str = "stopped", as_json: bool = False, **fields: Any) -> dict:
+        self.land("waiting")
+        req = self.request(None, as_json=as_json)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get))
+        self.land(state, **fields)
+        return req
+
+    def test_each_way_a_land_request_ends_exits_land_ended_with_its_reason(self) -> None:
+        for state, said in (("stopped", "the land request stopped (wait_refused: ws-check has no data at the head)"),
+                            ("cancelled", "the land request was cancelled")):
+            req = self.ended_wait(state, stop=self.STOP)
+            code, text = gg.wait_step(req, time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_LAND_ENDED, (state, text))
+            self.assertIn(said, text, state)
+        req = self.ended_wait("waiting")
+        (gg.LandQueue.entries_dir() / gg.file_name(self.KEY)).unlink()
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertIn("the land request is gone from glaeda land", text)
+
+    def test_json_names_the_code_reason_and_the_lands_next_step(self) -> None:
+        req = self.ended_wait(stop=self.STOP, as_json=True)
+        code, text = gg.wait_step(req, time.time(), self.get)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["result"], doc["ok"], doc["code"]),
+                         (gg.EXIT_LAND_ENDED, "land-ended", False, "land-ended"))
+        self.assertIn("wait_refused", doc["reason"])
+        self.assertEqual(doc["next"], "glaeda-gh land status o/r#1")
+
+    def test_a_red_head_after_the_land_ended_still_fails(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(rollup="FAILURE", conclusion="FAILURE")
+        self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+    def test_a_merge_after_the_land_ended_is_still_merged(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+
+    def test_a_green_wait_the_caller_asked_for_still_exits_0_on_an_open_pr(self) -> None:
+        self.land("stopped", stop=self.STOP)
+        self.put()
+        for until in ("green", "done", "required"):
+            code, text = gg.wait_step(self.request(until), time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_OK, (until, text))
+            self.assertIn("PR still OPEN, not merged", text, until)
 
 
 class WaitSubscriptionTest(Base):
@@ -32906,6 +32989,7 @@ class LandTest(Base):
         e = self.tick(gg.LAND_REARM_AFTER * 3)
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
 
+    @mock.patch.dict(os.environ, {"GLAEDA_LAND_STUCK_MERGE": "0"})  # the re-arm alone, as a spent stuck merge leaves it
     def test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts(self):
         # 2026-11-24, one lane's queue after 10.5 h idle: 5 of its 5 open PRs stopped, none on a red of its own; one
         # stopped checks_stuck on a status that never posted, and a stopped row reads nothing, so a status posting
@@ -32939,6 +33023,144 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 2))
         self.tick()
         self.assert_merged_at(LA)
+
+    def stuck_updates(self) -> list:
+        return [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+
+    def rerun_cap_stop(self, head: str = LA) -> dict:
+        """A row stopped rerun_failed_cap at HEAD: its verdict job cancelled at every rerun (LAND_RERUN_CAP)."""
+        for _ in range(gg.LAND_RERUN_CAP + 3):
+            self.w.answers.append(refusal("cancelled", head, {"kind": "rerun_failed", "runs": [77]},
+                                          reason="not excused: 'ios fast verdict status' is cancelled"))
+        e = self.tick()
+        for i in range(gg.LAND_RERUN_CAP + 2):
+            if e["state"] == "stopped":
+                break
+            self.pr(head, checks=[("shard", "COMPLETED", "CANCELLED"), (f"other{i}", "COMPLETED", "SUCCESS")])
+            e = self.tick(60)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "rerun_failed_cap"), e.get("stop"))
+        self.w.answers.clear()
+        return e
+
+    def test_a_cancelled_verdict_at_the_rerun_cap_takes_one_base_merge_and_lands_at_the_new_head(self):
+        # LAND_STUCK_MERGE: manaflow-ai/cmux#54128, 2026-11-28: stopped rerun_failed_cap, its ios fast verdict cancelled
+        # three times at c0064150, and its lane barred from making the base merge itself; it sat stopped.
+        self.pr(LA)
+        self.land()
+        e = self.rerun_cap_stop()
+        said = self.w.sent()[-1]
+        self.assertIn("stopped: rerun_failed_cap", said[-1])
+        self.assertIn(f"this queue base-merges {LA[:12]} once", said[-1])
+        self.assertIn("fyi", " ".join(said))  # nothing is the requester's to do: it wakes nobody
+        self.assertEqual(self.stuck_updates(), [])
+        e = self.tick()
+        self.assertEqual((e["state"], e["lastStop"]["code"], e["stuckMerge"]["due"]),
+                         ("queued", "rerun_failed_cap", True))
+        judged = len(self.w.explains())
+        e = self.tick()
+        self.assertEqual(self.stuck_updates(), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                 f"expected_head_sha={LA}"]])
+        self.assertEqual(len(self.w.explains()), judged)  # the base merge is the step: no judgment of the same head
+        self.assertEqual((e["state"], e["wait"]["kind"], e["stuckMerge"]["n"], e["stuckMerge"]["due"]),
+                         ("waiting", "head_change", 1, False))
+        self.pr(LB, parent=LA)
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(4):
+            e = self.tick()
+            if e["state"] in gg.LAND_DONE:
+                break
+        self.assert_merged_at(LB)
+        self.assertEqual(len(self.stuck_updates()), 1)
+
+    def test_a_checks_stuck_stop_takes_one_base_merge_and_lands_at_the_new_head(self):
+        # LAND_STUCK_MERGE: manaflow-ai/cmux#54011, 2026-11-28: stopped checks_stuck, its cmux/ui-proof look never
+        # dispatched at f9bdfc03. The look comes only with a new head; the stuck check is never waited on again.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/ui-proof", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        self.w.answers.clear()
+        e = self.tick()
+        self.assertEqual((e["state"], e["stuckMerge"]["code"]), ("queued", "checks_stuck"))
+        e = self.tick()
+        # never deferred behind the pending check that is the stop's whole cause (update_branch's PAST_RUNNING)
+        self.assertEqual(len(self.stuck_updates()), 1, e.get("history", [])[-4:])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.pr(LB, parent=LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/ui-proof", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(4):
+            e = self.tick()
+            if e["state"] in gg.LAND_DONE:
+                break
+        self.assert_merged_at(LB)
+
+    def test_a_stuck_base_merge_is_once_per_head_and_capped_per_land(self):
+        self.pr(LA)
+        self.land()
+        self.rerun_cap_stop(LA)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.stuck_updates()), 1)
+        # the new head stops the same way: its own one base merge
+        self.pr(LB, parent=LA)
+        e = self.rerun_cap_stop(LB)
+        self.tick()
+        e = self.tick()
+        self.assertEqual((len(self.stuck_updates()), e["stuckMerge"]["n"]), (2, gg.LAND_STUCK_MERGE_CAP))
+        # the cap is spent: the third head stops and stays stopped, told as a stop with its own next step
+        self.pr(LC, parent=LB)
+        e = self.rerun_cap_stop(LC)
+        self.assertNotIn("base-merges", self.w.sent()[-1][-1])
+        for _ in range(3):
+            e = self.tick(60)
+        self.assertEqual((e["state"], len(self.stuck_updates())), ("stopped", 2))
+        # once per head: a stop at a head this land already base-merged from takes none
+        e = {"stuckMerge": {"head": LA, "n": 1}}
+        st = {"code": "checks_stuck", "head": LA, "at": self.t, "reason": "x"}
+        self.assertEqual(gg.land_stuck_merge_why(e, st, self.t), "")
+        self.assertEqual(gg.land_stuck_merge_why({}, st, self.t), "checks_stuck")
+
+    def test_an_own_red_of_the_prs_own_never_takes_a_stuck_merge(self):
+        at = self.t
+        own = {"code": "own_red", "head": LA, "at": at,
+               "reason": "land-judge: refused: base_red_excuse.py exit 1: not excused: 'tests' is not red on main run 9"}
+        base = {**own, "reason": "not excused: 'plan': its red base verdict's log does not map one to one onto its "
+                                 "steps (step_owners), so no base line can"}
+        lost = {**own, "code": "red_not_excused", "reason": "not excused: 'cmux/ui-proof': a status (error: UI proof "
+                                                            "not read (HTTPError): rerun this job)"}
+        self.assertEqual(gg.land_stuck_merge_why({}, own, at), "")
+        self.assertEqual(gg.land_stuck_merge_why({}, base, at), "own_red (red base verdict)")
+        self.assertEqual(gg.land_stuck_merge_why({}, lost, at), "red_not_excused (UI proof not read)")
+        for code in ("block", "conflict", "hold", "head_moved", "update_again_unnamed"):
+            self.assertEqual(gg.land_stuck_merge_why({}, {**base, "code": code}, at), "", code)
+        self.assertEqual(gg.land_stuck_merge_why({"override": "x"}, base, at), "")  # an override's pin is kept
+        self.assertEqual(gg.land_stuck_merge_why({}, base, at + gg.LAND_STUCK_MERGE_MAX_AGE + 1), "")  # too old
+        self.assertEqual(gg.land_stuck_merge_why({}, {**base, "head": ""}, at), "")
+        with mock.patch.dict(os.environ, {"GLAEDA_LAND_STUCK_MERGE": "0"}):
+            self.assertEqual(gg.land_stuck_merge_why({}, base, at), "")  # the undo
+        # and a real own red stays stopped, re-armed as before, with no base merge sent
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("own_red", LA, {"kind": "stop", "stop": "own_red"}, reason=own["reason"]))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
+        for _ in range(3):
+            e = self.tick(60)
+        self.assertEqual((e["state"], self.stuck_updates(), e.get("stuckMerge")), ("stopped", [], None))
+
+    def test_the_stuck_merge_hour_budget_holds_the_rest_for_the_next_hour(self):
+        self.pr(LA)
+        self.land()
+        self.rerun_cap_stop()
+        self.q.stuck_merge_sent = [self.t] * gg.LAND_STUCK_MERGE_HOURLY
+        e = self.tick()
+        self.assertEqual((e["state"], self.stuck_updates()), ("stopped", []))
+        e = self.tick(3600)
+        self.assertEqual(e["state"], "queued")
+        self.tick()
+        self.assertEqual(len(self.stuck_updates()), 1)
 
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)
@@ -35226,6 +35448,50 @@ class LandTest(Base):
             self.w.answers.append(ok_answer(LA))
             e = self.tick()
         self.assertEqual((len(self.handoffs()), e["state"]), (1, "forwarded"))
+
+    UNLISTED = ("gh: lane-gh call dispatch o/r: refused: dispatch starts only the reviewed workflows the broker lists "
+                "(manaflow-ai/cmux cmux-next-cef-publish.yml, manaflow-ai/cmux cmux-next-remote-browser-host-publish.yml)")
+
+    def test_a_dispatch_the_broker_does_not_list_hands_the_land_to_the_broker_host_once(self):
+        # cmux#46130 at bd06fcd6, fs-agent-lane-12, 2026-11-28 04:09Z..05:09Z: land_judge named the fast-gates dispatch,
+        # the broker refused the workflow 7 times over two lands, and the row stopped dispatch_refused with no red. The
+        # first refusal hands the land to the broker host's queue, which dispatches with its own login.
+        self.gates_allowed()
+        self.broker = True
+        self.w.gh_rc["dispatch"] = 1
+        self.w.gh_err["dispatch"] = self.UNLISTED
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(self.gates_refusal(LA))
+            e = self.tick()
+        self.assertEqual(len(self.dispatches()), 1)
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual((e["state"], e.get("forwardedTo"), e["handedOff"]["head"]), ("forwarded", "huge-blue", LA))
+        self.assertFalse(e.get("dispatchSent"))
+        self.assertIn("dispatch_unlisted", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stop"))
+
+    def dispatch_refused_here(self, broker: bool, err: str) -> dict:
+        self.gates_allowed()
+        self.broker = broker
+        self.w.gh_rc["dispatch"] = 1
+        self.w.gh_err["dispatch"] = err
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.handoffs(), [])
+        self.assertNotEqual(e["state"], "forwarded")
+        self.assertIn("step_refused", [h["event"] for h in e["history"]])
+        return e
+
+    def test_a_lane_vms_dispatch_refused_for_another_reason_is_never_handed_off(self):
+        self.dispatch_refused_here(True, "HTTP 403: Resource not accessible by integration")
+
+    def test_a_dispatch_refused_on_a_host_with_its_own_login_is_never_handed_off(self):
+        self.dispatch_refused_here(False, self.UNLISTED)
 
     def broker_lands(self) -> list[list[str]]:
         return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land"]]
@@ -37678,6 +37944,36 @@ class LandTest(Base):
         self.assertEqual(e["state"], "forwarded")
         self.broker = False
 
+    LABEL_REFUSED = ("land-judge: refused: compile_missing: manaflow-ai/cmux#1 at " + LA + " has no compile receipt: "
+                     "awaiting_land. Add ready-to-land (its full tier compiles the head), then merge again. Could not "
+                     "add ready-to-land: lane-gh call pr_edit manaflow-ai/cmux: refused: PR 1's branch 'feat' was not "
+                     "pushed by vm-1")
+
+    def test_a_compile_stop_whose_label_add_the_broker_refused_hands_the_land_to_the_broker_host(self):
+        # cmux#63635, #57830, #57226, 2026-11-28: green, idle teammate PRs stopped compile_missing on a lane VM because
+        # land_judge's ready-to-land add went through the broker, which refuses pr_edit on a PR the VM did not push.
+        # The broker host's queue adds it with its own login; its land_judge still applies the teammate rule.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(refusal("compile_missing", LA, {"kind": "stop"}, reason=self.LABEL_REFUSED))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual(e["state"], "forwarded")
+        self.broker = False
+
+    def test_a_compile_stop_naming_no_broker_refusal_or_off_a_lane_vm_stays_here(self):
+        self.broker = True
+        e = {"state": "waiting"}
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertTrue(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA))
+            self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": (
+                "land-judge: refused: compile_missing: no compile receipt: awaiting_land")}, {}, LA), "")
+        self.broker = False
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA), "")
+
     def test_a_tool_error_naming_no_broker_refusal_or_off_a_lane_vm_stays_a_stop_here(self):
         self.broker = True
         e = {"state": "waiting"}
@@ -38317,6 +38613,52 @@ class LandTest(Base):
         print(f"forward-quiet bound (miss, direct read, re-pin): {round(repinned - at)} s", file=sys.stderr)
         self.tick(gg.LAND_FORWARD_QUIET - 120)
         self.assertEqual(self.quiet_notices(), [], "the new hand-off's quiet clock starts at the re-pin")
+
+    def test_a_forward_whose_pin_a_person_merged_the_base_into_is_landed_again_at_once(self):
+        # LAND_FORWARD_MOVED: the far queue merged the base into the pin through GitHub's update-branch under a
+        # person's login; the copy here shows it a minute after the hand-off. Before: picked up only past
+        # LAND_FORWARD_QUIET, and told "re-pin it" since own_base_update knows only the queue's bot. Now: landed again
+        # here at the pin on the next pass, so its judgment's base_merge_check follows the merge or stops on it.
+        e = self.handed_off()
+        at = float(e.get("forwardFirst") or e["handedOff"]["at"])
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA, LC], "a": "someone", "c": "web-flow"})
+        relanded = []
+        reland = self.q.forward_reland
+        self.q.forward_reland = lambda e, head, *a, **k: (relanded.append((head, self.t)), reland(e, head, *a, **k))[1]
+        self.tick(30)
+        self.pr(LB)
+        for _ in range(4):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if relanded:
+                break
+        self.assertEqual([h for h, _ in relanded], [LA], "landed again at the pin, not at the live head")
+        self.assertLess(relanded[0][1] - at, gg.LAND_FORWARD_QUIET / 4, "on the next pass, not past the quiet bound")
+        self.assertEqual(self.quiet_notices(), [], "a merge on the pin tells nobody")
+        self.assertEqual(self.w.refreshed, [], "the copy already showed the moved head: no extra read of the PR")
+        e = self.q.entries[self.KEY]
+        self.assertTrue(any(h.get("event") == "forward_quiet" and h.get("merge") == LB[:12] for h in e["history"]))
+        self.assertTrue(any(h.get("event") == "forward_relanded" for h in e["history"]))
+        print(f"forward moved pin (a person's base merge, re-landed): {round(relanded[0][1] - at)} s", file=sys.stderr)
+
+    def test_a_forward_whose_head_was_pushed_early_tells_once_and_is_not_followed(self):
+        # LAND_FORWARD_MOVED: a push (no merge on the pin) seen before the quiet bound tells at once, once per PR
+        e = self.handed_off()
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})
+        relanded = []
+        self.q.forward_reland = lambda *a, **k: relanded.append(a)
+        self.tick(30)
+        self.pr(LB)
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(relanded, [])
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", sent[-1])
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(len(self.quiet_notices()), 1, "once per PR")
+        self.assertFalse(self.q.merge_on_pin(LA, {"p": [LA]}))
+        self.assertFalse(self.q.merge_on_pin(LA, {"p": [LC, LA]}))
+        self.assertTrue(self.q.merge_on_pin(LA, {"p": [LA, LC]}))
 
     def test_a_forward_whose_head_someone_else_moved_tells_once_with_the_live_sha(self):
         self.fresh_head = LB
@@ -43730,6 +44072,48 @@ class LandTest(Base):
         self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), ("hostx/sid-1", "$ACPMUX_SESSION_ID", "stopped"))
         self.assertEqual(self.w.sent()[-1][3], "hostx/sid-1")
         self.assertEqual(e["history"][0]["via"], "$ACPMUX_SESSION_ID")
+
+    def test_a_land_over_ssh_records_the_callers_session_as_its_notify_target(self):
+        # 2026-11-28: `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'` recorded no requester (no session crosses a
+        # plain ssh hop), and over reach the session's ACPMUX_FROM was recorded as cmux-cp-1/NAME, a session that does
+        # not exist there. Either way the caller heard no merge and no stop.
+        keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
+        ssh = {**keys, "CMUX_AGENT_HOST": "", "SSH_CONNECTION": "100.64.0.9 50000 100.64.0.1 22"}
+        reach = {**ssh, "ACPMUX_FROM": "claude-sr2-coord-old", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72",
+                 "CMUX_AGENT_HOST": "cosmic-gray"}
+        with mock.patch.object(gg, "policy_host", return_value="cmux-cp-1"):
+            with mock.patch.dict(os.environ, reach):
+                self.assertEqual(gg.land_requester_from(None), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from(""), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from("coord"), ("cosmic-gray/coord", "--notify"))
+                self.assertEqual(gg.land_requester_from("air-blue/x"), ("air-blue/x", "--notify"))
+            with mock.patch.dict(os.environ, {**reach, "ACPMUX_FROM": "cmux-cp-1/own"}):
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/own", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, {**reach, "CMUX_AGENT_HOST": "cmux-cp-1"}):
+                # a caller on this host: its own host, as before
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/claude-sr2-coord-old", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, ssh):
+                self.assertEqual(gg.land_requester_from(""), ("", ""))
+                note = gg.land_no_requester_note()
+                self.assertIn("no --notify and no session", note)
+                self.assertIn("--notify-to YOURHOST/SESSION", note)
+                self.assertIn("reach HOST", note)
+            with mock.patch.dict(os.environ, {**ssh, "SSH_CONNECTION": ""}):
+                self.assertNotIn("--notify-to", gg.land_no_requester_note())
+            for argv, env, want, via in (
+                    (["land", "o/r#1", "--notify", "--json"], reach, "cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"),
+                    (["land", "o/r#1", "--notify-to", "cosmic-gray/claude-sr2-coord-old", "--json"], ssh,
+                     "cosmic-gray/claude-sr2-coord-old", "--notify")):
+                for f in gg.LandQueue.entries_dir().glob("*.json"):
+                    f.unlink()
+                with mock.patch.dict(os.environ, env), mock.patch.object(gg, "daemon_running", return_value=True), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gg.main(argv), 0, argv)
+                self.pr(LA)
+                self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+                e = self.tick()
+                self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), (want, via, "stopped"), argv)
+                self.assertEqual(self.w.sent()[-1][3], want, argv)
 
     def test_nobody_to_tell_is_a_notice_not_silence(self):
         self.pr(LA)
@@ -52341,6 +52725,45 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
+    def test_slow_full_reads_spread_over_more_workers_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 04:0xZ: 70 waited cmux PRs at 2.7 s a full read. A worker's WAITED_POOL_BUDGET (50 s)
+        holds floor(50 / 5.4) queries of 2, so 18 PRs. Before: 3 workers of 30, 30, 10 read 18 + 18 + 10 = 46 at best (the
+        pool logged 21-26). After: chunks sized to the measure, 6 workers of 12 (or fewer), every one read in budget."""
+        per = 2.7
+        waited = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 71)]
+
+        def run(measure):
+            d = gg.Daemon.__new__(gg.Daemon)
+            d.now, d.deferred_since = 10000.0, {}
+            d.oldest_waited_age = lambda waited: 9999.0
+            if measure:
+                d.full_pr_secs = {"manaflow-ai/cmux": per}
+            sizes = []
+
+            def read_many(keys, budget):  # queries of 2 full reads, serial, cut by the worker's budget
+                sizes.append(len(keys))
+                fits = int(budget // (2 * per)) * 2
+                return {k: (None if i < fits else "not read: deferred, the tick's time ran out") for i, k in enumerate(keys)}
+            with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                    mock.patch.object(gg, "upstream_command", lambda: None):
+                futures, handed = d.start_waited_pool(waited)
+                done = {}
+                for f in futures:
+                    done.update(f.result(timeout=5))
+            return sorted(sizes, reverse=True), sum(1 for v in done.values() if v is None)
+        self.assertEqual(run(False), ([30, 30, 10], 46))  # before: no measure, the fixed chunk
+        sizes, read = run(True)
+        self.assertEqual(sizes, [12, 12, 12, 12, 12, 10])  # 50 * 0.7 / 2.7 = 12 a worker, 6 workers
+        self.assertEqual(read, 70)
+
+    def test_a_fast_repo_keeps_the_fixed_chunk_and_the_in_flight_bound(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.full_pr_secs = 10000.0, {"o/r": 0.5, "o/slow": 10.0}
+        self.assertEqual(d.waited_pool_chunk("o/r"), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(d.waited_pool_chunk("o/slow"), 3)
+        self.assertEqual(d.waited_pool_chunk("o/unmeasured"), gg.WAITED_POOL_CHUNK)
+
+
 class SuitesPastOnePagePaged(unittest.TestCase):
     """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
     so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
@@ -52372,6 +52795,28 @@ class SuitesPastOnePagePaged(unittest.TestCase):
 
     def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
         d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_rest_pages_complete_the_head_when_graphql_refuses(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "rate limited"}]}]), self.commit()
+        got = []
+
+        def get(path, etag):
+            got.append(path)
+            n = 100 if path.endswith("page=1") else 30
+            return "fresh", {"total_count": 130, "check_suites": [
+                {"node_id": f"R{len(got)}_{i}", "latest_check_runs_count": 1} for i in range(n)]}, None
+        d.get = get
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])
+
+    def test_a_short_rest_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "x"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
         d.page_more_suites("o/r", commit)
         self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
 
