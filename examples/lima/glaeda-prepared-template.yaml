@@ -64,7 +64,10 @@ propagateProxyEnv: false
 # Lima plain mode deliberately retains system provisioning. This fixed script consumes no
 # repository input, downloads only the pinned official runner, verifies size and SHA-256 before
 # extraction, runs the archive's official dependency installer, and creates the non-sudo workload
-# account used by the later JIT boundary.
+# account used by the later JIT boundary. It also installs the team's Linux CI toolchain from
+# Ubuntu's signed repositories plus two Launchpad PPAs whose signing keys are pinned by
+# fingerprint and SHA-256 and whose packages are limited to a named list by apt pinning, then
+# proves that toolchain as the workload account on every boot.
 provision:
   - mode: system
     script: |
@@ -101,6 +104,17 @@ provision:
       readonly marker="${marker_dir}/prepared-template.json"
       readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
       readonly suid_dumpable_policy="/etc/sysctl.d/99-smolrunner-runner-secrets.conf"
+      readonly userns_policy="/etc/sysctl.d/99-smolrunner-runner-userns.conf"
+      readonly toolchain_check="${launcher_dir}/smolrunner-ci-toolchain-check"
+      readonly apt_keyrings="/etc/apt/keyrings"
+      readonly git_core_keyring="${apt_keyrings}/smolrunner-git-core-ppa.gpg"
+      readonly git_core_keyring_sha256="18784b89b0dddeab155f111da4fb528cbe8ebe4c2ceaf3fb2b9eea7789fa2502"
+      readonly git_core_fingerprint="E1DD270288B4E6030699E45FA1715D88E1DF1F24"
+      readonly deadsnakes_keyring="${apt_keyrings}/smolrunner-deadsnakes-ppa.gpg"
+      readonly deadsnakes_keyring_sha256="1d34623278d5a7c3627fd6acda29f536e1af447144ba0d5d7e0613169511374d"
+      readonly deadsnakes_fingerprint="F23C5A6CF475977595C89F51BA6932366A755776"
+      readonly ppa_sources="/etc/apt/sources.list.d/smolrunner-ci-ppas.sources"
+      readonly ppa_preferences="/etc/apt/preferences.d/smolrunner-ci-ppas"
 
       if [[ "$(/usr/bin/id -u)" != "0" ]]; then
         echo "prepared-template provisioning requires root" >&2
@@ -149,6 +163,13 @@ provision:
       /usr/bin/install -o root -g root -m 0644 /dev/null "${suid_dumpable_policy}"
       /usr/bin/printf '%s\n' 'fs.suid_dumpable = 0' >"${suid_dumpable_policy}"
       /usr/sbin/sysctl --load "${suid_dumpable_policy}" >/dev/null
+      # Ubuntu 24.04's AppArmor denies unprivileged user namespaces, so bubblewrap sandboxes
+      # (codex-review-box, the cmux Linux agent sandbox and their suites) cannot start. The VM is
+      # the job boundary; the GCP Linux pool's remote-ssh probe makes the same setting.
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${userns_policy}"
+      /usr/bin/printf '%s\n' 'kernel.apparmor_restrict_unprivileged_userns = 0' >"${userns_policy}"
+      /usr/sbin/sysctl --load "${userns_policy}" >/dev/null
+      [[ "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" == "0" ]]
       [[ "$(/usr/bin/id -Gn "${runner_user}")" == "${runner_user}" ]]
 
       verify_runner_secret_protection() {
@@ -162,6 +183,26 @@ provision:
 
       verify_runner_install() {
         [[ "$(${integrity_verifier})" == "smolrunner-runner-integrity-ok" ]]
+      }
+
+      # The toolchain as a job sees it: the workload account, its own HOME, PATH=/usr/bin:/bin.
+      verify_ci_toolchain() {
+        local result
+        result="$(/usr/sbin/runuser -u "${runner_user}" -- /usr/bin/env -i \
+          HOME="${runner_home}" PATH=/usr/bin:/bin LC_ALL=C "${toolchain_check}")"
+        [[ "${result}" == smolrunner-ci-toolchain-ok* ]]
+        /usr/bin/printf '%s\n' "${result}"
+      }
+
+      install_pinned_keyring() {
+        local destination="$1" sha256="$2" fingerprint="$3" encoded="$4" stage
+        stage="${destination}.new"
+        /usr/bin/printf '%s' "${encoded}" | /usr/bin/base64 --decode >"${stage}"
+        /usr/bin/printf '%s  %s\n' "${sha256}" "${stage}" | /usr/bin/sha256sum --check --status
+        [[ "$(/usr/bin/gpg --show-keys --with-colons "${stage}" 2>/dev/null \
+          | /usr/bin/awk -F: '$1 == "fpr" { print $10 }')" == "${fingerprint}" ]]
+        /usr/bin/install -o root -g root -m 0644 "${stage}" "${destination}"
+        /usr/bin/rm -f -- "${stage}"
       }
 
       /usr/bin/install -d -o root -g root -m 0755 \
@@ -193,6 +234,7 @@ provision:
         verify_runner_install
         verify_runner_secret_protection
         verify_automatic_updates_disabled
+        verify_ci_toolchain >/dev/null
         exit 0
       fi
 
@@ -200,6 +242,89 @@ provision:
         echo "runner installation exists without the exact readiness marker" >&2
         exit 1
       fi
+
+      # The toolchain checker lands before any package so every later boot can run it.
+      /usr/bin/cat >"${toolchain_check}.new" <<'TOOLCHAIN_CHECK'
+      #!/bin/bash
+      set -euo pipefail
+      export PATH=/usr/bin:/bin LC_ALL=C
+      readonly runner_user="smolrunner-runner"
+      readonly runner_home="/var/lib/smolrunner-runner"
+      readonly runner_work="/opt/smolrunner/actions-runner/_work"
+      fail() { echo "smolrunner-ci-toolchain-failed: $*" >&2; exit 1; }
+      [[ "$(/usr/bin/id -un)" == "${runner_user}" ]] || fail "not ${runner_user}"
+      # A real HOME of the workload account's own: suites write ~/.gitconfig and caches there.
+      [[ "${HOME}" == "${runner_home}" && -d "${HOME}" && ! -L "${HOME}" ]] || fail "HOME ${HOME}"
+      [[ "$(/usr/bin/stat --format=%U "${HOME}")" == "${runner_user}" ]] || fail "HOME owner"
+      probe="$(/usr/bin/mktemp --directory "${HOME}/.toolchain-check.XXXXXX")" || fail "HOME not writable"
+      /usr/bin/rmdir -- "${probe}"
+      # RUNNER_TOOL_CACHE defaults to _work/_tool: setup-python, setup-node and setup-bun download there.
+      [[ -d "${runner_work}" && -w "${runner_work}" ]] || fail "runner work not writable"
+      for tool in git curl unzip xz zstd jq tar gzip make gcc g++ bwrap python3 python3.9; do
+        [[ -x "/usr/bin/${tool}" ]] || fail "missing /usr/bin/${tool}"
+      done
+      git_version="$(/usr/bin/git --version)"
+      git_version="${git_version#git version }"
+      /usr/bin/dpkg --compare-versions "${git_version}" ge 2.49 || fail "git ${git_version} < 2.49"
+      [[ "$(/usr/bin/git backfill -h 2>&1 || true)" == *"usage: git backfill"* ]] || fail "git backfill"
+      py39="$(/usr/bin/python3.9 -c 'import ensurepip, sys, venv; print("%d.%d.%d" % sys.version_info[:3])')"
+      [[ "${py39}" == 3.9.* ]] || fail "python3.9 ${py39}"
+      /usr/bin/python3 -c 'import PIL' || fail "python3 PIL"
+      /usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent /usr/bin/true \
+        || fail "bwrap --unshare-all"
+      echo "smolrunner-ci-toolchain-ok git=${git_version} python3.9=${py39}"
+      TOOLCHAIN_CHECK
+      /usr/bin/chown root:root "${toolchain_check}.new"
+      /usr/bin/chmod 0755 "${toolchain_check}.new"
+      /usr/bin/mv -- "${toolchain_check}.new" "${toolchain_check}"
+
+      # Team Linux CI toolchain: git >= 2.49 (git backfill) from the git-core PPA and python3.9
+      # from deadsnakes beside Ubuntu's own python3; everything else from Ubuntu. Each PPA may
+      # supply only its named packages (pin -1 for the rest of it).
+      /usr/bin/install -d -o root -g root -m 0755 "${apt_keyrings}"
+      install_pinned_keyring "${git_core_keyring}" "${git_core_keyring_sha256}" "${git_core_fingerprint}" \
+        'xo0ESXjaGwEEAMA26F3+mnRW8uRqASMsEa5EsmgvUpLD7EKpC7903OpiMGSvZ2sE34g7W6nUQY0R//AZS2iW4ZXfvdhQTQuuPlHM6Q3iUAt+nyXcf9xBlscs8Gm722u4jAtFtBS4BMQRhRRfWTHwJIOM6OpGIccjPe8pQfIeoRxkKJxlehzw2mU1ABEBAAHNKExhdW5jaHBhZCBQUEEgZm9yIFVidW50dSBHaXQgTWFpbnRhaW5lcnPCtgQTAQIAIAUCSXjaGwIbAwYLCQgHAwIEFQIIAwQWAgMBAh4BAheAAAoJEKFxXYjh3x8k/zMD/RKBMjavvFl71YBazSOGl2YfSsZiR/ANsby3+rUaULb8uxzCHXAQnlH5vdtLSPryaLBvzCU8C3C02qNT8jRacU2752zsCkCi1SLRSOXdI/ATJHza5aTvYV93rTITBhU4sJQeK9RW0CtaDRAxJsn/Dr6J3lL/c9m9cT5fFpxOIsF4'
+      install_pinned_keyring "${deadsnakes_keyring}" "${deadsnakes_keyring_sha256}" "${deadsnakes_fingerprint}" \
+        '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'
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${ppa_sources}"
+      /usr/bin/printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://ppa.launchpadcontent.net/git-core/ppa/ubuntu' \
+        'Suites: noble' \
+        'Components: main' \
+        "Signed-By: ${git_core_keyring}" \
+        '' \
+        'Types: deb' \
+        'URIs: https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu' \
+        'Suites: noble' \
+        'Components: main' \
+        "Signed-By: ${deadsnakes_keyring}" \
+        >"${ppa_sources}"
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${ppa_preferences}"
+      /usr/bin/printf '%s\n' \
+        'Package: git git-man' \
+        'Pin: release o=LP-PPA-git-core' \
+        'Pin-Priority: 500' \
+        '' \
+        'Package: python3.9 python3.9-minimal python3.9-venv python3.9-distutils python3.9-lib2to3 libpython3.9-minimal libpython3.9-stdlib' \
+        'Pin: release o=LP-PPA-deadsnakes' \
+        'Pin-Priority: 500' \
+        '' \
+        'Package: *' \
+        'Pin: release o=LP-PPA-git-core' \
+        'Pin-Priority: -1' \
+        '' \
+        'Package: *' \
+        'Pin: release o=LP-PPA-deadsnakes' \
+        'Pin-Priority: -1' \
+        >"${ppa_preferences}"
+      /usr/bin/env -i DEBIAN_FRONTEND=noninteractive PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/bin/apt-get -qq -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update
+      /usr/bin/env -i DEBIAN_FRONTEND=noninteractive PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/bin/apt-get -qq -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
+        git git-man curl ca-certificates unzip xz-utils zstd jq tar gzip build-essential \
+        bubblewrap python3 python3-pil python3.9 python3.9-venv >/dev/null
+      [[ "$(/usr/bin/dpkg-query --show --showformat='${Version}' git)" == *ppa* ]]
 
       /usr/bin/rm -rf -- "${install_stage}"
       /usr/bin/rm -f -- "${archive}"
@@ -274,6 +399,7 @@ provision:
       verify_runner_install
       verify_runner_secret_protection
       verify_automatic_updates_disabled
+      verify_ci_toolchain
 
       readonly marker_stage="${marker}.new"
       /usr/bin/printf '%s\n' \
@@ -302,3 +428,5 @@ probes:
       /usr/bin/test -x /opt/smolrunner/actions-runner/bin/Runner.Listener
       /usr/bin/test -x /opt/smolrunner/bin/smolrunner-jit-launcher
       /usr/bin/test "$(/usr/bin/id -Gn smolrunner-runner)" = "smolrunner-runner"
+      /usr/bin/test -x /opt/smolrunner/bin/smolrunner-ci-toolchain-check
+      /usr/bin/test "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "0"

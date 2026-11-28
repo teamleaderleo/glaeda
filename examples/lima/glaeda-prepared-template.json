@@ -19,8 +19,8 @@
     "disk_bytes": 21474836480
   },
   "provisioning": {
-    "recipe_revision": 7,
-    "lima_template_digest": "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2",
+    "recipe_revision": 8,
+    "lima_template_digest": "sha256:151df0476a300ccd2d65efa487ffd70be3f34dcd3462650114ddeaecbc7654f2",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",
@@ -32,7 +32,7 @@
     "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a",
     "ready_marker_path": "/etc/smolrunner/prepared-template.json",
     "runner_dependency_install": "official_archive_script",
-    "os_package_source": "ubuntu_noble_signed_repositories_at_build",
+    "os_package_source": "ubuntu_noble_and_pinned_launchpad_ppas_signed_at_build",
     "automatic_os_updates_after_readiness": false,
     "runner_auto_update": false,
     "workload_sudo": false,

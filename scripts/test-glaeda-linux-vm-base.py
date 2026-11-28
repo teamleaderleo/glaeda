@@ -42,11 +42,16 @@ def ok(stdout="", code=0, stderr=""):
     return SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
 
 
+TOOLCHAIN_OK = ok("smolrunner-ci-toolchain-ok git=2.56.1 python3.9=3.9.25\n")
+
+
 class FakeLima:
     """A stateful limactl: instances live in LIMA_HOME directories like the real one."""
 
-    def __init__(self, root: pathlib.Path, *, version="2.2.0", guest_arch="aarch64", mounts="", groups=None):
+    def __init__(self, root: pathlib.Path, *, version="2.2.0", guest_arch="aarch64", mounts="", groups=None,
+                 toolchain=TOOLCHAIN_OK):
         self.root = root
+        self.toolchain = toolchain
         self.version = version
         self.guest_arch = guest_arch
         self.mounts = mounts
@@ -112,6 +117,10 @@ class FakeLima:
             return ok()
         if argv[:2] == ["/usr/bin/sudo", "--non-interactive"] and argv[2].endswith("integrity"):
             return ok("smolrunner-runner-integrity-ok\n")
+        if argv[:5] == ["/usr/bin/sudo", "--non-interactive", "--set-home", "--user", PROV["workload_user"]]:
+            assert argv[5:] == ["/usr/bin/env", "-i", "HOME=/var/lib/smolrunner-runner", "PATH=/usr/bin:/bin", "LC_ALL=C",
+                                "/opt/smolrunner/bin/smolrunner-ci-toolchain-check"], argv
+            return self.toolchain
         if argv[:2] == ["/usr/bin/sudo", "--non-interactive"] and argv[2] == "--user":
             return ok("", 1, "a password is required")
         if argv[0] == "/usr/bin/id":
@@ -174,6 +183,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(out["status"], "Stopped")
         self.assertEqual(out["checks"]["guest_arch"], "aarch64")
         self.assertEqual(out["checks"]["runner_integrity"], "smolrunner-runner-integrity-ok")
+        self.assertEqual(out["checks"]["ci_toolchain"], "smolrunner-ci-toolchain-ok git=2.56.1 python3.9=3.9.25")
         create = [c for c in self.fake.calls if c[2:4] == ["start", "--name"]]
         self.assertEqual(len(create), 1)
         self.assertEqual(create[0][3:6], ["--name", base.BASE_INSTANCE, "--timeout=45m"])
@@ -266,6 +276,12 @@ class InstallerTests(unittest.TestCase):
         self.fake.guest_arch = "aarch64"
         out = self.installer().execute(apply=True)
         self.assertEqual(out["plan"], ["verify", "stop"])
+
+    def test_missing_ci_toolchain_fails_readiness(self):
+        self.fake.toolchain = ok("", 1, "smolrunner-ci-toolchain-failed: git 2.43.0 < 2.49\n")
+        with self.assertRaisesRegex(base.Failed, "ci_toolchain.*git 2.43.0"):
+            self.installer().execute(apply=True)
+        self.assertEqual(json.loads((self.root / "base.json").read_text())["state"], "created")
 
     def test_host_mount_in_guest_fails_readiness(self):
         self.fake.mounts = "/mnt/host virtiofs\n"

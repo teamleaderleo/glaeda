@@ -449,7 +449,8 @@ fn validate_wire(
             != "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
         || provisioning.ready_marker_path != "/etc/smolrunner/prepared-template.json"
         || provisioning.runner_dependency_install != "official_archive_script"
-        || provisioning.os_package_source != "ubuntu_noble_signed_repositories_at_build"
+        || provisioning.os_package_source
+            != "ubuntu_noble_and_pinned_launchpad_ppas_signed_at_build"
         || provisioning.automatic_os_updates_after_readiness
         || provisioning.runner_auto_update
         || provisioning.workload_sudo
@@ -586,7 +587,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2"
+            "sha256:151df0476a300ccd2d65efa487ffd70be3f34dcd3462650114ddeaecbc7654f2"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:6a47d79a6a66e0e267104c39b8de7b818aaaffd691c653013a4cce907ae87a15"
+            "sha256:56e11766e51a441eaa4eeea30693d143556ac3a437d51b712d7c385a8556f07f"
         );
     }
 

@@ -63,6 +63,8 @@ STOP_TIMEOUT = 5 * 60
 SHELL_TIMEOUT = 90
 LIST_TIMEOUT = 60
 TAIL = 400
+# The workload account's HOME, as disposable_runner_runtime.rs hands it to the JIT runner.
+RUNNER_HOME = "/var/lib/smolrunner-runner"
 MASKED_APT_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service")
 
 
@@ -329,6 +331,12 @@ class Installer:
         result = self.guest(name, "/usr/bin/sudo", "--non-interactive", "--user", prov["workload_user"], "/usr/bin/sudo",
                             "--non-interactive", "/usr/bin/true")
         need("workload_no_sudo", result.returncode != 0, result.returncode)
+        # The team's Linux CI toolchain as a job sees it (git >= 2.49, python3.9, PIL, bwrap, a writable HOME).
+        check = str(pathlib.PurePosixPath(prov["jit_launcher_path"]).parent / "smolrunner-ci-toolchain-check")
+        result = self.guest(name, "/usr/bin/sudo", "--non-interactive", "--set-home", "--user", prov["workload_user"],
+                            "/usr/bin/env", "-i", f"HOME={RUNNER_HOME}", "PATH=/usr/bin:/bin", "LC_ALL=C", check)
+        need("ci_toolchain", result.returncode == 0 and result.stdout.startswith("smolrunner-ci-toolchain-ok "),
+             tail(result.stdout.strip() or result.stderr))
         masked = []
         for unit in MASKED_APT_UNITS:
             result = self.guest(name, "/usr/bin/systemctl", "is-enabled", unit)
