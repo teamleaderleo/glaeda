@@ -6531,7 +6531,7 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
         contexts = contexts.replace("... on StatusContext{context state description}",
                                     f"... on StatusContext{{context state description{required}}}")
     suites = "" if cursor else " " + SUITE_ATTEMPTS
-    return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{oid '
+    return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
             + contexts + suites + "}}}")
 
 
@@ -13511,10 +13511,10 @@ class Daemon:
         for i in range(len(entries)):
             for alias in (f"h{i}", f"m{i}"):
                 obj = (data.get(alias) or {}).get("object")
-                _, owner, repo, _ = split_key(entries[i]["key"])
+                _, owner, repo, sha = split_key(entries[i]["key"])
                 if alias[0] == "m":  # the check-of-record commit lives in another repository
                     owner, repo = CHECKS_OF_RECORD.get((owner, repo), (owner, repo))
-                self.page_more_suites(f"{owner}/{repo}", obj)
+                self.page_more_suites(f"{owner}/{repo}", obj, str(sha))
                 attempts[alias] = ran_nothing_suites(obj)
         suite_runs, suites_error = self.suite_runs(
             [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
@@ -13582,7 +13582,7 @@ class Daemon:
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
 
-    def page_more_suites(self, repo_key: str, commit: dict | None) -> None:
+    def page_more_suites(self, repo_key: str, commit: dict | None, oid: str = "") -> None:
         """Fill COMMIT's checkSuites past its first page (more than 100 suites: a cmux head has up to a few hundred):
         read the next pages by cursor and append them, so ran_nothing_suites sees every suite and the head's verdict
         reads whole instead of "more than 100 check suites" (cmux#62623, 2026-11-28: a land verdict that ran out its 229 s
@@ -13592,7 +13592,7 @@ class Daemon:
         if not isinstance(suites, dict) or not (suites.get("pageInfo") or {}).get("hasNextPage"):
             return
         owner, _, name = repo_key.partition("/")
-        oid, cursor = str((commit or {}).get("oid") or ""), (suites.get("pageInfo") or {}).get("endCursor")
+        oid, cursor = oid or str((commit or {}).get("oid") or ""), (suites.get("pageInfo") or {}).get("endCursor")
         nodes = list(suites.get("nodes") or [])
         reason, self.gql_reason = self.gql_reason, "suites-more"
         try:
