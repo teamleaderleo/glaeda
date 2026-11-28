@@ -255,7 +255,8 @@ check, a failed run, a PR closed without being merged, an issue that does not ex
 whatever --until says or head --sha names (a closed unmerged PR exits 1 at once), 6 when no check or status ever reported on the PR's head
 (--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass),
 7 (inconclusive) when --until done is left with only checks queued with no runner past 30 min, or the
-deadline passes on a read that never came back whole. Done and green never exit 0 while any check
+deadline passes on a read that never came back whole, 8 (land-ended) when a wait with no --until waited for the
+merge of a PR glaeda land held and that land request stopped, was cancelled or went away with the PR still OPEN. Done and green never exit 0 while any check
 is queued, in progress, waiting, requested or pending, or an expected status is not posted.
 --until green (default) fails as soon as any completed check
 failed, required or not, and succeeds once every check finished with success, neutral or skipped;
@@ -305,7 +306,8 @@ when this file changes, so an update takes effect without a restart.
   the PR, a run or a review comment. After a push-making step it judges nothing until the cache shows the new head
   (a head read before the step is never pinned). It is judged only when its PR's cache entry, a wait, a wake-at or a
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
-  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land_judge names
+  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME, over `reach` the caller's
+  CMUX_AGENT_HOST/ACPMUX_FROM, over a plain ssh hop only --notify-to HOST/SESSION) on a merge, a stop land_judge names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, 3 identical
   refusals in a row of a step that is not a wait (a named update-branch never counts: it is sent once per head), or a
   wait past its bound (checks: 4 h with none moving, checks_stuck, re-armed hourly as a red is; a review, a retry or a cancelled job's
@@ -686,6 +688,14 @@ HEADS_MIN_SHARE = 20
 WAITED_POOL_MIN = 12
 WAITED_POOL_WORKERS = 3
 WAITED_POOL_CHUNK = 30
+# ... and a repository whose full reads are slow gets smaller chunks in more workers, so each worker's chunk fits its
+# WAITED_POOL_BUDGET at the measured seconds a PR (full_pr_secs, WAITED_POOL_FILL of the budget), within the same bound of
+# PRs in flight (WAITED_POOL_WORKERS * WAITED_POOL_CHUNK) and at most WAITED_POOL_WORKERS_MAX workers. cmux-cp-2,
+# 2026-11-28 04:0xZ: ~70 waited cmux PRs at 2.7 s a full read went to 3 workers of 30, 30 and 10; each worker's 50 s held
+# ~18 full reads, so 21 to 26 a pool were read, the rest deferred by "the tick's time (TICK_BUDGET) ran out", and the
+# oldest waited PR's data stayed 3,000 to 4,000 s old.
+WAITED_POOL_WORKERS_MAX = 8
+WAITED_POOL_FILL = 0.7
 WAITED_POOL_BUDGET = 50.0
 # ... and only once the serial reads fall behind: the oldest waited PR's data past WAITED_POOL_STALE_S (half the stale
 # bound, so the pool starts before NOW's red at STALE_DATA_AFTER and stops once the serial reads keep up again). cmux-cp-2,
@@ -755,6 +765,12 @@ EXIT_NOTHING = 6  # `wait pr`: the head's settle window passed and no check or s
 # 2026-11-18: hq#13438 at 10b0ae08 and hq#13202 at 0a581929 ended `wait --until done` with "result: success" while 7
 # and 8 of 13 checks were queued on a busy pool (queued 34 min, then they ran); land_judge refused both checks_running.
 EXIT_INCONCLUSIVE = 7
+# `wait pr` with no --until on a PR glaeda land held a request for waits for the merge (wait_until_chosen). When that
+# request then stopped, was cancelled or went away and the PR is still OPEN, the merge this wait was for is not coming,
+# so it never exits 0 there: it ends EXIT_LAND_ENDED and prints the land's stop reason. 2026-11-28: such a wait exited 0
+# on green checks while the PR sat open (its land request had stopped), and its caller read the 0 as merged. A green
+# wait the caller asked for (--until green|done|required) still exits 0 on an open PR.
+EXIT_LAND_ENDED = 8
 # A green head is green only once nothing more is coming. teamleaderleo/leo-workspace#3538 (2026-11-05): a `wait pr
 # --sha f40f2a3d` returned success on GitGuardian's pass alone, before the fleet-reconciler (cmuxterm-hq
 # fleet-reconciler-ws-check.yml) got round to posting the `ws-check` status its merges wait on: the head was pushed
@@ -10208,17 +10224,37 @@ class Daemon:
             at = (e.get("cache") or {}).get("dataAt")
             return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
 
-        for group in sorted(by_repo.values(), key=len, reverse=True):
+        for repo, group in sorted(by_repo.items(), key=lambda kv: len(kv[1]), reverse=True):
             group.sort(key=data_at)  # the oldest data of a repository in the first chunk, not whichever came first
-            for i in range(0, len(group), WAITED_POOL_CHUNK):
-                chunks.append(group[i:i + WAITED_POOL_CHUNK])
+            size = self.waited_pool_chunk(repo)
+            for i in range(0, len(group), size):
+                chunks.append(group[i:i + size])
         chunks.sort(key=lambda g: (min(data_at(e) for e in g),
                                    min(self.deferred_since.get(e["key"], self.now) for e in g)))
-        chunks = chunks[:WAITED_POOL_WORKERS]
+        # the same PRs in flight as WAITED_POOL_WORKERS full chunks, in as many workers as their cost needs
+        cap, taken, picked = WAITED_POOL_WORKERS * WAITED_POOL_CHUNK, 0, []
+        for g in chunks:
+            if len(picked) >= max(WAITED_POOL_WORKERS, WAITED_POOL_WORKERS_MAX) or (picked and taken + len(g) > cap):
+                break
+            picked.append(g)
+            taken += len(g)
+        chunks = picked
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="waited-pr")
         futures = [pool.submit(land_direct_read_many, [e["key"] for e in g], WAITED_POOL_BUDGET) for g in chunks]
         pool.shutdown(wait=False)
         return futures, [e for g in chunks for e in g]
+
+    def waited_pool_chunk(self, repo: str) -> int:
+        """How many of REPO's waited PRs one pool worker takes: WAITED_POOL_CHUNK, or fewer when the repository's measured
+        seconds a full read (full_pr_secs, or a cut query's hold while it lasts) would not fit WAITED_POOL_FILL of the
+        worker's WAITED_POOL_BUDGET."""
+        secs = (self.__dict__.get("full_pr_secs") or {}).get(repo)
+        hold = (self.__dict__.get("full_pr_secs_held") or {}).get(repo)
+        if hold is not None and self.now - hold[1] < MEASURE_HOLD_S:
+            secs = max(secs or 0.0, hold[0])
+        if not secs:
+            return WAITED_POOL_CHUNK
+        return max(1, min(WAITED_POOL_CHUNK, int(WAITED_POOL_BUDGET * WAITED_POOL_FILL / secs)))
 
     def finish_waited_pool(self, futures: list[concurrent.futures.Future], handed: list[dict]) -> None:
         """Wait for the workers (their own budget bounds them), then put back for the serial read any entry one could not
@@ -17432,7 +17468,13 @@ LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
 # its own login, through no broker, so it judges the same rules in full. teamleaderleo/glaeda#3133, 2026-11-27: the
 # classifier's base-verdict read of the base repo was refused on gcp-agent-lane-15 and the land stopped tool_error
 # ("next: none") on a PR the broker host merges; handed off by hand. A refusal that names no broker stays a stop.
-LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error"})
+# compile_missing is the same refusal for land_judge's compile gate (engine.py awaiting_land_refusal): the head's compile
+# receipt is awaiting_land, so land_judge adds ready-to-land itself, and on a lane VM that add goes through the broker's
+# pr_edit, which refuses it on a teammate's PR ("branch X was not pushed by VM"). The land stopped on a `gh pr edit` no
+# lane may run, green and idle (cmux#63635, #57830, #57226, 2026-11-28). The broker host's land_judge adds the label
+# with its own login and still decides the merge under the teammate rule (opt-in or idle_pass); a compile_missing
+# whose reason names no broker refusal stays a step here.
+LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error", "compile_missing"})
 LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: ")
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
@@ -19115,12 +19157,33 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
                              and os.environ[k].strip().lower() not in LAND_NO_REQUESTER), ("", ""))
     if not name:
         return "", ""
+    # A caller over `reach HOST 'glaeda-gh land ...'` exports its session as ACPMUX_FROM and its own host as
+    # CMUX_AGENT_HOST: that session lives on CMUX_AGENT_HOST, never here. Before, the far side recorded
+    # THIS-HOST/SESSION (cmux-cp-1/claude-sr2-coord-old), and the merge or stop went to a session that does not exist.
+    far = reader_host()
     if source != "--notify":
         host, local = land_session_host(name)
+        if far and host == policy_host() and name.partition("/")[0] != host:
+            return f"{far}/{name}", source
         if host:
             return f"{host}/{local}", source
         # no registry to tell a peer's HOST/NAME from PARENT/CHILD: kept as it is (acpmux send resolves both)
+    elif far and "/" not in name:
+        return f"{far}/{name}", source  # a bare --notify NAME over reach: the caller's host
     return (name if "/" in name else f"{policy_host()}/{name}"), source
+
+
+def land_no_requester_note() -> str:
+    """The line a land with nobody to tell prints. Over a plain ssh hop (SSH_CONNECTION, no reach variables) the
+    caller's session never crosses, so a bare --notify has nothing to name: the line says the two forms that carry it.
+    2026-11-28: helpers queued `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'`, heard no merge and no stop, and
+    ended their turns with the PRs unmerged."""
+    line = ("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
+            "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+    if os.environ.get("SSH_CONNECTION", "").strip():
+        line += ("; over ssh your session does not cross: run it as `reach HOST 'cmux-gh land ...'` (reach carries "
+                 "your session and host) or pass --notify-to YOURHOST/SESSION (idempotent: run it again now)")
+    return line
 
 
 def land_requester(given: str | None) -> str:
@@ -30753,8 +30816,7 @@ def land_print_answer(out: dict, as_json: bool, key: str, where: str) -> None:
     print((land_line(entry, time.time()) if entry else f"{key_name(key)} requested; the daemon takes it next tick")
           + f"  (on {where})")
     if not out.get("requester"):
-        say_waiting("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
-                    "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+        say_waiting(land_no_requester_note())
 
 
 def land_progress(entry: Any) -> Any:
@@ -31447,8 +31509,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
             say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
             say_waiting("next: glaeda-gh restart")
         elif not requester:
-            say_waiting("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
-                        "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+            say_waiting(land_no_requester_note())
     if not running:
         return EXIT_DOWN
     if state == "merged":
@@ -35302,6 +35363,11 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
         return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
                            f"(deadline {deadline}; {last}); last seen: {state}",
                            blocked_next(req, blocked) if blocked else timeout_next(req, entry, now))
+    if result == EXIT_LAND_ENDED:
+        chosen = req.get("chosen") if isinstance(req.get("chosen"), dict) else {}
+        return fail_fields("land-ended", f"{name} is still OPEN and not merged: "
+                           f"{chosen.get('ended') or 'the land request ended'}",
+                           chosen.get("next") or f"glaeda-gh land status {name}")
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
@@ -35884,6 +35950,8 @@ def wait_land_ended(req: dict) -> None:
     chosen["ended"] = ("the land request stopped" + (f" ({why})" if why else "") if state == "stopped"
                        else "the land request was cancelled" if state == "cancelled"
                        else "the land request is gone from glaeda land")
+    if stop.get("next"):
+        chosen["next"] = str(stop["next"])
     req["until"] = "green"
 
 
@@ -35975,16 +36043,23 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         else:
             req.pop("runsUnread", None)
             req.pop("runsUnfinished", None)
+    land_chosen = req.get("chosen") if isinstance(req.get("chosen"), dict) else None
+    if (result == EXIT_OK and kind == "pr" and data.get("state") == "OPEN" and land_chosen
+            and land_chosen.get("ended")):
+        result = EXIT_LAND_ENDED  # the merge this wait was chosen for is not coming: never 0 (EXIT_LAND_ENDED)
     if result is not None:
         merged = kind == "pr" and data.get("state") == "MERGED" and result == EXIT_OK
         outcome_name = {EXIT_OK: "merged" if merged else "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
-                        EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
+                        EXIT_INCONCLUSIVE: "inconclusive", EXIT_LAND_ENDED: "land-ended"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited, "ended_by": outcome_name}
         if kind == "pr" and result == EXIT_NOTHING:
             extra["note"] = (f"no check or status reported on this head within {int(settle)}s of its push: "
                              "its CI has not started (not a pass)")
         elif kind == "pr" and result == EXIT_INCONCLUSIVE:
             extra["note"] = inconclusive_note(data, time.time())
+        elif kind == "pr" and result == EXIT_LAND_ENDED:
+            extra["note"] = (f"checks passed, but the PR is still OPEN and not merged: {land_chosen['ended']}; "
+                             "the merge this wait was waiting for is not coming from glaeda land")
         elif kind == "pr" and result == EXIT_CONFLICT:
             extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
                              "merge or rebase onto the base and push")
@@ -45821,9 +45896,10 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
-    ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
+    ld.add_argument("--notify", "--notify-to", dest="notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
-                         "host/$ACPMUX_SESSION_NAME)")
+                         "host/$ACPMUX_SESSION_NAME; over reach, the caller's host/session); --notify-to is the same, "
+                         "the explicit form for a plain ssh hop, where no session crosses")
     # --pin: what the rulebook and every agent here call this ("land pinned <sha>", "glaeda-gh land --pin"), asked
     # for so on gcp-agent-lane-2, 2026-11-22, and refused as an unrecognized argument with the land unqueued.
     ld.add_argument("--sha", "--match-head-commit", "--pin", "--pinned", "--head", dest="sha", metavar="SHA",

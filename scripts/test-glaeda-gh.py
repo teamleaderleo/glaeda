@@ -13824,12 +13824,75 @@ class WaitPrNotMergedTest(Base):
         self.assertIsNone(gg.wait_step(req, time.time(), self.get))
         self.land("stopped", stop={"code": "review_required", "reason": "needs an approving review", "next": "x"})
         code, text = gg.wait_step(req, time.time(), self.get)
-        self.assertEqual(code, gg.EXIT_OK, text)  # what the same wait with no land would have said: green, exit 0
-        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        # before 2026-11-28 this was exit 0 ("green ... not merged") and a caller read the 0 as merged: the merge
+        # this wait was chosen for is not coming, so it is never 0 (EXIT_LAND_ENDED), and it says why
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertNotEqual(code, gg.EXIT_OK)
+        self.assertIn("result: land-ended", text)
         self.assertIn("land: the land request stopped (review_required: needs an approving review)", text)
+        self.assertIn("still OPEN and not merged", text)
         self.put(rollup="FAILURE", conclusion="FAILURE")
         req = self.request(None)  # no land request any more: green, so a red fails as before
         self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+
+class WaitLandEndedTest(WaitPrNotMergedTest):
+    """2026-11-28: a `wait pr` with no --until on a PR glaeda land held a request for exited 0 on green checks after
+    that request stopped; the PR was still OPEN and its caller read the 0 as merged. Exit codes before -> after, for
+    the same open green PR: chosen merged then land ended 0 -> 8 (EXIT_LAND_ENDED); --until green|done|required
+    0 -> 0; merged 0 -> 0; a red head after the land ended 1 -> 1."""
+
+    STOP = {"code": "wait_refused", "reason": "ws-check has no data at the head", "next": "glaeda-gh land status o/r#1"}
+
+    def ended_wait(self, state: str = "stopped", as_json: bool = False, **fields: Any) -> dict:
+        self.land("waiting")
+        req = self.request(None, as_json=as_json)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get))
+        self.land(state, **fields)
+        return req
+
+    def test_each_way_a_land_request_ends_exits_land_ended_with_its_reason(self) -> None:
+        for state, said in (("stopped", "the land request stopped (wait_refused: ws-check has no data at the head)"),
+                            ("cancelled", "the land request was cancelled")):
+            req = self.ended_wait(state, stop=self.STOP)
+            code, text = gg.wait_step(req, time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_LAND_ENDED, (state, text))
+            self.assertIn(said, text, state)
+        req = self.ended_wait("waiting")
+        (gg.LandQueue.entries_dir() / gg.file_name(self.KEY)).unlink()
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertIn("the land request is gone from glaeda land", text)
+
+    def test_json_names_the_code_reason_and_the_lands_next_step(self) -> None:
+        req = self.ended_wait(stop=self.STOP, as_json=True)
+        code, text = gg.wait_step(req, time.time(), self.get)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["result"], doc["ok"], doc["code"]),
+                         (gg.EXIT_LAND_ENDED, "land-ended", False, "land-ended"))
+        self.assertIn("wait_refused", doc["reason"])
+        self.assertEqual(doc["next"], "glaeda-gh land status o/r#1")
+
+    def test_a_red_head_after_the_land_ended_still_fails(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(rollup="FAILURE", conclusion="FAILURE")
+        self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+    def test_a_merge_after_the_land_ended_is_still_merged(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+
+    def test_a_green_wait_the_caller_asked_for_still_exits_0_on_an_open_pr(self) -> None:
+        self.land("stopped", stop=self.STOP)
+        self.put()
+        for until in ("green", "done", "required"):
+            code, text = gg.wait_step(self.request(until), time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_OK, (until, text))
+            self.assertIn("PR still OPEN, not merged", text, until)
 
 
 class WaitSubscriptionTest(Base):
@@ -37678,6 +37741,36 @@ class LandTest(Base):
         self.assertEqual(e["state"], "forwarded")
         self.broker = False
 
+    LABEL_REFUSED = ("land-judge: refused: compile_missing: manaflow-ai/cmux#1 at " + LA + " has no compile receipt: "
+                     "awaiting_land. Add ready-to-land (its full tier compiles the head), then merge again. Could not "
+                     "add ready-to-land: lane-gh call pr_edit manaflow-ai/cmux: refused: PR 1's branch 'feat' was not "
+                     "pushed by vm-1")
+
+    def test_a_compile_stop_whose_label_add_the_broker_refused_hands_the_land_to_the_broker_host(self):
+        # cmux#63635, #57830, #57226, 2026-11-28: green, idle teammate PRs stopped compile_missing on a lane VM because
+        # land_judge's ready-to-land add went through the broker, which refuses pr_edit on a PR the VM did not push.
+        # The broker host's queue adds it with its own login; its land_judge still applies the teammate rule.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(refusal("compile_missing", LA, {"kind": "stop"}, reason=self.LABEL_REFUSED))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual(e["state"], "forwarded")
+        self.broker = False
+
+    def test_a_compile_stop_naming_no_broker_refusal_or_off_a_lane_vm_stays_here(self):
+        self.broker = True
+        e = {"state": "waiting"}
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertTrue(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA))
+            self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": (
+                "land-judge: refused: compile_missing: no compile receipt: awaiting_land")}, {}, LA), "")
+        self.broker = False
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA), "")
+
     def test_a_tool_error_naming_no_broker_refusal_or_off_a_lane_vm_stays_a_stop_here(self):
         self.broker = True
         e = {"state": "waiting"}
@@ -43730,6 +43823,48 @@ class LandTest(Base):
         self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), ("hostx/sid-1", "$ACPMUX_SESSION_ID", "stopped"))
         self.assertEqual(self.w.sent()[-1][3], "hostx/sid-1")
         self.assertEqual(e["history"][0]["via"], "$ACPMUX_SESSION_ID")
+
+    def test_a_land_over_ssh_records_the_callers_session_as_its_notify_target(self):
+        # 2026-11-28: `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'` recorded no requester (no session crosses a
+        # plain ssh hop), and over reach the session's ACPMUX_FROM was recorded as cmux-cp-1/NAME, a session that does
+        # not exist there. Either way the caller heard no merge and no stop.
+        keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
+        ssh = {**keys, "CMUX_AGENT_HOST": "", "SSH_CONNECTION": "100.64.0.9 50000 100.64.0.1 22"}
+        reach = {**ssh, "ACPMUX_FROM": "claude-sr2-coord-old", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72",
+                 "CMUX_AGENT_HOST": "cosmic-gray"}
+        with mock.patch.object(gg, "policy_host", return_value="cmux-cp-1"):
+            with mock.patch.dict(os.environ, reach):
+                self.assertEqual(gg.land_requester_from(None), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from(""), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from("coord"), ("cosmic-gray/coord", "--notify"))
+                self.assertEqual(gg.land_requester_from("air-blue/x"), ("air-blue/x", "--notify"))
+            with mock.patch.dict(os.environ, {**reach, "ACPMUX_FROM": "cmux-cp-1/own"}):
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/own", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, {**reach, "CMUX_AGENT_HOST": "cmux-cp-1"}):
+                # a caller on this host: its own host, as before
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/claude-sr2-coord-old", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, ssh):
+                self.assertEqual(gg.land_requester_from(""), ("", ""))
+                note = gg.land_no_requester_note()
+                self.assertIn("no --notify and no session", note)
+                self.assertIn("--notify-to YOURHOST/SESSION", note)
+                self.assertIn("reach HOST", note)
+            with mock.patch.dict(os.environ, {**ssh, "SSH_CONNECTION": ""}):
+                self.assertNotIn("--notify-to", gg.land_no_requester_note())
+            for argv, env, want, via in (
+                    (["land", "o/r#1", "--notify", "--json"], reach, "cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"),
+                    (["land", "o/r#1", "--notify-to", "cosmic-gray/claude-sr2-coord-old", "--json"], ssh,
+                     "cosmic-gray/claude-sr2-coord-old", "--notify")):
+                for f in gg.LandQueue.entries_dir().glob("*.json"):
+                    f.unlink()
+                with mock.patch.dict(os.environ, env), mock.patch.object(gg, "daemon_running", return_value=True), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gg.main(argv), 0, argv)
+                self.pr(LA)
+                self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+                e = self.tick()
+                self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), (want, via, "stopped"), argv)
+                self.assertEqual(self.w.sent()[-1][3], want, argv)
 
     def test_nobody_to_tell_is_a_notice_not_silence(self):
         self.pr(LA)
@@ -52339,6 +52474,45 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertEqual(len(handed), 69)
         oldest = [f"pr:o/r#{i}" for i in range(69, 39, -1)]
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
+
+
+    def test_slow_full_reads_spread_over_more_workers_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 04:0xZ: 70 waited cmux PRs at 2.7 s a full read. A worker's WAITED_POOL_BUDGET (50 s)
+        holds floor(50 / 5.4) queries of 2, so 18 PRs. Before: 3 workers of 30, 30, 10 read 18 + 18 + 10 = 46 at best (the
+        pool logged 21-26). After: chunks sized to the measure, 6 workers of 12 (or fewer), every one read in budget."""
+        per = 2.7
+        waited = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 71)]
+
+        def run(measure):
+            d = gg.Daemon.__new__(gg.Daemon)
+            d.now, d.deferred_since = 10000.0, {}
+            d.oldest_waited_age = lambda waited: 9999.0
+            if measure:
+                d.full_pr_secs = {"manaflow-ai/cmux": per}
+            sizes = []
+
+            def read_many(keys, budget):  # queries of 2 full reads, serial, cut by the worker's budget
+                sizes.append(len(keys))
+                fits = int(budget // (2 * per)) * 2
+                return {k: (None if i < fits else "not read: deferred, the tick's time ran out") for i, k in enumerate(keys)}
+            with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                    mock.patch.object(gg, "upstream_command", lambda: None):
+                futures, handed = d.start_waited_pool(waited)
+                done = {}
+                for f in futures:
+                    done.update(f.result(timeout=5))
+            return sorted(sizes, reverse=True), sum(1 for v in done.values() if v is None)
+        self.assertEqual(run(False), ([30, 30, 10], 46))  # before: no measure, the fixed chunk
+        sizes, read = run(True)
+        self.assertEqual(sizes, [12, 12, 12, 12, 12, 10])  # 50 * 0.7 / 2.7 = 12 a worker, 6 workers
+        self.assertEqual(read, 70)
+
+    def test_a_fast_repo_keeps_the_fixed_chunk_and_the_in_flight_bound(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.full_pr_secs = 10000.0, {"o/r": 0.5, "o/slow": 10.0}
+        self.assertEqual(d.waited_pool_chunk("o/r"), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(d.waited_pool_chunk("o/slow"), 3)
+        self.assertEqual(d.waited_pool_chunk("o/unmeasured"), gg.WAITED_POOL_CHUNK)
 
 
 class SuitesPastOnePagePaged(unittest.TestCase):
