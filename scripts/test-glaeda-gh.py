@@ -1286,9 +1286,11 @@ class FakeController:
 
     def __init__(self) -> None:
         self.runs: dict[int, dict] = {}
+        self.holds_docs: dict[tuple[str, int], dict] = {}
         self.suites: list[dict] = []
         self.comments: list[dict] = []
         self.calls: list[int] = []  # run() reads
+        self.hold_calls: list[tuple[str, int]] = []
         self.feeds: list[int | None] = []  # events() reads, by cursor
         self.down = False
         self.token = "t"
@@ -1303,6 +1305,11 @@ class FakeController:
         self.calls.append(run_id)
         self.fail()
         return self.runs.get(run_id)
+
+    def holds(self, repo: str, number: int) -> dict:
+        self.hold_calls.append((repo.lower(), number))
+        self.fail()
+        return self.holds_docs.get((repo.lower(), number), {})
 
     def events(self, since: int | None) -> dict:
         self.feeds.append(since)
@@ -1325,6 +1332,63 @@ def ctl_run(run_id: int, status: str, conclusion: str = "", updated: str = "2026
             "attempt": 1, "status": status, "conclusion": conclusion, "url": f"https://x/{run_id}", "updated_at": updated}
 
 
+def ctl_hold(now: float = NOW, **changes: Any) -> dict:
+    body = "controller body"
+    doc = {"repo": "o/r", "number": 7, "holds_as_of": iso(now - 5), "holds_since": iso(now - 60),
+           "freeze": [], "freeze_seeded": True, "freeze_synced_at": iso(now - 60), "freeze_error": "",
+           "seeded": True, "found": True,
+           "pr": {"repo": "o/r", "number": 7, "state": "open", "head_sha": "a" * 40,
+                  "title": "controller PR", "body": body,
+                  "body_sha256": gg.hashlib.sha256(body.encode()).hexdigest(),
+                  "body_truncated": False, "labels": [], "comments": [], "comments_complete": True,
+                  "comments_dropped": False, "reviews": [], "updated_at": iso(now - 5),
+                  "created_at": iso(now - 30), "base_ref": "main", "head_ref": "topic",
+                  "url": "https://github.com/o/r/pull/7", "author": "owner", "head_repo": "o/r",
+                  "additions": 3, "deletions": 1, "mergeable": True, "source": "delivery"}}
+    doc.update(changes)
+    return doc
+
+
+class ControllerHoldProjectionTest(unittest.TestCase):
+    def test_a_complete_current_hold_projects_to_the_pr_cache_shape(self) -> None:
+        projected = gg.controller_hold_projection(ctl_hold(), "o/r", 7, "a" * 40, NOW)
+        self.assertIsNotNone(projected)
+        data, at = projected
+        self.assertEqual(at, NOW - 5)
+        self.assertEqual((data["headRefOid"], data["mergeable"], data["landJudgeControllerFreeze"]),
+                         ("a" * 40, "MERGEABLE", []))
+
+    def test_a_hold_projection_rejects_stale_or_incomplete_authority(self) -> None:
+        for name, changes in (
+                ("stale holds", {"holds_as_of": iso(NOW - gg.CONTROLLER_HOLD_MAX_AGE - 1)}),
+                ("missing seed", {"seeded": False}),
+                ("missing freeze seed", {"freeze_seeded": False}),
+                ("freeze error", {"freeze_error": "read failed"}),
+                ("missing comments", {"pr": {**ctl_hold()["pr"], "comments_complete": False}}),
+                ("body hash", {"pr": {**ctl_hold()["pr"], "body_sha256": "0" * 64}}),
+                ("head mismatch", {"pr": {**ctl_hold()["pr"], "head_sha": "b" * 40}}),
+                ("review state", {"pr": {**ctl_hold()["pr"], "reviews": [{"id": 1, "login": "r",
+                    "state": "COMMENTED", "submitted_at": iso(NOW - 10)}]}})):
+            with self.subTest(name=name):
+                self.assertIsNone(gg.controller_hold_projection(ctl_hold(**changes), "o/r", 7, "a" * 40, NOW))
+
+    def test_an_associationless_receipt_is_rejected_but_an_ordinary_comment_is_not(self) -> None:
+        ordinary = {"id": 1, "author": "reviewer", "body": "ordinary", "created_at": iso(NOW - 10)}
+        self.assertIsNotNone(gg.controller_hold_projection(ctl_hold(pr={**ctl_hold()["pr"], "comments": [ordinary]}),
+                                                           "o/r", 7, "a" * 40, NOW))
+        receipt = {**ordinary, "body": "Review (Codex): SHIP at " + "a" * 40}
+        self.assertIsNone(gg.controller_hold_projection(ctl_hold(pr={**ctl_hold()["pr"], "comments": [receipt]}),
+                                                        "o/r", 7, "a" * 40, NOW))
+        deleted = {**receipt, "deleted": True}
+        self.assertIsNotNone(gg.controller_hold_projection(ctl_hold(pr={**ctl_hold()["pr"], "comments": [deleted]}),
+                                                           "o/r", 7, "a" * 40, NOW))
+
+    def test_controller_holds_quotes_and_normalizes_the_repository(self) -> None:
+        with mock.patch.object(gg.Controller, "get", return_value={}) as get:
+            gg.Controller("http://controller", None).holds("O/R", 7)
+        get.assert_called_once_with("/v1/github/holds?repo=o/r&number=7")
+
+
 class ControllerTest(Base):
     def setUp(self) -> None:
         super().setUp()
@@ -1332,6 +1396,34 @@ class ControllerTest(Base):
         feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0  # these tests read the feed each tick
         self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+
+    def test_a_complete_controller_hold_replaces_the_landing_cache_without_github(self) -> None:
+        key = "pr:o/r#7"
+        self.daemon.land_queue = types.SimpleNamespace(entries={key: {"state": "queued"}})
+        self.daemon.store(key, None, data={"state": "OPEN", "headRefOid": "a" * 40,
+                                           "title": "old"}, dataAt=NOW - 1, via="rest")
+        self.ctl.holds_docs[("o/r", 7)] = ctl_hold()
+        self.daemon.now = NOW
+        self.daemon.refresh_controller_holds([{"key": key, "cache": gg.read_cache(key)}])
+        cached = gg.read_cache(key)
+        self.assertEqual(cached["via"], "controller")
+        self.assertEqual(cached["data"]["title"], "controller PR")
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertEqual(self.ctl.hold_calls, [("o/r", 7)])
+
+    def test_a_rejected_controller_hold_leaves_the_existing_cache_untouched(self) -> None:
+        key = "pr:o/r#7"
+        self.daemon.land_queue = types.SimpleNamespace(entries={key: {"state": "queued"}})
+        self.daemon.store(key, None, data={"state": "OPEN", "headRefOid": "a" * 40,
+                                           "title": "old"}, dataAt=NOW - 1, via="rest")
+        before = gg.read_cache(key)
+        self.ctl.holds_docs[("o/r", 7)] = ctl_hold(holds_as_of=iso(NOW - gg.CONTROLLER_HOLD_MAX_AGE - 1))
+        self.daemon.now = NOW
+        self.daemon.refresh_controller_holds([{"key": key, "cache": before}])
+        after = gg.read_cache(key)
+        self.assertEqual(after, before)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertEqual(self.ctl.hold_calls, [("o/r", 7)])
 
     def test_a_controller_request_ends_at_the_ticks_controller_budget(self) -> None:
         # air-blue 2026-11-18 22:4xZ: 17.1 of a 19.1 s tick went to a controller answering TimeoutError. A controller
