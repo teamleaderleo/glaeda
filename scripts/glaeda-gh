@@ -20498,8 +20498,9 @@ class LandQueue:
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
                 e.pop("forwardQuietTold", None)  # a land by hand is a new ask: it may be told once again
-            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
-                         **land_override_history(e), **land_nominated_history(e))
+            # a session-less caller (a helper subagent, a script) has no requester: the history names whoever queued it
+            self.history(e, "queued", by=e["requester"] or e.get("queuedBy") or None, via=e["requesterFrom"],
+                         after=",".join(e["after"]), **land_override_history(e), **land_nominated_history(e))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e),
                          **land_nominated_history(e))
@@ -23790,6 +23791,16 @@ class LandQueue:
             return False
         return e.get("overridePinJudged") != f"{e.get('requestId') or ''}|{head}"
 
+    def laneless_conflict(self, e: dict, data: dict) -> bool:
+        """True for an open row nobody on a lane asked for (no "lane": a sweep's or a script's request) whose cache shows
+        it conflicting with its base: judging it can only say "merge main into it", so it goes behind every row that can
+        still move, like a re-read (judge_order). cmux-cp-1, 2026-11-25 11:00-12:00Z: 316 of 724 judgments (7,200 worker
+        seconds) were conflicts_base stops of 346 laneless hq rows, oldest-due first, while 16 of 16 workers were busy and
+        500+ due rows, lane-owned ones among them, waited 45+ minutes. A row with a lane keeps its place: its lane is told."""
+        if e.get("lane") or data.get("state") != "OPEN":
+            return False
+        return data.get("mergeStateStatus") == "DIRTY" or data.get("mergeable") == "CONFLICTING"
+
     def judge_order(self, key: str) -> tuple[int, int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
         longest: a PR the cache shows CLEAN with no check running (one merge away) ahead of the rest, then by when it
@@ -23814,7 +23825,7 @@ class LandQueue:
         # a re-read (reread: its last answer judged nothing at this head) is never "one merge away", and goes behind
         # every other due entry: a lane VM, 2026-11-22, three CLEAN-looking PRs judged "unreadable" every few
         # minutes sorted first each time a worker freed, and 27 lands due for hours never got one (LAND_REREAD_SHARE)
-        again = self.reread(e)
+        again = self.reread(e) or self.laneless_conflict(e, data)
         ready = ready and not again
         if self.due(e):
             return tier, (0 if ready else 1), (1 if again else 0), self.due_since(e)

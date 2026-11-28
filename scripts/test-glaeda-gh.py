@@ -39014,6 +39014,16 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 1))
 
+    def test_a_sessionless_land_is_queued_in_history_by_whoever_queued_it(self):
+        """The queued event names the requester, else queuedBy: a helper's mass land with no lane stays traceable."""
+        rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "after": [], "requester": "",
+                                      "queuedBy": "host/session:abc:agent:helper", "id": "r-helper"})
+        self.assertEqual(why, "")
+        self.pr(LA)
+        e = self.tick()
+        queued = [h for h in e["history"] if h["event"] == "queued"]
+        self.assertEqual(queued[0]["by"], "host/session:abc:agent:helper")
+
     def test_a_forwarded_land_keeps_its_lane_and_host(self):
         req = {"op": "land", "target": "o/r#1", "requester": "host/parent/child", "id": "r1", "lane": "child",
                "laneHost": "host"}
@@ -42416,6 +42426,21 @@ class LandTest(Base):
         self.w.set_pr(again, land_pr("b" * 40), self.t)  # a new head: the last answer no longer applies
         self.assertFalse(self.q.reread(self.q.entries[again]))
         self.assertLess(self.q.judge_order(again), self.q.judge_order(moves))
+
+    def test_a_laneless_conflicting_row_sorts_behind_a_due_land_that_can_move(self):
+        """judge_order: a due row with no lane whose cache shows DIRTY can only be told to merge main, so it goes behind
+        every due row that can move, however long it waited; a row with a lane keeps its place."""
+        old = self.stuck(21, 3 * 3600)
+        moves = self.stuck(22, 600)
+        for k in (old, moves):
+            self.q.entries[k]["explain"]["code"] = "checks_pending"
+            self.q.entries[k].pop("lane", None)
+        self.assertLess(self.q.judge_order(old), self.q.judge_order(moves))
+        self.w.set_pr(old, {**land_pr("c" * 40), "mergeStateStatus": "DIRTY"}, self.t)
+        self.assertGreater(self.q.judge_order(old), self.q.judge_order(moves))
+        self.assertEqual(self.q.judge_order(old)[2], 1)  # behind every row that can move, as a re-read is
+        self.q.entries[old]["lane"] = "gcp-agent-lane-1/x"
+        self.assertEqual(self.q.judge_order(old)[2], 0)  # a lane keeps its place among the due rows
 
     def test_a_job_holding_its_worker_past_the_bound_is_logged_named_and_freed(self):
         """LAND_SLOT_HELD: a job holding its worker that long is logged once (land-slot-held), named in the land-pool
