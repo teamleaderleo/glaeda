@@ -1208,6 +1208,35 @@ class HeadRunOrderTest(unittest.TestCase):
         gg.fold_contexts([torn, running], runs, {}, {}, order=order)
         self.assertFalse(gg.head_data("a" * 40, runs, {}, {}, order)["settled"])
 
+    def test_a_conclusion_without_its_completion_time_is_still_unfinished(self) -> None:
+        # the rule land_judge's _is_finished keeps (hq finished-check-read-as-running): a verdict needs its end time
+        half = {**self.node("web / c", 32, "2026-11-23T19:12:12Z", ""), "status": "IN_PROGRESS"}
+        self.assertEqual(gg.finished_status(half), "IN_PROGRESS")
+        self.assertEqual(gg.finished_status({"status": "in_progress", "conclusion": "success",
+                                             "completed_at": "2026-11-23T19:12:19Z"}), "completed")
+        self.assertEqual(gg.finished_status({"status": "queued", "conclusion": None,
+                                             "completed_at": "2026-11-23T19:12:19Z"}), "queued")
+
+    def test_a_torn_record_is_finished_for_every_reader_of_a_pr(self) -> None:
+        # parse_pr is the one builder both routes feed (GraphQL and rest_contexts), so land_unfinished,
+        # land_unfinished_names and land_wait_shape (what a checks_stuck stop names) never list the torn check
+        torn = {"__typename": "CheckRun", "name": "cmux-next push head preflight", "status": "IN_PROGRESS",
+                "conclusion": "SUCCESS", "detailsUrl": "https://ci/x", "databaseId": 137944317666,
+                "startedAt": "2026-11-23T19:12:12Z", "completedAt": "2026-11-23T19:12:19Z"}
+        running = {**torn, "name": "compile", "conclusion": None, "completedAt": None, "databaseId": 2}
+        data = gg.parse_pr(pr_node(52236, rollup="PENDING", checks=[torn, running]))
+        head = data["headRefOid"]
+        self.assertEqual(gg.land_unfinished_names(data, head), ["compile"])
+        self.assertNotIn("push head preflight", gg.land_unfinished(data, NOW))
+        only_torn = gg.parse_pr(pr_node(52236, rollup="PENDING", checks=[torn]))
+        self.assertEqual(gg.land_unfinished_names(only_torn, head), [])
+        self.assertNotIn("jobId", only_torn["checks"][0])
+        # and the REST head read: a torn run is not a pending head
+        rest = {"check_runs": [{"status": "in_progress", "conclusion": "success",
+                                "completed_at": "2026-11-23T19:12:19Z"}]}
+        self.assertFalse(gg.head_pending(rest, []))
+        self.assertTrue(gg.head_pending({"check_runs": [{"status": "in_progress", "conclusion": None}]}, []))
+
     def test_a_failed_run_stores_its_job_step_count_once(self) -> None:
         """land-judge judges a stored red as a live one (runner_refused: a failed job with no step run is the runner's
         refusal): each failure row's identity gets `steps`, read once per job by node id; a read that fails leaves
