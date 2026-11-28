@@ -13032,6 +13032,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "eligibility_refusal", side_effect=slow_look):
             self.assertIn(hook.TOOLCHAIN_MISSING, gate.claimed() or "")
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+            gate.eligible_looked = True  # a look answered before rustup went missing, so FIRST_LOOK_FIRST has no wait
             make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
             self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
             self.assertTrue(gate.eligible_look.is_alive())
