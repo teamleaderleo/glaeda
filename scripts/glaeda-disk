@@ -11657,6 +11657,8 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         if (os.path.realpath(common) + "/").startswith(inside):
             gitdirs[os.path.realpath(common)] = Path(common)
             continue
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
+            continue  # a seed's lock (worktree_locked let it through): its owner re-creates it, so its reflog keeps nothing
         tips = local_tips(Path(own.strip()), worktree_only=True)
         if tips and external is not None:
             tips = _present_commits(Path(common), tips)  # a reflog entry gc already took is lost already

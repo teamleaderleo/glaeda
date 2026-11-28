@@ -8395,6 +8395,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertNotIn(str(root / "seed"), listed)
         self.assertIn(str(root / "mine"), listed)
 
+    def test_a_seed_keeps_no_reflog_bundle_but_a_persons_locked_worktree_keeps_the_item(self) -> None:
+        # cmux16: the seed's bundle asked for room for the whole 11.4 GiB mirror ("no room") for a clean seed tree
+        root, origin = self.root / "trees", self.root / "origin"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        for name, reason in (("seed", "cmux-worktree seed: clean checkout new worktrees clone; never edit it"),
+                             ("mine", "kept by hand")):
+            item = root / name
+            item.mkdir()
+            self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(item / "wt"))
+            self._git("-C", str(origin), "worktree", "lock", "--reason", reason, str(item / "wt"))
+            self._git("-C", str(item / "wt"), "commit", "-q", "--allow-empty", "-m", "reflog only")
+            self._git("-C", str(item / "wt"), "checkout", "-q", "--detach", "main")
+        external: dict = {}
+        why, gitdirs, trees = gd.mirror_repos(root / "seed", external)
+        self.assertEqual((why, external), ("", {}))
+        why, *_ = gd.mirror_repos(root / "mine", {})
+        self.assertIn("locked worktree", why)
+
     def _shared_mirror(self, packs: int = 4) -> tuple[Path, Path, str]:
         """A home whose tools/wt mirror ~/Projects/.wt-mirrors/o/r.git holds packs packs, one of them an object
         no ref names (a worktree's commit before its ref moves); returns home, the mirror and that object."""
