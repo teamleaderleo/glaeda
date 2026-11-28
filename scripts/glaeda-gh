@@ -1656,6 +1656,10 @@ SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt c
 # it keeps its fingerprint, and a probe that matches confirms it (still partial, never greener: checksPageError stays).
 SUITES_PAST_ONE_PAGE = "graphql: last real attempt: more than 100 check suites on one commit"
 STABLE_PARTIAL = frozenset({SUITES_PAST_ONE_PAGE})
+# A partial of that shape read before the later pages were paged (#3161, #3166) is not the head's true shape: probe_ok
+# refuses it until one full read since then (wholeAt, which only a full read moves) pages the rest. cmux-cp-1,
+# 2026-11-28 04:04Z: cmux#63508 stayed "28 of 896 read" for hours, its stale partial confirmed by probe after probe.
+SUITES_PAGED_SINCE = 1795840247.0
 
 
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
@@ -13239,6 +13243,8 @@ class Daemon:
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"
+        if data.get("checksPageError") in STABLE_PARTIAL and not c.get("wholeAt", 0) >= SUITES_PAGED_SINCE:
+            return "partial-before-paging"
         if self.now - c["fullAt"] >= (PR_FULL_PENDING_EVERY if self.queued_pending(e) or self.queued_red(e)
                                       else PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY):
             return "full-due"
