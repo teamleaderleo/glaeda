@@ -52227,6 +52227,39 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(4)))
             self.assertEqual(d.sent, [1, 1, 1, 1])
 
+    def test_the_waited_pass_reads_full_prs_by_measure_not_by_batch_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 02-03Z: read_waited sent its full reads as whole chunks of the batch size (5, or 10 grown
+        back), 2.7 s a cmux PR, so GitHub cut each at 10.5 s with nothing stored; the tick spent 475 of 536 s in read pr
+        and stored 127 PR reads in 600 s. Before: the pass's old fetch, one query of 10 PRs. After: fetch_full_sized."""
+        before, clock_b = self.daemon(2.7)
+        before.full_pr_secs = {"manaflow-ai/cmux": 2.7}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock_b[0]), mock.patch.object(gg, "log", lambda e: None):
+            error = before.fetch_aliased(self.entries(10), "pr")  # the old lambda chunk: fetch_aliased(chunk, "pr")
+        self.assertIsNotNone(error)
+        self.assertEqual((before.sent, clock_b[0]), ([10], 10.5))  # 10.5 s of the tick, 0 PRs stored
+        after, clock_a = self.daemon(2.7)
+        after.full_pr_secs = {"manaflow-ai/cmux": 2.7}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock_a[0]), mock.patch.object(gg, "log", lambda e: None):
+            self.assertIsNone(after.fetch_full_sized(self.entries(10)))
+        self.assertEqual(after.sent, [2, 2, 2, 2, 2])  # 27 s of the tick, 10 PRs stored: 2.7 s a stored PR
+        self.assertAlmostEqual(clock_a[0], 27.0)
+
+    def test_every_full_pr_read_goes_through_the_measured_size(self):
+        """The class: a path handing batched() fetch_aliased(chunk, "pr") skips the measure (#3157's sawtooth went on
+        through land_direct_read_many, then read_waited). Only fetch_full_sized may send a full PR query."""
+        source = Path(gg.__file__).read_text(encoding="utf-8")
+        sites = [i for i, line in enumerate(source.splitlines(), 1)
+                 if re.search(r"fetch_aliased\([^)]*\"pr\"\)", line)]
+        self.assertEqual(len(sites), 1, f"full PR reads that skip fetch_full_sized at lines {sites}")
+
+    def test_a_batched_refresh_sends_full_reads_by_measured_cost(self):
+        """land_direct_read_many's batched() sent whole chunks of 5: the measure was only read by fetch_prs."""
+        d, clock = self.daemon(5.0)
+        d.full_pr_secs = {"manaflow-ai/cmux": 5.0}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_full_sized(self.entries(4)))
+        self.assertEqual(d.sent, [1, 1, 1, 1])
+
     def test_a_fast_repo_keeps_its_batch(self):
         d, clock = self.daemon(0.5)
         with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
@@ -52308,6 +52341,45 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
+    def test_slow_full_reads_spread_over_more_workers_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 04:0xZ: 70 waited cmux PRs at 2.7 s a full read. A worker's WAITED_POOL_BUDGET (50 s)
+        holds floor(50 / 5.4) queries of 2, so 18 PRs. Before: 3 workers of 30, 30, 10 read 18 + 18 + 10 = 46 at best (the
+        pool logged 21-26). After: chunks sized to the measure, 6 workers of 12 (or fewer), every one read in budget."""
+        per = 2.7
+        waited = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 71)]
+
+        def run(measure):
+            d = gg.Daemon.__new__(gg.Daemon)
+            d.now, d.deferred_since = 10000.0, {}
+            d.oldest_waited_age = lambda waited: 9999.0
+            if measure:
+                d.full_pr_secs = {"manaflow-ai/cmux": per}
+            sizes = []
+
+            def read_many(keys, budget):  # queries of 2 full reads, serial, cut by the worker's budget
+                sizes.append(len(keys))
+                fits = int(budget // (2 * per)) * 2
+                return {k: (None if i < fits else "not read: deferred, the tick's time ran out") for i, k in enumerate(keys)}
+            with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                    mock.patch.object(gg, "upstream_command", lambda: None):
+                futures, handed = d.start_waited_pool(waited)
+                done = {}
+                for f in futures:
+                    done.update(f.result(timeout=5))
+            return sorted(sizes, reverse=True), sum(1 for v in done.values() if v is None)
+        self.assertEqual(run(False), ([30, 30, 10], 46))  # before: no measure, the fixed chunk
+        sizes, read = run(True)
+        self.assertEqual(sizes, [12, 12, 12, 12, 12, 10])  # 50 * 0.7 / 2.7 = 12 a worker, 6 workers
+        self.assertEqual(read, 70)
+
+    def test_a_fast_repo_keeps_the_fixed_chunk_and_the_in_flight_bound(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.full_pr_secs = 10000.0, {"o/r": 0.5, "o/slow": 10.0}
+        self.assertEqual(d.waited_pool_chunk("o/r"), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(d.waited_pool_chunk("o/slow"), 3)
+        self.assertEqual(d.waited_pool_chunk("o/unmeasured"), gg.WAITED_POOL_CHUNK)
+
+
 class SuitesPastOnePagePaged(unittest.TestCase):
     """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
     so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
@@ -52339,6 +52411,28 @@ class SuitesPastOnePagePaged(unittest.TestCase):
 
     def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
         d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_rest_pages_complete_the_head_when_graphql_refuses(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "rate limited"}]}]), self.commit()
+        got = []
+
+        def get(path, etag):
+            got.append(path)
+            n = 100 if path.endswith("page=1") else 30
+            return "fresh", {"total_count": 130, "check_suites": [
+                {"node_id": f"R{len(got)}_{i}", "latest_check_runs_count": 1} for i in range(n)]}, None
+        d.get = get
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])
+
+    def test_a_short_rest_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "x"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
         d.page_more_suites("o/r", commit)
         self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
 
