@@ -1189,6 +1189,54 @@ class HeadRunOrderTest(unittest.TestCase):
                            {"run": 920, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}]])
         self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
 
+    def test_a_torn_record_with_a_conclusion_reads_completed_and_settles_its_head(self) -> None:
+        # manaflow-ai/cmux#52236 at dd25ad19: "cmux-next push head preflight" read IN_PROGRESS beside SUCCESS (and a
+        # completedAt); the head never read settled and glaeda land stopped it checks_stuck after 409 min.
+        torn = {**self.node("cmux-next push head preflight", 30, "2026-11-23T19:12:12Z", "2026-11-23T19:12:19Z"),
+                "status": "IN_PROGRESS"}
+        running = {**self.node("web / b", 31, "2026-11-23T19:12:12Z", ""), "status": "IN_PROGRESS",
+                   "conclusion": None}
+        self.assertEqual((gg.finished_status(torn), gg.finished_status(running)), ("COMPLETED", "IN_PROGRESS"))
+        runs: dict = {}
+        order: dict = {}
+        gg.fold_contexts([torn], runs, {}, {}, order=order)
+        data = gg.head_data("a" * 40, runs, {}, {}, order)
+        self.assertEqual(data["found"]["CI / cmux-next push head preflight"], ["completed", "success"])
+        self.assertEqual(data["runs"]["CI / cmux-next push head preflight"][0][1], "completed")
+        self.assertTrue(data["settled"])
+        runs, order = {}, {}
+        gg.fold_contexts([torn, running], runs, {}, {}, order=order)
+        self.assertFalse(gg.head_data("a" * 40, runs, {}, {}, order)["settled"])
+
+    def test_a_conclusion_without_its_completion_time_is_still_unfinished(self) -> None:
+        # the rule land_judge's _is_finished keeps (hq finished-check-read-as-running): a verdict needs its end time
+        half = {**self.node("web / c", 32, "2026-11-23T19:12:12Z", ""), "status": "IN_PROGRESS"}
+        self.assertEqual(gg.finished_status(half), "IN_PROGRESS")
+        self.assertEqual(gg.finished_status({"status": "in_progress", "conclusion": "success",
+                                             "completed_at": "2026-11-23T19:12:19Z"}), "completed")
+        self.assertEqual(gg.finished_status({"status": "queued", "conclusion": None,
+                                             "completed_at": "2026-11-23T19:12:19Z"}), "queued")
+
+    def test_a_torn_record_is_finished_for_every_reader_of_a_pr(self) -> None:
+        # parse_pr is the one builder both routes feed (GraphQL and rest_contexts), so land_unfinished,
+        # land_unfinished_names and land_wait_shape (what a checks_stuck stop names) never list the torn check
+        torn = {"__typename": "CheckRun", "name": "cmux-next push head preflight", "status": "IN_PROGRESS",
+                "conclusion": "SUCCESS", "detailsUrl": "https://ci/x", "databaseId": 137944317666,
+                "startedAt": "2026-11-23T19:12:12Z", "completedAt": "2026-11-23T19:12:19Z"}
+        running = {**torn, "name": "compile", "conclusion": None, "completedAt": None, "databaseId": 2}
+        data = gg.parse_pr(pr_node(52236, rollup="PENDING", checks=[torn, running]))
+        head = data["headRefOid"]
+        self.assertEqual(gg.land_unfinished_names(data, head), ["compile"])
+        self.assertNotIn("push head preflight", gg.land_unfinished(data, NOW))
+        only_torn = gg.parse_pr(pr_node(52236, rollup="PENDING", checks=[torn]))
+        self.assertEqual(gg.land_unfinished_names(only_torn, head), [])
+        self.assertNotIn("jobId", only_torn["checks"][0])
+        # and the REST head read: a torn run is not a pending head
+        rest = {"check_runs": [{"status": "in_progress", "conclusion": "success",
+                                "completed_at": "2026-11-23T19:12:19Z"}]}
+        self.assertFalse(gg.head_pending(rest, []))
+        self.assertTrue(gg.head_pending({"check_runs": [{"status": "in_progress", "conclusion": None}]}, []))
+
     def test_a_failed_run_stores_its_job_step_count_once(self) -> None:
         """land-judge judges a stored red as a live one (runner_refused: a failed job with no step run is the runner's
         refusal): each failure row's identity gets `steps`, read once per job by node id; a read that fails leaves
@@ -4367,6 +4415,30 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + 2 * gg.CYCLE)
         self.assertEqual(len(self.gh.job_calls()), 2)
         self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 2)
+
+    def test_passed_rerun_replaces_its_failed_attempts_jobs(self) -> None:
+        """cmux#63263 (2026-11-28): attempt 1 failed and its jobs were read; `gh run rerun --failed` passed as
+        attempt 2. The kept list stayed attempt 1's failures ("attempt 2 not read yet") and land-judge refused."""
+        key = "run:o/r/5"
+        self.gh.runs[5] = {"id": 5, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                           "updated_at": iso(NOW)}
+        self.gh.jobs[5] = [job("build", end=NOW), job("lint", "success", end=NOW)]
+        gg.register(key)  # no --jobs: only a failed attempt reads its list
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 1)
+        self.gh.runs[5] = {**self.gh.runs[5], "conclusion": "success", "run_attempt": 2, "updated_at": iso(NOW + 9)}
+        self.gh.jobs[5] = [job("build", "success", run_attempt=2, end=NOW), job("lint", "success", end=NOW)]
+        path = gg.watch_dir() / gg.file_name(key)
+        os.utime(path, (NOW + gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + gg.CYCLE)
+        entry = gg.read_cache(key)
+        self.assertEqual(gg.jobs_attempt(entry["jobs"]), 2)
+        self.assertNotIn("failed: build", gg.summary(key, entry))
+        self.assertNotIn("not read yet", gg.summary(key, entry))
+        calls = len(self.gh.job_calls())
+        os.utime(path, (NOW + 2 * gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), calls)  # read once for the attempt, then kept
 
     def replay_one_runs_life(self, waiters: int, done_cycles: int) -> dict:
         """One run's life as the pool host's daemon sees it through the broker relay (2026-11-17: GET
@@ -32754,6 +32826,19 @@ class LandTest(Base):
         e = self.tick(gg.LAND_REARM_AFTER * 2)
         self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "closed", None))
 
+    def test_a_stop_on_a_pr_closed_since_on_a_copy_still_open_reads_its_state_and_stops_closed(self):
+        # manaflow-ai/cmux#52236: closed 2026-11-24 10:49Z while this host's copy still read OPEN; re-armed and judged
+        # hourly on that copy until 00:03Z. A re-arm on a copy read before its stop reads the PR's state first.
+        self.stop_retry_deadline()
+        judged = len(self.w.explains())
+        self.w.view_state = "CLOSED"  # GitHub's answer; the cached copy still says OPEN
+        e = self.tick(gg.LAND_REARM_AFTER)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len(self.w.explains()), judged)  # never judged closed
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.explains())), ("stopped", "closed", judged))
+
     def test_land_cancel_on_a_stopped_entry_survives_the_rearm(self):
         # hq#14618, 2026-11-21: `glaeda-gh land cancel` at ~01:00Z left the entry stopped, and it re-armed at 01:55Z.
         self.stop_retry_deadline()
@@ -52254,6 +52339,46 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertEqual(len(handed), 69)
         oldest = [f"pr:o/r#{i}" for i in range(69, 39, -1)]
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
+
+
+class SuitesPastOnePagePaged(unittest.TestCase):
+    """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
+    so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
+
+    def commit(self, more=True):
+        return {"oid": "a" * 40, "checkSuites": {"totalCount": 130, "pageInfo": {"hasNextPage": more, "endCursor": "C1"},
+                                                  "nodes": [{"id": f"S{i}", "latest": {"totalCount": 1}} for i in range(100)]}}
+
+    def daemon(self, pages):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.gql_reason, d.asked = "x", []
+
+        def graphql(query, variables):
+            d.asked.append(variables.get("after"))
+            return pages.pop(0), None
+        d.graphql = graphql
+        return d
+
+    def page(self, ids, more=False, end="C2"):
+        return {"data": {"repository": {"object": {"checkSuites": {"pageInfo": {"hasNextPage": more, "endCursor": end},
+                "nodes": [{"id": i, "latest": {"totalCount": 1}} for i in ids]}}}}}
+
+    def test_the_later_pages_complete_the_head(self):
+        d, commit = self.daemon([self.page([f"T{i}" for i in range(30)])]), self.commit()
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(d.asked, ["C1"])
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])  # no partial error: every suite counted
+
+    def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_a_head_within_one_page_asks_nothing(self):
+        d, commit = self.daemon([]), self.commit(more=False)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(d.asked, [])
 
 
 class HeadReadsSizedByMeasuredCost(unittest.TestCase):
