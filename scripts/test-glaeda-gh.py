@@ -7743,9 +7743,9 @@ class ClientTest(Base):
         # a red past the first 100 besides the superseded one: still a failure
         more = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "FAILURE": 1}, "statuses": {}}
         self.assertEqual(gg.verdict("pr", {**base, "checkCounts": more}, "green"), 1)
-        # something still running past the first 100: not decided by the counts
+        # something still running past the first 100: not green yet, and not red either: it decides (cmux#64213)
         running = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "IN_PROGRESS": 1}, "statuses": {}}
-        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
+        self.assertIsNone(gg.verdict("pr", {**base, "checkCounts": running}, "green"))
         # no counts (an older read): the rollup decides, as before
         self.assertEqual(gg.verdict("pr", base, "green"), 1)
         # a superseded red read by suite id (lastRealAttempt) is in no count: it never cancels a red past page 1
