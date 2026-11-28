@@ -13,6 +13,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import io
+import hashlib
 import json
 import math
 import random
@@ -36686,7 +36687,8 @@ class LandTest(Base):
 
     def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md",
                      main_path: str = "", same: bool = False,
-                     texts: tuple[str, str, str] | None = None) -> tuple[str, str]:
+                     texts: tuple[str, str, str] | None = None,
+                     others: dict[str, tuple[str, str, str]] | None = None) -> tuple[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
         line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. With MAIN_PATH,
         main appends to that file instead, so git merges the two cleanly. With SAME, main appends the lane's own
@@ -36707,6 +36709,9 @@ class LandTest(Base):
         (origin / ".gitattributes").write_text(attrs)
         (origin / path).parent.mkdir(parents=True, exist_ok=True)
         (origin / path).write_text(texts[0] if texts else "- 10:00Z goal set\n")
+        for other, three in (others or {}).items():  # OTHERS: more paths' texts at the fork, on the lane, on main
+            (origin / other).parent.mkdir(parents=True, exist_ok=True)
+            (origin / other).write_text(three[0])
         git("add", "-A")
         git("commit", "-qm", "init")
         git("checkout", "-qb", "lane/x")
@@ -36715,6 +36720,8 @@ class LandTest(Base):
         else:
             with open(origin / path, "a") as f:
                 f.write("- 11:00Z the lane's line\n")
+        for other, three in (others or {}).items():
+            (origin / other).write_text(three[1])
         git("commit", "-qam", "the lane appends")
         head = git("rev-parse", "HEAD")
         git("checkout", "-q", "main")
@@ -36724,6 +36731,8 @@ class LandTest(Base):
         else:
             with open(origin / (main_path or path), "a") as f:
                 f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
+        for other, three in (others or {}).items():
+            (origin / other).write_text(three[2])
         git("add", "-A")
         git("commit", "-qam", "main appends")
         base = git("rev-parse", "HEAD")
@@ -36852,6 +36861,58 @@ class LandTest(Base):
                                                  'next_step: "the lane\'s step"', "owner: a/b", "---"])
         self.assertIn("- 11:00Z the lane's line", text)
         self.assertIn("- 11:05Z another PR's line, landed first", text)
+
+    def hook_pin_texts(self, inside: bool = True) -> tuple[dict, tuple[str, str, str], str, str]:
+        """glaeda-disk and the runner hook at the fork, on the lane, on main: each side changed the hook (apart, so it
+        merges) and appended its sha to the pin block; with INSIDE false the lane also edits a line the base edited
+        outside the block. (others, disk texts, the merged glaeda-disk, the merged hook)."""
+        fork_hook = "#!/bin/sh\nfirst\nb\nc\nd\nlast\n"
+        lane_hook, main_hook = fork_hook.replace("first", "first lane"), fork_hook.replace("last", "last main")
+        merged_hook = lane_hook.replace("last", "last main")
+        sha = lambda t: hashlib.sha256(t.encode()).hexdigest()
+
+        def disk(*pins: str, knob: str = "1") -> str:
+            return ("#!/usr/bin/env python3\nKNOB = " + knob + "\nCMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({\n"
+                    + "".join(f'    "{p}",\n' for p in pins) + "})\nAFTER = 1\n")
+        fork = disk(sha(fork_hook))
+        lane = disk(sha(fork_hook), sha(lane_hook), knob="1" if inside else "2")
+        main = disk(sha(fork_hook), sha(main_hook), knob="1" if inside else "3")
+        return ({"scripts/glaeda-cmux-runner-hook": (fork_hook, lane_hook, main_hook)}, (fork, lane, main),
+                disk(sha(fork_hook), sha(main_hook), sha(merged_hook)), merged_hook)
+
+    def test_a_conflict_only_in_the_hook_pin_block_is_settled_and_repinned(self):
+        """LAND_HOOK_PIN, teamleaderleo/glaeda#3075, 2026-11-27/28: it stopped as a conflict three times, each time
+        only in glaeda-disk's CMUX_NEXT_DRAIN_HOOK_SHA256, where every hook-changing PR appends at the same spot, and
+        each was hand-resolved as main's pins plus the merged hook's sha. Before: conflict stop; after: the queue makes
+        that merge, with the merged hook's sha last and the lane's draft pin dropped."""
+        others, texts, want, hook = self.hook_pin_texts()
+        head, base = self.union_origin(attrs="", path="scripts/glaeda-disk", texts=texts, others=others)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("show", f"{merged}:scripts/glaeda-cmux-runner-hook") + "\n", hook)
+        self.assertEqual(self.origin_git("show", f"{merged}:scripts/glaeda-disk") + "\n", want)
+        self.assertIn("hook pins", self.origin_git("log", "-1", "--format=%B", merged))
+
+    def test_a_hook_pin_conflict_beside_another_conflict_still_stops(self):
+        others, texts, _, _ = self.hook_pin_texts(inside=False)
+        head, _ = self.union_origin(attrs="", path="scripts/glaeda-disk", texts=texts, others=others)
+        e = self.union_conflict_tick(head)
+        self.assertEqual(e["state"], "stopped")
+        self.assertIn("true conflict", json.dumps(e.get("stop")))
+
+    def test_land_hook_pin_settle_takes_the_base_side_then_moves_the_hook_sha_last(self):
+        a, b, c, h = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+        text = (f'x = 1\nCMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({{\n    "{a}",\n<<<<<<< lane\n    "{b}",\n'
+                f'||||||| fork\n=======\n    "{c}",\n>>>>>>> main\n}})\ny = 2\n')
+        self.assertEqual(gg.land_hook_pin_settle(text, h),
+                         f'x = 1\nCMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({{\n    "{a}",\n    "{c}",\n    "{h}",\n}})'
+                         f'\ny = 2\n')
+        outside = text.replace("x = 1\n", "<<<<<<< lane\nx = 1\n=======\nx = 2\n>>>>>>> main\n")
+        self.assertIsNone(gg.land_hook_pin_settle(outside, h))
+        self.assertIsNone(gg.land_hook_pin_settle(text.replace(f'    "{b}",\n', "    os.remove(x)\n"), h))
+        self.assertIsNone(gg.land_hook_pin_settle(text, "not a sha"))
 
     def test_land_one_line_per_key_keeps_list_lines_and_leaves_single_keys(self):
         merged = "---\npre:\n  - a\nk: 1\npre:\n  - b\n---\nbody\n"

@@ -18118,6 +18118,66 @@ LAND_UNION_REPACK_DEADLINE = 300.0
 # fixed the record; hq#32592 the broker's own union merge). Union is right for a record's body, never for its keys:
 # union_plan keeps one entry per frontmatter key in each path git's plain merge conflicts on, the side's that changed
 # it from the merge base, the head's when both did (it lands after the base).
+# LAND_HOOK_PIN: a conflict confined to glaeda-disk's CMUX_NEXT_DRAIN_HOOK_SHA256 sha lines is settled here. Every PR
+# that changes scripts/glaeda-cmux-runner-hook appends its sha there (glaeda_hook_pin.py), at the same spot as every
+# other such PR, so git's line merge conflicts on each landing: teamleaderleo/glaeda#3075 stopped three times on it
+# (2026-11-27/28), each resolved by hand as "main's pins, then the merged hook's sha". The pins cannot take
+# merge=union: glaeda-disk is code, installed to ~/.local/bin as one file, and cmuxterm-hq's
+# glaeda_signing_hooks_sync.py reads the block from it. So union_plan settles exactly that by hand-resolution rule:
+# main's side of each conflicted hunk (the head's own pin hashes hook bytes that never land), then the merged tree's
+# hook sha moved last, as glaeda_hook_pin.py would on the merged checkout. Any other conflicted line, or a conflict in
+# any other file, is still a true conflict. The merge's head then runs the repo's CI like any push.
+# Detector: test-glaeda-gh.py test_a_conflict_only_in_the_hook_pin_block_is_settled_and_repinned.
+LAND_HOOK_PIN_DISK = "scripts/glaeda-disk"
+LAND_HOOK_PIN_HOOK = "scripts/glaeda-cmux-runner-hook"
+LAND_HOOK_PIN_OPEN = "CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({"
+LAND_HOOK_PIN_LINE = re.compile(r'    "[0-9a-f]{64}",')
+
+
+def land_hook_pin_settle(text: str, hook_sha: str) -> str | None:
+    """TEXT (glaeda-disk with git's conflict markers) with each conflicted hunk taking the base's side and HOOK_SHA last
+    in the pin block (LAND_HOOK_PIN); None when a hunk lies outside the block or holds anything but pin lines."""
+    if not re.fullmatch(r"[0-9a-f]{64}", hook_sha or ""):
+        return None
+    lines, out, i, inside, settled = text.split("\n"), [], 0, False, False
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("<<<<<<< "):
+            ours, ancestor, theirs, part, i = [], [], [], "ours", i + 1
+            while i < len(lines) and not lines[i].startswith(">>>>>>> "):
+                if lines[i].startswith("||||||| ") and part == "ours":
+                    part = "ancestor"
+                elif lines[i] == "=======" and part in ("ours", "ancestor"):
+                    part = "theirs"
+                else:
+                    {"ours": ours, "ancestor": ancestor, "theirs": theirs}[part].append(lines[i])
+                i += 1
+            if (i >= len(lines) or part != "theirs" or not inside
+                    or not all(LAND_HOOK_PIN_LINE.fullmatch(x) for x in ours + ancestor + theirs)):
+                return None
+            out.extend(theirs)  # the base's pins (merge-tree HEAD BASE: theirs is the base)
+            settled, i = True, i + 1
+            continue
+        if line.startswith(("=======", "||||||| ", ">>>>>>> ")) and not inside:
+            return None
+        out.append(line)
+        if line == LAND_HOOK_PIN_OPEN:
+            inside = True
+        elif inside and line == "})":
+            inside = False
+        i += 1
+    if not settled:
+        return None
+    start = out.index(LAND_HOOK_PIN_OPEN) + 1
+    end = start
+    while end < len(out) and LAND_HOOK_PIN_LINE.fullmatch(out[end]):
+        end += 1
+    if end >= len(out) or out[end] != "})":
+        return None
+    pins = [x for x in out[start:end] if x != f'    "{hook_sha}",'] + [f'    "{hook_sha}",']
+    return "\n".join(out[:start] + pins + out[end:])
+
+
 LAND_FRONT_KEY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:\s|$)")
 
 
@@ -27554,6 +27614,11 @@ class LandQueue:
         tree = words[0].strip()
         if merged.returncode == 1:
             files = [p for p in words[1:] if p]
+            settled = self.union_hook_pin(gitdir, tree, files) if SHA40.fullmatch(tree) else ""
+            if settled:
+                tree, paths, merged = settled, sorted(set(paths) | set(files)), subprocess.CompletedProcess([], 0)
+                e["unionMerge"]["hookPin"] = True
+        if merged.returncode == 1:
             e["unionMerge"].update(conflicts=files[:20])
             if SHA40.fullmatch(tree):
                 e["unionMerge"]["hunks"] = self.conflict_hunks(gitdir, tree, files)
@@ -27580,7 +27645,9 @@ class LandQueue:
                     "update_noop": "GitHub's update-branch made no new head (LAND_UPDATE_LOCAL)"}.get(
             kind, "GitHub's update-branch refused a merge conflict")
         msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: {why_here}; "
-               + (f"git's merge conflicted only in paths {base}'s .gitattributes settles "
+               + (f"git's merge conflicted only in {LAND_HOOK_PIN_DISK}'s hook pins, settled as {base}'s pins then "
+                  f"the merged hook's sha (LAND_HOOK_PIN)." if e["unionMerge"].get("hookPin") else
+                  f"git's merge conflicted only in paths {base}'s .gitattributes settles "
                   f"({land_trim(', '.join(paths), 300)}), merged here honoring them."
                   if paths else "git merges the two cleanly, so it was merged here."))
         parents = ["-p", head, "-p", base_sha]
@@ -27597,6 +27664,31 @@ class LandQueue:
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
         e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir, branch=branch)
         return sha, branch, base_sha, ""
+
+    def union_hook_pin(self, gitdir: str, tree: str, files: list[str]) -> str:
+        """TREE (merge-tree's, with conflict markers) with glaeda-disk's hook pin conflict settled (LAND_HOOK_PIN), or
+        "" when FILES is anything but that one file or a hunk is not confined to the pin block."""
+        if files != [LAND_HOOK_PIN_DISK]:
+            return ""
+        disk = self.union_git(gitdir, "cat-file", "blob", f"{tree}:{LAND_HOOK_PIN_DISK}")
+        if disk.returncode != 0:
+            return ""
+        with tempfile.TemporaryDirectory(prefix="glaeda-union-pin-") as tmp:
+            # The hook's own bytes, through a scratch index (call's text and redaction would change what is hashed).
+            index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            if (self.union_git(gitdir, "read-tree", tree, extra=index).returncode != 0
+                    or self.union_git(gitdir, "--work-tree", tmp, "checkout-index", f"--prefix={tmp}/out/", "--",
+                                      LAND_HOOK_PIN_HOOK, extra=index).returncode != 0):
+                return ""
+            try:
+                sha = hashlib.sha256(Path(tmp, "out", LAND_HOOK_PIN_HOOK).read_bytes()).hexdigest()
+            except OSError:
+                return ""
+        text = land_hook_pin_settle(disk.stdout or "", sha)
+        if text is None:
+            return ""
+        out, why = self.union_write(gitdir, tree, {LAND_HOOK_PIN_DISK: text})
+        return "" if why else out
 
     def union_one_key(self, gitdir: str, tree: str, paths: list[str], head: str, base: str) -> tuple[str, str]:
         """(TREE with each of PATHS naming each frontmatter key once (land_one_line_per_key), "") or ("", why not)
@@ -27620,6 +27712,11 @@ class LandQueue:
                 fixed[path] = one
         if not fixed:
             return tree, ""
+        return self.union_write(gitdir, tree, fixed)
+
+    def union_write(self, gitdir: str, tree: str, fixed: dict[str, str]) -> tuple[str, str]:
+        """(TREE with each path of FIXED holding its text, "") or ("", why not). Writes only objects into this host's
+        union mirror, through a scratch index."""
         with tempfile.TemporaryDirectory(prefix="glaeda-union-key-") as tmp:
             index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
             got = self.union_git(gitdir, "read-tree", tree, extra=index)
