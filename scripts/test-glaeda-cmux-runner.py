@@ -12963,7 +12963,10 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "eligibility_refusal", return_value=busy):
             gate.claimed()
             settle()
-            self.assertIsNone(gate.claimed(), "a timed-out probe after a change is no evidence: the recheck decides")
+            # a timed-out probe after a change is no evidence: no hold, the recheck decides (with no listener up,
+            # FIRST_LOOK_FIRST waits for that recheck before starting one)
+            self.assertIsNone(gate.eligible_why, "a timed-out probe after a change is no evidence: the recheck decides")
+            self.assertEqual(gate.claimed(), f"ineligible: {busy} (rechecking before the listener starts)")
 
     def test_a_require_eligible_runner_holds_while_its_node_would_be_refused(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
