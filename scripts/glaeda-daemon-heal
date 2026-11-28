@@ -42,8 +42,10 @@ A copy installed before this existed cannot update itself: one root --install of
 The same root pass also keeps the cmux fleet's root ops scripts current (config/fleet-ops.json, a third file of the
 snapshot that follows the release with the other two): each one's body, pinned to its source commit and SHA-256, at
 /Library/Application Support/cmux-fleet-ops/NAME with its LaunchDaemon. It acts only on a fleet Mac that already has
-that directory and no ec2-user account, never on a reserved host, and treats a reservation list it cannot read as a
-reservation (fleet_ops_hold).
+that directory, never on a reserved host, and treats a reservation list it cannot read as a reservation
+(fleet_ops_hold). On an EC2 Mac (an ec2-user account) it keeps current only the ops already installed there and
+never installs a missing one: until 2026-11-27 it held every EC2 Mac, so an op installed there by hand (fleet-sudo)
+never got a newer body and each change took another hand install (aws-m4pro-7's job-user-home-reclaim, hq#31994).
 The same pass keeps each runner account's glaeda-runner-hygiene job on that release: the root-pinned glaeda-disk
 at /Library/Application Support/glaeda/runner-hygiene/<uid> and its LaunchDaemon, which glaeda-update (the runner
 user's) cannot write. glaeda-disk and glaeda-runner-hygiene are two more members the release chain installs into
@@ -1344,13 +1346,28 @@ def platform_node() -> str:
 
 
 def fleet_ops_eligible(ops_dir: Path) -> str:
-    """Why this host is not one the ops belong on ("" when it is): a fleet Mac whose ops directory a root install
-    already made, and not an EC2 Mac (they carry ec2-user, and nothing installs fleet ops on them)."""
+    """Why this host is not an office fleet Mac ("" when it is): a fleet Mac whose ops directory a root install
+    already made, and not an EC2 Mac (ec2-user). The sandboxd reboot heal holds to this; the fleet-ops pass takes
+    fleet_ops_dir_eligible and keeps an EC2 Mac's installed ops current."""
+    if sys.platform == "darwin" and is_ec2_mac():
+        return "an EC2 Mac (ec2-user)"
+    return fleet_ops_dir_eligible(ops_dir)
+
+
+def is_ec2_mac() -> bool:
+    """An EC2 Mac carries the ec2-user account."""
+    try:
+        pwd.getpwnam("ec2-user")
+    except KeyError:
+        return False
+    return True
+
+
+def fleet_ops_dir_eligible(ops_dir: Path) -> str:
+    """Why the fleet-ops pass leaves this host alone ("" when it acts): macOS with the ops directory a root install
+    made."""
     if sys.platform != "darwin":
         return "not macOS"
-    with contextlib.suppress(KeyError):
-        pwd.getpwnam("ec2-user")
-        return "an EC2 Mac (ec2-user): fleet ops are not installed here"
     if not ops_dir.is_dir() or ops_dir.is_symlink():
         return f"no {ops_dir}: not a fleet Mac a root install set up"
     return ""
@@ -1395,14 +1412,17 @@ def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
 
 
 def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEET_OPS_DIR,
-                   plist_dir: Path = PLIST.parent, root: bool = True, hold=fleet_ops_hold, eligible=fleet_ops_eligible,
-                   ctl=None, ledger: Path = INSTALL_DIR / "state" / "fleet-ops-managed.json",
+                   plist_dir: Path = PLIST.parent, root: bool = True, hold=fleet_ops_hold,
+                   eligible=fleet_ops_dir_eligible, ec2=is_ec2_mac, ctl=None,
+                   ledger: Path = INSTALL_DIR / "state" / "fleet-ops-managed.json",
                    wait=time.sleep) -> dict[str, Any]:
     """Each op's state here (current, stale, missing) and, on apply, what was installed. A body is replaced
     atomically (launchd runs the path afresh at each StartInterval, so no reload is needed for it); the
     LaunchDaemon is rewritten and reloaded only when it differs from the op's, and loaded when it is not. An op this
     pass installed earlier (the root-owned ledger) that the file no longer lists is unloaded and removed; nothing
-    it did not install is touched."""
+    it did not install is touched. On an EC2 Mac (ec2()) a missing op is never installed: only the ops installed
+    there (by hand, fleet-sudo) are kept current, since the office ops (the GUI CI users, the seed roots) are not
+    all ones an EC2 Mac runs."""
     ctl = ctl or launchctl
     doc = load_fleet_ops(read_bytes(ops_path) or b"")
     out: dict[str, Any] = {"ops": {}, "installed": []}
@@ -1415,6 +1435,9 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
     if why:
         out["held"] = why
         return out
+    only_installed = ec2()
+    if only_installed:
+        out["scope"] = "an EC2 Mac (ec2-user): the ops installed here are kept current; a missing one is never installed"
     if not apply:
         return out
     if root:
@@ -1433,6 +1456,8 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
         out.setdefault("removed", []).append(name)
     for name, op in sorted(doc["ops"].items()):
         target = ops_dir / name
+        if only_installed and out["ops"][name]["state"] == "missing" and not target.is_symlink():
+            continue
         if target.is_symlink() or target.exists() and not target.is_file():
             out["ops"][name]["error"] = f"{target} is not a regular file; left alone"
             continue

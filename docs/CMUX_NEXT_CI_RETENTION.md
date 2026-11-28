@@ -161,7 +161,7 @@ pressure pass over younger generated output only with the enrolled-runner drain
 gate:
 
 ```sh
-glaeda-disk --runner-caches --pressure --need 100 --family cmux-next-ci-generated \
+cmux-disk --runner-caches --pressure --need 100 --family cmux-next-ci-generated \
   --cmux-next-reservation-owner leo@fleet \
   --cmux-next-drain --apply --json --receipt ~/Projects/recovery/cmux-next-drain.jsonl
 ```

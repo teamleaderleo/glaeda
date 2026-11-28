@@ -19,6 +19,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
+import re
 import signal
 import stat
 import subprocess
@@ -43,6 +45,48 @@ RETRY_AFTER_S = 60
 LOG_MAX_BYTES = 8 * 1024 * 1024
 LOG_KEEP_BYTES = LOG_MAX_BYTES // 2
 LOG_ROW_BYTES = 128 * 1024  # two bounded child output tails, even when JSON-escaped
+DEFAULT_LABEL = "com.teamleaderleo.glaeda.idle-repair"
+
+
+# Boot spread. cosmic-gray (a personal Mac) panicked from memory exhaustion on 2026-11-24 and, after the reboot, every
+# RunAtLoad job started in the same second (load 214; 148 ssh and 71 python in the jetsam report). The LaunchAgent sets
+# BOOT_SPREAD_S: while the host came up (boot or wake) less than a fixed 0..BOOT_SPREAD_S seconds ago, seeded by the
+# launchd label (XPC_SERVICE_NAME) and the boot second, a tick exits at once, before any lock, read or import. Without
+# BOOT_SPREAD_S (a manual run, systemd) nothing waits. The same formula as leo-workspace timer_run.boot_delay, so its
+# boot_burst count sees the job where it really starts.
+def came_up_at(now: float | None = None, run=subprocess.run, uptime: Path = Path("/proc/uptime")) -> float | None:
+    """Epoch seconds the host last booted or (macOS) woke, or None when it cannot tell."""
+    now = time.time() if now is None else now
+    if sys.platform == "darwin":
+        try:
+            out = run(["/usr/sbin/sysctl", "-n", "kern.boottime", "kern.waketime"], capture_output=True, text=True,
+                      timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        marks = [int(s) for s in re.findall(r"\bsec\s*=\s*(\d+)", out or "") if int(s)]
+        return float(max(marks)) if marks else None
+    try:
+        return now - float(uptime.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def boot_hold(env=None, now: float | None = None, up=came_up_at) -> float:
+    """Seconds this job's first pass after boot or wake still waits (0: run now)."""
+    env = os.environ if env is None else env
+    try:
+        spread = float(env.get("BOOT_SPREAD_S") or 0)
+    except ValueError:
+        return 0.0
+    if not spread > 0:
+        return 0.0
+    now = time.time() if now is None else now
+    came = up(now) if callable(up) else up
+    if came is None or came > now:
+        return 0.0
+    label = env.get("XPC_SERVICE_NAME") or DEFAULT_LABEL
+    wait = random.Random(f"{label}:{int(came)}").uniform(0.0, spread)
+    return max(0.0, came + wait - now)
 
 
 def load_disk_module() -> Any:
@@ -53,6 +97,39 @@ def load_disk_module() -> Any:
     sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
+
+
+# Someone at the keyboard. On a personal desktop Mac this job ran the full disk pass,
+# `cmux-disk --refresh --pressure --idle --apply`, every 15-26 min while it was in use: 2026-11-27 13:5xZ-15:1xZ the
+# last three passes each hit their 660 s bound (exit 124) at load 60-250, with git cat-file over a mirror on top of
+# an agent-daemon delivery wedge, while the keyboard read active (HID idle 0 s). host_busy asks only about CI
+# jobs and builds, so an attended desktop always read idle. The idle sweep and the --refresh survey are named for an
+# idle host; under a person they wait. Disk pressure does not: an attended Mac still gets `--pressure --apply`,
+# which acts only below its free target. The same reading and threshold as the desktop presence check
+# (HID idle under 600 s is a person there; a locked screen or no reading changes nothing here). A fleet mini nobody
+# touches reads days of HID idle and keeps the whole pass.
+ATTENDED_IDLE_S = 600
+IOREG = os.environ.get("GLAEDA_IDLE_REPAIR_IOREG") or "/usr/sbin/ioreg"
+
+
+def hid_idle_s(run=subprocess.run) -> float | None:
+    """Seconds since this Mac's last keyboard or mouse input (IOHIDSystem HIDIdleTime), or None off macOS or when
+    it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = run([IOREG, "-c", "IOHIDSystem", "-d", "4", "-k", "HIDIdleTime"], capture_output=True, text=True,
+                  timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"HIDIdleTime" = (\d+)', out or "")
+    return int(found.group(1)) / 1e9 if found else None
+
+
+def attended(idle_s=hid_idle_s) -> bool:
+    """Someone used this Mac's keyboard or mouse in the last ATTENDED_IDLE_S seconds. No reading is not attended."""
+    seconds = idle_s() if callable(idle_s) else idle_s
+    return seconds is not None and seconds < ATTENDED_IDLE_S
 
 
 def read_state() -> dict[str, Any]:
@@ -203,7 +280,7 @@ def status() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="glaeda-idle-repair")
+    parser = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]) or "glaeda-idle-repair")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="run queued repairs when the host is idle")
     mode.add_argument("--status", action="store_true", help="print the durable queue receipt")
@@ -212,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.status or not args.apply:
         return status()
+    if boot_hold() > 0:
+        return 0  # the host just came up: this job's first pass waits its boot spread (a later tick runs it)
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+") as handle:
@@ -245,10 +324,19 @@ def main(argv: list[str] | None = None) -> int:
         disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
         health_path = os.environ.get("GLAEDA_HEALTH", str(HOME / ".local/bin/glaeda-mini-health"))
         actions: list[dict[str, Any]] = []
+        # run it as cmux-disk, its primary name, when the shim sits beside it: glaeda-disk counts uses of its old name
+        # (cmuxterm-hq docs/design/glaeda-into-cmux.md, Rename map). GLAEDA_DISK stays the program's own path, the one
+        # load_disk_module imports (the shim is not a module: it runs the program).
+        primary = Path(disk_path).with_name("cmux-disk")
+        if Path(disk_path).name == "glaeda-disk" and primary.is_file():
+            disk_path = os.fspath(primary)
         disk_command = [python, disk_path]
         if role := os.environ.get("GLAEDA_ROLE"):
             disk_command.extend(["--role", role])
-        disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
+        if attended():  # a person at this Mac: the pressure pass alone (ATTENDED_IDLE_S)
+            disk_command.extend(["--pressure", "--apply", "--top", "0"])
+        else:
+            disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
         commands = [
             (disk_command, 660),
             ([python, health_path, "--apply"], 180),
@@ -274,5 +362,47 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if failed else 0
 
 
+def count_old_name(old: str, new: str) -> None:
+    """The rename to cmux-* names (Leo, 2026-11-25: "start migrating off glaeda and into cmux-prefixed naming
+    tooling"): run as NEW (scripts/NEW sets CMUX_NAME_AS), nothing happens; run under the OLD name, this use is
+    counted, silently, in ~/.local/state/cmux-names/OLD.json (uses per UTC day for 14 days, the last use, the last
+    few callers), so the old name can be removed once the fleet shows it unused (cmuxterm-hq
+    docs/design/glaeda-into-cmux.md, Rename map). Never prints, never raises: a caller parsing output sees nothing."""
+    as_new = os.environ.get("CMUX_NAME_AS") == new
+    # kept for this program's own children (glaeda-disk's background --refresh and --census run __file__): one call,
+    # one count. Another tool it runs compares this to its own new name, so it still counts its own old name.
+    os.environ["CMUX_NAME_AS"] = new
+    if as_new:
+        return
+    try:
+        import json as _json
+        import time as _time
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cmux-names"
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{old}.json"
+        try:
+            data = _json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        days = {k: v for k, v in (data.get("days") or {}).items() if isinstance(v, int)}
+        today = _time.strftime("%Y-%m-%d", _time.gmtime())
+        days[today] = days.get(today, 0) + 1
+        try:
+            raw = Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+            parent = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:  # macOS has no /proc; the parent's name is enough to find a caller
+            parent = f"pid {os.getppid()}"
+        callers = [c for c in (data.get("callers") or []) if isinstance(c, str) and c != parent[:200]]
+        data = {"schema": 1, "old": old, "new": new, "last": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                "days": dict(sorted(days.items())[-14:]), "callers": ([parent[:200]] + callers)[:5]}
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(_json.dumps(data, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001  counting never costs the call
+        pass
+
+
 if __name__ == "__main__":
+    count_old_name("glaeda-idle-repair", "cmux-idle-repair")
     raise SystemExit(main())

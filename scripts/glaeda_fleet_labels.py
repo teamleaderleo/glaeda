@@ -271,6 +271,61 @@ def widened_labels(labels: list[str]) -> list[str]:
     return [label for label in out if not _stale_nightly_spill(label, out)]
 
 
+# RFD 0185 (cmuxterm-hq docs/rfd/0185-one-fleet-standard.md), Leo 2026-11-27: "unify labels to simplify things". No Xcode
+# version and no glaeda- prefix in a routing label: mac-std, mac-light, mac-gui, plus the version-free labels that carry
+# safety or queue isolation (nightly, trusted, sim, gateway, fast, dev). Phase 1 issues them BESIDE the old labels
+# (with_unified); a workflow moves to them in phase 2; the old ones drop in phase 3 once no queued job names one.
+UNIFIED_STATIC = {
+    IOS_SIM_LABEL: "mac-ios-sim",
+    "glaeda-trusted": "mac-trusted",
+    "glaeda-trusted-next-nightly": "mac-trusted-nightly",
+    TRUSTED_NEXT_SIGNING_LABEL: "mac-trusted-signing",
+}
+UNIFIED_FIXED = {"gateway": "mac-gateway", "sim": "mac-sim", "small": "mac-light"}
+UNIFIED_ROLES = {"root", "side", "gui", "session", "fast", "trusted", "nightly", "dev"}
+
+
+def unified_label(label: str) -> str | None:
+    """The version-free label a legacy pool label also answers to, or None (no counterpart: the bare xcode-<v>, the
+    capability labels, a namespaced pool such as glaeda-aws-side-std-xcode-<v>, and anything that is not a pool label).
+    Folds: root and side -> mac-std (std, xl) or mac-light; session -> mac-gui; small and the shared side -> mac-light.
+    Kept apart, because they carry safety or isolate a queue: nightly, trusted, dev, fast, sim, gateway."""
+    if label in UNIFIED_STATIC:
+        return UNIFIED_STATIC[label]
+    parts = label.split("-")
+    if len(parts) < 4 or parts[0] != "glaeda" or parts[-2] != "xcode" or not re.fullmatch(VERSION_RE, parts[-1]):
+        return None
+    middle = parts[1:-2]
+    if len(middle) == 1 and middle[0] in UNIFIED_FIXED:
+        return UNIFIED_FIXED[middle[0]]
+    if middle == ["side"]:  # the shared side label, no class
+        return "mac-light"
+    klass = next((p for p in middle if p in RUNNER_CLASSES), None)
+    if klass is None or middle[-1] != klass:
+        return None
+    roles = middle[:-1]
+    if not set(roles) <= UNIFIED_ROLES or len(set(roles)) != len(roles):
+        return None
+    if "trusted" in roles:
+        return f"mac-trusted-{'gui' if {'gui', 'session'} & set(roles) else klass}"
+    for role in ("nightly", "dev", "fast"):
+        if role in roles:
+            return f"mac-{role}" + ("" if klass == "std" else f"-{klass}")
+    if {"gui", "session"} & set(roles):
+        return "mac-gui"
+    return "mac-std" if klass in ("xl", "std") else "mac-light"
+
+
+def with_unified(labels: list[str]) -> list[str]:
+    """`labels` plus the unified_label() of each, in order, each once. Pure and idempotent."""
+    out = list(dict.fromkeys(labels))
+    for label in list(out):
+        extra = unified_label(label)
+        if extra is not None and extra not in out:
+            out.append(extra)
+    return out
+
+
 def _stale_nightly_spill(label: str, labels: list[str]) -> bool:
     """Whether `label` is a nightly slot label whose pool, at a wider class, is also among `labels`'s nightly slot
     labels (widened_labels())."""
@@ -446,12 +501,37 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
     return [a for a in apps if isinstance(a, dict)] if isinstance(apps, list) else []
 
 
+# POOL_XCODE: xcodeApps[0] is the pool Xcode, what a gated runner's job-started hook names as --toolchain-xcode and
+# its listener's DEVELOPER_DIR. The gate refuses every job while that Xcode differs from the class receipt, so the
+# pool Xcode is the ready app on the build the class was accepted on, not the manifest's newest. 2026-11-27: the
+# manifest put Xcode_27.2 first while every class receipt was on 26.6 (17F113); a signing mini's gated runners
+# re-installed onto 27.2 and were held off ("toolchain drifted from the m4pro-48 class receipt") for 9 h. With no
+# accepted build known, manifest order stands.
+def accepted_xcode_build(manifest: Any, hardware: Any) -> str | None:
+    """The manifest's hardware.<hardware>.acceptance.xcode_build, or None."""
+    table = manifest.get("hardware") if isinstance(manifest, dict) else None
+    entry = table.get(hardware) if isinstance(table, dict) and isinstance(hardware, str) else None
+    acceptance = entry.get("acceptance") if isinstance(entry, dict) else None
+    build = acceptance.get("xcode_build") if isinstance(acceptance, dict) else None
+    return build if isinstance(build, str) and build.strip() else None
+
+
+def pool_xcode_first(ready: list[dict[str, Any]], accepted_build: str | None) -> list[str]:
+    """The ready apps' paths, the first one on accepted_build moved to the front (POOL_XCODE)."""
+    paths = [str(a.get("path")) for a in ready]
+    hit = next((i for i, a in enumerate(ready) if accepted_build and str(a.get("build") or "") == accepted_build), None)
+    return paths if hit is None else [paths[hit], *paths[:hit], *paths[hit + 1:]]
+
+
 def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
                   ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None,
-                  macos_major: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+                  macos_major: str | None = None, accepted_build: str | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner).
     macos_major: the observed macOS major version of the host ("27"); it adds glaeda-macos-<major>. None (the
-    declared view, or a host that could not tell) adds no OS label."""
+    declared view, or a host that could not tell) adds no OS label.
+    accepted_build: the Xcode build the member's class receipt was accepted on, as the host reads it; None reads the
+    manifest's hardware.<class>.acceptance.xcode_build (POOL_XCODE)."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
         return None, "manifest has no hosts table"
     host = manifest["hosts"].get(member)
@@ -658,7 +738,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "dedicatedOnly": dedicated_only, "poolUser": pool_user,
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
-            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
+            "hardware": hardware, "xcodeApps": pool_xcode_first(ready, accepted_build or accepted_xcode_build(
+                manifest, hardware)), "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "reserveCores": reserve, "compileSlots": compile_slots,
             "listeners": member_listeners(manifest, hardware, units, reserve),
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
@@ -798,11 +879,13 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay, user}], None), or ([], why
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, trustedRef, trustedRepo,
+    yieldToExclusive, yieldToWaiters, lanRelay, lanRelayFollow, user}], None), or ([], why
     the member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
     floor, or None for the member's disk.min_free_gib. lanRelay is the private LAN "IPv4:port" the entry's relay
     agent forwards to (LAN_RELAY), the list of one host's adapter addresses on one port it tries in order
-    (LAN_RELAY_ADAPTERS), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for the
+    (LAN_RELAY_ADAPTERS), or None. lanRelayFollow is the host's tailnet node whose own advertised LAN endpoints the
+    relay tries first (LAN_RELAY_FOLLOW), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for the
     member's own user."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
@@ -826,7 +909,8 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay", "user"})
+                                       "yieldToFleetBuild", "yieldToWaiters", "lanRelay", "lanRelayFollow",
+                                       "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -902,8 +986,20 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         yields = entry.get("yieldToExclusive", False)
         if not isinstance(yields, bool):
             return [], f"{where}.yieldToExclusive must be boolean"
+        # YIELD_TO_FLEET_BUILD: the runner's jobs wait while the mini's fleet build (the CAS writer's fill) holds it
+        fleet_yields = entry.get("yieldToFleetBuild", False)
+        if not isinstance(fleet_yields, bool):
+            return [], f"{where}.yieldToFleetBuild must be boolean"
+
+        # YIELD_TO_WAITERS: the runner's listener holds off while a build waits for the host lock, as a pool gate does
+        waits = entry.get("yieldToWaiters", False)
+        if not isinstance(waits, bool):
+            return [], f"{where}.yieldToWaiters must be boolean"
         relay, why = lan_relay(entry.get("lanRelay"), where, trusted_ref is not None,
                                runner.get("dedicatedOnly") is True)
+        if why:
+            return [], why
+        follow, why = lan_relay_follow(entry.get("lanRelayFollow"), where, relay)
         if why:
             return [], why
         user = entry.get("user")
@@ -916,14 +1012,15 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             if trusted_ref is None:
                 return [], (f"{where}.user needs trustedRef and trustedRepo: a runner in its own macOS account takes "
                             "only merged code of its repository, never PR code")
-            if relay is not None or yields:
-                return [], (f"{where}.user goes without lanRelay and yieldToExclusive: both are the member user's "
-                            "(its relay socket, its capacity ledger)")
+            if relay is not None or yields or waits:
+                return [], (f"{where}.user goes without lanRelay, yieldToExclusive and yieldToWaiters: each is the "
+                            "member user's (its relay socket, its capacity ledger, its host lock's waiter spans)")
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "lanRelay": relay, "user": user})
+                    "yieldToFleetBuild": fleet_yields, "yieldToWaiters": waits,
+                    "lanRelay": relay, "lanRelayFollow": follow, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
@@ -946,6 +1043,51 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
 # one port", and no name is ever resolved.
 LAN_RELAY_RE = r"((?:[0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})"
 LAN_RELAY_MAX = 4
+# LAN_RELAY_FOLLOW: a host's LAN address is a DHCP lease, so a declared list breaks each time the lease moves (or a
+# third adapter appears), and the next device to take an old lease answers there instead. "lanRelayFollow":
+# {"tailnetIp": "100.x.y.z", "node": "<stable node ID>", "within": "A.B.C.0/24"} makes the relay ask the mini's own
+# tailscaled, per connection, for that tailnet node (LocalAPI whois over its Unix socket), check the answer is the
+# declared stable node ID, and try first every IPv4 endpoint the node itself advertises inside the declared private
+# prefix (/8, /16 or /24), on lanRelay's one port; then lanRelay's declared addresses, in order, as before. The
+# destinations stay that one host's own addresses on one port inside one private prefix, and ssh still checks the
+# host key it pins, so a wrong device on an old lease is refused, never trusted. It needs lanRelay (its port and its
+# fallback when tailscaled cannot answer).
+LAN_RELAY_FOLLOW_PREFIXES = (8, 16, 24)
+STABLE_NODE_ID_RE = r"[A-Za-z0-9]{6,64}"
+
+
+def lan_relay_follow(value: Any, where: str, relay: Any) -> tuple[dict[str, str] | None, str | None]:
+    """({"tailnetIp", "node", "within"}, None) for a valid lanRelayFollow, (None, None) when absent, or (None, why)."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict) or set(value) != {"tailnetIp", "node", "within"}:
+        return None, f"{where}.lanRelayFollow must be {{tailnetIp, node, within}}"
+    if relay is None:
+        return None, f"{where}.lanRelayFollow needs lanRelay (its port, and the addresses it falls back to)"
+    ip = value["tailnetIp"]
+    octets = [int(x) for x in ip.split(".")] if isinstance(ip, str) and re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", ip) else []
+    if not octets or any(x > 255 for x in octets) or not (octets[0] == 100 and 64 <= octets[1] <= 127):
+        return None, f"{where}.lanRelayFollow.tailnetIp must be a tailnet (100.64.0.0/10) IPv4 address"
+    if not isinstance(value["node"], str) or not re.fullmatch(STABLE_NODE_ID_RE, value["node"]):
+        return None, f"{where}.lanRelayFollow.node must be the tailnet node's stable ID ({STABLE_NODE_ID_RE})"
+    within = value["within"]
+    match = re.fullmatch(r"((?:[0-9]{1,3}\.){3}[0-9]{1,3})/([0-9]{1,2})", within) if isinstance(within, str) else None
+    net = [int(x) for x in match.group(1).split(".")] if match else []
+    bits = int(match.group(2)) if match else -1
+    if (not match or any(x > 255 for x in net) or bits not in LAN_RELAY_FOLLOW_PREFIXES
+            or any(net[bits // 8:])):
+        return None, f"{where}.lanRelayFollow.within must be a network A.B.C.D/N with N one of 8, 16, 24"
+    if not (net[0] == 10 or (net[0] == 172 and 16 <= net[1] <= 31 and bits >= 16) or (net[0] == 192 and net[1] == 168
+                                                                                     and bits >= 16)):
+        return None, f"{where}.lanRelayFollow.within must lie inside RFC 1918"
+    return {"tailnetIp": ".".join(map(str, octets)), "node": value["node"],
+            "within": ".".join(map(str, net)) + f"/{bits}"}, None
+
+
+def follow_prefix(within: str) -> str:
+    """The dotted string prefix every address inside `within` starts with: "10.1.2.0/24" -> "10.1.2."."""
+    net, bits = within.split("/")
+    return ".".join(net.split(".")[: int(bits) // 8]) + "."
 
 
 def lan_relay_address(value: Any, where: str) -> tuple[str | None, str | None]:

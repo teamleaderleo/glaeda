@@ -1381,6 +1381,36 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "e8b2987ea107362e8a33992f81f8f42819b50ac8cb691fbd0e49f9437877fa77",
     "41ee6fae299b956a84f680209f2e1856dcd7b68820f456a26f702b5d797ab443",
     "90f8b203cffeeb07ac7fcd34f7a71f3041b97dd16ca7cb9397ed77fd6f857188",
+    "0ca58b7e1b774f308f303a7f17e5540df906e7ed32f0414a21e5836ee568ab0f",
+    "7e33ef00ca1f811fb1414eb6bc55ea9ab1186bc643568b19dc06cdcd55759478",
+    "4e82031cbbd048f8de1de7dd6168a5075f6533b166cedaaf508bb2d2bd12f3b3",
+    "5cb62fe6c6a63a88a2ffcefa0875073925f55a989e484bbcb094700851b14d95",
+    "69875b280c4b02c56ae0f71dfd5fd91b5ffc2cbf3fc9f01a1b7e92d0d57d5180",
+    "16b54de696ace2e9396c3ac8ddb093559a73763942a5c26460667a04d977f212",
+    "8e8442f48250b370e63348fb2a49dc4334feb70371020f9a3c1b597622d4ef3c",
+    "7a855efe64dfc1ba89f04b452aa998c5de4326ff14b7ad23f5031a93ea8d05da",
+    "4567868bceeae5751670caf375230bce235a1f5a90eea903aa18e66256109087",
+    "2839c8e6956ffc6776f3553b4e2a4774459075b568437957a3a10f1eeef735e2",
+    "63aba53442d623bb33e68927897a84cdda307baffd294383123bfc73a9d5bbe3",
+    "f349a345e89a2cc7e2984b50cd7c05c8ed4be5470124f21e4f418db42e04a8ef",
+    "2ed5b420a0f3d5259e7174c26a4a458febc6d158b2eb9d89a01df80477c6d780",
+    "4b1ac78a53b20a3a3a1419579f25a9edbb9e012eb58fba86bfd27423824e4211",
+    "c4a9926b25fb82d0f1115b1a6df45527563936bdbb8483d2f51f53fa8db280e7",
+    "443c21047cf9e843f59cabc4dcf43a7187a9a83dc4ba8b1673ac0999f9fb97f5",
+    "4838b861b5d651804b529175018bb78ef15b9c12c8249c9cd90e620c9a46dd5c",
+    "86494acba19b74c2392b48cecac94cc3237a9dedeab83c48e372c7b799a577b3",
+    "470558058d19df771cf82f61aae2bdf3edd98eeef58cd77893311191f44c9203",
+    "6582941d181caa7ebb01db8487b12e9db6234689e286dbffb13fb7d1f2106470",
+    "f55441b1ad80c13de648f2c39a30727b7bba8c0d5c95541fc37bc19f2698cd8e",
+    "564206744d0c5f2e27d338ff597363ef02b4e3a943b05b6c01681fa747a3c7fc",
+    "78c3d27524ce96a98d7ea914c56453b3ef29ed5fd481e0957a787209dd5174f9",
+    "3921da1635191cfb276af97c9b26c958da208c45374345920c0cb0db7d0d5676",
+    "6a47948dae3e9ed806e2d7c548dba5c96a629c667559c43decdeb98ec8104b30",
+    "8e5b471e25981713d59c03435509aa08fb4c3135ef061ad67d296d64d603de81",
+    "cce703733549062e116dd3735b9c9ab404329e26090aecdbb1c81727dd2a9769",
+    "cffd38e9b8e60d31b87b66d0bade72659421212904f918a03cbf1c8fe429166c",
+    "5cc1ca3c6311dbaed553d70a1985143da97d89ae1fe3f565ad08e0815be75abc",
+    "87e7f6c73d44ee1cf79c6d5e38197e95aa0b0677b1f3a995e634d70edc7a0f6e",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2376,8 +2406,13 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
         except ValueError:
             free_need = 0
         row["free_short"] = max(0, free_need - fs.free)
+        # the fleet compilation cache above its budget cap closes a shortfall too: fleet_cas_budget_cap takes it back
+        # with a fetch, never a rebuild. No survey item counts it, so a mini whose only slack was its CAS (cmux17,
+        # 2026-11-27: 16 GiB of CAS, 36 GiB free under the runner gate's 41.8 GiB floor) read over 0 and every
+        # floor eviction freed 0.0 GiB while its gui-light runner stayed held.
+        cas_excess = max(0, row["families"].get("fleet-cas", 0) - fleet_cas_cap_bytes(fs.total))
         closable = (max(0, row["free_short"] - (unclosable or {}).get(dev, 0)) if reclaimable is None
-                    else min(row["free_short"], reclaimable.get(dev, 0)))
+                    else min(row["free_short"], reclaimable.get(dev, 0) + cas_excess))
         row["free_short_left"] = row["free_short"] - closable
         row["over"] = min(row["used"], max(over_share, closable))
     return out
@@ -2557,9 +2592,15 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low": "35%:100-200",
     "target": "45%:150-350",
     "emergency": "10%:30-60",
+    # A saturated host (SATURATED_LOAD_PER_CORE) holds an apply only while every filesystem keeps at least this much free
+    # (space()'s syntax; "0": the old behaviour, hold until the emergency floor). Lane VMs run at load 2-3x their cores
+    # all day, so with only the emergency floor the pressure timer skipped every pass from 70% to 90% full
+    # (2026-11-25).
+    "saturated_delete_below_free": "20%",
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    "tmp_transcript_hold_hours": 6.0,  # tmp_transcript_hold: a temp entry a recent agent transcript names stays
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
     # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
@@ -2644,9 +2685,15 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # cargo-stale-artifacts (sweep_cargo_targets): inside every Cargo target under these roots, live worktree or not,
     # a <profile>/deps unit or <profile>/incremental crate dir whose files' mtime and atime are all older than
     # cargo_stale_hours goes, the newest per crate stem always stays. [] or 0 turns it off.
+    # /Users/Shared/cmux-build-fleet/cache: the hq lent and dev-build workers' shared cmux-tui-target/src-<hash>, which
+    # grew 13 -> 32 GiB in a night (release/incremental 26 GiB) on gui-light carriers whose runner gate then held the
+    # listener off for disk (2026-11-27); its family keeps the whole target while a build names it
     "cargo_stale_roots": ["~/Projects", "~/.wt/checkouts", "~/.cache/cargo-target", "~/lanes", "~/lane-scratch",
-                          "~/lab-target"],
+                          "~/lab-target", "/Users/Shared/cmux-build-fleet/cache"],
     "cargo_stale_hours": 6.0,
+    # a pressure pass (under the floor) trims units unused this long instead: least recently used first by age, the
+    # newest unit of every crate stem and anything open still stay. 0: the pressure pass uses cargo_stale_hours too
+    "pressure_cargo_stale_hours": 1.0,
     # The fleet controller's base URL (http://host:port, over the tailnet). Set, shared-mirror-compact asks its
     # POST /v1/seeds/release before a fold deletes a mirror's packs and folds only on "ok" (seed_release_veto).
     # "" (the default): no call; the seed heartbeat that fills the controller's holder index is not built yet, so
@@ -2843,9 +2890,24 @@ def host_saturated() -> str:
     return ""
 
 
+# A Linux lane VM (role devbox, not DARWIN) holds no pressure delete for load: it runs at load 2-3x its 4 cores all day,
+# so the saturated_delete_below_free share (20%) was its real trigger and every 15-minute pass from 70% to 80% used
+# skipped (two lane VMs at 77-78% used, +12 and +31 GB/day, load 7-63 on 4 cores,
+# 2026-11-27: "host CPU saturated ... skipped before measuring" at the timer's own --low 30%). Its sessions are the
+# load, not a CI job a delete would slow; deletes still run at background IO priority and keep every in-use veto.
+def lane_vm_pressure(fss: "dict[int, Fs]") -> bool:
+    """A Linux devbox with a filesystem under its pressure line (Fs.low)."""
+    return ROLE == "devbox" and not DARWIN and any(not fs.tmpfs and fs.under for fs in fss.values())
+
+
 def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
-    """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
-    if emergency_devs(fss, emergency, floor_gib):
+    """host_saturated as an apply halt, except while a filesystem is below its emergency floor or a lane VM is under
+    pressure (lane_vm_pressure): then nothing holds."""
+    if emergency_devs(fss, emergency, floor_gib) or lane_vm_pressure(fss):
+        return None
+    spec = str(POLICY.get("saturated_delete_below_free", "0")).strip()
+    if spec not in ("", "0") and any(
+            not fs.tmpfs and fs.free < space(spec, fs.total) for fs in fss.values()):
         return None
     return host_saturated
 
@@ -3214,6 +3276,16 @@ SIM_DEVICE_MIN_BYTES = 512 * 1024 ** 2  # dataPathSize under this: a fresh or er
 SIM_DEVICE_BUDGET_S = 300.0  # one pass erases for at most this long; the next pass continues
 
 
+def _device_plist_age_hours(home: str, now: float) -> float | None:
+    """Hours since CoreSimulator last rewrote HOME/device.plist, which it does on every state change (boot, shutdown,
+    erase). simctl on Xcode 26.6 and 27.2 (macOS 27) lists no lastBootedAt for any device: cmux21 2026-11-27, 0 of 32
+    devices, 16 GB held by 6 shutdown ones, so every device read "no last-boot time" and none was ever erased."""
+    try:
+        return (now - os.stat(os.path.join(home, "device.plist")).st_mtime) / 3600
+    except OSError:
+        return None
+
+
 def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: float | None = None,
                      leases: str | None = None) -> list[Item]:
     """Judge simulator devices (`simctl list devices -j`) for erasing. Reclaimable only when shutdown, available,
@@ -3234,6 +3306,10 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             sized = isinstance(size, int) and not isinstance(size, bool)
             size = size if sized else 0
             idle = _iso_age_hours(d.get("lastBootedAt"), now)
+            data = d.get("dataPath")
+            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
+            if idle is None and home is not None:
+                idle = _device_plist_age_hours(home, now)  # simctl lists no lastBootedAt: its last state change
             reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
             keep = []
             if d.get("state") != "Shutdown":
@@ -3246,8 +3322,6 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append("its data is already small")
             if idle is None:
                 keep.append("no last-boot time")
-            data = d.get("dataPath")
-            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
             if home is None:
                 keep.append("no data path")
             elif in_cwd(home, opened):
@@ -5046,12 +5120,29 @@ CARGO_STALE_SEARCH_SKIP = frozenset({".git", "node_modules", ".build", "DerivedD
                                      ".gradle", "Pods", "src", "tests", "docs"})
 
 
+CARGO_PROFILE_NAMES = frozenset({"debug", "release"})
+
+
+def cargo_untagged_target(path: Path, names: set[str]) -> bool:
+    """PATH is a Cargo target directory with no CACHEDIR.TAG: cargo writes the tag only when it creates the directory,
+    so a CARGO_TARGET_DIR a tool made first (the hq worker's cmux-tui-target/src-<hash>) has none. A debug or release
+    child holding cargo's build lock (.cargo-lock) beside deps or incremental proves it."""
+    for name in CARGO_PROFILE_NAMES & names:
+        prof = path / name
+        if (not prof.is_symlink() and os.path.lexists(prof / ".cargo-lock")
+                and any((prof / p).is_dir() and not (prof / p).is_symlink() for p in CARGO_PART_DIRS)):
+            return True
+    return False
+
+
 def cargo_target_dir(path: Path, names: set[str] | None = None) -> bool:
-    """PATH is a Cargo target directory: a real directory holding cargo's CACHEDIR.TAG."""
-    if names is not None and "CACHEDIR.TAG" not in names:
+    """PATH is a Cargo target directory: a real directory holding cargo's CACHEDIR.TAG, or an untagged one
+    (cargo_untagged_target) when NAMES, its entries, are given."""
+    if path.is_symlink() or not path.is_dir():
         return False
-    return (not path.is_symlink() and path.is_dir()
-            and bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256))))
+    if names is not None and "CACHEDIR.TAG" not in names:
+        return cargo_untagged_target(path, names)
+    return bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
 
 
 def cargo_stale_roots(home: Path | None = None) -> list[Path]:
@@ -5696,9 +5787,15 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def worker_cargo_target(path: Path) -> bool:
+def worker_cargo_target(path: Path, _nested: bool = False) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
-    real directory (not a symlink) that holds no version control of its own."""
+    real directory (not a symlink) that holds no version control of its own; or a directory of nothing but such
+    targets, one per source tree.
+
+    The hq worker's CARGO_TARGET_DIR is cache/cmux-tui-target/src-<hash> (one target per source tree), so the family
+    item cache/cmux-tui-target holds targets and is none itself: it read "report-only" and "unchecked" under pressure
+    while cmux21 (24 GiB free) and cmux17 (21 GiB) sat under their gui-light disk floor with 8.5 GiB there and 0.0G
+    reclaimable (2026-11-27). Every in-use veto still holds the whole item while a cargo or rustc names it."""
     try:
         if path.is_symlink() or not path.is_dir():
             return False
@@ -5706,8 +5803,16 @@ def worker_cargo_target(path: Path) -> bool:
         return False
     if any(os.path.lexists(path / m) for m in VCS_MARKERS):
         return False
-    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
-            or (path / ".rustc_info.json").is_file())
+    if (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file()):
+        return True
+    if _nested:
+        return False
+    try:
+        entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(worker_cargo_target(Path(e.path), _nested=True) for e in entries)
 
 
 def worker_build_output(fam: Family, path: Path) -> bool:
@@ -6163,7 +6268,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
-               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "PassKit", "tidy-branches", "CloudKit",
+               skip=("glaeda", "cmux-next-ci", "Sparkle_generate_appcast", "cmux-perf-bench", "PassKit", "tidy-branches", "CloudKit",
                      "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
@@ -6219,6 +6324,30 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                  build_output=True, min_idle_hours=JOURNEY_IDLE_HOURS, owner="cmux scripts/journeys (build_cache.py)",
                  rebuild_minutes=3, pressure_only=role == "devbox", platform=host_cache_platform())
           for sub in JOURNEY_SUBDIRS),
+        # cmux's perf bench (scripts/perf-bench: xbench.py, rivals.py, fetch_browsers.py) keeps vendor-signed app copies
+        # in ~/Library/Caches/cmux-perf-bench/apps/<app>/<version> (fetch_browsers downloads them again) and one
+        # throwaway cp -R copy per rival session in rivals-copies/<app>-<round>-<pid> (never reused, never removed by
+        # the bench). On cmux20 (2026-11-26) the two held 18.8 GiB that no family reached: the bundles are too deep for
+        # the git search, so library-caches read them "unchecked", and bench steps queued for disk. Both are build output.
+        # Apps go once unused PERF_BENCH_APPS_IDLE_HOURS (a bench run opens them; a live one keeps its copy), copies
+        # after PERF_BENCH_COPIES_IDLE_HOURS: the session that made one is long over.
+        Family(PERF_BENCH_APPS, HOME / PERF_BENCH_CACHE / "apps", True, "fetch_browsers.py downloads the vendor copy again",
+               depth=2, build_output=True, min_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, max_idle_hours=PERF_BENCH_APPS_IDLE_HOURS, owner="cmux scripts/perf-bench (fetch_browsers.py)",
+               rebuild_minutes=3, platform="macos"),
+        Family(PERF_BENCH_COPIES, HOME / PERF_BENCH_CACHE / "rivals-copies", True, "the next rival session copies the app again",
+               build_output=True, min_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, max_idle_hours=PERF_BENCH_COPIES_IDLE_HOURS, owner="cmux scripts/perf-bench (rivals.py)",
+               rebuild_minutes=1, platform="macos"),
+        # cmux's CEF runtimes (~/Library/Caches/cmux/cef/cef-<version>[-<arch>]): one per CEF release the app or a
+        # tagged build ever ran, downloaded again on demand. cmux20 held ten, 5.9 GiB, the oldest from October. Only the
+        # cef-* runtimes: the helper and shim folders beside them are small and in step with the running app.
+        Family(CMUX_CEF_RUNTIMES, HOME / "Library/Caches/cmux/cef", True, "cmux downloads the CEF runtime again",
+               include=("cef-",), build_output=True, min_idle_hours=CMUX_CEF_IDLE_HOURS, max_idle_hours=CMUX_CEF_IDLE_HOURS, owner="cmux (CEF runtime download)",
+               rebuild_minutes=5, platform="macos"),
+        # vphone-cli's IPSW downloads (~/.vphone/ipsws: Apple's restore image, 11.5 GiB, and its .partial resume file).
+        # A public download, only read when a VM is created. Not the rest of ~/.vphone: the local cloudos image and
+        # the *-parts folders are not provably re-downloadable, so they stay (report only, unchecked).
+        Family(VPHONE_IPSWS, HOME / ".vphone/ipsws", True, "vphone-cli downloads the restore image again",
+               files=True, min_idle_hours=VPHONE_IPSW_IDLE_HOURS, max_idle_hours=VPHONE_IPSW_IDLE_HOURS, owner="vphone-cli", rebuild_minutes=30, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -7109,6 +7238,14 @@ def _ended_step_checkout(path: Path) -> str:
 # cmux's journey cache (scripts/journeys/build_cache.py): its builds and fetch scratch, an entry per job.
 JOURNEY_CACHE = Path(".cache/cmux-journeys")  # under HOME
 JOURNEY_SUBDIRS = ("builds", "fetch")
+PERF_BENCH_CACHE = Path("Library/Caches/cmux-perf-bench")  # under HOME: scripts/perf-bench's --cache default
+PERF_BENCH_APPS, PERF_BENCH_COPIES = "perf-bench-apps", "perf-bench-rivals-copies"
+PERF_BENCH_APPS_IDLE_HOURS = 3 * 24.0
+PERF_BENCH_COPIES_IDLE_HOURS = 2.0
+CMUX_CEF_RUNTIMES = "cmux-cef-runtimes"
+CMUX_CEF_IDLE_HOURS = 7 * 24.0
+VPHONE_IPSWS = "vphone-ipsws"
+VPHONE_IPSW_IDLE_HOURS = 14 * 24.0
 JOURNEY_IDLE_HOURS = 3 * 24.0
 
 # --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
@@ -7835,7 +7972,7 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
     clones = []
     for gitdir in shared_mirrors(home):
         release_abandoned_compact_lock(gitdir / "objects/maintenance.lock")
-        packs = git_pack_count(gitdir)
+        packs = len(mirror_fold_packs(gitdir))  # kept packs are not folded: they never count toward the trigger
         if packs >= SHARED_MIRROR_COMPACT_PACKS and not one_pack_dominates(gitdir):
             clones.append((git_object_bytes(gitdir), packs, gitdir))
     clones.sort(key=lambda c: (-c[0], -c[1]))
@@ -7849,14 +7986,16 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
 
 
 def one_pack_dominates(gitdir: Path) -> bool:
-    """True when the largest pack holds more than SHARED_MIRROR_DOMINANT_SHARE of the mirror's pack bytes: a fold
-    would rewrite it to free at most the small rest."""
+    """True when the largest pack a fold would rewrite (mirror_fold_packs) holds more than
+    SHARED_MIRROR_DOMINANT_SHARE of those packs' bytes: a fold would rewrite it to free at most the small rest.
+    A pack with a .keep beside it counts for neither side: `repack -a` leaves it, so it can never be merged in.
+    fs-agent-lane-22, 2026-11-27: a dead fetch's 1.1 GiB kept pack beside the 1.8 GiB fold pack read as 61%, so
+    the cmux mirror was folded 59 times in 24 h (every 15 min, 180-600 CPU-s and up to 2.9 GB resident each on a
+    4-core, 8 GB VM) to free 26 MiB a fold; the pressure pass drove the load to 60-104."""
     sizes = []
-    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
-        for e in it:
-            if e.name.endswith(".pack") and not e.name.startswith((".tmp-", "tmp_")):
-                with contextlib.suppress(OSError):
-                    sizes.append(e.stat(follow_symlinks=False).st_size)
+    for stem in mirror_fold_packs(gitdir):
+        with contextlib.suppress(OSError):
+            sizes.append((gitdir / "objects/pack" / f"{stem}.pack").stat(follow_symlinks=False).st_size)
     total = sum(sizes)
     return total > 0 and max(sizes) > SHARED_MIRROR_DOMINANT_SHARE * total
 
@@ -8086,6 +8225,104 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
+# An agent session's own notes in the temp dir. A live Claude session kept a folder of 40 notes at /tmp/<name>, wrote
+# it last at 18:35Z, then waited on a model gateway outage for two hours; at 19:33Z the "tmp" family (one hour window)
+# found it idle, unheld (no process has a file open there between tool calls) and named by no running command, and
+# took it while the session was alive (2026-11-27). On that host the same pass took 64 top-level /tmp entries in 24 h,
+# and most of them are named in a transcript that went on being written after the delete. The session that writes a
+# path names it in its transcript, so a top-level temp entry a transcript names is held while that transcript was
+# written within the policy's tmp_transcript_hold_hours (6 by default): it goes once no session that named
+# it has written for that long. The index reads each transcript once and then only what was appended
+# (TRANSCRIPT_TMP_INDEX), so a pass costs the bytes written since the last one, not the transcripts' size.
+TMP_NAME_RE = re.compile(rb"/(?:private/)?tmp/([A-Za-z0-9._@+=-]{1,200})")
+_TRANSCRIPT_TMP_NAMES: dict[str, str] | None = None
+_TRANSCRIPT_TMP_AT = 0.0
+_TRANSCRIPT_TMP_HOME: Path | None = None
+TRANSCRIPT_TMP_FRESH_S = 30.0  # apply's fresh re-check rereads appended bytes at most this often, not once per item
+
+
+def transcript_tmp_index_path() -> Path:
+    return HOME / ".cache/glaeda-disk/transcript-tmp-names.json"
+
+
+def recent_transcripts(window_s: float, now: float | None = None) -> list[tuple[Path, os.stat_result]]:
+    """Claude (every config dir, subagents too) and Codex transcripts written within window_s."""
+    cutoff = (time.time() if now is None else now) - window_s
+    roots = [c / "projects" for c in claude_config_dirs()] + [HOME / ".codex/sessions"]
+    out = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    out.append((path, st))
+    return out
+
+
+def transcript_tmp_names(fresh: bool = False) -> dict[str, str]:
+    """Top-level temp entry name -> the newest recent transcript that names it, read incrementally (see above)."""
+    global _TRANSCRIPT_TMP_NAMES, _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME
+    if (_TRANSCRIPT_TMP_NAMES is not None and _TRANSCRIPT_TMP_HOME == HOME
+            and (not fresh or time.monotonic() - _TRANSCRIPT_TMP_AT < TRANSCRIPT_TMP_FRESH_S)):
+        return _TRANSCRIPT_TMP_NAMES
+    window_s = float(POLICY["tmp_transcript_hold_hours"]) * 3600
+    index_path = transcript_tmp_index_path()
+    try:
+        old = json.loads(index_path.read_text())
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    index: dict[str, dict] = {}
+    names: dict[str, tuple[float, str]] = {}
+    for path, st in recent_transcripts(window_s):
+        key = os.fspath(path)
+        prev = old.get(key) if isinstance(old.get(key), dict) else {}
+        same = prev.get("ino") == st.st_ino and isinstance(prev.get("offset"), int) and prev["offset"] <= st.st_size
+        offset = prev["offset"] if same else 0
+        found = set(prev.get("names", [])) if same else set()
+        if offset < st.st_size:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(st.st_size - offset)
+            except OSError:
+                chunk = b""
+            end = chunk.rfind(b"\n") + 1  # a line still being written is read whole next pass
+            found.update(m.decode("ascii", "replace") for m in TMP_NAME_RE.findall(chunk[:end]))
+            offset += end
+        index[key] = {"ino": st.st_ino, "offset": offset, "names": sorted(found)}
+        for n in found:
+            if n not in names or names[n][0] < st.st_mtime:
+                names[n] = (st.st_mtime, key)
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index_path.with_name(f"{index_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(index))
+        os.replace(tmp, index_path)
+    except OSError:
+        pass  # an unwritten index only costs the next pass a full read
+    _TRANSCRIPT_TMP_NAMES = {n: k for n, (_m, k) in names.items()}
+    _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME = time.monotonic(), HOME
+    return _TRANSCRIPT_TMP_NAMES
+
+
+def tmp_transcript_hold(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why a top-level temp entry is held by an agent session that names it ("" when none does)."""
+    if fam.id not in ("tmp", STALE_TMP_SCRATCH) or path.parent != fam.root:
+        return ""
+    transcript = transcript_tmp_names(fresh).get(path.name)
+    if not transcript:
+        return ""
+    hours = float(POLICY["tmp_transcript_hold_hours"])
+    return f"named by an agent session written in the last {hours:g}h ({Path(transcript).name})"
+
+
 # A Linux lane VM's own families (lane_vm_families). One reached 100% (4.2 GB free of 495 GB) and its tests failed
 # with ENOSPC while this script found 0.0G reclaimable in 141 GiB: /tmp/wt-rd 23G, /tmp/claude-<uid> 17G, /tmp/bsz 13G
 # and /tmp/acpmux-<uid> 11G were each one "tmp" item, in use or unchecked as a whole, because a live session's
@@ -8128,6 +8365,27 @@ LANE_HOME_FAMILY_IDS = frozenset(t[0] for t in LANE_HOME_TREES)
 WT_CARGO_TARGET = "wt-cargo-target"
 WT_CHECKOUTS = ".wt/checkouts"  # tools/wt's host_worktrees, below HOME
 SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | LANE_HOME_FAMILY_IDS | {"claude-scratchpad", WT_CARGO_TARGET}
+# The machine git cache on a lane VM (`cmux host git-cache serve --cache /var/cache/cmux/git-cache`, started by
+# leo-workspace tools/lane_vm_git_cache.py; cmux-tui crates/cmux-git-cache). Its layout is
+# <root>/<tenant>/github.com/<owner>/<repo>.git (full bare mirrors of GitHub) and <root>/crates (a crates.io mirror).
+# No family's root reached /var/cache, so fs-agent-lane-24 (2026-11-26, 83% of 63G) reported 36.1G "unclassified"
+# and 0.0G reclaimable while 24G of it was this cache: a 16G fill pack of manaflow-ai/cmux.git, its kept clone packs,
+# and 7.9G of objects/pack/tmp_pack_* that the cache's stopped fetches left behind (it killed git, not git's
+# index-pack, which wrote on after the cache's own clear). Two families:
+# - GIT_CACHE_PARTIAL: a mirror's partial writes (objects/pack/tmp_*, .tmp-*), any run, once nothing wrote them for
+#   GIT_CACHE_PARTIAL_IDLE_HOURS (the cache's own STALE_PARTIAL: every live writer touches its file) and no process
+#   holds them open. Nothing reads them: git never serves a tmp pack.
+# - GIT_CACHE_MIRRORS: a whole mirror, and the crates store, under pressure only, once nothing below it changed for
+#   GIT_CACHE_MIRROR_IDLE_HOURS and no process (an upload-pack serving it, a fill) has a file open in it. The cache
+#   refills a mirror on the next miss, and only above its own disk floor (cmux-git-cache room.rs), so an evicted
+#   mirror stays away until the host has room.
+GIT_CACHE_ROOT = Path("/var/cache/cmux/git-cache")
+GIT_CACHE_PARTIAL = "git-cache-partial-writes"
+GIT_CACHE_MIRRORS = "git-cache-mirrors"
+GIT_CACHE_CRATES = "git-cache-crates"
+GIT_CACHE_PARTIAL_IDLE_HOURS = 1.0
+GIT_CACHE_MIRROR_IDLE_HOURS = 0.5
+GIT_CACHE_OWNER = "cmux host git-cache (leo-workspace tools/lane_vm_git_cache.py)"
 ACPMUX_DEAD_STATUSES = frozenset({"closed"})  # acpmux's own: a closed session's folder goes at its purge
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION_ENV_KEYS = ("ACPMUX_SESSION_ID",)
@@ -8550,7 +8808,520 @@ def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
         fams.append(Family(WT_CARGO_TARGET, wt_root, True, "cargo builds it again in its worktree",
                            checkout_builds=True, build_output=True, min_idle_hours=window, deep_mtime=True,
                            owner="cargo, in a tools/wt lane worktree", rebuild_minutes=10, platform="linux"))
+    fams += git_cache_families(GIT_CACHE_ROOT)
     return fams
+
+
+def git_cache_mirrors(root: Path) -> list[Path]:
+    """The git cache's mirror directories, <root>/<tenant>/github.com/<owner>/<repo>.git; no symlink is followed."""
+    def dirs(p: Path) -> list[Path]:
+        return [c for c in _children(p) if not c.is_symlink() and c.is_dir()]
+    return [repo for tenant in dirs(root) if tenant.name != "crates"
+            for host in dirs(tenant) if host.name == "github.com"
+            for owner in dirs(host) for repo in dirs(owner) if repo.name.endswith(".git")]
+
+
+def git_cache_families(root: Path) -> list[Family]:
+    """The machine git cache's families (GIT_CACHE_ROOT's comment says which and why): none when it is absent."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    fams = [Family(GIT_CACHE_MIRRORS, root, True, "the git cache fills the mirror again on its next miss",
+                   depth=4, skip=("crates",), pressure_only=True, build_output=True,
+                   min_idle_hours=GIT_CACHE_MIRROR_IDLE_HOURS, deep_mtime=True, owner=GIT_CACHE_OWNER,
+                   rebuild_minutes=20, platform="linux")]
+    crates = root / "crates"
+    if crates.is_dir() and not crates.is_symlink():
+        fams.append(replace(fams[0], id=GIT_CACHE_CRATES, root=crates, depth=1, skip=(),
+                            rebuild="the git cache downloads the crate again on its next miss"))
+    for mirror in git_cache_mirrors(root):
+        pack = mirror / "objects/pack"
+        if pack.is_dir() and not pack.is_symlink():
+            fams.append(Family(GIT_CACHE_PARTIAL, pack, True, "nothing: git never serves a partial pack",
+                               files=True, include=("tmp_", ".tmp-"), build_output=True,
+                               min_idle_hours=GIT_CACHE_PARTIAL_IDLE_HOURS,
+                               max_idle_hours=GIT_CACHE_PARTIAL_IDLE_HOURS, owner=GIT_CACHE_OWNER,
+                               rebuild_minutes=0.0, platform="linux"))
+    return fams
+
+
+# The container image store (docker's /var/lib/docker; containerd's /var/lib/containerd, where docker's containerd
+# image store keeps its content blobs and snapshots). A lane VM builds its runner image there (leo-workspace
+# tools/lane_host_runners.py), so on one 63G lane VM (2026-11-26) the census filed 18.5G of these two roots under
+# "unclassified" and nothing ever gave any of it back: one image came to 3.87G by docker's count and 6.3G in
+# containerd. The store is root's and only docker's own commands may change it, so this is no Family (a Family walks
+# and renames files; nothing here ever touches the store's files):
+# - DOCKER_IMAGES: one item per image and tag, its bytes as `docker system df -v` counts them (unique to it). A
+#   tagged image stays (docker image prune takes only untagged ones; a tag's owner prunes its own tags, as
+#   lane_host_runners.py prune does); an image any container uses, running or stopped, stays whatever its tag; an
+#   untagged ("<none>") image nothing uses goes under pressure only, by `docker image prune --force` (untagged and
+#   unused only, by docker's own rule).
+# - DOCKER_BUILD_CACHE: BuildKit's cache, one item. Under pressure, `docker builder prune --force --keep-storage`
+#   trims it to DOCKER_BUILD_CACHE_KEEP_BYTES, so the next build of the same image still finds its base layers.
+# Apply reads the store again first (an image a container took since the survey stays), and stops for a docker
+# build that runs now (DOCKER_BUILD_RUN), the run's halt, or a filesystem back at its target. Each command is one
+# receipt line with the bytes before and after. The census names both roots with DOCKER_STORE_OWNER, so their bytes
+# read as this store's, not "unclassified".
+DOCKER_IMAGES = "docker-images"
+DOCKER_BUILD_CACHE = "docker-build-cache"
+DOCKER_STORE_ROOTS = (Path("/var/lib/docker"), Path("/var/lib/containerd"))
+DOCKER_STORE_KIND = "container-store"
+DOCKER_STORE_OWNER = ("docker and containerd's image store (cmux-disk's docker-images and docker-build-cache: under "
+                      "pressure, docker image prune for untagged images and docker builder prune --keep-storage)")
+DOCKER_BUILD_CACHE_KEEP_BYTES = 4 * GIB
+DOCKER_TIMEOUT_S = 120
+DOCKER_BUILD_RUN = re.compile(r"(?:^|[\s/])(?:docker|docker-buildx)(?:\s+buildx)?\s+(?:image\s+|builder\s+)?"
+                              r"(?:build|bake)(?:\s|$)|(?:^|[\s/])docker\s+compose\s+(?:\S+\s+)*build(?:\s|$)")
+_DOCKER_SIZE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKMGTP]?)(i?)B\s*$")
+_DOCKER_ARGV: list[str] | None = None
+
+
+def docker_bytes(text: Any) -> int:
+    """docker's human size ("3.87GB", "645.7MB", "0B": decimal units, as docker prints them) in bytes; 0 if unread."""
+    m = _DOCKER_SIZE.match(str(text))
+    if not m:
+        return 0
+    power = " kMGTP".index(m.group(2).replace("K", "k") or " ")
+    return int(float(m.group(1)) * (1024 if m.group(3) else 1000) ** power)
+
+
+def docker_store_present() -> bool:
+    """Whether this Linux host has a container image store and a docker CLI to ask about it."""
+    return not DARWIN and bool(shutil.which("docker")) and any(os.path.isdir(r) for r in DOCKER_STORE_ROOTS)
+
+
+def docker_argv() -> list[str] | None:
+    """How to reach the docker daemon here: `docker` when this account may (the docker group), else `sudo -n docker`
+    where sudo needs no password; None when neither answers. Probed once per run."""
+    global _DOCKER_ARGV
+    if _DOCKER_ARGV is None:
+        _DOCKER_ARGV = []
+        for argv in (["docker"], ["sudo", "-n", "docker"] if sudo_reads() else None):
+            if argv is None:
+                continue
+            try:
+                r = subprocess.run([*argv, "version", "--format", "{{.Server.Version}}"], capture_output=True,
+                                   text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if r.returncode == 0 and r.stdout.strip():
+                _DOCKER_ARGV = argv
+                break
+    return _DOCKER_ARGV or None
+
+
+def docker_run(args: list[str], timeout: float = DOCKER_TIMEOUT_S) -> tuple[int, str]:
+    """One docker command (exit code, stdout); (-1, why) when docker cannot be reached or does not answer in time."""
+    argv = docker_argv()
+    if argv is None:
+        return -1, "no docker daemon this account can reach"
+    try:
+        r = subprocess.run([*argv, *args], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, e.__class__.__name__
+    return r.returncode, r.stdout if r.returncode == 0 else (r.stderr.strip()[:200] or f"exit {r.returncode}")
+
+
+def docker_store_items(pressure: bool = False) -> list[Item] | None:
+    """The image store's items (see DOCKER_IMAGES), judged for a pressure pass or not; None when docker cannot say."""
+    code, out = docker_run(["system", "df", "--verbose", "--format", "{{json .}}"])
+    if code != 0:
+        return None
+    try:
+        df = json.loads(out.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+    if not isinstance(df, dict):
+        return None
+    items: list[Item] = []
+    for img in df.get("Images") or []:
+        if not isinstance(img, dict):
+            continue
+        repo, tag = str(img.get("Repository") or "<none>"), str(img.get("Tag") or "<none>")
+        untagged = repo == "<none>" or tag == "<none>"
+        name = (f"{repo}:{tag}" if not untagged else
+                f"<none>@{str(img.get('ID') or '?').removeprefix('sha256:')[:12]}")
+        try:
+            users = int(str(img.get("Containers") or "0"))
+        except ValueError:
+            users = -1  # an unread count keeps it, as a user would
+        size = docker_bytes(img.get("UniqueSize") or img.get("Size"))
+        why = [f"{gib(docker_bytes(img.get('Size'))).strip()} with shared layers, created "
+               f"{img.get('CreatedSince') or img.get('CreatedAt') or '?'}"]
+        if users != 0:
+            verdict = "in-use"
+            why.insert(0, f"{users} containers use it" if users > 0 else "its container count is unreadable")
+        elif not untagged:
+            verdict = "kept"
+            why.insert(0, "a tagged image: docker image prune takes only untagged ones, and its tag's owner prunes it")
+        elif not pressure:
+            verdict = "kept"
+            why.insert(0, "an untagged image nothing uses: it goes under pressure (docker image prune)")
+        else:
+            verdict = "reclaimable"
+            why.insert(0, "an untagged image no container uses (docker image prune)")
+        items.append(Item(DOCKER_IMAGES, f"docker-image:{name}", size, 0.0, verdict, why, platform="linux"))
+    cache = [c for c in df.get("BuildCache") or [] if isinstance(c, dict)]
+    if cache:
+        total = sum(docker_bytes(c.get("Size")) for c in cache)
+        in_use = sum(docker_bytes(c.get("Size")) for c in cache if c.get("InUse") in (True, "true"))
+        over = max(0, total - max(in_use, DOCKER_BUILD_CACHE_KEEP_BYTES))
+        why = [f"{len(cache)} records, {gib(in_use).strip()} in use by a build"]
+        if over and pressure:
+            verdict = "reclaimable"
+            why.insert(0, f"{gib(over).strip()} past its {gib(DOCKER_BUILD_CACHE_KEEP_BYTES).strip()} keep "
+                          "(docker builder prune --keep-storage)")
+        else:
+            verdict = "kept"
+            why.insert(0, f"within its {gib(DOCKER_BUILD_CACHE_KEEP_BYTES).strip()} keep" if not over else
+                       f"{gib(over).strip()} past its keep: trimmed under pressure (docker builder prune)")
+        items.append(Item(DOCKER_BUILD_CACHE, "docker-build-cache", total, 0.0, verdict, why, platform="linux"))
+    return items
+
+
+def docker_store_dev() -> int | None:
+    for root in DOCKER_STORE_ROOTS:
+        with contextlib.suppress(OSError):
+            return os.stat(root).st_dev
+    return None
+
+
+def apply_docker_store(receipt: Path, halt=None, below_target=None, families: frozenset[str] | None = None) -> int:
+    """Under pressure, give back the image store's reclaimable bytes by docker's own commands (DOCKER_IMAGES says
+    which and when); returns the bytes released by docker's own count (a fresh read before and after)."""
+    released = 0
+    for fam, command in ((DOCKER_IMAGES, ["image", "prune", "--force"]),
+                         (DOCKER_BUILD_CACHE, ["builder", "prune", "--force",
+                                               f"--keep-storage={DOCKER_BUILD_CACHE_KEEP_BYTES}"])):
+        if families and fam not in families:
+            continue
+        if below_target is not None and not below_target():
+            break
+        fresh = docker_store_items(pressure=True)
+        if fresh is None:
+            break  # docker does not answer: nothing to judge by
+        due = [i for i in fresh if i.family == fam and i.verdict == "reclaimable"]
+        if not due:
+            continue
+        why = halt() if halt is not None else ""
+        if not why:
+            try:
+                _, cmds = process_evidence()
+            except NoEvidence as e:
+                why = f"no process evidence: {e}"
+            else:
+                run = next((line for line in cmds.splitlines() if DOCKER_BUILD_RUN.search(line)), "")
+                if run:
+                    why = f"a docker build runs ({run.strip()[:120]})"
+        before = sum(i.bytes for i in fresh if i.family == fam)
+        after = before
+        if why:
+            outcome = f"stopped:{why[:60]}"
+        else:
+            code, out = docker_run(command, timeout=900)
+            outcome = "reclaimed" if code == 0 else f"incomplete:{out[:60]}"
+            again = docker_store_items(pressure=True)
+            if again is not None:
+                after = sum(i.bytes for i in again if i.family == fam)
+            freed = max(0, before - after)
+            released += freed
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": fam, "command": "docker " + " ".join(command), "bytes_before": before,
+               "bytes_after": after, "items": [asdict(i) for i in due], "sweep": "pressure",
+               "rebuild": "docker pulls or builds the image again; BuildKit rebuilds the cache on the next build"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(max(0, before - after))}  {fam} (docker {' '.join(command)})")
+        if why:
+            break
+    return released
+
+
+# Another account's runner directories (/home/ghrun/<runner>, an ordinary actions/runner install the build-fleet
+# started with its own user). A lane VM (2026-11-27, 92% of 774G) held 124.4G there that no family named, so every
+# pass reported 0.0G reclaimable and blocked 219.5G: the folder is mode 750 and owned by another account, which the
+# in-process families can neither list nor delete. This family reads and deletes it with `sudo -n` (where sudo needs
+# no password) and only these parts, each only once nothing can be using it:
+# - <runner>/_work/<repo> and <runner>/work/<repo> (job checkouts and their build output) and <runner>/_work/_tool
+#   (the tool cache a job's setup step downloads again), when no Runner.Listener or Runner.Worker runs from that runner
+#   directory and nothing below the item changed for GHRUN_IDLE_HOURS;
+# - /home/ghrun/.cache/go-build, when no Runner.Worker runs anywhere on the host and nothing changed in it for the
+#   window (go rebuilds it).
+# Never: a runner's config (.runner, .credentials*, .path, .env), bin, externals, svc.sh, _diag, _actions, _temp,
+# _PipelineMapping. Without `sudo -n` the family reports one blocked item and deletes nothing. Deletion needs sudo.
+# Each item is also proved as root (GHRUN_PROOF_SRC), once when listed and again right before its `rm`: no process
+# holds a file, cwd, root or executable at or below it (every /proc entry read; one unreadable keeps everything), and
+# its runner's systemd unit (<runner>/.service) is inactive or failed (one that is active, starting, or did not answer
+# keeps the runner's items). A command line alone names no open file, and the gate starts a stopped runner at any time.
+GHRUN_FAMILY = "ghrun-idle-runner"
+GHRUN_ROOT = Path("/home/ghrun")
+GHRUN_IDLE_HOURS = BUILD_STATE_STALE_HOURS
+GHRUN_TIMEOUT_S = 300
+GHRUN_RUNNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GHRUN_WORKER_RE = re.compile(r"(/[^\s]*?)/bin/Runner\.(Listener|Worker)(?:\s|$)")
+GHRUN_UNIT_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+\.service$")
+GHRUN_STOPPED_STATES = frozenset({"inactive", "failed"})
+# Read as root (`sudo -n python3 -I -c`): every process's cwd, root, executable and open files, since this account
+# cannot read another account's /proc/PID/fd and a command line names no open file; and each runner's `.service` (the
+# systemd unit svc.sh installed, which the gate stops and starts). Prints {paths, denied, units}; read only.
+GHRUN_PROOF_SRC = r'''
+import json, os, sys
+runners = json.loads(sys.argv[1])
+paths, denied = [], 0
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    base = "/proc/" + pid
+    try:
+        fds = [base + "/fd/" + fd for fd in os.listdir(base + "/fd")]
+    except FileNotFoundError:
+        continue
+    except OSError:
+        denied, fds = denied + 1, []
+    for link in [base + "/cwd", base + "/root", base + "/exe", *fds]:
+        try:
+            paths.append(os.readlink(link))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            denied += 1
+units = {}
+for r in runners:
+    try:
+        with open(os.path.join(r, ".service"), "rb") as f:
+            units[r] = f.read(512).decode("utf-8", "replace").strip()
+    except FileNotFoundError:
+        units[r] = ""
+    except OSError:
+        units[r] = None
+print(json.dumps({"paths": paths, "denied": denied, "units": units}))
+'''
+
+
+def ghrun_present() -> bool:
+    """Whether this Linux host has the runner account's folder (it exists even where we cannot read it)."""
+    return not DARWIN and os.path.isdir(GHRUN_ROOT)
+
+
+def ghrun_target_ok(path: str, root: Path | None = None) -> bool:
+    """Whether PATH, as it stands (already a realpath), is one of the only places this family may delete:
+    <root>/<runner>/_work/_tool, <root>/<runner>/{_work,work}/<repo> (a name not starting with _ or .), or
+    <root>/.cache/go-build. Any `..`, empty part, relative path or other shape is refused."""
+    root = GHRUN_ROOT if root is None else root
+    if not isinstance(path, str) or not path.startswith("/") or os.path.normpath(path) != path:
+        return False
+    try:
+        rel = Path(path).relative_to(root).parts
+    except ValueError:
+        return False
+    if rel == (".cache", "go-build"):
+        return True
+    if len(rel) != 3 or not GHRUN_RUNNER_RE.match(rel[0]) or rel[1] not in ("_work", "work"):
+        return False
+    leaf = rel[2]
+    if leaf == "_tool":
+        return rel[1] == "_work"
+    return bool(GHRUN_RUNNER_RE.match(leaf)) and not leaf.startswith(("_", "."))
+
+
+def ghrun_sudo(args: list[str], timeout: float = GHRUN_TIMEOUT_S) -> tuple[int, str]:
+    """One command as root (`sudo -n`): (exit code, stdout); (-1, why) when sudo is unavailable or the call fails."""
+    if not sudo_reads():
+        return -1, "sudo -n is not available here"
+    try:
+        r = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, e.__class__.__name__
+    return r.returncode, r.stdout if r.returncode == 0 else (r.stderr.strip()[:200] or f"exit {r.returncode}")
+
+
+def ghrun_live() -> tuple[set[str], bool]:
+    """(the runner directories with a Runner.Listener or Runner.Worker running from them, whether any Runner.Worker
+    runs on the host). Raises NoEvidence when the process list cannot be read: that keeps everything."""
+    _, cmds = process_evidence()
+    dirs: set[str] = set()
+    worker = False
+    for m in GHRUN_WORKER_RE.finditer(cmds):
+        worker = worker or m.group(2) == "Worker"
+        dirs.add(os.path.normpath(m.group(1)))
+    return dirs, worker
+
+
+def ghrun_unit_states(units: list[str]) -> dict[str, str]:
+    """systemd's word for each unit ("active", "inactive", ...); a unit it did not answer for is absent."""
+    if not units:
+        return {}
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--", *units], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    lines = r.stdout.split()
+    return dict(zip(units, lines)) if len(lines) == len(units) else {}
+
+
+def ghrun_proofs(runners: list[str]) -> tuple[list[str], dict[str, str]]:
+    """(every path a process on the host holds, read as root; RUNNER -> why its service keeps it, or "" when it has
+    no unit or its unit is stopped). Raises NoEvidence when /proc cannot be read whole: that keeps everything."""
+    code, out = ghrun_sudo(["python3", "-I", "-c", GHRUN_PROOF_SRC, json.dumps(sorted(set(runners)))], timeout=300)
+    if code != 0:
+        raise NoEvidence(f"cannot read /proc as root: {out[:120]}")
+    try:
+        got = json.loads(out)
+        paths, denied, units = list(got["paths"]), int(got["denied"]), dict(got["units"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise NoEvidence(f"the /proc proof did not parse: {e.__class__.__name__}") from e
+    if denied or not paths:
+        raise NoEvidence(f"/proc as root: {denied} entries unreadable, {len(paths)} read")
+    named = {r: u for r, u in units.items() if isinstance(u, str) and GHRUN_UNIT_RE.match(u)}
+    states = ghrun_unit_states(sorted(set(named.values())))
+    held = {}
+    for r in set(runners):
+        u = units.get(r)
+        if u == "":
+            held[r] = ""  # no unit installed: the process check alone decides
+        elif r not in named:
+            held[r] = "its runner service could not be read"
+        elif states.get(named[r]) is None:
+            held[r] = f"its runner service {named[r]} did not report its state"
+        elif states[named[r]] not in GHRUN_STOPPED_STATES:
+            held[r] = f"its runner service {named[r]} is {states[named[r]]}"
+        else:
+            held[r] = ""
+    return [h.removesuffix(" (deleted)") for h in paths], held
+
+
+def ghrun_holder(path: str, holders: list[str]) -> str:
+    """The first held path at or below PATH; "" when no process holds anything there."""
+    return next((h for h in holders if h == path or h.startswith(path + "/")), "")
+
+
+def ghrun_held(path: str, runner: str, holders: list[str], units: dict[str, str]) -> str:
+    """Why the root proof keeps PATH (a process holds a file below it, or its runner's service is not stopped)."""
+    h = ghrun_holder(path, holders)
+    if h:
+        return f"a process holds {h[len(path):][:60] or 'it'} below it"
+    return units.get(runner, "its runner service was not read") if runner else ""
+
+
+def ghrun_changed_since(path: str, hours: float) -> str:
+    """"" when nothing below PATH changed in the last HOURS, else why not (a changed file, or why it could not be read)."""
+    cutoff = int(time.time() - hours * 3600)
+    code, out = ghrun_sudo(["find", path, "-xdev", "-newermt", f"@{cutoff}", "-print", "-quit"])
+    if code != 0:
+        return f"cannot tell whether it changed: {out}"
+    return f"changed in the last {hours:g}h ({out.strip()[:80]})" if out.strip() else ""
+
+
+def ghrun_size(path: str) -> int:
+    code, out = ghrun_sudo(["du", "-xs", "-B1", "--", path])
+    try:
+        return int(out.split()[0]) if code == 0 else 0
+    except (ValueError, IndexError):
+        return 0
+
+
+def ghrun_candidates(root: Path | None = None) -> list[str] | None:
+    """The candidate paths (one `sudo -n find` of the account's fixed places), or None when sudo cannot list them."""
+    root = GHRUN_ROOT if root is None else root
+    code, out = ghrun_sudo(["find", os.fspath(root), "-mindepth", "1", "-maxdepth", "4", "-xdev", "-type", "d",
+                            "(", "-path", f"{root}/*/_work/*", "-o", "-path", f"{root}/*/work/*", "-o", "-path",
+                            f"{root}/.cache/go-build", ")", "-prune", "-print"], timeout=120)
+    if code != 0:
+        return None
+    return sorted({p for p in out.splitlines() if ghrun_target_ok(p, root)})
+
+
+def ghrun_runner_of(path: str) -> str:
+    """The runner directory an item sits in; "" for the account's go-build cache."""
+    return "" if path.endswith("/.cache/go-build") else os.fspath(Path(path).parent.parent)
+
+
+def ghrun_items(root: Path | None = None, live: tuple[set[str], bool] | None = None) -> list[Item]:
+    """The account's items with their verdicts (see GHRUN_FAMILY); one unchecked item when it cannot be judged."""
+    root = GHRUN_ROOT if root is None else root
+    cands = ghrun_candidates(root)
+    if cands is None:
+        return [Item(GHRUN_FAMILY, os.fspath(root), 0, 0.0, "unchecked",
+                     ["blocked: sudo -n cannot list it, so nothing here can be judged or deleted"],
+                     platform="linux")]
+    try:
+        dirs, worker = ghrun_live() if live is None else live
+        holders, units = ghrun_proofs([r for r in map(ghrun_runner_of, cands) if r])
+    except NoEvidence as e:
+        return [Item(GHRUN_FAMILY, p, ghrun_size(p), 0.0, "unchecked", [f"no process evidence: {e}"],
+                     platform="linux") for p in cands]
+    items = []
+    for p in cands:
+        runner = ghrun_runner_of(p)
+        held = ghrun_held(p, runner, holders, units)
+        if runner and runner in dirs:
+            verdict, why = "in-use", "a Runner.Listener or Runner.Worker runs from this runner directory"
+        elif not runner and worker:
+            verdict, why = "in-use", "a Runner.Worker is running on this host"
+        elif held:
+            verdict, why = "in-use", held
+        else:
+            why = ghrun_changed_since(p, GHRUN_IDLE_HOURS)
+            verdict = "recent" if why.startswith("changed") else "unchecked" if why else "reclaimable"
+            why = why or ((f"its runner is not running" if runner else "no Runner.Worker runs")
+                          + f" and nothing changed for {GHRUN_IDLE_HOURS:g}h")
+        items.append(Item(GHRUN_FAMILY, p, ghrun_size(p), GHRUN_IDLE_HOURS if verdict == "reclaimable" else 0.0,
+                          verdict, [why], platform="linux"))
+    return items
+
+
+def ghrun_remove(path: str, root: Path | None = None) -> str:
+    """Delete one item: "" on success, else why not. Confined to ghrun_target_ok on the realpath; liveness and the
+    idle window are read again right before the delete."""
+    root = GHRUN_ROOT if root is None else root
+    code, real = ghrun_sudo(["realpath", "-e", "--", path], timeout=60)
+    real = real.strip()
+    if code != 0 or real != path or not ghrun_target_ok(real, root):
+        return f"refusing: {path} is not a confined path (realpath {real or '?'})"
+    try:
+        dirs, worker = ghrun_live()
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    runner = ghrun_runner_of(real)
+    if (runner and runner in dirs) or (not runner and worker):
+        return "a runner is live now"
+    try:
+        holders, units = ghrun_proofs([runner] if runner else [])
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    held = ghrun_held(real, runner, holders, units)
+    if held:
+        return held
+    changed = ghrun_changed_since(real, GHRUN_IDLE_HOURS)
+    if changed:
+        return changed
+    code, out = ghrun_sudo(["rm", "-rf", "--one-file-system", "--", real], timeout=3600)
+    return "" if code == 0 else f"rm failed: {out}"
+
+
+def apply_ghrun(receipt: Path, halt=None, below_target=None, root: Path | None = None) -> int:
+    """Under pressure, delete the account's reclaimable items largest first (see GHRUN_FAMILY); returns the bytes
+    released. Each removed path is printed and appended to the receipt with its size."""
+    released = 0
+    for item in sorted((i for i in ghrun_items(root) if i.verdict == "reclaimable"), key=lambda i: -i.bytes):
+        if below_target is not None and not below_target():
+            break
+        stop = halt() if halt is not None else ""
+        why = stop or ghrun_remove(item.path, root)
+        outcome = "reclaimed" if not why else f"kept:{why[:80]}"
+        released += 0 if why else item.bytes
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": GHRUN_FAMILY, "path": item.path, "bytes": item.bytes, "sweep": "pressure",
+               "rebuild": "a job's checkout step or setup step, or go build, makes it again"}
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome[:16]:16s} {gib(item.bytes)}  {GHRUN_FAMILY} {item.path}")
+        if stop:
+            break
+    return released
 
 
 DELETING_PREFIX =".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
@@ -8600,6 +9371,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "user-cache",          # ~/.cache
     "cua-cache",
     "cmux-ghosttykit-cache",
+    PERF_BENCH_APPS, PERF_BENCH_COPIES, CMUX_CEF_RUNTIMES, VPHONE_IPSWS,  # re-downloadable caches no job owns
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
     "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
     "lume-bench-images",   # LUME_BENCH_IMAGES: a pulled bench image; a lume command or open disk.img still keeps it
@@ -8647,7 +9419,7 @@ def deletion_owner_live(path: Path) -> str:
     except OSError:
         pass  # another user's live process
     command = _owner_command(pid)
-    if not command or "glaeda-disk" in command:
+    if not command or "glaeda-disk" in command or "cmux-disk" in command:
         return f"glaeda-disk (pid {pid}) is still deleting it"
     return ""
 
@@ -9692,14 +10464,6 @@ def mirror_archive() -> Path:
     return HOME / "archive" / "glaeda-disk"
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def drop_unused_archives(written: list[Path]) -> None:
     """Delete the archives this pass wrote for a mirror item that then stayed (in use, or not all of it could be
     archived), and their manifest lines. The tree still holds everything they hold. Without this, a warm cache that
@@ -9853,6 +10617,57 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
         os.chmod(tmp, 0o600)
         os.replace(tmp, manifest)
     return gone
+
+
+# What a writer of ~/archive/glaeda-disk leaves when it is killed before its `finally` (a pass past its bound, a
+# reboot): `.<archive name>.<pid>.tmp` (a bundle, patch or tar being written or checked, _write_bundle,
+# archive_work_tree, archive_git_dir; `.manifest.<pid>.tmp` too) and `.<archive name>.<pid>.expiring` (an expired
+# archive renamed aside by prune_mirror_archive before its hash). cmux22, 2026-11-26: seven `.tmp` files from
+# 2026-11-07..24, 3.7 GB, none open and their writers long gone, which no pass ever took: the manifest lists only
+# finished archives, so prune_mirror_archive never saw them, and they sat on a mini whose 18 runners waited on the
+# disk floor. A leftover is stale once its writer's pid is gone, or once nothing wrote it for
+# ARCHIVE_LEFTOVER_STALE_S (a writer's git and tar steps are bounded at 600 s each; a reused pid keeps one no longer).
+ARCHIVE_LEFTOVER_RE = re.compile(r"\.(?P<name>.+)\.(?P<pid>\d+)\.(?P<kind>tmp|expiring)")
+ARCHIVE_LEFTOVER_STALE_S = 24 * 3600
+
+
+def prune_archive_leftovers(now: float | None = None, in_use=lambda p: False) -> list[str]:
+    """Reclaim the stale leftovers of killed archive writers in ~/archive/glaeda-disk (ARCHIVE_LEFTOVER_RE): a
+    `.tmp` is deleted (it never became an archive; an archive linked from it keeps its own name), an `.expiring`
+    goes back to its archive name, which the manifest still lists, so the next prune hashes it as usual (never
+    over a file there). Kept: a writer still alive and writing, anything in_use, a symlink or anything not a plain
+    file, and anything else in the directory. The names reclaimed or restored."""
+    now, root, done = time.time() if now is None else now, mirror_archive(), []
+    if root.is_symlink() or not root.is_dir():
+        return done
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return done
+    for e in entries:
+        if not (m := ARCHIVE_LEFTOVER_RE.fullmatch(e.name)):
+            continue
+        p = Path(e.path)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        idle = now - st.st_mtime  # a writer's bytes move mtime; a pid reused since keeps it no longer than this
+        if pid_alive(int(m["pid"])) and idle < ARCHIVE_LEFTOVER_STALE_S:
+            continue  # its writer may still be at it
+        if in_use(p):
+            continue
+        try:
+            if m["kind"] == "tmp":
+                p.unlink()
+            else:
+                rename_noreplace(p, root / m["name"])
+        except OSError:
+            continue
+        done.append(e.name)
+    return done
 
 
 def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> list[str]:
@@ -11275,6 +12090,32 @@ def git_common_dir(path: Path) -> str:
 
 UNREADABLE: set[str] = set()
 
+# A dead FUSE or stale mount (ENOTCONN, ESTALE, EIO, ESHUTDOWN) makes pathlib's is_dir/is_file/exists/is_symlink raise, which
+# ended a whole cleaner pass (a lane VM, 2026-11-26: /home/cmux/.wt/checkouts/cmux/lane--share-black-screen-repair, a dead
+# cmux-projection mount, Errno 107). Each predicate answers False for such a path, which is then skipped and reported.
+DEAD_MOUNT_ERRNOS = frozenset(getattr(errno, n) for n in ("ENOTCONN", "ESTALE", "EIO", "ESHUTDOWN", "ENODEV") if hasattr(errno, n))
+DEAD_MOUNTS: set[str] = set()
+
+
+def _tolerate_dead_mounts(method):
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except OSError as error:
+            if error.errno not in DEAD_MOUNT_ERRNOS:
+                raise
+            DEAD_MOUNTS.add(str(self))
+            return False
+    wrapper.__name__ = method.__name__
+    wrapper._dead_mount_tolerant = True
+    return wrapper
+
+
+for _name in ("is_dir", "is_file", "exists", "is_symlink", "is_mount"):
+    _method = getattr(Path, _name, None)
+    if _method is not None and not getattr(_method, "_dead_mount_tolerant", False):
+        setattr(Path, _name, _tolerate_dead_mounts(_method))
+
 
 def _entries(path: Path, *, catalogue: bool = False) -> list[os.DirEntry]:
     """Like _children, but entries carry their type, so filtering tens of thousands (a macOS
@@ -11296,7 +12137,9 @@ def _children(path: Path) -> list[Path]:
     except PermissionError:
         UNREADABLE.add(str(path))
         return []
-    except OSError:
+    except OSError as error:
+        if error.errno in DEAD_MOUNT_ERRNOS:
+            DEAD_MOUNTS.add(str(path))
         return []
 
 
@@ -11316,16 +12159,6 @@ def owner_retired(fam: Family) -> bool:
                 return False
         except (OSError, subprocess.SubprocessError):
             return False  # unknown: say nothing rather than call a live owner retired
-    return True
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # someone else's live process
     return True
 
 
@@ -12609,6 +13442,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
+        if (why := tmp_transcript_hold(fam, path)):
+            reasons.append(why)
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
         if fam.id == WT_CARGO_TARGET and not blind and (why := wt_checkout_hold(path, opened, cmds)):
@@ -13350,7 +14185,16 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     (str(HOME / "Applications"), "user-installed apps"),
     (str(HOME / ".rustup"), "rustup toolchains (home-caches reclaims stale ones)"),
     (str(HOME / ".local"), "installed tools (glaeda's bin among them)"),
+    *((str(root), DOCKER_STORE_OWNER) for root in DOCKER_STORE_ROOTS),
 )
+
+
+def census_kind(label: str, kind: str) -> str:
+    """A census row's kind as shown: a sized tree in the container image store is that store's (DOCKER_STORE_KIND),
+    not "unclassified"; every other kind as the census wrote it."""
+    if kind == "unclassified" and any(label == str(r) or label.startswith(f"{r}/") for r in DOCKER_STORE_ROOTS):
+        return DOCKER_STORE_KIND
+    return kind
 
 
 def census_owner(path: str) -> str:
@@ -13518,6 +14362,95 @@ CENSUS_AFTER_SKIPS = (None, "no pressure", "no pressure; idle sweep ran within t
 DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
 OPEN_DELETED = "open-deleted (files a process still holds; lsof +L1 names them)"  # Linux has no purgeable space
+
+# A Linux gap used to be named open-deleted whole, unmeasured; on a lane VM it said 55.9G while the deleted
+# files processes held came to 2 KB and the bytes sat under overlay and FUSE mount points, where du -x never
+# looks. So a gap is split: what /proc says is held open (measured), the rest named as shadowed by mounts.
+_OPEN_DELETED_SRC = r"""
+import os
+def open_deleted(dev, proc="/proc"):
+    seen, held, denied = set(), {}, 0
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(proc + "/" + pid + "/fd")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            denied += 1
+            continue
+        for fd in fds:
+            link = proc + "/" + pid + "/fd/" + fd
+            try:
+                if not os.readlink(link).endswith(" (deleted)"):
+                    continue
+                st = os.stat(link)
+            except OSError:
+                continue
+            if st.st_dev != dev or (st.st_mode & 0o170000) != 0o100000 or (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            held[pid] = held.get(pid, 0) + st.st_blocks * 512
+    return held, denied
+"""
+_open_deleted_ns: dict[str, Any] = {}
+exec(_OPEN_DELETED_SRC, _open_deleted_ns)
+open_deleted_local = _open_deleted_ns["open_deleted"]
+
+
+def open_deleted_held(dev: int, timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[dict[str, int], int]:
+    """Bytes of deleted regular files on dev that processes still hold, by pid, and how many pids stayed
+    unreadable; read as root (`sudo -n`, bounded) when some pids are not ours to read."""
+    held, denied = open_deleted_local(dev)
+    if denied and sudo_reads():
+        code = _OPEN_DELETED_SRC + f"\nimport json, sys\nsys.stdout.write(json.dumps(open_deleted({int(dev)})))\n"
+        try:
+            out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)),
+                                  sys.executable or "/usr/bin/python3", "-I", "-c", code],
+                                 capture_output=True, text=True, timeout=timeout + 15)
+            got = json.loads(out.stdout) if out.returncode == 0 else None
+            if isinstance(got, list) and isinstance(got[0], dict) and isinstance(got[1], int):
+                held, denied = {str(k): int(v) for k, v in got[0].items()}, got[1]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+            pass
+    return held, denied
+
+
+def mounts_over(mount: str, mountinfo: str = "/proc/self/mountinfo") -> collections.Counter:
+    """Mount points sitting on the filesystem mounted at mount, by type: du -x stops at each and never
+    sees the bytes left on this filesystem underneath it."""
+    rows = []
+    try:
+        for line in Path(mountinfo).read_text().splitlines():
+            head, _, tail = line.partition(" - ")
+            f = head.split()
+            if len(f) >= 5 and tail:
+                rows.append((f[0], f[1], f[4].replace("\\040", " "), tail.split()[0]))
+    except OSError:
+        return collections.Counter()
+    ids = {mid for mid, _, point, _ in rows if point == mount}
+    return collections.Counter(kind for _, parent, point, kind in rows if parent in ids and point != mount)
+
+
+def linux_gap_residual(fs: "Fs", gap: int, shown: int = 3) -> str:
+    """Name a Linux volume's gap by measuring it: open-deleted bytes from /proc with their top holders,
+    and the rest as bytes under this filesystem's mount points or unmeasured."""
+    if gap <= 0:
+        return OPEN_DELETED
+    held, denied = open_deleted_held(fs.dev)
+    total = sum(held.values())
+    top = [kv for kv in sorted(held.items(), key=lambda kv: -kv[1])[:shown] if kv[1] >= 64 * 2**20]
+    parts = [f"open-deleted {gib(total).strip()} measured in /proc"
+             + (f" (top holders: {', '.join(f'pid {p} {gib(b).strip()}' for p, b in top)})" if top else "")
+             + (f", {denied} pids unreadable" if denied else "")]
+    rest = max(0, gap - total)
+    if rest:
+        over = mounts_over(fs.mount)
+        kinds = ", ".join(f"{n} {k}" for k, n in over.most_common(4))
+        parts.append(f"{gib(rest).strip()} under mount points or unmeasured"
+                     + (f" ({sum(over.values())} mounts on this fs: {kinds})" if over else ""))
+    return "; ".join(parts)
 
 
 _CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
@@ -13939,8 +14872,10 @@ def pwd_name(uid: int) -> str:
 def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, list[Any]] = {}
     for key, row in census["rows"].items():
-        label = _census_label(key, str(row[1]))
-        hit = merged.setdefault(label, [0, row[1]])
+        shown = _census_label(key, str(row[1])).split(":", 1)[1]
+        kind = census_kind(shown, str(row[1]))
+        label = f"{kind}:{shown}"
+        hit = merged.setdefault(label, [0, kind])
         hit[0] += int(row[0])
     ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
     children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
@@ -14273,8 +15208,9 @@ def root_census_coverage(census: dict[str, Any]) -> list[dict[str, Any]]:
         label = _root_label(key)
         account = row[3] if len(row) > 3 and row[3] else ""
         owner = census_owner(label) or (f"{account}'s files" if account else "")
-        children.append({"category": f"{row[1]}:{label}", "bytes": size, "private": False,
-                         "classification": str(row[1]), **({"owner": owner} if owner else {}),
+        kind = census_kind(label, str(row[1]))
+        children.append({"category": f"{kind}:{label}", "bytes": size, "private": False,
+                         "classification": kind, **({"owner": owner} if owner else {}),
                          **({"account": account} if account else {})})
     rest = sum(size for size, _, _ in ranked[CENSUS_ROWS_SHOWN:])
     if rest:
@@ -14503,7 +15439,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
             sudo_measured = len(census.get("sudo_measured") or [])
             # an APFS volume (macOS, or its sibling volumes read) hides purgeable space; a Linux one only open-deleted files
-            residual = (APFS_INVISIBLE if DARWIN or volumes else OPEN_DELETED) + (
+            residual = (APFS_INVISIBLE if DARWIN or volumes else linux_gap_residual(fs, gap)) + (
                 f" and {unreadable} unreadable or skipped dirs (lower bounds)" if unreadable else "") \
                 + (f"; {sudo_measured} measured with sudo" if sudo_measured else "") \
                 + census_unreadable_named(census)
@@ -14877,6 +15813,8 @@ def _owner_command(pid: int) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
+    """One definition for the whole file: an earlier copy (PermissionError read as alive) was shadowed by this one,
+    which every caller already ran (Python keeps the last top-level def)."""
     if pid <= 0:
         return False
     try:
@@ -14900,7 +15838,7 @@ def _take_over_stale_evict_owner() -> bool:
         # A dead owner has already released flock; retrying the acquisition is sufficient.
         return True
     command = _owner_command(pid)
-    if "glaeda-disk" not in command:
+    if "glaeda-disk" not in command and "cmux-disk" not in command:  # cmux-disk: its primary name runs the same code
         return False
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGTERM)
@@ -14914,7 +15852,9 @@ def _take_over_stale_evict_owner() -> bool:
 
 
 def _write_evict_owner() -> None:
-    EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    """The evict lock holder's record. On a full disk (ENOSPC, EDQUOT) it is skipped, not raised: the flock already
+    makes this run the one evictor, the record only names it, and an OSError here used to end the pass before it
+    freed a byte (take_evict_lock catches only BlockingIOError)."""
     try:
         owner = pwd.getpwuid(os.getuid()).pw_name
     except (KeyError, OSError):
@@ -14922,8 +15862,17 @@ def _write_evict_owner() -> None:
     payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
                "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv)}
     tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")))
-    os.replace(tmp, EVICT_OWNER)
+    try:
+        EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, EVICT_OWNER)
+    except OSError as e:
+        if e.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        with contextlib.suppress(OSError):
+            print(f"glaeda-disk: evict owner record not written ({e}); the pass goes on", file=sys.stderr)
 
 
 def caller_floor_wait_s(now: float | None = None) -> float | None:
@@ -14961,7 +15910,54 @@ def pressure_pass_lock() -> bool:
         os.close(fd)
         return True
     _PRESSURE_PASS_HANDLE = fd
+    with contextlib.suppress(OSError):  # who holds it, for a skipped pass's line (pressure_pass_holder)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({"pid": os.getpid(), "started_at": time.time(),
+                                  "caller": RUN.get("caller")}).encode(), 0)
     return True
+
+
+def pressure_pass_holder(now: float | None = None) -> tuple[str, dict]:
+    """Why a pressure pass skipped, said so a reader can tell a live pass from a stuck one: who holds
+    pressure-pass.lock (pid, age, caller, as the holder wrote it) and what the last pass that ran, from the run log,
+    freed and found blocked. 2026-11-26, two lane VMs at 95-96%: a coordinator's own apply skipped with "another
+    pressure pass is running" and read it as a stuck lock; the holder was the 15-minute timer's pass, alive 2-4 min,
+    and each finished pass had freed 0 GiB with 70-77 GiB blocked as live-held."""
+    now = time.time() if now is None else now
+    details: dict = {}
+    parts: list[str] = []
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        held = json.loads((EVICT_LOCK.parent / "pressure-pass.lock").read_text() or "{}")
+        if isinstance(held, dict) and held.get("pid"):
+            alive = True
+            try:
+                os.kill(int(held["pid"]), 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                pass
+            age = max(0, int(now - float(held.get("started_at") or now)))
+            details["holder"] = {"pid": int(held["pid"]), "age_s": age, "caller": held.get("caller"), "alive": alive}
+            parts.append(f"pid {held['pid']} ({'alive' if alive else 'gone'}), started {age // 60} min {age % 60} s "
+                         f"ago by {held.get('caller') or 'an unnamed caller'}")
+    last = None
+    with contextlib.suppress(OSError, ValueError):
+        with open(RUN_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - (1 << 20)))
+            for line in reversed(fh.read().decode("utf-8", "replace").splitlines()):
+                with contextlib.suppress(ValueError):
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("mode") == "pressure" and not row.get("skipped"):
+                        last = row
+                        break
+    if last:
+        blocked = last.get("blocked") or {}
+        details["last_pass"] = {k: last.get(k) for k in ("at", "reclaimed_gib", "free_gib_after", "blocked")}
+        held_by = ", ".join(f"{k} {v} GiB" for k, v in sorted(blocked.items(), key=lambda kv: -kv[1])[:4])
+        parts.append(f"the last pass that ran ({last.get('at')}) freed {last.get('reclaimed_gib', 0)} GiB"
+                     + (f"; it found in use: {held_by}" if held_by else ""))
+    return ("; ".join(parts), details)
 
 
 def floor_evict_wait_until(apply_: bool) -> float:
@@ -15227,6 +16223,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
         hint = (f"background jobs need Full Disk Access for {os.path.realpath(sys.executable)}"
                 if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")
         print(f"\ncannot read {u}: permission denied ({hint})", file=sys.stderr)
+    for u in sorted(DEAD_MOUNTS):
+        print(f"\nskipped {u}: dead mount (ENOTCONN/ESTALE/EIO); unmount or repair it, the pass went on", file=sys.stderr)
     total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
     if not DARWIN:
         for line in owned_elsewhere_lines():
@@ -15642,14 +16640,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
     cwds = open_index(cwds)
+
+    def archive_in_use(q: Path) -> bool:
+        try:
+            o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
+        except NoEvidence as error:
+            RUN["apply_incomplete"] = f"archive pruning: {error}"
+            return True
+        return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
+    # Every pass, mirror items or not: a killed writer's leftovers are no archive any expiry reaches (cmux22,
+    # 2026-11-26, 3.7 GB; prune_archive_leftovers).
+    if not archive_root_why() and (left := prune_archive_leftovers(in_use=archive_in_use)):
+        RUN.setdefault("archive_leftovers", []).extend(left)
     if any(f.mirror_idle_hours is not None for f in every):
-        def archive_in_use(q: Path) -> bool:
-            try:
-                o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
-            except NoEvidence as error:
-                RUN["apply_incomplete"] = f"archive pruning: {error}"
-                return True
-            return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
         if not archive_root_why():
             prune_mirror_archive(in_use=archive_in_use)
         if (expired := prune_foreign_archives(in_use=archive_in_use)):
@@ -15827,6 +16830,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
+                or tmp_transcript_hold(fam, p, fresh=True)
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
                 or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
@@ -17278,7 +18282,9 @@ def _file_key(st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
 
-def _sha256(path: str) -> str:
+def _sha256(path: str | os.PathLike[str]) -> str:
+    """One definition for the whole file: an earlier `_sha256(path: Path)` at the archive code was shadowed by this
+    one (Python keeps the last top-level def), so its callers already ran this; open() takes a str or a Path."""
     import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -17868,7 +18874,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # pass that holds it judges the same filesystems against the same floor, so a second one only waits.
     if (a.pressure and a.apply and under and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
             and not pressure_pass_lock()):
-        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
+        said, held = pressure_pass_holder()
+        RUN["pressure_pass_holder"] = held
+        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped"
+                        + (f" ({said})" if said else ""), **held)
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # what a fleet mini under pressure frees that it otherwise holds for good (PRESSURE_WORKER_BUILD_OUTPUT)
@@ -18207,12 +19216,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
     tmp_residue = tmp_test_residue_census() if not RUNNER_CACHE_PROFILE else None
-    fill_holds([*items, *tooling])
+    # the container image store, by image and tag (DOCKER_IMAGES): a report lists it; an apply asks docker again
+    docker_items = ((docker_store_items(pressure=bool(a.pressure and under)) or [])
+                    if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and docker_store_present() else [])
+    ghrun_report = (ghrun_items() if not a.apply and not RUNNER_CACHE_PROFILE and not DEAD_MODE and ghrun_present()
+                    else [])
+    fill_holds([*items, *tooling, *docker_items, *ghrun_report])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
                           "cmux_acts": ROLE == "devbox" and cmux_build_caches_on(),
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
+                          "docker": [asdict(i) for i in docker_items],
+                          "ghrun": [asdict(i) for i in ghrun_report],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
                           "held": held_summary(items),
@@ -18233,6 +19249,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print("\nXcode copies and simulator runtimes")
         for t in tooling:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
+        if docker_items:
+            print("\nContainer image store (docker's own commands reclaim it, under pressure only)")
+        for t in sorted(docker_items, key=lambda i: -i.bytes):
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
+        if ghrun_report:
+            print("\nRunner account (sudo -n lists and deletes it: idle runners' checkouts, _tool and go-build only)")
+        for t in sorted(ghrun_report, key=lambda i: -i.bytes):
+            print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
         RUN["io_priority"] = lower_io_priority()
@@ -18259,7 +19283,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         cargo_stale_freed = 0
         if ((a.pressure or sweep) and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
                 and not out_of_band and not DEAD_MODE and (not a.family or CARGO_STALE_FAMILY in a.family)):
-            cargo_stale = sweep_cargo_targets(a.receipt, halt=halt)
+            pressure_hours = float(POLICY.get("pressure_cargo_stale_hours") or 0)
+            base_hours = float(POLICY.get("cargo_stale_hours") or 0)  # 0: the pass is off, pressure or not
+            stale_hours = (min(base_hours, pressure_hours) if a.pressure and pressure_hours > 0 and base_hours > 0
+                           else None)
+            cargo_stale = sweep_cargo_targets(a.receipt, halt=halt, stale_hours=stale_hours)
             cargo_stale_freed = cargo_stale["bytes"]
             RUN["cargo_stale_gib"] = round(cargo_stale_freed / GIB, 1)
             if cargo_stale["units"] or cargo_stale["stopped"]:
@@ -18313,6 +19341,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if PRESSURE_SIM_RUNTIMES and sim_job_host() is False:
             logical_released += apply_runtimes(simulator_runtimes(unrouted=True), a.receipt, halt, unrouted=True,
                                                below_target=short_of_target)
+        # the container image store under pressure, after every family, by docker's own commands (DOCKER_IMAGES), when
+        # the store sits on a filesystem this pass is short on. A running CI job does not defer it: docker never
+        # prunes an image a container uses, and apply_docker_store stops for a docker build itself
+        docker_families = frozenset({DOCKER_IMAGES, DOCKER_BUILD_CACHE})
+        if (a.pressure and under and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
+                and not DEAD_MODE and (not a.family or docker_families & set(a.family))
+                and docker_store_present() and docker_store_dev() in {fs.dev for fs in shown}):
+            logical_released += apply_docker_store(a.receipt, halt, below_target=short_of_target,
+                                                   families=frozenset(a.family) & docker_families if a.family
+                                                   else None)
+        if (a.pressure and under and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
+                and not DEAD_MODE and (not a.family or GHRUN_FAMILY in a.family) and ghrun_present()):
+            logical_released += apply_ghrun(a.receipt, halt, below_target=short_of_target)
         RUN["released"] = logical_released
         blocked: dict[str, int] = {}
         for i in items:
@@ -18393,7 +19434,39 @@ FULL_DISK_REFILL_OVER = 10 * 1024**3
 
 
 def full_disk_reserve_path() -> Path:
+    """The one reserve on a host: leo-workspace tools/full_disk.py (wt reclaim, disk_hygiene, worktree_reclaim)
+    releases and refills this same file, so a host never holds two."""
     return HOME / ".cache/glaeda-disk/full-disk-reserve"
+
+
+FULL_DISK_SCRATCH_UNDER = 64 * 1024**2  # still this tight after the reserve: scratch goes to memory
+
+
+def full_disk_scratch() -> str:
+    """Under FULL_DISK_SCRATCH_UNDER free on HOME's volume (no reserve, or not enough), point TMPDIR (this run's
+    tempfile and its children's mktemp) at a private dir in memory: /run/user/UID/full-disk/tmp-glaeda-disk, else
+    /dev/shm/full-disk-UID/tmp-glaeda-disk, 0700 and this user's only. The dir, or "" when it did nothing (fs-agent-
+    lane-22, 2026-11-25: 0 bytes free, and the cleaners' first mktemp failed with ENOSPC)."""
+    left = _home_free()
+    if left is None or left >= FULL_DISK_SCRATCH_UNDER:
+        return ""
+    uid = os.getuid()
+    for root in (Path(f"/run/user/{uid}/full-disk"), Path(f"/dev/shm/full-disk-{uid}")):
+        if not root.parent.is_dir():
+            continue
+        target = root / "tmp-glaeda-disk"
+        try:
+            root.mkdir(mode=0o700, exist_ok=True)
+            target.mkdir(mode=0o700, exist_ok=True)
+            ok = all(not stat.S_ISLNK(os.lstat(d).st_mode) and os.lstat(d).st_uid == uid
+                     and not os.lstat(d).st_mode & 0o022 for d in (root, target))
+        except OSError:
+            continue
+        if ok:
+            os.environ["TMPDIR"] = str(target)
+            tempfile.tempdir = None
+            return str(target)
+    return ""
 
 
 def release_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> int:
@@ -18461,6 +19534,16 @@ FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 # glaeda-fleet-cas-prune's fixed 20 GiB: 40 GiB was 18% of a 228 GB mini. Every object comes back from the fleet store
 # (cmux-lawrence's SSD) on the next lookup, so a smaller cap costs a fetch, never a rebuild.
 FLEET_CAS_BUDGET_SHARE = 0.025
+
+
+def fleet_cas_cap_gib(total: int) -> float:
+    """The cap each fleet-cas store gets over the cache budget on a volume of TOTAL bytes, in GiB."""
+    return max(2.0, round(total * FLEET_CAS_BUDGET_SHARE / GIB, 1))
+
+
+def fleet_cas_cap_bytes(total: int) -> int:
+    """What both fleet-cas stores may hold together under their budget cap (node store and local CAS each)."""
+    return int(2 * fleet_cas_cap_gib(total) * GIB)
 
 
 def _fleet_cas_prune(root: Path, prune: Path, args: list[str]) -> dict[str, Any] | None:
@@ -18550,7 +19633,7 @@ def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     RUN["fleet_cas_budget_cap"] = True
     counted = CACHE_BUDGET[dev].get("families", {}).get("fleet-cas", 0)
     before = read_fleet_cas_record()
-    freed = fleet_cas_node_cap(root, cap_gib=max(2.0, round(fss[dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1)))
+    freed = fleet_cas_node_cap(root, cap_gib=fleet_cas_cap_gib(fss[dev].total))
     after = read_fleet_cas_record()
     if after and after.get("dev") == dev and after["at"] > (before.get("at", 0.0) if before else 0.0):
         shrank = max(0, counted - after["bytes"])
@@ -18587,6 +19670,14 @@ USERS_ROOT = Path("/Users")
 RUNNER_HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
 RUNNER_HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"
 SUDO = "/usr/bin/sudo"
+# The root-owned copy glaeda-runner-account-disk-root installs beside its sudoers rule (/etc/sudoers.d/
+# glaeda-runner-account-disk), which lets the fleet user run exactly
+# `/usr/bin/python3 -I RUNNER_ACCOUNT_ROOT_COPY --runner-account ...` as each runner account, with no password and no
+# shell. A fleet mini's sudo asks for a password, so without it every pass read "not reached" and the gui pool
+# accounts' homes (cmuxci-gui-01, 30-55 GiB per mini) were never cleaned (2026-11-27). Present and root-owned, the
+# pass runs it instead of copying this script in through /bin/sh (which would need a shell rule as that account).
+RUNNER_ACCOUNT_ROOT_COPY = Path("/usr/local/libexec/glaeda/glaeda-disk")
+RUNNER_ACCOUNT_ROOT_PYTHON = "/usr/bin/python3"
 RUNNER_ACCOUNT_ADMIN_GROUPS = ("admin", "wheel", "sudo")
 RUNNER_ACCOUNT_MODE = False  # set in the pass run inside another account: it never delegates again
 _RUNNER_ACCOUNTS_ENABLED = True  # the test suite turns it off, so no test ever reaches sudo
@@ -18667,12 +19758,28 @@ def _runner_account_python() -> str:
     return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
 
 
-def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
-    """One pass in ENTRY's account (RUNNER_ACCOUNTS): copy this script into its home as it, run it there as it with
-    ARGS, and return its summary row. Never raises."""
+def runner_account_root_copy(path: Path | None = None) -> Path | None:
+    """RUNNER_ACCOUNT_ROOT_COPY when it is a regular file root owns that no group or other may write, else None."""
+    path = RUNNER_ACCOUNT_ROOT_COPY if path is None else path
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return path if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022 else None
+
+
+def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run,
+                       root_copy: Path | None = None) -> dict[str, Any]:
+    """One pass in ENTRY's account (RUNNER_ACCOUNTS): run the root-owned copy as it when one is installed
+    (runner_account_root_copy; ROOT_COPY in tests), else copy this script into its home as it and run that, with
+    ARGS; return its summary row. Never raises."""
     row: dict[str, Any] = {"account": entry.pw_name, "home": entry.pw_dir}
     dest = Path(entry.pw_dir) / RUNNER_ACCOUNT_COPY_DIR
     sudo = [SUDO, "-n", "-u", entry.pw_name, "-H"]
+    root_copy = runner_account_root_copy() if root_copy is None else root_copy
+    if root_copy is not None:  # exactly the command the sudoers rule names: no env, no shell
+        return _runner_account_pass(row, [*sudo, RUNNER_ACCOUNT_ROOT_PYTHON, "-I", os.fspath(root_copy),
+                                          *runner_account_argv(args)], run)
     try:
         source = Path(os.path.abspath(__file__)).read_bytes()
         put = run([*sudo, "/bin/sh", "-c", _RUNNER_ACCOUNT_INSTALL, "sh", os.fspath(dest)], input=source,
@@ -18682,8 +19789,15 @@ def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = su
     if put.returncode != 0:
         why = (put.stderr or b"").decode(errors="replace").strip()[-200:] or f"exit {put.returncode}"
         return {**row, "state": "not reached", "why": why}
+    # CMUX_NAME_AS: a copy this program runs itself is not a use of the old name (count_old_name); sudo drops the env
     argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
+            "CMUX_NAME_AS=cmux-disk",
             _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
+    return _runner_account_pass(row, argv, run)
+
+
+def _runner_account_pass(row: dict[str, Any], argv: list[str], run: Callable[..., Any]) -> dict[str, Any]:
+    """Run one runner-account pass ARGV and fold its summary line into ROW. Never raises."""
     try:
         done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
@@ -18807,6 +19921,12 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if DEAD_MOUNTS:  # paths a walk skipped on ENOTCONN/ESTALE/EIO: a dying drive or a dead mount, as a count and names
+        # (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md), not only a line on stderr
+        row["unreadable_entries"] = len(DEAD_MOUNTS)
+        row["unreadable_examples"] = sorted(DEAD_MOUNTS)[:5]
+    if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
+        row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass
         row["runner_accounts"] = RUN["runner_accounts"]
     if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)
@@ -18825,6 +19945,9 @@ def _logged_main(args: list[str]) -> int:
     RUN["caller"] = run_caller()
     if released := release_full_disk_reserve():
         RUN["full_disk_reserve_released"] = released
+    with contextlib.suppress(Exception):  # never the reason a pass does not run
+        if scratch := full_disk_scratch():
+            RUN["full_disk_scratch"] = scratch
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)
@@ -18928,6 +20051,48 @@ def install_intent(prog: str) -> None:
         return
 
 
+def count_old_name(old: str, new: str) -> None:
+    """The rename to cmux-* names (Leo, 2026-11-25: "start migrating off glaeda and into cmux-prefixed naming
+    tooling"): run as NEW (scripts/NEW sets CMUX_NAME_AS), nothing happens; run under the OLD name, this use is
+    counted, silently, in ~/.local/state/cmux-names/OLD.json (uses per UTC day for 14 days, the last use, the last
+    few callers), so the old name can be removed once the fleet shows it unused (cmuxterm-hq
+    docs/design/glaeda-into-cmux.md, Rename map). Never prints, never raises: a caller parsing output sees nothing."""
+    as_new = os.environ.get("CMUX_NAME_AS") == new
+    # kept for this program's own children (glaeda-disk's background --refresh and --census run __file__): one call,
+    # one count. Another tool it runs compares this to its own new name, so it still counts its own old name.
+    os.environ["CMUX_NAME_AS"] = new
+    if as_new:
+        return
+    try:
+        import json as _json
+        import time as _time
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cmux-names"
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{old}.json"
+        try:
+            data = _json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        days = {k: v for k, v in (data.get("days") or {}).items() if isinstance(v, int)}
+        today = _time.strftime("%Y-%m-%d", _time.gmtime())
+        days[today] = days.get(today, 0) + 1
+        try:
+            raw = Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+            parent = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:  # macOS has no /proc; the parent's name is enough to find a caller
+            parent = f"pid {os.getppid()}"
+        callers = [c for c in (data.get("callers") or []) if isinstance(c, str) and c != parent[:200]]
+        data = {"schema": 1, "old": old, "new": new, "last": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                "days": dict(sorted(days.items())[-14:]), "callers": ([parent[:200]] + callers)[:5]}
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(_json.dumps(data, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001  counting never costs the call
+        pass
+
+
 if __name__ == "__main__":
+    count_old_name("glaeda-disk", "cmux-disk")
     install_intent("glaeda-disk")
     sys.exit(main())

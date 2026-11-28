@@ -90,7 +90,7 @@ class Server:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
         runner = {f"glaeda/scripts/{name}": ((runner_files or {}).get(name, f"{name} at {source}".encode()),
                                              0o755 if "." not in name else 0o644)
-                  for name in gu.RUNNER_FILES}
+                  for name in (*gu.RUNNER_FILES, *gu.LIBEXEC_FILES)}  # step 6c's seed scripts ship in every release
         if ancestry is None:
             ancestry = [source, *reversed(self.sources)]
         extra = {"ancestry.txt": ("".join(c + "\n" for c in ancestry).encode(), 0o644)}
@@ -149,6 +149,11 @@ class UpdateTest(unittest.TestCase):
         gu.local_target = lambda: TARGET
         os.environ["GLAEDA_TEST_BIN"] = str(self.bin)
         self.config = {"ring": "canary", "setupArgs": ["--hygiene-only"], "host": "test", "reportStatus": False}
+        # The minute probe as on a host of its own, whatever host runs this suite (a runner mini has FLEET_DIR).
+        self.real_shared_egress = gu.shared_egress
+        egress = mock.patch.object(gu, "shared_egress", return_value=False)
+        egress.start()
+        self.addCleanup(egress.stop)
 
     def tearDown(self) -> None:
         gu.fetch, gu.attestation, gu.local_target, test_bin = self.saved
@@ -550,6 +555,176 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {newer['tag']}")
 
+    def test_update_only_health_does_not_require_hygiene_or_watcher(self) -> None:
+        self.bin.mkdir()
+        updater = self.bin / "glaeda-update"
+        updater.write_text("import json; print(json.dumps({'result': 'plan'}))\n")
+        self.assertEqual(gu.health(self.bin, self.root, update_only=True), (True, "tools run"))
+        gen = self.root / "generation"
+        (gen / "glaeda/scripts").mkdir(parents=True)
+        (gen / "glaeda/scripts/glaeda-update").write_bytes(updater.read_bytes())
+        (gen / "glaeda/config").mkdir()
+        (gen / "glaeda/config/gh-daemon.json").write_text("{}")
+        self.assertEqual(gu.tool_drift(gen, self.bin, update_only=True), (1, []))
+        updater.write_text("stale updater")
+        self.assertEqual(gu.tool_drift(gen, self.bin, update_only=True), (1, ["glaeda-update"]))
+
+    def test_cas_launch_copy_refreshes_recursively_without_creating_a_role(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        name = "glaeda-fleet-cas-prune"
+        src = gu.generation(self.state, entry["tag"]) / "glaeda/scripts" / name
+        src.write_text("the release prune")
+        launch = home / ".cache/glaeda-fleet-cas/launch"
+        self.assertNotIn("casScripts", gu.runner_steps(self.state, staged, home, bin_dir=self.bin))
+        self.assertFalse(launch.exists())
+        launch.mkdir(parents=True)
+        dest = launch / name
+        dest.write_text("old prune")
+        wrapper = launch / "fleet-cas-run"
+        wrapper.write_text("installer-owned wrapper")
+        before = gu.observe(self.state, self.bin, home, staged)
+        self.assertFalse(before["casScripts"][name]["current"])
+        converged, why, _ = gu.convergence({"result": "current"},
+            {"tag": entry["tag"], "casScripts": before["casScripts"]}, {"tag": entry["tag"]}, [])
+        self.assertFalse(converged)
+        self.assertTrue(any(name in reason for reason in why))
+        gu.runner_steps(self.state, staged, home, bin_dir=self.bin)
+        self.assertEqual(dest.read_bytes(), src.read_bytes())
+        self.assertEqual(wrapper.read_text(), "installer-owned wrapper")
+        self.assertTrue(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"], "current")
+        stamp = json.loads((launch / gu.SOURCE_STAMP).read_text())
+        self.assertEqual(stamp["source"], SOURCES[0])
+        # An operator's newer copy stays visible as drift, never silently downgraded.
+        dest.write_text("operator newer prune")
+        (launch / gu.SOURCE_STAMP).write_text(json.dumps({"by": "rollout", "date": "2026-09-25", "source": "d" * 40}))
+        self.assertIn("kept", gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"])
+        self.assertFalse(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
+
+    def test_service_script_refresh_preserves_operator_symlinks(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        scripts = gu.generation(self.state, entry["tag"]) / "glaeda/scripts"
+        for key, relative, name in (
+            ("casScripts", ".cache/glaeda-fleet-cas/launch", "glaeda-fleet-cas-prune"),
+            ("libexecScripts", str(gu.LIBEXEC_RELATIVE), "glaeda-seed-archive"),
+        ):
+            with self.subTest(family=key):
+                target = home / relative
+                target.mkdir(parents=True)
+                (scripts / name).write_text("release bytes")
+                operator = self.root / (name + "-operator")
+                operator.write_text("operator bytes")
+                dest = target / name
+                dest.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertEqual(operator.read_text(), "operator bytes")
+                row = gu.observe(self.state, self.bin, home, staged)[key][name]
+                self.assertIsNone(row["installedSha256"])
+                self.assertFalse(row["current"])
+                operator.unlink()  # dangling links remain operator-owned and visible
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+                dest.unlink()
+                dest.write_text("old installed bytes")
+                stamp = target / gu.SOURCE_STAMP
+                stamp.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(stamp.is_symlink())
+                self.assertEqual(dest.read_text(), "old installed bytes")
+                stamp.unlink()
+                moved = target.with_name(target.name + "-operator")
+                target.rename(moved)
+                target.symlink_to(moved, target_is_directory=True)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(target.is_symlink())
+                self.assertEqual((moved / name).read_text(), "old installed bytes")
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+
+    def test_linked_seed_does_not_prevent_regular_sibling_refresh(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        target = home / gu.LIBEXEC_RELATIVE
+        target.mkdir(parents=True)
+        operator = self.root / "operator-seed-serve"
+        operator.write_text("operator bytes")
+        linked = target / "glaeda-seed-serve"
+        linked.symlink_to(operator)
+        archive = target / "glaeda-seed-archive"
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                if dangling:
+                    operator.unlink()
+                archive.write_text("stale archive")
+                # runner_steps uses the whole default LIBEXEC_FILES tuple, as real OTA does.
+                result = gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["libexecScripts"]
+                self.assertIn(f"refreshed glaeda-seed-archive to {entry['tag']}", result)
+                self.assertIn("kept (operator symlink: glaeda-seed-serve)", result)
+                self.assertEqual(archive.read_text(), f"glaeda-seed-archive at {SOURCES[0]}")
+                self.assertTrue(linked.is_symlink())
+                if not dangling:
+                    self.assertEqual(operator.read_text(), "operator bytes")
+                self.assertFalse((target / "glaeda-seed-prefetch").exists())
+                rows = gu.observe(self.state, self.bin, home, staged)["libexecScripts"]
+                self.assertTrue(rows["glaeda-seed-archive"]["current"])
+                self.assertFalse(rows["glaeda-seed-serve"]["current"])
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target))
+
+    def test_a_hand_installed_seed_script_is_refreshed_and_a_role_is_never_added(self) -> None:
+        libexec = self.root / "home/.local/libexec"
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "absent")  # no seed role: nothing made
+        self.assertFalse(libexec.exists())
+        libexec.mkdir(parents=True)
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "no seed scripts")
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        # cmux-lawrence: the archive and prefetch copied in by hand over SSH months ago, no stamp, no serve role
+        for name in ("glaeda-seed-archive", "glaeda-seed-prefetch"):
+            (libexec / name).write_text("the Sep 28 copy of " + name)
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec),
+                         f"refreshed glaeda-seed-archive, glaeda-seed-prefetch to {entry['tag']}")
+        for name in ("glaeda-seed-archive", "glaeda-seed-prefetch"):
+            self.assertEqual((libexec / name).read_text(), f"{name} at {SOURCES[0]}")
+            self.assertTrue(os.access(libexec / name, os.X_OK))
+        self.assertFalse((libexec / "glaeda-seed-serve").exists(), "a host is never given a seed role it lacks")
+        stamp = json.loads((libexec / gu.SOURCE_STAMP).read_text())
+        self.assertEqual((stamp["by"], stamp["tag"], stamp["source"]), ("glaeda-update", entry["tag"], SOURCES[0]))
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "current")
+        # an operator staged main the same day: kept, never downgraded
+        (libexec / "glaeda-seed-archive").write_text("operator main")
+        (libexec / gu.SOURCE_STAMP).write_text(json.dumps({"by": "ssh", "date": "2026-09-25", "source": "d" * 40}))
+        self.assertIn("kept", gu.refresh_libexec_scripts(self.state, libexec))
+        self.assertEqual((libexec / "glaeda-seed-archive").read_text(), "operator main")
+        # the same copy, older than the release: refreshed
+        (libexec / gu.SOURCE_STAMP).write_text(json.dumps({"by": "ssh", "date": "2026-09-24", "source": "d" * 40}))
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec),
+                         f"refreshed glaeda-seed-archive to {entry['tag']}")
+
+    def test_the_seed_scripts_are_a_step_and_a_status_row_only_where_they_are_installed(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"),
+                                    hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertNotIn("libexecScripts", gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
+                         "a host with no seed script says nothing about one")
+        self.assertNotIn("libexecScripts", gu.observe(self.state, self.bin, home, staged))
+        libexec = home / gu.LIBEXEC_RELATIVE
+        libexec.mkdir(parents=True)
+        (libexec / "glaeda-seed-serve").write_text("a stale serve")
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["libexecScripts"],
+                         f"refreshed glaeda-seed-serve to {entry['tag']}")
+        row = gu.observe(self.state, self.bin, home, staged)["libexecScripts"]
+        self.assertEqual(list(row), ["glaeda-seed-serve"])
+        self.assertTrue(row["glaeda-seed-serve"]["current"])
+        self.assertEqual(row["glaeda-seed-serve"]["installedSha256"],
+                         gr.sha256(f"glaeda-seed-serve at {SOURCES[0]}".encode()))
+
     def runner_mini(self) -> tuple[Path, Path, Path]:
         """A mini as glaeda-cmux-runner --apply left it: an owned runner whose hooks came from the staged copy."""
         home = self.root / "home"
@@ -802,9 +977,9 @@ class UpdateTest(unittest.TestCase):
         real_setup = gu.run_setup
         calls = []
 
-        def setup(gen, args):
+        def setup(gen, args, bin_dir=None):
             calls.append(gen.name)
-            return real_setup(gen, args) if len(calls) == 1 else (False, "timed out")
+            return real_setup(gen, args, bin_dir) if len(calls) == 1 else (False, "timed out")
 
         with mock.patch.object(gu, "health", return_value=(None, "glaeda-disk: timed out")), \
                 mock.patch.object(gu, "run_setup", setup):
@@ -1064,6 +1239,51 @@ class UpdateTest(unittest.TestCase):
         response.__enter__.return_value = response
         return response
 
+    def test_a_host_with_a_controller_probes_through_it_and_never_asks_github(self) -> None:
+        answer = {"repo": "teamleaderleo/glaeda", "tag": "ota-channels", "status": 200,
+                  "assets": {"control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"}}
+        asked = []
+
+        def urlopen(request, timeout):
+            asked.append(request.full_url)
+            if isinstance(answer, Exception):
+                raise answer
+            response = mock.MagicMock()
+            response.read.return_value = json.dumps(answer).encode()
+            response.__enter__.return_value = response
+            return response
+        github = mock.Mock(side_effect=AssertionError("github.com asked"))
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "", "CMUX_CI_CONTROLLER": ""}), \
+                mock.patch.object(gu.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.object(gu.urllib.request, "build_opener", github):
+            config = Path(home) / gu.PROBE_CONTROLLER_CONFIG
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"controller": "http://100.89.225.106:18765/"}))
+            seen = gu.channel_fingerprint("stable", home=Path(home))
+            self.assertEqual(asked, ["http://100.89.225.106:18765/v1/github-release-probe/teamleaderleo/glaeda/ota-channels"])
+            self.assertEqual(seen, {"repo": gu.REPOSITORY, "via": "controller",
+                                    "control.json": "1:2026-11-27T00:00:00Z:10", "stable.json": "2:2026-11-27T00:00:00Z:20"})
+            self.assertEqual(gu.channel_fingerprint("canary", home=Path(home))["canary.json"], "absent")
+            answer["assets"]["stable.json"] = "3:2026-11-27T00:05:00Z:21"
+            self.assertNotEqual(gu.channel_fingerprint("stable", home=Path(home)), seen)
+            answer["status"], answer["assets"] = 404, {}  # no channel release yet: both files absent
+            self.assertEqual(gu.channel_fingerprint("stable", home=Path(home))["control.json"], "absent")
+            answer["status"] = 500  # GitHub refused the controller: no answer, and no github.com fallback
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.HTTPError("u", 503, "the controller is starting", {}, None)
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            answer = urllib.error.URLError("offline")
+            self.assertIsNone(gu.channel_fingerprint("stable", home=Path(home)))
+            with mock.patch.dict(os.environ, {"CMUX_CI_CONTROLLER": "http://10.0.0.1:18765"}):
+                self.assertEqual(gu.probe_controller(Path(home)), "http://10.0.0.1:18765")
+            with mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"}):
+                self.assertIsNone(gu.probe_controller(Path(home)))
+            config.write_text("not json")
+            self.assertIsNone(gu.probe_controller(Path(home)))
+        github.assert_not_called()
+
+    @mock.patch.dict(os.environ, {"GLAEDA_UPDATE_PROBE": "off"})  # this host's controller, if any, is not the test's
     def test_the_channel_fingerprint_is_the_asset_each_file_redirects_to(self) -> None:
         location = "https://release-assets.githubusercontent.com/github-production-release-asset/1/{}?sig=x&se=1"
         answers = {"control.json": urllib.error.HTTPError("u", 302, "Found", {"Location": location.format("c1")}, None),
@@ -1112,6 +1332,45 @@ class UpdateTest(unittest.TestCase):
         (self.state / gu.PROBE.name).write_text("not json")
         with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
             self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
+
+    def test_a_runner_mini_probes_every_five_minutes_not_every_minute(self) -> None:
+        # Leo, 2026-11-27: "we dont wanna like... get banned again ideally": ~25 minis share one office address.
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "stable.json": "s1"}
+        changed = {**seen, "stable.json": "s2"}
+        every = gu.SHARED_EGRESS_PROBE_EVERY_S
+        self.assertEqual(every, 300)
+        with mock.patch.object(gu, "shared_egress", return_value=True):
+            self.assertEqual(gu.probe_every(), every)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=changed) as probe:
+                gu.save_probe({"channel": seen, "fullRunAt": now}, self.state)
+                # within five minutes of the full run: no request, even though the channel moved
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state), (False, seen, "probed recently"))
+                self.assertEqual(gu.probe_gate(self.config, now + every - 1, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 0)
+                # five minutes on, it probes and sees the change
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state), (True, changed, "channel changed"))
+                self.assertEqual(probe.call_count, 1)
+            with mock.patch.object(gu, "channel_fingerprint", return_value=seen) as probe:
+                # an unchanged probe is recorded, so the next one waits five minutes from it
+                self.assertEqual(gu.probe_gate(self.config, now + every, self.state)[0::2], (False, "unchanged"))
+                self.assertEqual(gu.load_probe(self.state)["probedAt"], now + every)
+                self.assertEqual(gu.load_probe(self.state)["fullRunAt"], now)
+                self.assertEqual(gu.probe_gate(self.config, now + every + 60, self.state)[0::2], (False, "probed recently"))
+                self.assertEqual(probe.call_count, 1)
+                # a due full run and a soak's end never wait for the probe interval
+                self.assertEqual(gu.probe_gate(self.config, now + gu.APPLY_EVERY_S, self.state)[0::2], (True, "due"))
+                gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": now + 60}, self.state)
+                self.assertEqual(gu.probe_gate(self.config, now + 60, self.state)[0::2], (True, "soak ended"))
+                # a clock step back probes (and runs: the full run is due)
+                self.assertEqual(gu.probe_gate(self.config, now - 1, self.state)[0::2], (True, "due"))
+        with mock.patch.object(gu, "FLEET_DIR", self.root / "fleet"), \
+                mock.patch.object(gu, "shared_egress", self.real_shared_egress):
+            self.assertFalse(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), gu.PROBE_EVERY_S)
+            (self.root / "fleet").mkdir()
+            self.assertTrue(gu.shared_egress())
+            self.assertEqual(gu.probe_every(), every)
 
     def test_the_minute_probe_starts_a_full_run_when_a_canary_soak_ends(self) -> None:
         now = 1_800_000_000.0
@@ -1465,6 +1724,32 @@ class UpdateTest(unittest.TestCase):
             reclaim.write_text("#!/bin/sh\n# a hand install\nexit 0\n")
             self.assertEqual(self.apply(now + 3)["repair"], "reinstalled glaeda-worktree-reclaim")
 
+    def test_a_repair_for_another_tool_keeps_the_fast_patched_bytes(self) -> None:
+        """A lane VM, 2026-11-25: setup reinstalls every tool, so a repair for another tool's drift (or a release
+        cut before main's commit) put the ring's older glaeda-gh over fast-patch's, and the daemon re-exec'd onto
+        it. The fast-patched bytes stay until a release includes their commit."""
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        patched = b"#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n"
+        reclaim.write_bytes(patched)
+        os.chmod(reclaim, 0o755)
+        marker = self.root / "fast-patch-live.json"
+        marker.write_text(json.dumps({"commit": "f" * 40, "tools": {"glaeda-worktree-reclaim": gu.sha256(patched)}}))
+        policy = self.bin.parent / "share/glaeda/gh-daemon.json"
+        policy.write_text('{"default": {"restShare": 1}}')
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            result = self.apply(now + 1)
+            self.assertEqual(result["repair"], "reinstalled gh-daemon.json")
+            self.assertEqual(reclaim.read_bytes(), patched, "setup's older bytes did not stay")
+            self.assertTrue(os.access(reclaim, os.X_OK))
+            self.assertEqual(list(self.bin.glob(".*.fast-patch")), [])
+        # with no fast-patch named, setup's bytes win as before
+        policy.write_text('{"default": {"restShare": 1}}')
+        self.assertEqual(self.apply(now + 2)["repair"], "reinstalled glaeda-worktree-reclaim, gh-daemon.json")
+        self.assertNotEqual(reclaim.read_bytes(), patched)
+
     def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
         self.server.publish(SOURCES[0])
         now = 1_800_000_000.0
@@ -1565,6 +1850,62 @@ class UpdateTest(unittest.TestCase):
         # a failing canary's report (waited out up to FAILURE_WAIT_MAX, then retried after a backoff) lands
         # before the CI smoke may promote a release no canary reported on
         self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
+
+
+class StaleHookClockTest(unittest.TestCase):
+    """A runner left on one old hook alerts from when it fell behind, not from the latest release (2026-11-26: a
+    runner on a hook five hours and three releases old read alertAfter two hours after the newest release)."""
+
+    def record(self, previous: dict, tag: str, hooks: list[dict], now: float, path: Path) -> dict:
+        running = {"tag": tag, "releaseHookSha256": "new-" + tag, "tools": {}, "hooks": hooks}
+        return gu.record_convergence({"host": "mini", "ring": "stable"}, {"result": "current"},
+                                     {"tag": tag, "source": "x"}, previous, now, running, [], path)
+
+    def test_a_runner_stale_on_the_same_hook_keeps_its_clock_through_new_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            old = {"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "glaeda_reservation.py": "m", "current": False}
+            first = self.record({}, "r-1", [dict(old)], t0, path)
+            self.assertEqual(first["running"]["hooks"][0]["staleSince"], first["at"])
+            # three releases later, the runner still has the same bytes: its clock and the alert hold
+            later = t0
+            doc = first
+            for n, tag in enumerate(("r-2", "r-3", "r-4"), 1):
+                later = t0 + n * 1800
+                doc = self.record(json.loads(path.read_text()), tag, [dict(old)], later, path)
+            self.assertEqual(doc["since"], doc["at"])  # the host's clock restarts with the release, as before
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], first["at"])
+            self.assertEqual(gu.parse_utc(doc["alertAfter"]), gu.parse_utc(first["at"]) + gu.ALERT_AFTER_S)
+
+    def test_a_runner_that_took_a_newer_hook_starts_a_new_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            self.record({}, "r-1", [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}], t0, path)
+            # it installed r-1's hook (other bytes), then r-2 shipped while it had a job
+            doc = self.record(json.loads(path.read_text()), "r-2",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "new-r-1", "current": False}],
+                              t0 + 1800, path)
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], doc["at"])
+            self.assertEqual(gu.parse_utc(doc["alertAfter"]), t0 + 1800 + gu.ALERT_AFTER_S)
+
+    def test_a_converged_run_drops_the_clocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "converge.json"
+            t0 = 1_800_000_000.0
+            self.record({}, "r-1", [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}], t0, path)
+            doc = self.record(json.loads(path.read_text()), "r-2",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "new-r-2", "current": True}],
+                              t0 + 600, path)
+            self.assertTrue(doc["converged"])
+            self.assertIsNone(doc["alertAfter"])
+            self.assertNotIn("staleSince", doc["running"]["hooks"][0])
+            # it falls behind again later: a fresh clock, not the old one
+            doc = self.record(json.loads(path.read_text()), "r-3",
+                              [{"runnerDir": "/r/1", "glaeda-cmux-runner-hook": "aaa", "current": False}],
+                              t0 + 1200, path)
+            self.assertEqual(doc["running"]["hooks"][0]["staleSince"], doc["at"])
 
 
 class ScheduleReloadTest(unittest.TestCase):
@@ -1750,7 +2091,8 @@ class ReleaseTest(unittest.TestCase):
             out = Path(tmp)
             files = {f"glaeda/scripts/{name}": ((ROOT / "scripts" / name).read_bytes(), 0o755)
                      for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
-                                 "glaeda-update")}
+                                 "glaeda-update", "glaeda-procs", "glaeda-disk-registry", "cmux-disk", "cmux-procs",
+                                 "cmux-disk-registry", "glaeda-idle-repair", "cmux-idle-repair", "cmux-mini-health")}
             files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 0\n", 0o755)
             (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
             self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 0)

@@ -226,7 +226,9 @@ Each agent tick, for every live reservation on the routed repository:
   no runner for 30 s (measured from the latest of its creation, the reservation, and the first
   time the agent saw it waiting, so a job created before its `needs` finished never counts as
   late), or a job the runner's job-started hook refused (failed on a runner before any real
-  step), decides a rescue once GitHub confirms the run and the pull request is open at the same
+  step), decides a rescue, unless any job of the run holds a runner (assigned or running, on any
+  label, overflow included): such a run is never cancelled (`holds_runner`; cmux run 45823199209
+  lost a started Blacksmith macOS compile to a rescue on 2026-11-26), once GitHub confirms the run and the pull request is open at the same
   head. The agent writes `rescuing` first and cancels second, in the same tick, so a lost ledger
   write never leaves a cancelled run without its re-run.
 - `rescuing`: every effect is checked against GitHub again, because the ledger is only a claim.

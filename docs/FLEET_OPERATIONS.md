@@ -13,7 +13,7 @@ read-only unless a command ends with `--apply` or `--yes`.
 | What a host actually reports | the host probe | `glaeda-mini-fleet observe` and `glaeda-fleet-status` |
 | Current worker, queue, and controller state | the controller status endpoint | `build-fleet/status.py --json` or its saved JSON |
 | Installed Glaeda generation | the host's OTA receipt | `glaeda-fleet-status` tooling source and `fleet up` |
-| Disk pressure and reclaim receipts | the host's `glaeda-disk` state | `glaeda-disk --json` and `glaeda-fleet-status` disk source |
+| Disk pressure and reclaim receipts | the host's `glaeda-disk` state | `cmux-disk --json` and `glaeda-fleet-status` disk source |
 | Seed usefulness and transfer cost | job records and seed receipts | `glaeda-seed-prefetch`, seed logs, and build receipts |
 | Dashboard presentation | ci-dash's deployed data document | the dashboard version and role metadata in its snapshot |
 
@@ -227,6 +227,45 @@ listener, and every listener sizes itself from the whole scale set's assigned-jo
 cannot share one. The token step waits for the org-runners token push to reach the host. Each mini
 advertises a maximum capacity of one clone today: the bridge target refuses any other value, and
 the fleet host lock does not count VM clones yet, so a higher cap waits for that accounting.
+
+## New minis: plugged in to taking jobs
+
+One command from the operator Mac (cosmic-gray), after manifest-sync so the manifest is main's:
+
+```bash
+scripts/glaeda-mini-fleet manifest-sync --yes
+scripts/glaeda-mini-bringup cmux25 cmux26 ... cmux34 --registry-out /tmp/new-minis        # dry run
+scripts/glaeda-mini-bringup cmux25 cmux26 ... cmux34 --registry-out /tmp/new-minis --yes
+```
+
+To rehearse on a mini already in the fleet, run `scripts/glaeda-mini-bringup-dryrun [SHA|TREE] [MANIFEST]`
+there: it treats that mini as new (a copy of the manifest without it) and prints the admit entry, the
+runner labels and every bringup step, changing nothing.
+
+At the screen first, per mini (no tool can do these): create the `cmux` admin user, log in to
+Tailscale with a `tag:mac-mini-cluster` key (Lawrence owns the tag), name it `cmuxNN`
+(`machines/host-naming.md`: the pool continues after cmux24), turn on Remote Login and Remote
+Management, and add the fleet key. `reach` in the dry run lists every mini still missing one.
+
+What it runs, each step a no-op once done, so a rerun continues:
+
+| Step | Command | What it sets |
+| --- | --- | --- |
+| admit | `glaeda-mini-fleet admit HOST... --yes` | hardware class from the probe (a new chip/memory becomes `<chip>-<memory>`, such as `m5pro-64`), node ids, `std` class, dedicated, `ci-runner`, sudo mode, and a host Xcode override per complete Xcode installed beside the declared ones, so the runner carries `xcode-<v>` and `glaeda-std-xcode-<v>` for each |
+| seed | `onboard SEED --acceptance node`, then `upgrade SEED --candidate-run RUN` | a new class's one accept-local and its class receipt (RUN defaults to the newest green `fleet-candidate.yml` on main) |
+| onboard | `onboard REST --from SEED` | preflight, fix, sudo-plan, enroll on the receipt; Xcode and caches copy from the seed over the LAN |
+| runners | `glaeda-cmux-runner-fleet --apply --hosts ALL` | one runner per host with its labels |
+| check | `glaeda-mini-fleet check HOST...` | drift, the disk floor (`disk.min_free_gib`), runner state |
+
+Disk: no extra APFS volume. Everything lives on the data volume (`/System/Volumes/Data`), the fleet
+root at `/Users/Shared/cmux-build-fleet`, budgets in `config/disk-registry.toml`; admit notes a host
+under the fleet floor.
+
+Then the registry: copy `/tmp/new-minis/*.json` into leo-workspace `machines/fleet/machines/`, add
+the names to `machines/fleet/role_holders/ci-runner.json`, land that PR, and run
+`reach enroll cmuxNN --apply` per host (tailscale-self-heal). `--lane-host` adds a `lanes` budget
+and `lane_tools` so the minis also host agent lanes. Finally, land the operator manifest's diff in
+cmuxterm-hq `build-fleet/mini-fleet.json`.
 
 ## Runbook map
 

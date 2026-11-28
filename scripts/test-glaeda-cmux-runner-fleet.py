@@ -138,6 +138,8 @@ elif path == "repos/actions/runner/releases/latest":
     print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
                       "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
                                   "browser_download_url": "https://example.invalid/x"}}]}}))
+elif path.endswith("/actions/runners?per_page=100") and os.environ.get("FAKE_LIST_FAILS"):
+    sys.stderr.write("gh: API rate limit exceeded for user ID 1. (HTTP 403)\\n"); sys.exit(1)
 elif path.endswith("/actions/runners?per_page=100"):  # the operator's one list of a scope's runners; FAKE_NO_RUNNERS: none
     hosts = ("mini-a", "mini-b", "mini-light")
     names = [h + "-glaeda" + s for h in hosts for s in [""] + ["-" + str(k) for k in range(1, 16)] + ["-nightly-next"]]
@@ -324,9 +326,19 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(reads), 1, "eight instances on one scope read its runners once, not once each")
         self.assertIn("repos/manaflow-ai/cmux/actions/runners?per_page=100", reads[0])
         self.assertIn("--paginate", reads[0])
+        # LABELS_UNREAD_SKIPS, 2026-11-27 cmux24: a failed list (a spent quota) is not "GitHub lists no such runner".
+        # The mini is told the read failed and why, so it skips the relabel instead of re-registering blind
+        unread_from = len(self.calls())
+        unread = self.fleet("--apply", FAKE_LIST_FAILS="1")
+        self.assertEqual(unread.returncode, 0, unread.stdout + unread.stderr)
+        sent = [c["remote"] for c in self.calls()[unread_from:] if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(len(sent), 8)
+        self.assertTrue(all("--github-labels-unread=" in r and "GitHub rate limit" in r and "--github-labels=" not in r
+                            for r in sent), sent[0])
+        unlisted_from = len(self.calls())
         unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
         self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
-        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
+        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[unlisted_from:]
                              if c["tool"] == "ssh"), "a runner GitHub does not list: the mini decides as before")
         self.assertTrue(all(f"--latest-runner-version 2.401.0 --latest-runner-sha256 {'d' * 64}" in c["remote"]
                             for c in applies))
@@ -1174,6 +1186,59 @@ class ProcessBoundTest(unittest.TestCase):
         self.assertEqual(fleet.max_procs(1_000_000), 128)
         self.assertEqual(fleet.max_procs(256, 7), 7)
         self.assertGreaterEqual(fleet.raise_nofile(), 1)
+
+
+class HeadlessXcodeTest(unittest.TestCase):
+    """prepare_headless on an AWS ec2-user host: the Xcode.app layout it accepts, run in a fake /Applications."""
+
+    MANIFEST = {"hosts": {"aws-m4pro-2": {"gui": False, "ssh_user": "ec2-user"}}}
+
+    def script(self, fleet) -> str:
+        sent = []
+        with mock.patch.object(fleet, "run", side_effect=lambda argv, timeout: sent.append(argv[-1]) or (0, "", "")):
+            self.assertIsNone(fleet.prepare_headless("aws-m4pro-2", {"xcodeApps": ["/Applications/Xcode_26.6.app"]},
+                                                     self.MANIFEST))
+        return sent[0]
+
+    def run_in(self, root: Path, script: str) -> subprocess.CompletedProcess:
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name in ("sudo", "xcode-select", "pgrep", "readlink", "ln"):
+            (bin_dir / name).write_text("#!/bin/sh\necho \"$0 $*\" >> \"$CALLS\"\n"
+                                        + ('exec /usr/bin/readlink "$@"\n' if name == "readlink" else
+                                           "exit 1\n" if name == "pgrep" else "exit 0\n"))
+            (bin_dir / name).chmod(0o755)
+        text = script.replace("/opt/homebrew/bin/gh", os.fspath(root / "no-gh"))
+        text = text.replace("/Applications", os.fspath(root / "Applications"))
+        for tool in ("/usr/bin/xcode-select", "/usr/bin/pgrep", "/usr/bin/readlink", "/bin/ln"):
+            text = text.replace(tool, os.fspath(bin_dir / Path(tool).name))
+        text = text.replace("sudo -n ", os.fspath(bin_dir / "sudo") + " -n ")
+        return subprocess.run(["/bin/sh", "-c", text], capture_output=True, text=True,
+                              env={"PATH": "/usr/bin:/bin", "CALLS": os.fspath(root / "calls")})
+
+    def test_a_real_xcode_app_is_kept_with_the_host_selection(self) -> None:
+        fleet = load_fleet_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Applications" / "Xcode_26.6.app").mkdir(parents=True)
+            (root / "Applications" / "Xcode.app").mkdir()
+            done = self.run_in(root, self.script(fleet))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("keeping the real", done.stderr)
+            calls = (root / "calls").read_text() if (root / "calls").exists() else ""
+            self.assertNotIn("xcode-select -s", calls)
+            self.assertNotIn("ln -s", calls)
+
+    def test_no_xcode_app_gets_the_link_and_the_selection(self) -> None:
+        fleet = load_fleet_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Applications" / "Xcode_26.6.app").mkdir(parents=True)
+            done = self.run_in(root, self.script(fleet))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            calls = (root / "calls").read_text()
+            self.assertIn("ln -s", calls)
+            self.assertIn("xcode-select -s", calls)
 
 
 if __name__ == "__main__":

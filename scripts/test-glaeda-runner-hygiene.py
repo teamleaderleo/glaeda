@@ -55,7 +55,7 @@ class RunnerHygieneTest(unittest.TestCase):
     def test_profile_is_user_scoped_and_every_argument_is_pinned(self) -> None:
         plist = rh.plist_for(self.install)
         self.assertEqual(plist["UserName"], self.account.name)
-        self.assertEqual(plist["EnvironmentVariables"], {"HOME": str(self.home)})
+        self.assertEqual(plist["EnvironmentVariables"], {"HOME": str(self.home), "CMUX_NAME_AS": "cmux-disk"})
         self.assertEqual(plist["StartInterval"], 900)
         self.assertEqual(plist["ProgramArguments"], [
             "/usr/bin/python3", "-I", str(self.install.snapshot),
