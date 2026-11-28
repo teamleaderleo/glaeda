@@ -52602,6 +52602,19 @@ class PendingRowsConfirmByProbe(unittest.TestCase):
         self.assertEqual(d.probe_refusal(e), "rollup-stale")
         self.assertFalse(d.probe_ok(e))
 
+    def test_a_partial_read_before_paging_is_read_in_full_once(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = gg.SUITES_PAGED_SINCE + 5000
+        d.rollup_wanted = lambda: frozenset()
+        d.pr_behind = lambda c: False
+        d.rollup_stale = lambda key, c: False
+        cache = {"fp": self.fp(), "via": "graphql", "fullAt": d.now - 60, "wholeAt": gg.SUITES_PAGED_SINCE - 100,
+                 "data": {"state": "OPEN", "checks": [], "checksPageError": gg.SUITES_PAST_ONE_PAGE}}
+        e = {"key": "pr:o/r#1", "cache": cache}
+        self.assertEqual(d.probe_refusal(e), "partial-before-paging")  # a probe's fullAt does not count
+        cache["wholeAt"] = gg.SUITES_PAGED_SINCE + 10
+        self.assertIsNone(d.probe_refusal(e))
+
     def test_probe_stands_in_for_a_queued_pending_row_past_an_hour(self):
         d = gg.Daemon.__new__(gg.Daemon)
         d.now = 20000.0
