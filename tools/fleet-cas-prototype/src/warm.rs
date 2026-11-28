@@ -139,10 +139,15 @@ pub struct Mirror {
 /// days after its fill, as on the primary).
 fn put_marker(store: &Store, key: &[u8], value: &kv::Value) -> std::io::Result<bool> {
     let path = store.kv_path(key);
-    let bytes = value.encode_to_vec();
-    if std::fs::read(&path).is_ok_and(|b| b == bytes) {
+    // Compare decoded: `entries` is a map, and its encoded order differs between processes.
+    let same = std::fs::read(&path)
+        .ok()
+        .and_then(|b| <kv::Value as prost::Message>::decode(b.as_slice()).ok())
+        .is_some_and(|old| old == *value);
+    if same {
         return Ok(false);
     }
+    let bytes = value.encode_to_vec();
     std::fs::create_dir_all(path.parent().unwrap())?;
     write_atomic(&path, &bytes)?;
     Ok(true)
@@ -221,7 +226,7 @@ async fn warm(
         allow_file_paths: false,
         upstream: None,
         sign_key: None,
-        trusted: Some(keys),
+        trusted: Some(keys.clone()),
         strip_signatures: true,
         upstream_down_until: AtomicU64::new(0),
         reads_down_until: AtomicU64::new(0),
