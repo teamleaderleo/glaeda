@@ -14172,10 +14172,17 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     ("/opt", "Homebrew and system packages (never reclaimed)"),
     ("/private/var/db", "macOS (never reclaimed)"),
     ("/private/var/folders", "per-user temporary and cache dirs (other accounts' are root-only)"),
-    (str(HOME / ".acpmux"), "acpmux sessions (acpmux_store_reclaim takes only ~/.acpmux-supervised; see "
-                            "'owned elsewhere')"),
+    (str(HOME / ".acpmux"), "acpmux sessions (on a lane VM acpmux_store_reclaim's own-store pass archives and "
+                            "purges closed ones; see 'owned elsewhere')"),
     (str(HOME / ".acpmux-supervised"), "the app's acpmux sessions (acpmux_store_reclaim)"),
     (str(HOME / "Projects/checkouts"), "wt checkouts (wt reclaim, worktree_reclaim; see 'owned elsewhere')"),
+    # A lane VM's overlay checkouts: each <repo>/.wt-overlay/<name>/w/work is overlayfs's own work dir, root-owned and
+    # mode 0000, so a walk without sudo reads the whole store as "unreadable" (a lane VM, 2026-11-26: 43.5G
+    # of .wt-overlay and 47G of .wt-base-ovl-* lowers blocked, the disk at 93%). wt owns both: `wt overlay gc`
+    # (worktree_reclaim's and disk_hygiene's step) removes lowers no checkout sits on and relinks identical files
+    # across the rest; wt reclaim removes a checkout's layer with the checkout.
+    (str(HOME / ".wt/checkouts"), "wt checkouts and their overlay layers and lowers (wt reclaim; `wt overlay gc` "
+                                  "drops unused lowers and relinks identical files; see 'owned elsewhere')"),
     (str(HOME / "lanes"), "lane clones and their cargo targets (worktree_reclaim)"),
     (str(HOME / "lane-scratch"), "lane scratch checkouts (worktree_reclaim)"),
     (str(HOME / "Projects/lane-scratch"), "lane scratch checkouts (worktree_reclaim)"),
@@ -16334,8 +16341,34 @@ def acpmux_store_lines() -> list[str]:
             if code == 0 and out.strip():
                 size = int(out.strip().splitlines()[-1].split()[0]) * 1024
     shown = gib(size).strip() if size is not None else "size unknown"
+    own = acpmux_own_store_pass()
+    if own:
+        return [f"  acpmux store {sessions}: {len(closed)} closed sessions hold {shown}; {own}"]
     return [f"  acpmux store {sessions}: {len(closed)} closed sessions hold {shown}; no pass reclaims them here "
             f"(acpmux_store_reclaim takes only {HOME / ACPMUX_SUPERVISED_REL}, the app's daemon; acpmux has no purge command)"]
+
+
+ACPMUX_STORE_TRIES_REL = ".cache/worktree-reclaim/acpmux-store.json"  # acpmux_store_reclaim's per-session tries
+ACPMUX_OWN_STORE_FRESH_S = 2 * 24 * 3600
+
+
+def acpmux_own_store_pass(now: float | None = None) -> str:
+    """What acpmux_store_reclaim does with this host's own ~/.acpmux, from its tries file ("" when no pass tried a
+    session here lately). On a lane VM its `own` block (leo-workspace machines/worktree-reclaim.json) archives each
+    closed session idle past idle_hours (72) and has the daemon purge it (`acpmux session stop --purge`); the report
+    said no pass reclaimed them (a lane VM, 2026-11-26: 317 closed sessions, 1.3G), and an agent read that
+    as a store nothing owned. Sessions closed under the window stay resumable in place: session history, kept."""
+    now = time.time() if now is None else now
+    try:
+        tries = json.loads((HOME / ACPMUX_STORE_TRIES_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    stamps = [float(v) for v in tries.values() if isinstance(v, (int, float))] if isinstance(tries, dict) else []
+    if not stamps or now - max(stamps) > ACPMUX_OWN_STORE_FRESH_S:
+        return ""
+    return (f"acpmux_store_reclaim's own-store pass judges them (last tried {max(0.0, (now - max(stamps)) / 3600):.1f}h "
+            f"ago): each closed one idle past its window (72h on a lane VM) is archived, then purged by the daemon; "
+            f"younger ones stay resumable (session history)")
 
 
 def owned_elsewhere_lines(now: float | None = None) -> list[str]:

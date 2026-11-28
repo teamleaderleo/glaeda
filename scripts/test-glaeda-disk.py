@@ -9833,12 +9833,28 @@ class VolumeCensusTest(unittest.TestCase):
         gd.DARWIN = False
         self.assertIsNone(gd.apfs_sibling_volumes("/x", now=300.0))
 
+    def test_acpmux_own_store_pass_is_named_from_its_tries_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gd, "HOME", Path(tmp)):
+            self.assertEqual(gd.acpmux_own_store_pass(now=1000.0), "")  # no pass here: the old line stands
+            tries = Path(tmp) / gd.ACPMUX_STORE_TRIES_REL
+            tries.parent.mkdir(parents=True)
+            tries.write_text(json.dumps({"01a1fd1b-dc5f-74af-833b-c417c87c1237": 1000.0 - 7200}), encoding="utf-8")
+            line = gd.acpmux_own_store_pass(now=1000.0)
+            self.assertIn("own-store pass", line)
+            self.assertIn("2.0h ago", line)
+            self.assertEqual(gd.acpmux_own_store_pass(now=1000.0 + gd.ACPMUX_OWN_STORE_FRESH_S + 7200), "")
+            tries.write_text("junk", encoding="utf-8")
+            self.assertEqual(gd.acpmux_own_store_pass(now=1000.0), "")
+
     def test_census_rows_name_an_owner_by_longest_prefix(self) -> None:
         self.assertIn("simulator", gd.census_owner("/Library/Developer/CoreSimulator/Volumes/iOS_23F77"))
         self.assertIn("Xcode command line", gd.census_owner("/Library/Developer/CommandLineTools"))
         self.assertIn("installed apps", gd.census_owner("/Applications"))
         self.assertEqual(gd.census_owner("/Applicationsx"), "")
-        self.assertIn("~/.acpmux-supervised", gd.census_owner(str(gd.HOME / ".acpmux")))
+        self.assertIn("own-store pass", gd.census_owner(str(gd.HOME / ".acpmux")))
+        # a lane VM's overlay store (root-owned 0000 work dirs read as unreadable) names wt as its owner
+        self.assertIn("wt overlay gc", gd.census_owner(str(gd.HOME / ".wt/checkouts/cmux/.wt-overlay")))
+        self.assertIn("wt overlay gc", gd.census_owner(str(gd.HOME / ".wt/checkouts/cmux/.wt-base-ovl-ab-cd")))
         self.assertIn("acpmux_store_reclaim", gd.census_owner(str(gd.HOME / ".acpmux-supervised")))
         self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "lanes/pool/cmux")))
         self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "out/.work/tag")))
