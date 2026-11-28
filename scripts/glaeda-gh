@@ -11147,7 +11147,7 @@ class Daemon:
             if lead is not None:
                 self.waited_tried[lead["key"]] = self.now
                 with self.waited_spend():
-                    left = self.batched("pr", [lead], lambda chunk: self.fetch_aliased(chunk, "pr"))
+                    left = self.batched("pr", [lead], self.fetch_full_sized)
                 if left and self.rest_admits("pr", lead):
                     self.read_rest(left, left)
                 prs = [e for e in prs if e["key"] != lead["key"]]
@@ -11174,7 +11174,10 @@ class Daemon:
                     self.errors.append(f"waited: {error}")
                     return
                 full += changed
-            for kind, todo, fetch in (("pr", full, lambda chunk: self.fetch_aliased(chunk, "pr")),
+            # Full reads sized by the measure (fetch_full_sized), as every other path: this pass sent whole chunks of
+            # the batch size, 5 or 10 cmux PRs a query that GitHub cut at 10.5 s, tick after tick (cmux-cp-2,
+            # 2026-11-28 02-03Z: 127 PR reads stored in 600 s, 475 of the tick's 536 s in read pr, data 38+ min old).
+            for kind, todo, fetch in (("pr", full, self.fetch_full_sized),
                                       ("run", runs, self.graphql_fetch["run"])):
                 size = max(1, self.batch[kind])
                 for i in range(0, len(todo), size):
@@ -13079,12 +13082,7 @@ class Daemon:
             full += changed
         # The full reads in queries sized by their measured cost (PR_FULL_QUERY_SECONDS), not the batch's size. One that
         # fails stops the rest: batched() splits the chunk, and the PRs read here are probed then, which is cheap.
-        size = self.full_pr_size(full)
-        for i in range(0, len(full), size):
-            error = self.fetch_aliased(full[i:i + size], "pr")
-            if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
-                return error
-        return None
+        return self.fetch_full_sized(full) if full else None
 
     def fetch_full_sized(self, chunk: list[dict]) -> str | None:
         """Full reads of CHUNK (one repository's) in queries sized by the measured cost (full_pr_size), as fetch_prs
